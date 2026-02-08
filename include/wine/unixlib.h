@@ -47,6 +47,9 @@ NTSYSAPI const WCHAR *ntdll_get_data_dir(void);
 NTSYSAPI NTSTATUS ntdll_get_dos_file_name( const char *unix_name, WCHAR **dos, UINT disposition );
 NTSYSAPI NTSTATUS ntdll_get_unix_file_name( const WCHAR *dos, char **unix_name, UINT disposition );
 
+typedef int (*poll_callback)( void *private, int events );
+NTSYSAPI NTSTATUS ntdll_sched_poll( int fd, int events, poll_callback callback, void *private );
+
 /* exception handling */
 
 #include <setjmp.h>

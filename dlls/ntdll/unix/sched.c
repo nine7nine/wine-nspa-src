@@ -22,6 +22,7 @@
 
 #include "config.h"
 
+#include <assert.h>
 #include <stddef.h>
 #include <stdarg.h>
 
@@ -42,60 +43,10 @@ WINE_DEFAULT_DEBUG_CHANNEL(ntdll);
 
 #include <CoreFoundation/CoreFoundation.h>
 
-struct descriptor_params
-{
-    poll_callback   callback;
-    void           *private;
-};
-
-static void set_descriptor_callbacks( CFFileDescriptorRef descriptor, int events )
-{
-    if (events & POLLIN) CFFileDescriptorEnableCallBacks( descriptor, kCFFileDescriptorReadCallBack );
-    else CFFileDescriptorDisableCallBacks( desc, kCFFileDescriptorReadCallBack );
-    if (events & POLLOUT) CFFileDescriptorEnableCallBacks( descriptor, kCFFileDescriptorWriteCallBack );
-    else CFFileDescriptorDisableCallBacks( desc, kCFFileDescriptorWriteCallBack );
-}
-
-static void descriptor_cb( CFFileDescriptorRef descriptor, CFOptionFlags options, void *context )
-{
-    struct descriptor_params *params = context;
-    int events = 0;
-
-    if (options & kCFFileDescriptorReadCallBack) events |= POLLIN;
-    if (options & kCFFileDescriptorWriteCallBack) events |= POLLOUT;
-    events = params->callback( params->private, events );
-    set_descriptor_callbacks( descriptor, events );
-}
-
 NTSTATUS ntdll_sched_poll( int fd, int events, poll_callback callback, void *private )
 {
-    CFFileDescriptorContext descriptor_context = {0};
-    struct descriptor_params *params;
-    CFFileDescriptorRef descriptor;
-    CFRunLoopSourceRef source;
-
-    TRACE( "fd %d, events %d, callback %p, private %p\n", fd, events, callback, private );
-
-    if (!(params = malloc( sizeof(*params) ))) goto failed;
-    params->callback = callback;
-    params->private = private;
-    descriptor_context.info = params;
-    descriptor_context.release = (void *)free;
-
-    if (!(descriptor = CFFileDescriptorCreate( NULL, fd, false, descriptor_cb, &descriptor_context ))) goto failed;
-    set_descriptor_callbacks( descriptor, events );
-
-    source = CFFileDescriptorCreateRunLoopSource( NULL, descriptor, 0 );
-    CFRelease( descriptor );
-    if (!source) goto failed;
-
-    CFRunLoopAddSource( CFRunLoopGetMain(), source, kCFRunLoopCommonModes );
-    CFRelease( source );
-    return STATUS_SUCCESS;
-
-failed:
-    free( params );
-    return STATUS_NO_MEMORY;
+    ERR( "not implemented!\n" );
+    return STATUS_NOT_IMPLEMENTED;
 }
 
 void sched_run(void)
@@ -183,38 +134,29 @@ static void free_poll_user( struct poll_user *user )
     free( user );
 }
 
-static pthread_mutex_t queue_lock = PTHREAD_MUTEX_INITIALIZER;
-static struct list polls_queue = LIST_INIT( polls_queue );
-static int queue_fd;
+static pthread_mutex_t sched_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct list poll_users = LIST_INIT( poll_users );
+static int signal_fd;
 
-static void queue_poll_user( struct poll_user *user )
+static void add_poll_user( struct poll_user *user )
 {
     static int64_t value = 1;
+    struct poll_user *other;
 
-    pthread_mutex_lock( &queue_lock );
-    list_add_tail( &polls_queue, &user->entry );
-    pthread_mutex_unlock( &queue_lock );
+    pthread_mutex_lock( &sched_lock );
+    LIST_FOR_EACH_ENTRY( other, &poll_users, struct poll_user, entry )
+        if (other->fd == user->fd) other->fd = -1; /* invalidate previous user */
+    list_add_tail( &poll_users, &user->entry );
+    pthread_mutex_unlock( &sched_lock );
 
-    write( queue_fd, &value, sizeof(value) );
+    write( signal_fd, &value, sizeof(value) );
 }
 
-struct poll_context
+static int signal_cb( void *private, int events )
 {
-    struct list polls;
-    int control_fd;
-};
-
-static int control_cb( void *private, int events )
-{
-    struct poll_context *ctx = private;
+    int *wait_fd = private;
     int64_t value;
-
-    while (read( ctx->control_fd, &value, sizeof(value) ) > 0) { /* nothing */ }
-
-    pthread_mutex_lock( &queue_lock );
-    list_move_tail( &ctx->polls, &polls_queue );
-    pthread_mutex_unlock( &queue_lock );
-
+    while (read( *wait_fd, &value, sizeof(value) ) > 0) { /* nothing */ }
     return POLLIN;
 }
 
@@ -238,29 +180,26 @@ static void init_context_fds( int *wait, int *signal )
 
 void sched_run(void)
 {
-    struct array pfds = ARRAY_INIT( pfds, struct pollfd );
     struct array users = ARRAY_INIT( users, struct poll_user * );
-    struct poll_context ctx = { .polls = LIST_INIT( ctx.polls ) };
-    struct poll_user *user;
+    struct array pfds = ARRAY_INIT( pfds, struct pollfd );
+    struct poll_user *user, *next;
+    int ret, wait_fd;
 
-    init_context_fds( &ctx.control_fd, &queue_fd );
-    user = alloc_poll_user( ctx.control_fd, POLLIN, control_cb, &ctx );
-    if (user) list_add_tail( &ctx.polls, &user->entry );
-    else ERR( "control fd allocation failed\n" );
+    init_context_fds( &wait_fd, &signal_fd );
+    ntdll_sched_poll( wait_fd, POLLIN, signal_cb, &wait_fd );
 
     for (;;)
     {
-        int ret;
-
-        users.count = 0;
-        pfds.count = 0;
-        LIST_FOR_EACH_ENTRY( user, &ctx.polls, struct poll_user, entry )
+        users.count = pfds.count = 0;
+        pthread_mutex_lock( &sched_lock );
+        LIST_FOR_EACH_ENTRY_SAFE( user, next, &poll_users, struct poll_user, entry )
         {
             struct pollfd pfd = { user->fd, user->events };
-            if (!user->events) continue;
-            if (!array_append( &users, &user )) ERR( "user pointer allocation failed\n" );
-            if (!array_append( &pfds, &pfd )) ERR( "pollfd allocation failed\n" );
+            if (user->fd == -1 || !user->events) free_poll_user( user );
+            else if (!array_append( &users, &user )) ERR( "user pointer allocation failed\n" );
+            else if (!array_append( &pfds, &pfd )) ERR( "pollfd allocation failed\n" );
         }
+        pthread_mutex_unlock( &sched_lock );
 
         if ((ret = poll( pfds.data, pfds.count, -1 )) < 0)
         {
@@ -272,9 +211,11 @@ void sched_run(void)
         {
             struct pollfd *pfd = array_get( &pfds, i );
             if (!pfd->revents) continue;
+
             user = *(struct poll_user **)array_get( &users, i );
             user->events = user->callback( user->private, pfd->revents );
-            if (pfd->revents & (POLLHUP | POLLERR)) free_poll_user( user );
+            if (pfd->revents & (POLLHUP | POLLERR)) user->events = 0;
+
             if (!--ret) break;
         }
     }
@@ -287,7 +228,7 @@ NTSTATUS ntdll_sched_poll( int fd, int events, poll_callback callback, void *pri
     TRACE( "fd %d, events %d, callback %p, private %p\n", fd, events, callback, private );
 
     if (!(user = alloc_poll_user( fd, events, callback, private ))) return STATUS_NO_MEMORY;
-    queue_poll_user( user );
+    add_poll_user( user );
     return STATUS_SUCCESS;
 }
 

@@ -50,6 +50,13 @@ NTSYSAPI NTSTATUS ntdll_get_unix_file_name( const WCHAR *dos, char **unix_name, 
 typedef int (*poll_callback)( void *private, int events );
 NTSYSAPI NTSTATUS ntdll_sched_poll( int fd, int events, poll_callback callback, void *private );
 
+typedef void (*async_callback)( void *private );
+NTSYSAPI NTSTATUS ntdll_sched_timer( const LARGE_INTEGER *timeout, async_callback callback, void *private );
+NTSYSAPI NTSTATUS ntdll_sched_async( async_callback callback, void *private );
+
+typedef NTSTATUS (*call_callback)( void *private );
+NTSYSAPI NTSTATUS ntdll_sched_call( call_callback callback, void *private );
+
 /* exception handling */
 
 #include <setjmp.h>

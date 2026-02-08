@@ -25,28 +25,200 @@
 #include <assert.h>
 #include <stddef.h>
 #include <stdarg.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <stdbool.h>
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <pthread.h>
+#include <unistd.h>
 #include <poll.h>
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
-#include "unix_private.h"
+#include "windef.h"
+#include "winbase.h"
+#include "winternl.h"
 
+#include "unix_private.h"
 #include "wine/list.h"
 #include "wine/debug.h"
 
-WINE_DEFAULT_DEBUG_CHANNEL(ntdll);
+/* NSPA: dedicated debug channel so WINEDEBUG=+sched selectively enables
+ * dispatch traces without the broader ntdll firehose. */
+WINE_DEFAULT_DEBUG_CHANNEL(sched);
+
+/* NSPA: track sched thread identity so ntdll_sched_call can detect a
+ * self-call (which would deadlock — the sched thread can't dispatch
+ * its own pending work while blocked on its own alert). */
+static pthread_t sched_pthread_id;
+static volatile int sched_thread_alive;
 
 #ifdef __APPLE__
 
 #include <CoreFoundation/CoreFoundation.h>
 
+static struct list poll_users = LIST_INIT( poll_users );
+
+struct poll_user
+{
+    struct list         entry;
+    CFFileDescriptorRef descriptor;
+    CFRunLoopSourceRef  source;
+    poll_callback       callback;
+    void               *private;
+};
+
+static void set_descriptor_callbacks( CFFileDescriptorRef descriptor, int events )
+{
+    if (events & POLLIN) CFFileDescriptorEnableCallBacks( descriptor, kCFFileDescriptorReadCallBack );
+    else CFFileDescriptorDisableCallBacks( descriptor, kCFFileDescriptorReadCallBack );
+    if (events & POLLOUT) CFFileDescriptorEnableCallBacks( descriptor, kCFFileDescriptorWriteCallBack );
+    else CFFileDescriptorDisableCallBacks( descriptor, kCFFileDescriptorWriteCallBack );
+}
+
+static void free_poll_user( struct poll_user *user )
+{
+    CFRunLoopRemoveSource( CFRunLoopGetMain(), user->source, kCFRunLoopCommonModes );
+    CFRelease( user->source );
+    CFRelease( user->descriptor );
+    list_remove( &user->entry );
+    free( user );
+}
+
+static void descriptor_cb( CFFileDescriptorRef descriptor, CFOptionFlags options, void *context )
+{
+    struct poll_user *user = context;
+    int events = 0;
+
+    if (options & kCFFileDescriptorReadCallBack) events |= POLLIN;
+    if (options & kCFFileDescriptorWriteCallBack) events |= POLLOUT;
+    events = user->callback( user->private, events );
+
+    if (events) set_descriptor_callbacks( descriptor, events );
+    else free_poll_user( user );
+}
+
+static void set_poll_user( struct poll_user *user, int events, poll_callback callback, void *private )
+{
+    user->private = private;
+    user->callback = callback;
+    set_descriptor_callbacks( user->descriptor, events );
+}
+
+static struct poll_user *alloc_poll_user( int fd )
+{
+    CFFileDescriptorContext descriptor_context = {0};
+    struct poll_user *user;
+
+    if (!(descriptor_context.info = user = malloc( sizeof(*user) )) ||
+        !(user->descriptor = CFFileDescriptorCreate( NULL, fd, false, descriptor_cb, &descriptor_context )) ||
+        !(user->source = CFFileDescriptorCreateRunLoopSource( NULL, user->descriptor, 0 )))
+    {
+        if (user->descriptor) CFRelease( user->descriptor );
+        free( user );
+        return NULL;
+    }
+
+    set_descriptor_callbacks( user->descriptor, 0 );
+    CFRunLoopAddSource( CFRunLoopGetMain(), user->source, kCFRunLoopCommonModes );
+    return user;
+}
+
+static struct poll_user *get_poll_user( int fd, bool create )
+{
+    struct poll_user *user;
+
+    LIST_FOR_EACH_ENTRY( user, &poll_users, struct poll_user, entry )
+        if (CFFileDescriptorGetNativeDescriptor( user->descriptor ) == fd) return user;
+
+    return create ? alloc_poll_user( fd ) : NULL;
+}
+
+struct add_poll_user_params
+{
+    int             fd;
+    int             events;
+    poll_callback   callback;
+    void           *private;
+};
+
+static NTSTATUS add_poll_user( void *private )
+{
+    struct add_poll_user_params *params = private;
+    struct poll_user *user;
+
+    if (!(user = get_poll_user( params->fd, !!params->events ))) return params->events ? STATUS_NO_MEMORY : STATUS_SUCCESS;
+    if (params->events) set_poll_user( user, params->events, params->callback, params->private );
+    else if (user) free_poll_user( user );
+
+    return STATUS_SUCCESS;
+}
+
 NTSTATUS ntdll_sched_poll( int fd, int events, poll_callback callback, void *private )
 {
-    ERR( "not implemented!\n" );
-    return STATUS_NOT_IMPLEMENTED;
+    struct add_poll_user_params params = { .fd = fd, .events = events, .callback = callback, .private = private };
+    TRACE( "fd %d, events %d, callback %p, private %p\n", fd, events, callback, private );
+    return ntdll_sched_call( add_poll_user, &params );
+}
+
+struct timer_params
+{
+    async_callback callback;
+    void          *private;
+};
+
+static void timer_cb( CFRunLoopTimerRef timer, void *context )
+{
+    struct timer_params *params = context;
+    params->callback( params->private );
+}
+
+NTSTATUS ntdll_sched_timer( const LARGE_INTEGER *timeout, async_callback callback, void *private )
+{
+    CFRunLoopTimerContext timer_context = {0};
+    struct timer_params *params;
+    CFRunLoopTimerRef timer;
+    LARGE_INTEGER rel;
+
+    TRACE( "timeout %jd, callback %p, private %p\n", (intmax_t)timeout->QuadPart, callback, private );
+
+    if (timeout->QuadPart > 0)
+    {
+        NtQueryPerformanceCounter( &rel, NULL );
+        rel.QuadPart -= timeout->QuadPart;
+        timeout = &rel;
+    }
+
+    if (!(params = malloc( sizeof(*params) ))) goto failed;
+    params->callback = callback;
+    params->private = private;
+    timer_context.info = params;
+    timer_context.release = (void *)free;
+
+    if (!(timer = CFRunLoopTimerCreate( NULL, CFAbsoluteTimeGetCurrent() - timeout->QuadPart / 10000000.0,
+                                        0.0, 0, 0, timer_cb, &timer_context ))) goto failed;
+    CFRunLoopAddTimer( CFRunLoopGetMain(), timer, kCFRunLoopCommonModes );
+    CFRelease( timer );
+    return STATUS_SUCCESS;
+
+failed:
+    free( params );
+    return STATUS_NO_MEMORY;
+}
+
+NTSTATUS ntdll_sched_async( async_callback callback, void *private )
+{
+    CFRunLoopSourceContext source_context = { .perform = callback, .info = private };
+    CFRunLoopSourceRef source;
+
+    if (!(source = CFRunLoopSourceCreate( NULL, 0, &source_context ))) return STATUS_NO_MEMORY;
+    CFRunLoopAddSource( CFRunLoopGetMain(), source, kCFRunLoopCommonModes );
+    CFRunLoopSourceSignal( source );
+    CFRelease( source );
+    return STATUS_SUCCESS;
 }
 
 void sched_run(void)
@@ -80,7 +252,12 @@ static void *array_get( struct array *array, size_t index )
 
 static void *array_append( struct array *array, void *data )
 {
-    if (array->count == array->alloc ? array->alloc : sizeof(array->buf) / array->size)
+    /* NSPA: parens fix.  Without them, operator precedence parses this as
+     * `(count == alloc) ? alloc : initial_cap`, which evaluates to a truthy
+     * `initial_cap` whenever count != alloc and alloc == 0 — forcing a
+     * realloc on every append after the first while the inline buffer is
+     * still completely unused.  Reported upstream-WIP. */
+    if (array->count == (array->alloc ? array->alloc : sizeof(array->buf) / array->size))
     {
         void *ptr = array->data == array->buf ? NULL : array->data;
         size_t alloc = max( 64, array->count * 3 / 2 );
@@ -134,8 +311,43 @@ static void free_poll_user( struct poll_user *user )
     free( user );
 }
 
+struct timer_user
+{
+    struct list     entry;      /* entry in sorted timeout list */
+    LONGLONG        when;       /* absolute timeout expiry */
+    async_callback  callback;   /* callback function */
+    void           *private;    /* callback private data */
+};
+
+static struct timer_user *alloc_timer_user( const LARGE_INTEGER *timeout, async_callback callback, void *private )
+{
+    struct timer_user *user;
+    LARGE_INTEGER now;
+
+    if (timeout->QuadPart <= 0)
+    {
+        NtQueryPerformanceCounter( &now, NULL );
+        now.QuadPart -= timeout->QuadPart;
+        timeout = &now;
+    }
+
+    if (!(user = malloc( sizeof(*user) ))) return NULL;
+    user->when     = timeout->QuadPart;
+    user->callback = callback;
+    user->private  = private;
+
+    return user;
+}
+
+static void free_timer_user( struct timer_user *user )
+{
+    list_remove( &user->entry );
+    free( user );
+}
+
 static pthread_mutex_t sched_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct list poll_users = LIST_INIT( poll_users );
+static struct list timer_users = LIST_INIT( timer_users );
 static int signal_fd;
 
 static void add_poll_user( struct poll_user *user )
@@ -150,6 +362,52 @@ static void add_poll_user( struct poll_user *user )
     pthread_mutex_unlock( &sched_lock );
 
     write( signal_fd, &value, sizeof(value) );
+}
+
+static void add_timer_user( struct timer_user *user )
+{
+    static int64_t value = 1;
+    struct timer_user *next;
+
+    pthread_mutex_lock( &sched_lock );
+    LIST_FOR_EACH_ENTRY( next, &timer_users, struct timer_user, entry )
+        if (next->when >= user->when) break;
+    list_add_before( &next->entry, &user->entry );
+    pthread_mutex_unlock( &sched_lock );
+
+    write( signal_fd, &value, sizeof(value) );
+}
+
+static int get_next_timeout(void)
+{
+    struct list expired = LIST_INIT(expired);
+    struct timer_user *user, *next;
+    long long ret = -1;
+    LARGE_INTEGER now;
+
+    NtQueryPerformanceCounter( &now, NULL );
+
+    pthread_mutex_lock( &sched_lock );
+    LIST_FOR_EACH_ENTRY_SAFE( user, next, &timer_users, struct timer_user, entry )
+    {
+        if ((ret = user->when - now.QuadPart) > 0) break;
+        list_remove( &user->entry );
+        list_add_tail( &expired, &user->entry );
+    }
+    pthread_mutex_unlock( &sched_lock );
+
+    LIST_FOR_EACH_ENTRY_SAFE( user, next, &expired, struct timer_user, entry )
+    {
+        user->callback( user->private );
+        free_timer_user( user );
+    }
+
+    if (ret <= 0) return -1;
+
+    /* convert to milliseconds, ceil to avoid spinning with 0 timeout */
+    ret = (ret + 9999) / 10000;
+    if (ret > INT_MAX) ret = INT_MAX;
+    return ret;
 }
 
 static int signal_cb( void *private, int events )
@@ -185,6 +443,13 @@ void sched_run(void)
     struct poll_user *user, *next;
     int ret, wait_fd;
 
+    /* NSPA: name the sched thread for debugability + record identity so
+     * ntdll_sched_call can detect self-call.  Order matters: identity
+     * must be visible before sched_thread_alive is set. */
+    sched_pthread_id = pthread_self();
+    pthread_setname_np( sched_pthread_id, "wine-sched" );
+    __atomic_store_n( &sched_thread_alive, 1, __ATOMIC_RELEASE );
+
     init_context_fds( &wait_fd, &signal_fd );
     ntdll_sched_poll( wait_fd, POLLIN, signal_cb, &wait_fd );
 
@@ -201,7 +466,7 @@ void sched_run(void)
         }
         pthread_mutex_unlock( &sched_lock );
 
-        if ((ret = poll( pfds.data, pfds.count, -1 )) < 0)
+        if ((ret = poll( pfds.data, pfds.count, get_next_timeout() )) < 0)
         {
             WARN( "poll returned %d, error %d\n", ret, errno );
             continue;
@@ -232,4 +497,67 @@ NTSTATUS ntdll_sched_poll( int fd, int events, poll_callback callback, void *pri
     return STATUS_SUCCESS;
 }
 
+NTSTATUS ntdll_sched_timer( const LARGE_INTEGER *timeout, async_callback callback, void *private )
+{
+    struct timer_user *user;
+
+    TRACE( "timeout %jd, callback %p, private %p\n", (intmax_t)timeout->QuadPart, callback, private );
+
+    if (!(user = alloc_timer_user( timeout, callback, private ))) return STATUS_NO_MEMORY;
+    add_timer_user( user );
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS ntdll_sched_async( async_callback callback, void *private )
+{
+    static LARGE_INTEGER zero;
+    return ntdll_sched_timer( &zero, callback, private );
+}
+
 #endif
+
+struct call_params
+{
+    call_callback  callback;
+    void          *private;
+    HANDLE         tid;
+    NTSTATUS       status;
+};
+
+static void execute_call( void *context )
+{
+    struct call_params *params = context;
+    NTSTATUS status = params->callback( params->private );
+    assert( status != STATUS_PENDING );
+    InterlockedExchange( &params->status, status );
+    NtAlertThreadByThreadId( params->tid );
+}
+
+NTSTATUS ntdll_sched_call( call_callback callback, void *private )
+{
+    struct call_params *params;
+    NTSTATUS status;
+
+    TRACE( "callback %p, private %p\n", callback, private );
+
+    /* NSPA: detect self-call from the sched thread itself.  Without this
+     * fast path, async dispatch would post the callback to the sched
+     * thread and the same thread would block in NtWaitForAlertByThreadId
+     * waiting for itself to dispatch — guaranteed deadlock since the
+     * sched thread is the dispatcher.  Run inline instead. */
+    if (__atomic_load_n( &sched_thread_alive, __ATOMIC_ACQUIRE ) &&
+        pthread_equal( pthread_self(), sched_pthread_id ))
+        return callback( private );
+
+    if (!(params = malloc( sizeof(*params) ))) return STATUS_NO_MEMORY;
+    params->callback = callback;
+    params->private = private;
+    params->tid = NtCurrentTeb()->ClientId.UniqueThread;
+    params->status = STATUS_PENDING;
+
+    if ((status = ntdll_sched_async( execute_call, params ))) ERR( "failed to schedule call, status %#x\n", status );
+    else while ((status = ReadNoFence( &params->status )) == STATUS_PENDING) NtWaitForAlertByThreadId( NULL, NULL );
+
+    free( params );
+    return status;
+}

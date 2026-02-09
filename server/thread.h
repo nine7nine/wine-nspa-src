@@ -147,7 +147,7 @@ extern struct thread *current;
 
 /* thread functions */
 
-extern struct thread *create_thread( int fd, struct process *process,
+extern struct thread *create_thread( int fd, struct process *process, unsigned int flags,
                                      const struct security_descriptor *sd );
 extern void cleanup_thread_reply_data( struct thread *thread ); /* NSPA v1.5 */
 extern struct thread *get_thread_from_id( thread_id_t id );

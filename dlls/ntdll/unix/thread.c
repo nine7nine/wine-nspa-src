@@ -82,7 +82,9 @@ WINE_DECLARE_DEBUG_CHANNEL(seh);
 WINE_DECLARE_DEBUG_CHANNEL(syscall);
 WINE_DECLARE_DEBUG_CHANNEL(threadname);
 
-static LONG nb_threads = 1;
+pthread_key_t teb_key = 0;
+
+static LONG nb_threads = 0;
 
 
 
@@ -1444,6 +1446,10 @@ NTSTATUS WINAPI NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATT
         wow_teb->SkipThreadAttach = teb->SkipThreadAttach;
         wow_teb->SkipLoaderInit = teb->SkipLoaderInit;
     }
+#ifndef _WIN64
+    if (InterlockedExchange( &init_redirect, FALSE ) && teb->GdiBatchCount)
+        ((TEB64 *)teb->GdiBatchCount)->TlsSlots[WOW64_TLS_FILESYSREDIR] = TRUE;
+#endif
 
     data->request_fd = request_pipe[1];
     data->start = start;

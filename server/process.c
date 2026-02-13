@@ -667,6 +667,7 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
     }
     process->sync            = NULL;
     process->parent_id       = 0;
+    process->sched_thread    = NULL;
     process->debug_obj       = NULL;
     process->debug_event     = NULL;
     process->handles         = NULL;
@@ -781,6 +782,15 @@ data_size_t get_process_startup_info_size( struct process *process )
     return info->data_size;
 }
 
+struct security_descriptor *get_first_thread_info( struct process *process, unsigned int *flags )
+{
+    struct startup_info *info = process->startup_info;
+
+    if (!info) return NULL;
+    *flags = process->thread_flags;
+    return process->thread_sd;
+}
+
 /* destroy a process when its refcount is 0 */
 static void process_destroy( struct object *obj )
 {
@@ -788,6 +798,7 @@ static void process_destroy( struct object *obj )
     assert( obj->ops == &process_ops );
 
     /* we can't have a thread remaining */
+    assert( !process->sched_thread );
     assert( list_empty( &process->thread_list ));
     assert( list_empty( &process->asyncs ));
 
@@ -996,6 +1007,11 @@ void kill_console_processes( struct thread *renderer, int exit_code )
 /* a process has been killed (i.e. its last thread died) */
 static void process_killed( struct process *process )
 {
+    assert( process->sched_thread );
+    kill_thread( process->sched_thread, 0 );
+    release_object( process->sched_thread );
+    process->sched_thread = NULL;
+
     assert( list_empty( &process->thread_list ));
     process->end_time = current_time;
     close_process_desktop( process );
@@ -1022,6 +1038,8 @@ static void process_killed( struct process *process )
 /* add a thread to a process running threads list */
 void add_process_thread( struct process *process, struct thread *thread )
 {
+    assert( process->sched_thread );
+
     list_add_tail( &process->thread_list, &thread->proc_entry );
     if (!process->running_threads++)
     {
@@ -1044,6 +1062,7 @@ void remove_process_thread( struct process *process, struct thread *thread )
 {
     assert( process->running_threads > 0 );
     assert( !list_empty( &process->thread_list ));
+    assert( process->sched_thread );
 
     list_remove( &thread->proc_entry );
 
@@ -1429,7 +1448,7 @@ DECL_HANDLER(new_process)
 
     info->process = (struct process *)grab_object( process );
 
-    if (!(thread = create_thread( -1, process, process->thread_flags, process->thread_sd ))) goto done;
+    if (!(thread = create_thread( -1, process, 0, NULL ))) goto done;
     thread->system_regs = current->system_regs;
 
     reply->info = alloc_handle( current->process, info, SYNCHRONIZE, 0 );
@@ -1524,24 +1543,19 @@ DECL_HANDLER(get_startup_info)
 }
 
 /* signal the end of the process initialization */
-DECL_HANDLER(init_process_done)
+void init_process_done( struct process *process )
 {
-    struct process *process = current->process;
-
     if (is_process_init_done(process))
     {
         set_error( STATUS_INVALID_PARAMETER );
         return;
     }
 
-    process->start_time = current_time;
-    generate_startup_debug_events( process );
     set_process_startup_state( process, STARTUP_DONE );
 
     if (process->image_info.subsystem != IMAGE_SUBSYSTEM_WINDOWS_CUI)
         process->idle_event = create_event( NULL, NULL, 0, 1, 0, NULL );
     if (process->debug_obj) set_process_debug_flag( process, 1 );
-    reply->suspend = (current->suspend || process->suspend);
 }
 
 /* open a handle to a process */
@@ -1719,6 +1733,7 @@ void set_process_base_priority( struct process *process, int base_priority )
 
     process->base_priority = base_priority;
 
+    if ((thread = process->sched_thread)) set_thread_base_priority( thread, thread->base_priority );
     LIST_FOR_EACH_ENTRY( thread, &process->thread_list, struct thread, proc_entry )
     {
         set_thread_base_priority( thread, thread->base_priority );
@@ -1764,6 +1779,7 @@ static void set_process_disable_boost( struct process *process, int disable_boos
 
     process->disable_boost = disable_boost;
 
+    if ((thread = process->sched_thread)) set_thread_disable_boost( thread, disable_boost );
     LIST_FOR_EACH_ENTRY( thread, &process->thread_list, struct thread, proc_entry )
     {
         set_thread_disable_boost( thread, disable_boost );
@@ -1782,6 +1798,7 @@ static void set_process_affinity( struct process *process, affinity_t affinity )
 
     process->affinity = affinity;
 
+    if ((thread = process->sched_thread)) set_thread_affinity( thread, affinity );
     LIST_FOR_EACH_ENTRY( thread, &process->thread_list, struct thread, proc_entry )
     {
         set_thread_affinity( thread, affinity );

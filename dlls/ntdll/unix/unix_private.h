@@ -263,7 +263,6 @@ extern PEB *peb;
 extern DWORD pid;
 extern USHORT *uctable;
 extern USHORT *lctable;
-extern SIZE_T startup_info_size;
 extern BOOL is_prefix_bootstrap;
 extern int main_argc;
 extern char **main_argv;
@@ -282,7 +281,7 @@ extern struct _KUSER_SHARED_DATA *user_shared_data;
 extern ULONG process_cookie;
 
 extern void init_environment(void);
-extern void init_startup_info(void);
+extern void init_startup_info( SIZE_T info_size );
 
 /* NSPA RT v1.2: exposed so other ntdll/unix files can access the
  * HANDLE→unix_tid map and cached process priority class. All live in

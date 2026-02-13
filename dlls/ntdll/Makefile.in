@@ -61,6 +61,7 @@ SOURCES = \
 	unix/nspa/local_timer.c \
 	unix/process.c \
 	unix/registry.c \
+	unix/sched.c \
 	unix/security.c \
 	unix/serial.c \
 	unix/server.c \

@@ -1507,6 +1507,9 @@ DECL_HANDLER(get_startup_info)
     struct startup_info *info = process->startup_info;
     data_size_t size;
 
+    current->teb = req->teb;
+    process->peb = req->peb;
+
     if (!info) return;
 
     /* we return the data directly without making a copy so this can only be called once */
@@ -1529,9 +1532,6 @@ DECL_HANDLER(init_process_done)
         set_error( STATUS_INVALID_PARAMETER );
         return;
     }
-
-    current->teb = req->teb;
-    process->peb = req->peb;
 
     process->start_time = current_time;
 

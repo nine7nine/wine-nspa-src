@@ -1207,11 +1207,16 @@ void set_thread_id( struct thread_data *data )
 /***********************************************************************
  *           init_thread_stack
  */
-NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE_T commit_size )
+NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE_T commit_size, BOOL only_kernel )
 {
     WOW_TEB *wow_teb = get_wow_teb( teb );
     INITIAL_TEB stack;
     NTSTATUS status;
+
+    /* wine-11.8 kernel stack is allocated by virtual_alloc_thread_data
+     * (lives at the end of the thread_data view); no separate allocation
+     * needed here. only_kernel just skips the user-stack work below. */
+    if (only_kernel) return STATUS_SUCCESS;
 
     if (wow_teb)
     {
@@ -1430,7 +1435,7 @@ NTSTATUS WINAPI NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATT
     if ((status = virtual_alloc_teb( data ))) goto done;
     teb = data->teb;
 
-    if ((status = init_thread_stack( teb, get_zero_bits_limit( zero_bits ), stack_reserve, stack_commit )))
+    if ((status = init_thread_stack( teb, get_zero_bits_limit( zero_bits ), stack_reserve, stack_commit, FALSE )))
     {
         virtual_free_thread_data( data );
         goto done;

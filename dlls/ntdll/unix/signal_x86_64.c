@@ -2741,13 +2741,42 @@ static int libc_addr_cb( struct dl_phdr_info *info, size_t size, void *arg )
 }
 #endif
 
+static void init_wow_sel(void)
+{
+    INITIAL_TEB stack;
+    WOW_TEB *wow_teb;
+    NTSTATUS status;
+    SIZE_T size = 0;
+
+    if (!(wow_teb = get_wow_teb( NtCurrentTeb() ))) return;
+
+    /* main thread doesn't have a user stack, create a temporary one to please alloc_fs_sel */
+
+    if ((status = virtual_alloc_thread_stack( &stack, 0, 0, 0x1000, 0x1000, TRUE ))) return;
+    wow_teb->Tib.StackBase = PtrToUlong( stack.StackBase );
+    wow_teb->Tib.StackLimit = PtrToUlong( stack.StackLimit );
+    wow_teb->DeallocationStack = PtrToUlong( stack.DeallocationStack );
+
+#ifdef __linux__
+    cs32_sel = 0x23;
+    fs32_sel = alloc_fs_sel( -1, wow_teb );
+#elif defined(__APPLE__)
+    cs32_sel = ldt_alloc_entry( ldt_make_cs32_entry() );
+#endif
+
+    NtFreeVirtualMemory( GetCurrentProcess(), &stack.DeallocationStack, &size, MEM_RELEASE );
+    wow_teb->Tib.StackBase = 0;
+    wow_teb->Tib.StackLimit = 0;
+    wow_teb->DeallocationStack = 0;
+}
+
+
 /**********************************************************************
  *		signal_init_process
  */
 void signal_init_process(void)
 {
     struct sigaction sig_act;
-    WOW_TEB *wow_teb = get_wow_teb( NtCurrentTeb() );
     struct ntdll_thread_data *thread_data = ntdll_get_thread_data();
     void *ptr, *kernel_stack = (char *)thread_data->kernel_stack + kernel_stack_size;
 
@@ -2763,15 +2792,7 @@ void signal_init_process(void)
 
     xstate_extended_features = user_shared_data->XState.EnabledFeatures & ~(UINT64)3;
 
-    if (wow_teb)
-    {
-#ifdef __linux__
-        cs32_sel = 0x23;
-        fs32_sel = alloc_fs_sel( -1, wow_teb );
-#elif defined(__APPLE__)
-        cs32_sel = ldt_alloc_entry( ldt_make_cs32_entry() );
-#endif
-    }
+    init_wow_sel();
 
 #ifdef PR_SET_SYSCALL_USER_DISPATCH
     if (syscall_dispatch_enabled && !dl_iterate_phdr( libc_addr_cb, NULL ))

@@ -1715,6 +1715,13 @@ NTSTATUS WINAPI NtSetInformationProcess( HANDLE handle, PROCESSINFOCLASS class, 
         {
             PROCESS_PRIORITY_CLASS* ppc = info;
 
+            /* NSPA RT v1.2: update cached priority class so subsequent
+             * SetThreadPriority calls via the ntdll Tier 1 / cross-thread
+             * map path resolve base_priority against the new class
+             * without a wineserver round-trip. Only for our own process. */
+            if (handle == NtCurrentProcess())
+                nspa_rt_set_cached_priocls( ppc->PriorityClass );
+
             SERVER_START_REQ( set_process_info )
             {
                 req->handle   = wine_server_obj_handle( handle );
@@ -1724,6 +1731,16 @@ NTSTATUS WINAPI NtSetInformationProcess( HANDLE handle, PROCESSINFOCLASS class, 
                 ret = wine_server_call( req );
             }
             SERVER_END_REQ;
+
+            /* Note: we do NOT walk the v1.2 map to re-apply RT here.
+             * Wineserver's set_process_priority handler walks process->thread_list
+             * and calls set_thread_base_priority() on each thread, which
+             * re-resolves per-thread base_priority against the new class
+             * and triggers Tier 2's apply_thread_priority. Tier 2 knows
+             * each thread's actual base_priority (including TIME_CRITICAL),
+             * so it promotes correctly. A client-side reapply that assumes
+             * base_priority==NORMAL would clobber threads whose base is
+             * actually TIME_CRITICAL. Let Tier 2 own the bulk update. */
         }
         break;
 

@@ -241,6 +241,12 @@ extern ULONG process_cookie;
 
 extern void init_environment(void);
 extern void init_startup_info(void);
+
+/* NSPA RT v1.2: exposed so other ntdll/unix files can access the
+ * HANDLE→unix_tid map and cached process priority class. All live in
+ * dlls/ntdll/unix/thread.c. */
+extern void nspa_rt_set_cached_priocls( int cls );
+extern void nspa_rt_map_remove( HANDLE handle );
 extern void *create_startup_info( const UNICODE_STRING *nt_image, ULONG process_flags,
                                   const RTL_USER_PROCESS_PARAMETERS *params,
                                   const struct pe_image_info *pe_info, DWORD *info_size );

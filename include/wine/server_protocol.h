@@ -1397,9 +1397,9 @@ struct set_thread_info_request
     client_ptr_t entry_point;
     obj_handle_t token;
     int          disable_boost;
+    int          nspa_rt_override;
     unsigned int mask;
     /* VARARG(desc,unicode_str); */
-    char __pad_52[4];
 };
 struct set_thread_info_reply
 {
@@ -7099,6 +7099,6 @@ union generic_reply
     struct d3dkmt_mutex_release_reply d3dkmt_mutex_release_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 932
+#define SERVER_PROTOCOL_VERSION 933
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

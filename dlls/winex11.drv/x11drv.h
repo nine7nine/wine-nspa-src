@@ -765,7 +765,7 @@ extern RECT get_host_primary_monitor_rect(void);
 extern RECT get_work_area( const RECT *monitor_rect );
 extern BOOL xinerama_get_fullscreen_monitors( const RECT *rect, unsigned int *generation, long *indices );
 extern void xinerama_init( unsigned int width, unsigned int height );
-extern void init_recursive_mutex( pthread_mutex_t *mutex );
+extern void init_recursive_mutex( pi_mutex_t *mutex );
 extern void init_icm_profile(void);
 
 #define DEPTH_COUNT 3

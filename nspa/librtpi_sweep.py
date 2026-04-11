@@ -323,9 +323,60 @@ def cursor_function_name(cursor):
         return cursor.referenced.spelling
     return None
 
+def canonical_cond_key(expr):
+    """Reduce a cond expression to its canonical field-name suffix.
+
+    Used by the Phase 1 pairing discovery + Phase 2 signal/broadcast
+    resolution so that textually-different expressions referring to
+    the same underlying cond variable can still be matched. Examples:
+
+        &stream->event_empty_cond             -> event_empty_cond
+        &parser->streams[i]->event_empty_cond -> event_empty_cond
+        &my_cond                              -> my_cond
+        &ctx->audio.ready_cond                -> ready_cond
+        &q->items[n].cond                     -> cond
+
+    Transformation steps:
+      1. strip leading whitespace and `&` address-of
+      2. remove all [N] array subscripts
+      3. split on '->' and '.'
+      4. return the final segment (rightmost field name)
+
+    Rationale for this shape: the cond_wait call site often uses a
+    local variable alias (`stream->event_empty_cond`) while the
+    cond_signal site uses the full chain through the owning struct
+    (`parser->streams[i]->event_empty_cond`). Both point at the same
+    heap location; the sweep needs to recognize them as the same
+    conceptual cond to pair them. The final field name is invariant
+    under pointer chasing and array indexing.
+
+    Collisions are possible in theory (two unrelated conds named
+    "cond" in the same TU), but the resolver catches ambiguity at
+    lookup time and errors out. In practice Wine's cond variables
+    have descriptive names (event_empty_cond, read_done_cond, etc.)
+    so collisions are rare.
+    """
+    import re
+    s = expr.strip()
+    if s.startswith('&'):
+        s = s[1:].lstrip()
+    # Strip array subscripts anywhere in the expression
+    s = re.sub(r'\[[^\]]*\]', '', s)
+    # Split on struct-member separators (-> or .)
+    parts = re.split(r'->|\.', s)
+    return parts[-1].strip()
+
+
 def discover_pairings(files, cdb):
-    """Phase 1: scan all files, return cond_expr → {mutex_exprs} multimap."""
-    pairings = defaultdict(set)
+    """Phase 1: scan all files, return (by_full, by_canonical) pairing maps.
+
+    by_full is a dict: cond_full_text -> {mutex_exprs}
+    by_canonical is a dict: cond_canonical_key -> {mutex_exprs}
+
+    Signal/broadcast lookups try by_full first, then fall back to
+    by_canonical if the exact textual form isn't known."""
+    by_full = defaultdict(set)
+    by_canonical = defaultdict(set)
     index = Index.create()
 
     for f in files:
@@ -345,9 +396,12 @@ def discover_pairings(files, cdb):
             cond_text = call_arg_text(cursor, 0)
             mutex_text = call_arg_text(cursor, 1)
             if cond_text and mutex_text:
-                pairings[cond_text].add(mutex_text)
+                by_full[cond_text].add(mutex_text)
+                by_canonical[canonical_cond_key(cond_text)].add(mutex_text)
 
-    return pairings
+    # Pack both into one struct for backward compat — callers use
+    # a tuple (by_full, by_canonical).
+    return (by_full, by_canonical)
 
 
 # ============================================================================
@@ -483,14 +537,35 @@ class FileRewriter:
         self.needs_rtpi_include = True
 
     def resolve_mutex_for_cond(self, cond_text):
-        mutexes = self.pairings.get(cond_text, set())
-        if len(mutexes) == 0:
-            raise RewriteError(
-                f'pthread_cond_signal/broadcast on "{cond_text}" has no '
-                f'paired mutex — cond is never used with cond_wait anywhere '
-                f'in the sweep scope. Cannot auto-resolve.')
+        # self.pairings is (by_full, by_canonical). Try exact text match
+        # first, then fall back to canonical-suffix match. See
+        # canonical_cond_key() for why that's useful — cond_wait and
+        # cond_signal sites often use different textual forms (one via
+        # a local alias, one via the full struct chain) for the same
+        # underlying cond variable.
+        by_full, by_canonical = self.pairings
+        mutexes = by_full.get(cond_text, set())
         if len(mutexes) == 1:
             return next(iter(mutexes))
+        if len(mutexes) == 0:
+            # Exact lookup failed — try canonical suffix fallback.
+            canonical = canonical_cond_key(cond_text)
+            mutexes = by_canonical.get(canonical, set())
+            if len(mutexes) == 1:
+                return next(iter(mutexes))
+            if len(mutexes) == 0:
+                raise RewriteError(
+                    f'pthread_cond_signal/broadcast on "{cond_text}" has no '
+                    f'paired mutex — cond is never used with cond_wait anywhere '
+                    f'in the sweep scope (also tried canonical key "{canonical}"). '
+                    f'Cannot auto-resolve.')
+            # canonical has multiple candidates — fall through to ambiguity.
+            raise RewriteError(
+                f'pthread_cond_signal/broadcast on "{cond_text}" has no exact '
+                f'textual pairing; canonical fallback "{canonical}" has '
+                f'{len(mutexes)} candidate mutexes: {sorted(mutexes)}. '
+                f'Ambiguous, cannot auto-resolve.')
+        # Exact match had >1 candidate — real ambiguity.
         raise RewriteError(
             f'pthread_cond_signal/broadcast on "{cond_text}" has '
             f'{len(mutexes)} candidate mutexes: {sorted(mutexes)}. '
@@ -703,25 +778,20 @@ class FileRewriter:
 def inject_rtpi_include(src_bytes):
     """Inject #include <rtpi.h> into a source file.
 
-    Two rules, in order:
+    Injects after the LAST include in the first contiguous block of
+    includes at the top of the file. This keeps the new include in the
+    "header section" rather than deep in the file where conditional
+    #include blocks live (e.g. #ifdef __APPLE__ or #ifdef sun sections
+    that pull in platform-specific headers late in the source).
 
-      1. If the file already #includes "unix_private.h" (the Wine ntdll
-         internal header, which itself includes <rtpi.h>), don't inject
-         anything — the types are already visible transitively. This
-         avoids cluttering ntdll/unix/*.c files with a redundant
-         <rtpi.h> that might land inside an #ifdef block.
-
-      2. Otherwise, inject after the LAST include in the first contiguous
-         block of includes at the top of the file. This keeps the new
-         include in the "header section" rather than deep in the file
-         where conditional #include blocks live (e.g. #ifdef __APPLE__
-         or #ifdef sun sections that pull in platform-specific headers
-         late in the source).
+    Note: we do NOT try to skip injection when a file includes
+    "unix_private.h" — each Wine DLL with Unix-side code has its OWN
+    unix_private.h (ntdll's, nsiproxy.sys's, etc.), and we can't tell
+    from the textual filename alone whether a given one transitively
+    pulls in rtpi.h. Always inject; a redundant include is harmless.
+    The ntdll/unix/unix_private.h already has its own #include <rtpi.h>
+    so the redundancy only affects its consumers' own source files.
     """
-    # Rule 1: skip if unix_private.h is already pulled in (it includes rtpi.h).
-    if b'"unix_private.h"' in src_bytes or b'<unix_private.h>' in src_bytes:
-        return src_bytes
-
     lines = src_bytes.split(b'\n')
     first_block_end = -1
     in_block = False
@@ -846,9 +916,12 @@ def main():
 
     print('\n=== Phase 1: cond_wait pairing discovery ===')
     pairings = discover_pairings(files, cdb)
-    print(f'discovered {len(pairings)} cond_wait pairings')
+    # pairings is (by_full, by_canonical)
+    by_full, by_canonical = pairings
+    print(f'discovered {len(by_full)} exact cond_wait pairings '
+          f'({len(by_canonical)} canonical keys)')
     if args.verbose:
-        for cond, mutexes in sorted(pairings.items()):
+        for cond, mutexes in sorted(by_full.items()):
             print(f'  {cond!r} -> {sorted(mutexes)!r}')
 
     print('\n=== Phase 2: rewriting files ===')

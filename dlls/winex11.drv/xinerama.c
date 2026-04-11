@@ -33,6 +33,7 @@
 #include <dlfcn.h>
 #include "x11drv.h"
 #include "wine/debug.h"
+#include <rtpi.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(x11drv);
 
@@ -45,7 +46,7 @@ static MONITORINFOEXW default_monitor =
     { '\\','\\','.','\\','D','I','S','P','L','A','Y','1',0 }   /* szDevice */
 };
 
-static pthread_mutex_t xinerama_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pi_mutex_t xinerama_mutex = PI_MUTEX_INIT(0);
 static unsigned long xinerama_generation;
 static MONITORINFOEXW *monitors;
 static int nb_monitors;
@@ -133,7 +134,7 @@ BOOL xinerama_get_fullscreen_monitors( const RECT *rect, unsigned int *generatio
     POINT offset;
     INT i;
 
-    pthread_mutex_lock( &xinerama_mutex );
+    pi_mutex_lock( &xinerama_mutex );
 
     /* Convert window rectangle to root coordinates */
     offset = virtual_screen_to_root( rect->left, rect->top );
@@ -172,7 +173,7 @@ BOOL xinerama_get_fullscreen_monitors( const RECT *rect, unsigned int *generatio
     if (indices[0] != -1)
         ret = TRUE;
 
-    pthread_mutex_unlock( &xinerama_mutex );
+    pi_mutex_unlock( &xinerama_mutex );
     return ret;
 }
 
@@ -209,11 +210,11 @@ static BOOL xinerama_get_adapters( ULONG_PTR gpu_id, struct x11drv_adapter **new
         return FALSE;
 
     /* Being lazy, actual adapter count may be less */
-    pthread_mutex_lock( &xinerama_mutex );
+    pi_mutex_lock( &xinerama_mutex );
     adapters = calloc( nb_monitors, sizeof(*adapters) );
     if (!adapters)
     {
-        pthread_mutex_unlock( &xinerama_mutex );
+        pi_mutex_unlock( &xinerama_mutex );
         return FALSE;
     }
 
@@ -260,7 +261,7 @@ static BOOL xinerama_get_adapters( ULONG_PTR gpu_id, struct x11drv_adapter **new
 
     *new_adapters = adapters;
     *count = index;
-    pthread_mutex_unlock( &xinerama_mutex );
+    pi_mutex_unlock( &xinerama_mutex );
     return TRUE;
 }
 
@@ -277,7 +278,7 @@ static BOOL xinerama_get_monitors( ULONG_PTR adapter_id, struct gdi_monitor **ne
     INT index = 0;
     INT i;
 
-    pthread_mutex_lock( &xinerama_mutex );
+    pi_mutex_lock( &xinerama_mutex );
 
     for (i = first; i < nb_monitors; i++)
     {
@@ -290,7 +291,7 @@ static BOOL xinerama_get_monitors( ULONG_PTR adapter_id, struct gdi_monitor **ne
     monitor = calloc( monitor_count, sizeof(*monitor) );
     if (!monitor)
     {
-        pthread_mutex_unlock( &xinerama_mutex );
+        pi_mutex_unlock( &xinerama_mutex );
         return FALSE;
     }
 
@@ -312,7 +313,7 @@ static BOOL xinerama_get_monitors( ULONG_PTR adapter_id, struct gdi_monitor **ne
 
     *new_monitors = monitor;
     *count = monitor_count;
-    pthread_mutex_unlock( &xinerama_mutex );
+    pi_mutex_unlock( &xinerama_mutex );
     return TRUE;
 }
 
@@ -328,7 +329,7 @@ void xinerama_init( unsigned int width, unsigned int height )
     int i;
     RECT rect;
 
-    pthread_mutex_lock( &xinerama_mutex );
+    pi_mutex_lock( &xinerama_mutex );
 
     SetRect( &rect, 0, 0, width, height );
     if (!query_screens())
@@ -354,7 +355,7 @@ void xinerama_init( unsigned int width, unsigned int height )
     }
 
     xinerama_generation++;
-    pthread_mutex_unlock( &xinerama_mutex );
+    pi_mutex_unlock( &xinerama_mutex );
 
     handler.name = "Xinerama";
     handler.priority = 100;

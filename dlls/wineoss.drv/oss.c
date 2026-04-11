@@ -43,6 +43,7 @@
 #include "wine/unixlib.h"
 
 #include "unixlib.h"
+#include <rtpi.h>
 
 struct oss_stream
 {
@@ -63,7 +64,7 @@ struct oss_stream
     BYTE *local_buffer, *tmp_buffer;
     INT32 getbuf_last; /* <0 when using tmp_buffer */
 
-    pthread_mutex_t lock;
+    pi_mutex_t lock;
 };
 
 WINE_DEFAULT_DEBUG_CHANNEL(oss);
@@ -104,12 +105,12 @@ static int muldiv( int a, int b, int c )
 
 static void oss_lock(struct oss_stream *stream)
 {
-    pthread_mutex_lock(&stream->lock);
+    pi_mutex_lock(&stream->lock);
 }
 
 static void oss_unlock(struct oss_stream *stream)
 {
-    pthread_mutex_unlock(&stream->lock);
+    pi_mutex_unlock(&stream->lock);
 }
 
 static NTSTATUS oss_unlock_result(struct oss_stream *stream,
@@ -566,7 +567,7 @@ static NTSTATUS oss_create_stream(void *args)
     }
 
     stream->flow = params->flow;
-    pthread_mutex_init(&stream->lock, NULL);
+    pi_mutex_init(&stream->lock, 0);
 
     stream->fd = open_device(params->device, params->flow);
     if(stream->fd < 0){
@@ -636,7 +637,7 @@ exit:
             size = 0;
             NtFreeVirtualMemory(GetCurrentProcess(), (void **)&stream->local_buffer, &size, MEM_RELEASE);
         }
-        pthread_mutex_destroy(&stream->lock);
+        pi_mutex_destroy(&stream->lock);
         free(stream->fmt);
         free(stream);
     }else{
@@ -669,7 +670,7 @@ static NTSTATUS oss_release_stream(void *args)
         NtFreeVirtualMemory(GetCurrentProcess(), (void **)&stream->tmp_buffer, &size, MEM_RELEASE);
     }
     free(stream->fmt);
-    pthread_mutex_destroy(&stream->lock);
+    pi_mutex_destroy(&stream->lock);
     free(stream);
 
     params->result = S_OK;

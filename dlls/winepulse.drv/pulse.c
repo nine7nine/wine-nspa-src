@@ -44,6 +44,7 @@
 #include "../mmdevapi/unixlib.h"
 
 #include "mult.h"
+#include <rtpi.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(pulse);
 
@@ -113,8 +114,8 @@ static pa_mainloop *pulse_ml;
 static struct list g_phys_speakers = LIST_INIT(g_phys_speakers);
 static struct list g_phys_sources = LIST_INIT(g_phys_sources);
 
-static pthread_mutex_t pulse_mutex;
-static pthread_cond_t pulse_cond = PTHREAD_COND_INITIALIZER;
+static pi_mutex_t pulse_mutex;
+static pi_cond_t pulse_cond = PI_COND_INIT(0);
 
 static ULONG_PTR zero_bits = 0;
 
@@ -125,22 +126,22 @@ static NTSTATUS pulse_not_implemented(void *args)
 
 static void pulse_lock(void)
 {
-    pthread_mutex_lock(&pulse_mutex);
+    pi_mutex_lock(&pulse_mutex);
 }
 
 static void pulse_unlock(void)
 {
-    pthread_mutex_unlock(&pulse_mutex);
+    pi_mutex_unlock(&pulse_mutex);
 }
 
 static int pulse_cond_wait(void)
 {
-    return pthread_cond_wait(&pulse_cond, &pulse_mutex);
+    return pi_cond_wait(&pulse_cond, &pulse_mutex);
 }
 
 static void pulse_broadcast(void)
 {
-    pthread_cond_broadcast(&pulse_cond);
+    pi_cond_broadcast(&pulse_cond, &pulse_mutex);
 }
 
 static struct pulse_stream *handle_get_stream(stream_handle h)
@@ -245,8 +246,8 @@ static NTSTATUS pulse_process_attach(void *args)
     pthread_mutexattr_setprotocol(&attr, PTHREAD_PRIO_INHERIT);
     pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST);
 
-    if (pthread_mutex_init(&pulse_mutex, &attr) != 0)
-        pthread_mutex_init(&pulse_mutex, NULL);
+    if (pi_mutex_init(&pulse_mutex, 0) != 0)
+        pi_mutex_init(&pulse_mutex, 0);
 
 #ifdef _WIN64
     if (NtCurrentTeb()->WowTebOffset)

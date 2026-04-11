@@ -54,12 +54,13 @@
 #include "wine/unixlib.h"
 
 #include "unix_private.h"
+#include <rtpi.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(hid);
 
 #ifdef SONAME_LIBSDL2
 
-static pthread_mutex_t sdl_cs = PTHREAD_MUTEX_INITIALIZER;
+static pi_mutex_t sdl_cs = PI_MUTEX_INIT(0);
 static const struct bus_options *options;
 
 static void *sdl_handle = NULL;
@@ -441,9 +442,9 @@ static NTSTATUS sdl_device_start(struct unix_device *iface)
 {
     struct sdl_device *impl = impl_from_unix_device(iface);
 
-    pthread_mutex_lock(&sdl_cs);
+    pi_mutex_lock(&sdl_cs);
     impl->started = TRUE;
-    pthread_mutex_unlock(&sdl_cs);
+    pi_mutex_unlock(&sdl_cs);
 
     return STATUS_SUCCESS;
 }
@@ -456,10 +457,10 @@ static void sdl_device_stop(struct unix_device *iface)
     if (impl->sdl_controller) pSDL_GameControllerClose(impl->sdl_controller);
     if (impl->sdl_haptic) pSDL_HapticClose(impl->sdl_haptic);
 
-    pthread_mutex_lock(&sdl_cs);
+    pi_mutex_lock(&sdl_cs);
     impl->started = FALSE;
     list_remove(&impl->unix_device.entry);
-    pthread_mutex_unlock(&sdl_cs);
+    pi_mutex_unlock(&sdl_cs);
 }
 
 static NTSTATUS sdl_device_haptics_start(struct unix_device *iface, UINT duration_ms,
@@ -807,10 +808,10 @@ static void check_all_devices_effects_state(void)
     if (ticks - last_ticks < 10) return;
     last_ticks = ticks;
 
-    pthread_mutex_lock(&sdl_cs);
+    pi_mutex_lock(&sdl_cs);
     LIST_FOR_EACH_ENTRY(impl, &device_list, struct sdl_device, unix_device.entry)
         check_device_effects_state(impl);
-    pthread_mutex_unlock(&sdl_cs);
+    pi_mutex_unlock(&sdl_cs);
 }
 
 static BOOL set_report_from_joystick_event(struct sdl_device *impl, SDL_Event *event)
@@ -1028,7 +1029,7 @@ static void process_device_event(SDL_Event *event)
 
     TRACE("Received action %x\n", event->type);
 
-    pthread_mutex_lock(&sdl_cs);
+    pi_mutex_lock(&sdl_cs);
 
     if (event->type == SDL_JOYDEVICEADDED)
         sdl_add_device(((SDL_JoyDeviceEvent *)event)->which);
@@ -1068,7 +1069,7 @@ static void process_device_event(SDL_Event *event)
         else set_report_from_controller_event(impl, event);
     }
 
-    pthread_mutex_unlock(&sdl_cs);
+    pi_mutex_unlock(&sdl_cs);
 }
 
 NTSTATUS sdl_bus_init(void *args)

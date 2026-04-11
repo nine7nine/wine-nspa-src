@@ -22,6 +22,7 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <pthread.h>
+#include <rtpi.h>
 
 #include "ntstatus.h"
 #include "windef.h"
@@ -98,7 +99,7 @@ extern NTSTATUS return_wow64_string( const void *str, PTR32 *wow64_str );
 
 #endif
 
-extern pthread_mutex_t wgl_lock;
+extern pi_mutex_t wgl_lock;
 
 extern NTSTATUS process_attach( void *args );
 extern NTSTATUS thread_attach( void *args );

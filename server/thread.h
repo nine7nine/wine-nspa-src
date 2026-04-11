@@ -47,6 +47,34 @@ struct inflight_fd
 };
 #define MAX_INFLIGHT_FDS 16  /* max number of fds in flight per thread */
 
+#ifdef __linux__
+/* NSPA v1.5 shmem IPC: per-thread shared memory layout.
+ * Created by wineserver in create_request_shm(), mapped by clients in
+ * server_init_process / server_init_thread. Fast-path replacement for
+ * socket request/reply IPC. Synchronized via futex in the first field.
+ *
+ * Futex state machine:
+ *   0  = idle (server waiting for request)
+ *   1  = request pending (client wrote, woke server)
+ *   -1 = thread killed / teardown
+ *
+ * Layout: futex + padding, then union of current request or reply.
+ * The trailing space up to REQUEST_SHM_SIZE holds variable-size data. */
+#ifndef REQUEST_SHM_SIZE
+# define REQUEST_SHM_SIZE (1 * 1024 * 1024)
+#endif
+struct request_shm
+{
+    int futex;
+    int pad;
+    union
+    {
+        union generic_request req;
+        union generic_reply   reply;
+    } u;
+};
+#endif
+
 struct thread
 {
     struct object          obj;           /* object header */
@@ -75,6 +103,11 @@ struct thread
     struct fd             *request_fd;    /* fd for receiving client requests */
     struct fd             *reply_fd;      /* fd to send a reply to a client */
     struct fd             *wait_fd;       /* fd to use to wake a sleeping client */
+#ifdef __linux__
+    int                    request_shm_fd;    /* NSPA v1.5: shared memory fd */
+    volatile struct request_shm *request_shm; /* NSPA v1.5: shared memory mapping */
+    int                    request_shm_thread_running; /* NSPA v1.5: shm dispatcher pthread status */
+#endif
     enum run_state         state;         /* running state */
     int                    exit_code;     /* thread exit code */
     int                    unix_pid;      /* Unix pid of client */
@@ -107,6 +140,7 @@ extern struct thread *current;
 
 extern struct thread *create_thread( int fd, struct process *process,
                                      const struct security_descriptor *sd );
+extern void cleanup_thread_reply_data( struct thread *thread ); /* NSPA v1.5 */
 extern struct thread *get_thread_from_id( thread_id_t id );
 extern struct thread *get_thread_from_handle( obj_handle_t handle, unsigned int access );
 extern struct thread *get_thread_from_tid( int tid );

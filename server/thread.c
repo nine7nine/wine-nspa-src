@@ -23,15 +23,20 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>       /* NSPA v1.5: for request_shm_thread */
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>      /* NSPA v1.5: for munmap */
 #include <sys/types.h>
 #include <unistd.h>
 #include <time.h>
 #include <poll.h>
+#ifdef HAVE_SYS_SYSCALL_H  /* NSPA v1.5: for futex syscall */
+#include <sys/syscall.h>
+#endif
 #ifdef HAVE_SCHED_H
 /* FreeBSD needs this for cpu_set_t instead of its cpuset_t */
 #define _WITH_CPU_SET_T
@@ -235,7 +240,7 @@ static struct list thread_list = LIST_INIT(thread_list);
 #if defined(__linux__) && defined(RLIMIT_NICE)
 static int nice_limit;
 
-/* NSPA RT v1: SCHED_FIFO/RR support for the NT realtime band [16..31].
+/* NSPA RT: SCHED_FIFO/RR support for the NT realtime band [16..31].
  * Gated on NSPA_RT_PRIO being set at wineserver startup. When unset,
  * nspa_rt_prio_base stays -1 and the RT path is dormant, leaving the
  * existing nice-based behavior unchanged.
@@ -247,10 +252,11 @@ static int nice_limit;
 static int nspa_rt_policy    = SCHED_FIFO;  /* parsed from NSPA_RT_POLICY; applies to NT [16..30] only */
 static int nspa_rt_prio_base = -1;          /* parsed from NSPA_RT_PRIO; -1 = RT disabled */
 
-/* NSPA RT v1.1: wineserver main thread scheduling class. Exposed to the
- * v1.5 shmem dispatcher creation site so pthread_attr can be set up with
- * matching SCHED_FIFO/RR priority — otherwise PTHREAD_EXPLICIT_SCHED
- * would need to inherit, which is defeated by SCHED_RESET_ON_FORK. */
+/* NSPA RT v1.1: wineserver main thread scheduling class. Shmem dispatcher
+ * threads (v1.5) also use these and self-promote at startup — they cannot
+ * rely on pthread inheritance because SCHED_RESET_ON_FORK applies to
+ * clone()/pthread_create() too, not just fork(), so pthreads spawned by an
+ * RT-promoted parent start fresh as SCHED_OTHER. */
 static int nspa_srv_rt_policy = SCHED_FIFO;  /* parsed from NSPA_SRV_RT_POLICY */
 static int nspa_srv_rt_prio   = -1;          /* parsed from NSPA_SRV_RT_PRIO or derived; -1 = disabled */
 
@@ -361,8 +367,12 @@ static void nspa_rt_init(void)
 
     /* NSPA RT v1.1: optionally promote wineserver itself to RT, at a priority
      * BELOW the audio callback band so audio callbacks always preempt the
-     * server. Shmem dispatcher threads (v1.5) will use pthread_attr with
-     * explicit scheduling to match this class — see create_thread(). */
+     * server. Shmem dispatcher threads (v1.5) inherit via pthread default
+     * PTHREAD_INHERIT_SCHED and will come along at the same priority.
+     *
+     * Default derivation: nspa_rt_prio_base - 5, clamped to >= 1.
+     * Override via NSPA_SRV_RT_PRIO (integer) + NSPA_SRV_RT_POLICY (FF|RR).
+     * Gated on NSPA_RT_PRIO being set (since we only reach here if it is). */
     {
         const char *srv_pol_env  = getenv( "NSPA_SRV_RT_POLICY" );
         const char *srv_prio_env = getenv( "NSPA_SRV_RT_PRIO" );
@@ -398,9 +408,11 @@ static void nspa_rt_init(void)
                                   "(expected FF or RR), using FF\n", srv_pol_env );
         }
 
-        /* SCHED_RESET_ON_FORK is safe here: shmem dispatcher pthreads (v1.5)
-         * will be created with PTHREAD_EXPLICIT_SCHED, so their class is set
-         * explicitly, not inherited — reset-on-fork doesn't affect them. */
+        /* SCHED_RESET_ON_FORK is safe here: shmem dispatcher pthreads are
+         * created with PTHREAD_EXPLICIT_SCHED in create_thread() so their
+         * class is set explicitly, not inherited — reset-on-fork doesn't
+         * affect them. Any actual fork() (e.g. future wineserver helpers)
+         * will have its child correctly demoted to SCHED_OTHER. */
         param.sched_priority = nspa_srv_rt_prio;
         if (sched_setscheduler( 0, nspa_srv_rt_policy | SCHED_RESET_ON_FORK, &param ) == -1)
         {
@@ -615,6 +627,11 @@ static inline void init_thread_structure( struct thread *thread )
     thread->request_fd      = NULL;
     thread->reply_fd        = NULL;
     thread->wait_fd         = NULL;
+#ifdef __linux__
+    thread->request_shm_fd  = -1;
+    thread->request_shm     = NULL;
+    thread->request_shm_thread_running = 0;
+#endif
     thread->state           = RUNNING;
     thread->exit_code       = 0;
     thread->priority        = 0;
@@ -700,11 +717,122 @@ static struct context *create_thread_context( struct thread *thread )
 
 
 /* create a new thread */
+#ifdef __linux__
+
+/* NSPA v1.5 shmem IPC: helpers for the per-client dispatcher pthread.
+ * See server/file.h for global_lock / poll_generation semantics. */
+
+#define NSPA_FUTEX_WAIT 0
+#define NSPA_FUTEX_WAKE 1
+
+static void nspa_handle_shm_request( struct thread *thread, struct request_shm *request_shm )
+{
+    set_current_time();
+    read_request_shm( thread, request_shm );
+}
+
+/* Dispatcher pthread: one per client thread. Sits in FUTEX_WAIT on the
+ * client's request_shm->futex. When the client wakes it (futex 0->1),
+ * it grabs global_lock, dispatches the request via the existing
+ * req_handlers[] table, writes the reply into shared memory, transitions
+ * the futex back to 0, FUTEX_WAKEs the client, and loops.
+ *
+ * On teardown (futex set to -1 by cleanup_thread), it releases its hold on
+ * the shm mapping and exits. */
+static void *nspa_request_shm_thread( void *param )
+{
+    struct thread *thread = param;
+    int request_shm_fd;
+    volatile struct request_shm *request_shm;
+    unsigned long generation = 0;
+
+    pthread_mutex_lock( &global_lock );
+    request_shm_fd = thread->request_shm_fd;
+    request_shm = thread->request_shm;
+    pthread_mutex_unlock( &global_lock );
+
+    for (;;)
+    {
+        int val;
+
+        while ((val = request_shm->futex) != 1)
+        {
+            if (val == -1) goto done;
+            if (val != 0)
+                fatal_protocol_error( thread, "nspa shmem: unknown futex state %d\n", val );
+            syscall( __NR_futex, &request_shm->futex, NSPA_FUTEX_WAIT, val, NULL, NULL, 0 );
+        }
+
+        pthread_mutex_lock( &global_lock );
+        generation = poll_generation;
+
+        val = request_shm->futex;
+        if (val != 1)
+        {
+            if (val != -1)
+                fatal_protocol_error( thread, "nspa shmem: unknown futex state %d (locked)\n", val );
+            goto done_locked;
+        }
+
+        __asm__ __volatile__ ("" ::: "memory");
+        nspa_handle_shm_request( thread, (struct request_shm *)request_shm );
+        __asm__ __volatile__ ("" ::: "memory");
+
+        request_shm_fd = thread->request_shm_fd;
+        request_shm = thread->request_shm;
+        if (request_shm_fd == -1 || !request_shm) goto done_locked;
+
+        val = __sync_val_compare_and_swap( &request_shm->futex, 1, 0 );
+        if (val != 1 && val != -1)
+            fatal_protocol_error( thread, "nspa shmem: unknown futex state %d (post)\n", val );
+
+        pthread_mutex_unlock( &global_lock );
+        syscall( __NR_futex, &request_shm->futex, NSPA_FUTEX_WAKE, 1, NULL, NULL, 0 );
+
+        if (poll_generation != generation)
+            force_exit_poll();
+    }
+
+done:
+    pthread_mutex_lock( &global_lock );
+done_locked:
+    if (request_shm_fd != -1) close( request_shm_fd );
+    if (request_shm) munmap( (void *)request_shm, REQUEST_SHM_SIZE );
+    release_object( thread );
+    pthread_mutex_unlock( &global_lock );
+    if (poll_generation != generation)
+        force_exit_poll();
+    return NULL;
+}
+
+#endif /* __linux__ */
+
+/* NSPA v1.5: cleanup reply_data honoring shared memory ownership.
+ * If reply_data points into the request_shm region, it is not a heap
+ * allocation and must not be free()'d. */
+void cleanup_thread_reply_data( struct thread *thread )
+{
+#ifdef __linux__
+    if (thread->request_shm &&
+        (char *)thread->reply_data >= (char *)thread->request_shm &&
+        (char *)thread->reply_data < (char *)thread->request_shm + REQUEST_SHM_SIZE)
+    {
+        thread->reply_data = NULL;
+        return;
+    }
+#endif
+    free( thread->reply_data );
+    thread->reply_data = NULL;
+}
+
 struct thread *create_thread( int fd, struct process *process, const struct security_descriptor *sd )
 {
     struct desktop *desktop;
     struct thread *thread;
     int request_pipe[2];
+#ifdef __linux__
+    pthread_t pthread;
+#endif
 
     if (fd == -1)
     {
@@ -765,6 +893,32 @@ struct thread *create_thread( int fd, struct process *process, const struct secu
     if (!(thread->sync = create_internal_sync( 1, 0 ))) goto error;
     if (get_inproc_device_fd() >= 0 && !(thread->alert_sync = create_inproc_internal_sync( 1, 0 ))) goto error;
 
+#ifdef __linux__
+    /* Create per-thread shared memory + dispatcher pthread. Failure is soft:
+     * the thread falls back to socket IPC. */
+    if (create_request_shm( &thread->request_shm_fd, (struct request_shm **)&thread->request_shm ))
+    {
+        grab_object( thread );  /* hold for the dispatcher pthread */
+        if (pthread_create( &pthread, NULL, nspa_request_shm_thread, thread ) == 0)
+        {
+            pthread_detach( pthread );
+            thread->request_shm_thread_running = 1;
+        }
+        else
+        {
+            release_object( thread );
+            close( thread->request_shm_fd );
+            munmap( (void *)thread->request_shm, REQUEST_SHM_SIZE );
+            thread->request_shm_fd = -1;
+            thread->request_shm = NULL;
+        }
+    }
+    else
+    {
+        clear_error();  /* shmem is a fast path, socket is still valid */
+    }
+#endif
+
     if (process->desktop)
     {
         if (!(desktop = get_desktop_obj( process, process->desktop, 0 ))) clear_error();  /* ignore errors */
@@ -819,11 +973,33 @@ static void cleanup_thread( struct thread *thread )
     }
     clear_apc_queue( &thread->system_apc );
     clear_apc_queue( &thread->user_apc );
+#ifdef __linux__
+    /* NSPA v1.5: if req_data points into the shmem region, don't free it. */
+    if (thread->request_shm &&
+        (char *)thread->req_data >= (char *)thread->request_shm &&
+        (char *)thread->req_data < (char *)thread->request_shm + REQUEST_SHM_SIZE)
+        thread->req_data = NULL;
+#endif
     free( thread->req_data );
-    free( thread->reply_data );
+    cleanup_thread_reply_data( thread );
     if (thread->request_fd) release_object( thread->request_fd );
     if (thread->reply_fd) release_object( thread->reply_fd );
     if (thread->wait_fd) release_object( thread->wait_fd );
+#ifdef __linux__
+    /* NSPA v1.5: signal the dispatcher pthread to exit by transitioning the
+     * futex to -1 and waking it. The pthread owns the fd+mmap cleanup in its
+     * exit path; we only clean them up here if the pthread never started. */
+    if (thread->request_shm)
+    {
+        __atomic_exchange_n( &thread->request_shm->futex, -1, __ATOMIC_SEQ_CST );
+        syscall( __NR_futex, &thread->request_shm->futex, NSPA_FUTEX_WAKE, 1, NULL, NULL, 0 );
+    }
+    if (!thread->request_shm_thread_running)
+    {
+        if (thread->request_shm_fd != -1) close( thread->request_shm_fd );
+        if (thread->request_shm) munmap( (void *)thread->request_shm, REQUEST_SHM_SIZE );
+    }
+#endif
     cleanup_clipboard_thread(thread);
     destroy_thread_windows( thread );
     free_msg_queue( thread );
@@ -842,6 +1018,11 @@ static void cleanup_thread( struct thread *thread )
     thread->request_fd = NULL;
     thread->reply_fd = NULL;
     thread->wait_fd = NULL;
+#ifdef __linux__
+    thread->request_shm_fd = -1;
+    thread->request_shm = NULL;
+    thread->request_shm_thread_running = 0;
+#endif
     thread->desktop = 0;
     thread->desc = NULL;
     thread->desc_len = 0;
@@ -1978,6 +2159,16 @@ DECL_HANDLER(init_first_thread)
         reply->inproc_device = get_process_id( process ) | 1;
         send_client_fd( process, fd, reply->inproc_device );
     }
+
+#ifdef __linux__
+    /* NSPA v1.5 shmem IPC: pass per-thread shmem fd to the client.
+     * Ordering: inproc_device (above) is sent first if present, then
+     * request_shm. Client-side server_init_process receives in the same
+     * order. The fd handle token is reply->tid to disambiguate from
+     * inproc_device's token. */
+    if ((reply->has_request_shm = current->request_shm_fd != -1))
+        send_client_fd( current->process, current->request_shm_fd, reply->tid );
+#endif
 }
 
 /* initialize a new thread */
@@ -2002,6 +2193,12 @@ DECL_HANDLER(init_thread)
     set_thread_affinity( current, current->affinity );
 
     reply->suspend = (is_thread_suspended( current ) || current->context != NULL);
+
+#ifdef __linux__
+    /* NSPA v1.5: pass per-thread shmem fd (fd handle token = current's tid). */
+    if ((reply->has_request_shm = current->request_shm_fd != -1))
+        send_client_fd( current->process, current->request_shm_fd, get_thread_id( current ) );
+#endif
 }
 
 /* terminate a thread */

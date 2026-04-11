@@ -21,6 +21,7 @@
 #ifndef __WINE_SERVER_FILE_H
 #define __WINE_SERVER_FILE_H
 
+#include <pthread.h>  /* NSPA v1.5: for global_lock */
 #include <sys/types.h>
 
 #include "object.h"
@@ -30,6 +31,7 @@ struct mapping;
 struct async_queue;
 struct completion;
 struct reserve;
+struct request_shm;  /* NSPA v1.5 */
 
 /* server-side representation of I/O status block */
 struct iosb
@@ -130,6 +132,17 @@ extern void default_fd_queue_async( struct fd *fd, struct async *async, int type
 extern void default_fd_reselect_async( struct fd *fd, struct async_queue *queue );
 extern void main_loop(void);
 extern void remove_process_locks( struct process *process );
+
+/* NSPA v1.5 shmem IPC: global lock serializing wineserver dispatch between
+ * the main poll loop and per-client shm dispatcher pthreads. Released only
+ * around the kernel poll/epoll syscall. poll_generation guards against
+ * fd-reuse races when the poll set changes out of band. */
+extern pthread_mutex_t global_lock;
+extern unsigned long poll_generation;
+extern void force_exit_poll(void);
+#ifdef __linux__
+extern int create_request_shm( int *fd, struct request_shm **ptr );
+#endif
 
 static inline struct fd *get_obj_fd( struct object *obj ) { return obj->ops->get_fd( obj ); }
 

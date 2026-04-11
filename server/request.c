@@ -152,10 +152,32 @@ void fatal_error( const char *err, ... )
     exit(1);
 }
 
+#ifdef __linux__
+/* NSPA v1.5 commit 3: when dispatching from the shm path, return a pointer
+ * into the shared memory directly (if size fits), eliminating the memcpy
+ * from heap reply buffer to shmem in send_reply_shm. Gated on reply_in_shm
+ * which read_request_shm sets during shm dispatch only. */
+int reply_in_shm;
+#endif
+
 /* allocate the reply data */
 void *set_reply_data_size( data_size_t size )
 {
     assert( size <= get_reply_max_size() );
+#ifdef __linux__
+    if (current->request_shm && reply_in_shm)
+    {
+        char *data_ptr = (char *)(current->request_shm + 1)
+                         + current->req.request_header.request_size;
+        unsigned int size_limit = (char *)current->request_shm + REQUEST_SHM_SIZE - data_ptr;
+        if (size_limit >= size)
+        {
+            current->reply_data = data_ptr;
+            current->reply_size = size;
+            return current->reply_data;
+        }
+    }
+#endif
     if (size && !(current->reply_data = mem_alloc( size ))) size = 0;
     current->reply_size = size;
     return current->reply_data;
@@ -231,8 +253,7 @@ void write_reply( struct thread *thread )
     {
         if (!(thread->reply_towrite -= ret))
         {
-            free( thread->reply_data );
-            thread->reply_data = NULL;
+            cleanup_thread_reply_data( thread );  /* NSPA v1.5: shmem-aware free */
             /* sent everything, can go back to waiting for requests */
             set_fd_events( thread->request_fd, POLLIN );
             set_fd_events( thread->reply_fd, 0 );
@@ -274,8 +295,7 @@ static void send_reply( union generic_reply *reply )
             return;
         }
     }
-    free( current->reply_data );
-    current->reply_data = NULL;
+    cleanup_thread_reply_data( current );  /* NSPA v1.5: shmem-aware free */
     return;
 
  error:
@@ -286,6 +306,117 @@ static void send_reply( union generic_reply *reply )
     else
         fatal_protocol_error( current, "reply write: %s\n", strerror( errno ));
 }
+
+#ifdef __linux__
+/* NSPA v1.5 shmem IPC: send a reply via the shared memory region.
+ * Called from call_req_handler_shm after the request handler has run.
+ * If reply_data already points into the shmem region (PATCH 3 optimization),
+ * no copy is needed. Otherwise, copy what fits into shmem and fall back to
+ * the socket path for any overflow (rare — most replies are small). */
+void send_reply_shm( union generic_reply *reply, struct request_shm *request_shm, data_size_t req_data_size )
+{
+    char *data_ptr = (char *)(request_shm + 1) + req_data_size;
+    unsigned int copy_limit = (char *)request_shm + REQUEST_SHM_SIZE - data_ptr;
+    int ret;
+
+    if (!current->reply_size)
+        return;
+
+    /* PATCH 3 fast path: reply_data was allocated directly in shmem. */
+    if ((char *)current->reply_data >= (char *)request_shm &&
+        (char *)current->reply_data < (char *)request_shm + REQUEST_SHM_SIZE)
+    {
+        current->reply_data = NULL;  /* not owned by us, don't free */
+        return;
+    }
+
+    if (current->reply_size <= copy_limit)
+    {
+        memcpy( data_ptr, current->reply_data, current->reply_size );
+        cleanup_thread_reply_data( current );
+        return;
+    }
+
+    /* Reply doesn't fit in shmem trailing space; write overflow via socket. */
+    memcpy( data_ptr, current->reply_data, copy_limit );
+    current->reply_towrite = current->reply_size - copy_limit;
+
+    if ((ret = write( get_unix_fd( current->reply_fd ),
+                      (char *)current->reply_data + current->reply_size - current->reply_towrite,
+                      current->reply_towrite )) >= 0)
+    {
+        if (!(current->reply_towrite -= ret))
+            cleanup_thread_reply_data( current );
+        else
+        {
+            /* couldn't write it all, wait for POLLOUT */
+            set_fd_events( current->reply_fd, POLLOUT );
+            set_fd_events( current->request_fd, 0 );
+        }
+        return;
+    }
+    if (errno == EPIPE)
+        kill_thread( current, 0 );
+    else if (errno != EWOULDBLOCK && (EWOULDBLOCK == EAGAIN || errno != EAGAIN))
+        fatal_protocol_error( current, "nspa shmem reply write: %s\n", strerror( errno ));
+}
+
+/* call a request handler via the shm path */
+static void call_req_handler_shm( struct thread *thread, struct request_shm *request_shm )
+{
+    enum request req = thread->req.request_header.req;
+    data_size_t data_size = thread->req.request_header.request_size;
+
+    current = thread;
+    current->reply_size = 0;
+    clear_error();
+    memset( (void *)&request_shm->u.reply, 0, sizeof(request_shm->u.reply) );
+
+    if (debug_level) trace_request();
+
+    if (req < REQ_NB_REQUESTS)
+        req_handlers[req]( &current->req, (union generic_reply *)&request_shm->u.reply );
+    else
+        set_error( STATUS_NOT_IMPLEMENTED );
+
+    if (current)
+    {
+        if (current->reply_fd)
+        {
+            request_shm->u.reply.reply_header.error = current->error;
+            request_shm->u.reply.reply_header.reply_size = current->reply_size;
+            if (debug_level) trace_reply( req, (union generic_reply *)&request_shm->u.reply );
+            send_reply_shm( (union generic_reply *)&request_shm->u.reply, request_shm, data_size );
+        }
+        else
+        {
+            current->exit_code = 1;
+            kill_thread( current, 1 );
+        }
+    }
+    current = NULL;
+}
+
+/* read a request from shared memory and dispatch it */
+void read_request_shm( struct thread *thread, struct request_shm *request_shm )
+{
+    void *orig_req_data = thread->req_data;
+    data_size_t data_size;
+
+    memcpy( &thread->req, (void *)&request_shm->u.req, sizeof(thread->req) );
+    data_size = thread->req.request_header.request_size;
+    if (data_size)
+        thread->req_data = (void *)(request_shm + 1);
+    reply_in_shm = 1;
+
+    call_req_handler_shm( thread, request_shm );
+
+    reply_in_shm = 0;
+    /* Only restore req_data if the handler didn't swap it out. */
+    if (data_size && thread->req_data == (void *)(request_shm + 1))
+        thread->req_data = orig_req_data;
+}
+#endif /* __linux__ */
 
 /* call a request handler */
 static void call_req_handler( struct thread *thread )

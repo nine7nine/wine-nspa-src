@@ -53,6 +53,9 @@ extern const void *get_req_data_after_objattr( const struct object_attributes *a
 extern int receive_fd( struct process *process );
 extern int send_client_fd( struct process *process, int fd, obj_handle_t handle );
 extern void read_request( struct thread *thread );
+#ifdef __linux__
+extern void read_request_shm( struct thread *thread, struct request_shm *request_shm ); /* NSPA v1.5 */
+#endif
 extern void write_reply( struct thread *thread );
 extern timeout_t monotonic_counter(void);
 extern void open_master_socket(void);

@@ -280,6 +280,79 @@ static inline unsigned int wait_reply( int reply_fd, struct __server_request_inf
 }
 
 
+#ifdef __linux__
+
+/* NSPA v1.5 shmem IPC: futex-based fast path for small wineserver requests.
+ * See server/thread.c:nspa_request_shm_thread for the server side.
+ *
+ * State machine on request_shm->futex:
+ *   0 (idle)    → 1 (request pending): client wrote request, woke dispatcher
+ *   1 (pending) → 0 (reply ready):    dispatcher wrote reply, woke client
+ *   anything    → -1 (terminated):    teardown, either side should exit
+ */
+#define NSPA_FUTEX_WAIT 0
+#define NSPA_FUTEX_WAKE 1
+
+static unsigned int nspa_send_request_shm( const struct __server_request_info *req )
+{
+    volatile struct request_shm *request_shm = get_thread_data()->request_shm;
+    unsigned int i;
+
+    /* Copy fixed header + variable-size data into the shmem region. */
+    memcpy( (void *)&request_shm->u.req, &req->u.req, sizeof(req->u.req) );
+    if (req->u.req.request_header.request_size)
+    {
+        char *ptr = (char *)(request_shm + 1);
+        for (i = 0; i < req->data_count; i++)
+        {
+            memcpy( ptr, req->data[i].ptr, req->data[i].size );
+            ptr += req->data[i].size;
+        }
+    }
+
+    /* Publish: transition futex 0 -> 1 and wake the dispatcher. */
+    while (__sync_val_compare_and_swap( &request_shm->futex, 0, 1 ) != 0)
+        sched_yield();
+    syscall( __NR_futex, &request_shm->futex, NSPA_FUTEX_WAKE, 1, NULL, NULL, 0 );
+    return STATUS_SUCCESS;
+}
+
+static inline unsigned int nspa_wait_reply_shm( struct __server_request_info *req )
+{
+    volatile struct request_shm *request_shm = get_thread_data()->request_shm;
+    char *data_ptr = (char *)(request_shm + 1) + req->u.req.request_header.request_size;
+    unsigned int copy_limit = (char *)request_shm + NSPA_REQUEST_SHM_SIZE - data_ptr;
+    int val;
+
+    /* Wait for dispatcher to transition futex 1 -> 0. */
+    while ((val = request_shm->futex) != 0)
+    {
+        if (val == -1) abort_thread( 0 );  /* teardown */
+        syscall( __NR_futex, &request_shm->futex, NSPA_FUTEX_WAIT, val, NULL, NULL, 0 );
+    }
+
+    memcpy( &req->u.reply, (void *)&request_shm->u.reply, sizeof(req->u.reply) );
+    if (req->u.reply.reply_header.reply_size)
+    {
+        if (req->u.reply.reply_header.reply_size > copy_limit)
+        {
+            /* Overflow: part in shmem, rest via socket fallback. */
+            memcpy( req->reply_data, data_ptr, copy_limit );
+            read_reply_data( get_thread_data()->reply_fd,
+                             (char *)req->reply_data + copy_limit,
+                             req->u.reply.reply_header.reply_size - copy_limit );
+        }
+        else
+        {
+            memcpy( req->reply_data, data_ptr, req->u.reply.reply_header.reply_size );
+        }
+    }
+    return req->u.reply.reply_header.error;
+}
+
+#endif /* __linux__ */
+
+
 /***********************************************************************
  *           server_call_unlocked
  */
@@ -288,6 +361,16 @@ unsigned int server_call_unlocked( void *req_ptr )
     struct thread_data *data = get_thread_data();
     struct __server_request_info * const req = req_ptr;
     unsigned int ret;
+
+#ifdef __linux__
+    /* NSPA v1.5: use shmem fast path if set up AND request fits. */
+    if (data->request_shm &&
+        sizeof(req->u.req) + req->u.req.request_header.request_size < NSPA_REQUEST_SHM_SIZE)
+    {
+        if ((ret = nspa_send_request_shm( req ))) return ret;
+        return nspa_wait_reply_shm( req );
+    }
+#endif
 
     if ((ret = send_request( data->request_fd, req ))) return ret;
     return wait_reply( data->reply_fd, req );
@@ -1666,6 +1749,67 @@ size_t server_init_process(void)
 
     reply_pipe = init_thread_pipe();
 
+#ifdef __linux__
+    {
+        sigset_t sigset;
+        int shm_fd_local = -1;
+        BOOL received_shm = FALSE;
+
+        /* NSPA v1.5: wrap in fd_cache_mutex to match Torge's original patch
+         * and prevent races with any concurrent fd receive path. Strictly,
+         * the main thread is alone during init so the race window is tiny,
+         * but the lock costs nothing and matches server_init_thread. */
+        server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );
+
+        SERVER_START_REQ( init_first_thread )
+        {
+            req->unix_pid    = getpid();
+            req->unix_tid    = get_unix_tid();
+            req->reply_fd    = reply_pipe;
+            req->wait_fd     = data->wait_fd[1];
+            req->debug_level = (TRACE_ON(server) != 0);
+            wine_server_set_reply( req, supported_machines, sizeof(supported_machines) );
+            if (!(ret = server_call_unlocked( req )))
+            {
+                obj_handle_t handle;
+                pid               = reply->pid;
+                data->tid         = reply->tid;
+                peb->SessionId    = reply->session_id;
+                info_size         = reply->info_size;
+                server_start_time = reply->server_start;
+                supported_machines_count = wine_server_reply_size( reply ) / sizeof(*supported_machines);
+                if (reply->inproc_device)
+                {
+                    inproc_device_fd = wine_server_receive_fd( &handle );
+                    assert( handle == reply->inproc_device );
+                }
+                if (reply->has_request_shm)
+                {
+                    shm_fd_local = wine_server_receive_fd( &handle );
+                    assert( handle == data->tid );
+                    received_shm = TRUE;
+                }
+            }
+        }
+        SERVER_END_REQ;
+
+        server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
+
+        /* mmap outside the locked section */
+        if (received_shm && shm_fd_local >= 0)
+        {
+            data->request_shm_fd = shm_fd_local;
+            data->request_shm = mmap( NULL, NSPA_REQUEST_SHM_SIZE,
+                                      PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd_local, 0 );
+            if (data->request_shm == MAP_FAILED)
+            {
+                close( shm_fd_local );
+                data->request_shm_fd = -1;
+                data->request_shm = NULL;
+            }
+        }
+    }
+#else
     SERVER_START_REQ( init_first_thread )
     {
         req->unix_pid    = getpid();
@@ -1691,6 +1835,7 @@ size_t server_init_process(void)
         }
     }
     SERVER_END_REQ;
+#endif
     close( reply_pipe );
 
     if (ret) server_protocol_error( "init_first_thread failed with status %x\n", ret );
@@ -1782,9 +1927,22 @@ void server_init_thread( void *entry_point, BOOL *suspend )
     void *teb;
     struct thread_data *data = get_thread_data();
     int reply_pipe = init_thread_pipe();
+#ifdef __linux__
+    sigset_t sigset;
+    int shm_fd_local = -1;
+    BOOL received_shm = FALSE;
+#endif
 
     /* always send the native TEB */
     if (!(teb = NtCurrentTeb64())) teb = data->teb;
+
+#ifdef __linux__
+    /* NSPA v1.5: hold fd_cache_mutex around init_thread so the fd receive
+     * doesn't race with concurrent lazy inproc_sync fd fetches from other
+     * threads of the same process. Torge's original patch did this; I
+     * missed it in the first port and hit sync.c:679 assertion as a result. */
+    server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );
+#endif
 
     SERVER_START_REQ( init_thread )
     {
@@ -1793,10 +1951,45 @@ void server_init_thread( void *entry_point, BOOL *suspend )
         req->entry     = wine_server_client_ptr( entry_point );
         req->reply_fd  = reply_pipe;
         req->wait_fd   = data->wait_fd[1];
+#ifdef __linux__
+        /* Use server_call_unlocked since we're already in an uninterrupted
+         * section (wine_server_call would try to mask signals again). */
+        if (!server_call_unlocked( req ))
+            *suspend = reply->suspend;
+        else
+            *suspend = 0;
+
+        if (reply->has_request_shm)
+        {
+            obj_handle_t handle;
+            shm_fd_local = wine_server_receive_fd( &handle );
+            received_shm = TRUE;
+        }
+#else
         wine_server_call( req );
         *suspend = reply->suspend;
+#endif
     }
     SERVER_END_REQ;
+
+#ifdef __linux__
+    server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
+
+    /* mmap outside the locked section to minimize hold time */
+    if (received_shm && shm_fd_local >= 0)
+    {
+        data->request_shm_fd = shm_fd_local;
+        data->request_shm = mmap( NULL, NSPA_REQUEST_SHM_SIZE,
+                                  PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd_local, 0 );
+        if (data->request_shm == MAP_FAILED)
+        {
+            close( shm_fd_local );
+            data->request_shm_fd = -1;
+            data->request_shm = NULL;
+        }
+    }
+#endif
+
     close( reply_pipe );
 }
 

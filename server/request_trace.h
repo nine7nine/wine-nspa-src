@@ -149,6 +149,7 @@ static void dump_init_first_thread_reply( const struct init_first_thread_reply *
     dump_timeout( ", server_start=", &req->server_start );
     fprintf( stderr, ", session_id=%08x", req->session_id );
     fprintf( stderr, ", inproc_device=%04x", req->inproc_device );
+    fprintf( stderr, ", has_request_shm=%d", req->has_request_shm );
     fprintf( stderr, ", info_size=%u", req->info_size );
     dump_varargs_ushorts( ", machines=", cur_size );
 }
@@ -165,6 +166,7 @@ static void dump_init_thread_request( const struct init_thread_request *req )
 static void dump_init_thread_reply( const struct init_thread_reply *req )
 {
     fprintf( stderr, " suspend=%d", req->suspend );
+    fprintf( stderr, ", has_request_shm=%d", req->has_request_shm );
 }
 
 static void dump_terminate_process_request( const struct terminate_process_request *req )

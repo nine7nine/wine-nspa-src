@@ -155,6 +155,7 @@ struct fd
     unsigned int         cacheable :1;/* can the fd be cached on the client side? */
     unsigned int         fs_locks :1; /* can we use filesystem locks for this fd? */
     int                  poll_index;  /* index of fd in poll array */
+    unsigned long        poll_generation; /* NSPA v1.5: generation when added to poll array */
     struct async_queue   read_q;      /* async readers of this fd */
     struct async_queue   write_q;     /* async writers of this fd */
     struct async_queue   wait_q;      /* other async waiters of this fd */
@@ -523,6 +524,16 @@ static int active_users;                    /* current number of active users */
 static int allocated_users;                 /* count of allocated entries in the array */
 static struct fd **freelist;                /* list of free entries in the array */
 
+/* NSPA v1.5 shmem IPC: global lock serializing wineserver dispatch. The main
+ * poll loop holds this lock except around the actual poll/epoll syscall.
+ * Per-thread shm dispatchers (in thread.c) acquire it to run request handlers.
+ * poll_generation increments on every poll-set mutation so stale poll results
+ * (e.g. fd reused after close) are skipped. */
+pthread_mutex_t global_lock = PTHREAD_MUTEX_INITIALIZER;
+unsigned long   poll_generation;
+static int      poll_exit_pipe[2];
+static struct fd *poll_exit_fd;
+
 static int get_next_timeout( struct timespec *ts );
 
 static inline void fd_poll_event( struct fd *fd, int event )
@@ -604,13 +615,18 @@ static inline void main_loop_epoll(void)
 
     if (epoll_fd == -1) return;
 
+    pthread_mutex_lock( &global_lock );  /* NSPA v1.5 */
     while (active_users)
     {
+        unsigned long generation;  /* NSPA v1.5 */
+
         timeout = get_next_timeout( &ts );
 
         if (!active_users) break;  /* last user removed by a timeout */
         if (epoll_fd == -1) break;  /* an error occurred with epoll */
 
+        generation = poll_generation;
+        pthread_mutex_unlock( &global_lock );  /* NSPA v1.5: release around kernel wait */
 #ifdef HAVE_EPOLL_PWAIT2
         if (!failed_epoll_pwait2)
         {
@@ -621,6 +637,7 @@ static inline void main_loop_epoll(void)
         if (failed_epoll_pwait2)
 #endif
             ret = epoll_wait( epoll_fd, events, ARRAY_SIZE( events ), timeout );
+        pthread_mutex_lock( &global_lock );  /* NSPA v1.5: reacquire */
 
         set_current_time();
 
@@ -628,6 +645,9 @@ static inline void main_loop_epoll(void)
         for (i = 0; i < ret; i++)
         {
             int user = events[i].data.u32;
+            /* NSPA v1.5: skip entries whose fd was removed/reused after we captured generation */
+            if (user >= nb_users || pollfd[user].fd == -1 ||
+                poll_users[user]->poll_generation > generation) continue;
             pollfd[user].revents = events[i].events;
         }
 
@@ -635,9 +655,12 @@ static inline void main_loop_epoll(void)
         for (i = 0; i < ret; i++)
         {
             int user = events[i].data.u32;
+            if (user >= nb_users || pollfd[user].fd == -1 ||
+                poll_users[user]->poll_generation > generation) continue;
             if (pollfd[user].revents) fd_poll_event( poll_users[user], pollfd[user].revents );
         }
     }
+    pthread_mutex_unlock( &global_lock );  /* NSPA v1.5 */
 }
 
 #elif defined(HAVE_KQUEUE)
@@ -709,14 +732,20 @@ static inline void main_loop_epoll(void)
 
     if (kqueue_fd == -1) return;
 
+    pthread_mutex_lock( &global_lock );  /* NSPA v1.5 */
     while (active_users)
     {
+        unsigned long generation;  /* NSPA v1.5 */
+
         timeout = get_next_timeout( &ts );
 
         if (!active_users) break;  /* last user removed by a timeout */
         if (kqueue_fd == -1) break;  /* an error occurred with kqueue */
 
+        generation = poll_generation;
+        pthread_mutex_unlock( &global_lock );  /* NSPA v1.5 */
         ret = kevent( kqueue_fd, NULL, 0, events, ARRAY_SIZE( events ), timeout == -1 ? NULL : &ts );
+        pthread_mutex_lock( &global_lock );  /* NSPA v1.5 */
 
         set_current_time();
 
@@ -724,11 +753,15 @@ static inline void main_loop_epoll(void)
         for (i = 0; i < ret; i++)
         {
             long user = (long)events[i].udata;
+            if (user >= nb_users || pollfd[user].fd == -1 ||
+                poll_users[user]->poll_generation > generation) continue;
             pollfd[user].revents = 0;
         }
         for (i = 0; i < ret; i++)
         {
             long user = (long)events[i].udata;
+            if (user >= nb_users || pollfd[user].fd == -1 ||
+                poll_users[user]->poll_generation > generation) continue;
             if (events[i].filter == EVFILT_READ) pollfd[user].revents |= POLLIN;
             else if (events[i].filter == EVFILT_WRITE) pollfd[user].revents |= POLLOUT;
             if (events[i].flags & EV_EOF) pollfd[user].revents |= POLLHUP;
@@ -739,10 +772,13 @@ static inline void main_loop_epoll(void)
         for (i = 0; i < ret; i++)
         {
             long user = (long)events[i].udata;
+            if (user >= nb_users || pollfd[user].fd == -1 ||
+                poll_users[user]->poll_generation > generation) continue;
             if (pollfd[user].revents) fd_poll_event( poll_users[user], pollfd[user].revents );
             pollfd[user].revents = 0;
         }
     }
+    pthread_mutex_unlock( &global_lock );  /* NSPA v1.5 */
 }
 
 #elif defined(USE_EVENT_PORTS)
@@ -804,15 +840,21 @@ static inline void main_loop_epoll(void)
 
     if (port_fd == -1) return;
 
+    pthread_mutex_lock( &global_lock );  /* NSPA v1.5 */
     while (active_users)
     {
+        unsigned long generation;  /* NSPA v1.5 */
+
         timeout = get_next_timeout( &ts );
         nget = 1;
 
         if (!active_users) break;  /* last user removed by a timeout */
         if (port_fd == -1) break;  /* an error occurred with event completion */
 
+        generation = poll_generation;
+        pthread_mutex_unlock( &global_lock );  /* NSPA v1.5 */
         ret = port_getn( port_fd, events, ARRAY_SIZE( events ), &nget, timeout == -1 ? NULL : &ts );
+        pthread_mutex_lock( &global_lock );  /* NSPA v1.5 */
 
 	if (ret == -1) break;  /* an error occurred with event completion */
 
@@ -822,6 +864,8 @@ static inline void main_loop_epoll(void)
         for (i = 0; i < nget; i++)
         {
             long user = (long)events[i].portev_user;
+            if (user >= nb_users || pollfd[user].fd == -1 ||
+                poll_users[user]->poll_generation > generation) continue;
             pollfd[user].revents = events[i].portev_events;
         }
 
@@ -829,6 +873,8 @@ static inline void main_loop_epoll(void)
         for (i = 0; i < nget; i++)
         {
             long user = (long)events[i].portev_user;
+            if (user >= nb_users || pollfd[user].fd == -1 ||
+                poll_users[user]->poll_generation > generation) continue;
             if (pollfd[user].revents) fd_poll_event( poll_users[user], pollfd[user].revents );
             /* if we are still interested, reassociate the fd */
             if (pollfd[user].fd != -1) {
@@ -836,6 +882,7 @@ static inline void main_loop_epoll(void)
             }
         }
     }
+    pthread_mutex_unlock( &global_lock );  /* NSPA v1.5 */
 }
 
 #else /* HAVE_KQUEUE */
@@ -884,6 +931,7 @@ static int add_poll_user( struct fd *fd )
     pollfd[ret].events = 0;
     pollfd[ret].revents = 0;
     poll_users[ret] = fd;
+    fd->poll_generation = ++poll_generation;  /* NSPA v1.5 */
     active_users++;
     return ret;
 }
@@ -981,10 +1029,53 @@ static int get_next_timeout( struct timespec *ts )
     return ret;
 }
 
+/* NSPA v1.5: poll_exit_fd event handler (reads from the wake pipe). */
+static void poll_exit_poll_event( struct fd *fd, int event )
+{
+    char dummy;
+    read( fd->unix_fd, &dummy, sizeof(dummy) );
+}
+
+static const struct fd_ops poll_exit_fd_ops =
+{
+    NULL,                        /* get_poll_events */
+    poll_exit_poll_event,        /* poll_event */
+    NULL,                        /* get_fd_type */
+    NULL,                        /* read */
+    NULL,                        /* write */
+    NULL,                        /* flush */
+    NULL,                        /* get_file_info */
+    NULL,                        /* get_volume_info */
+    NULL,                        /* ioctl */
+    NULL,                        /* cancel_async */
+    NULL,                        /* queue_async */
+    NULL,                        /* reselect_async */
+};
+
+static int create_poll_exit_fd( void )
+{
+    if (pipe( poll_exit_pipe )) return 0;
+    poll_exit_fd = create_anonymous_fd( &poll_exit_fd_ops, poll_exit_pipe[0], NULL, 0 );
+    if (!poll_exit_fd) return 0;
+    set_fd_events( poll_exit_fd, POLLIN );
+    return 1;
+}
+
+/* NSPA v1.5: wake the main loop out of its poll/epoll syscall. Used by shm
+ * dispatchers when they mutate the poll set from outside the main loop. */
+void force_exit_poll( void )
+{
+    static char zero;
+    ssize_t ret = write( poll_exit_pipe[1], &zero, sizeof(zero) );
+    (void)ret;  /* non-blocking best-effort wake */
+}
+
 /* server main poll() loop */
 void main_loop(void)
 {
     int i, ret, timeout;
+
+    if (!create_poll_exit_fd()) return;  /* NSPA v1.5 */
 
     set_current_time();
     server_start_time = current_time;
@@ -992,19 +1083,27 @@ void main_loop(void)
     main_loop_epoll();
     /* fall through to normal poll loop */
 
+    pthread_mutex_lock( &global_lock );  /* NSPA v1.5 */
     while (active_users)
     {
+        unsigned long generation;  /* NSPA v1.5 */
+
         timeout = get_next_timeout( NULL );
 
         if (!active_users) break;  /* last user removed by a timeout */
 
+        generation = poll_generation;
+        pthread_mutex_unlock( &global_lock );  /* NSPA v1.5 */
         ret = poll( pollfd, nb_users, timeout );
+        pthread_mutex_lock( &global_lock );  /* NSPA v1.5 */
         set_current_time();
 
         if (ret > 0)
         {
             for (i = 0; i < nb_users; i++)
             {
+                /* NSPA v1.5: skip dead/reused entries */
+                if (pollfd[i].fd == -1 || poll_users[i]->poll_generation > generation) continue;
                 if (pollfd[i].revents)
                 {
                     fd_poll_event( poll_users[i], pollfd[i].revents );
@@ -1013,6 +1112,7 @@ void main_loop(void)
             }
         }
     }
+    pthread_mutex_unlock( &global_lock );  /* NSPA v1.5 */
 }
 
 
@@ -1676,6 +1776,7 @@ void set_fd_events( struct fd *fd, int events )
     int user = fd->poll_index;
     assert( poll_users[user] == fd );
 
+    fd->poll_generation = ++poll_generation;  /* NSPA v1.5 */
     set_fd_epoll_events( fd, user, events );
 
     if (events == -1)  /* stop waiting on this fd completely */

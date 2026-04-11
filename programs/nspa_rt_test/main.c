@@ -237,33 +237,43 @@ static int cmd_priority(int argc, char **argv)
     HANDLE ph1[3], ph2[NUM_PRIO_P2];
     DWORD pid = GetCurrentProcessId();
     int i;
+    int spawn_fail = 0;
+    BOOL rt_class_ok;
+    DWORD rt_class_err = 0;
+    int total_workers = 3 + (int)NUM_PRIO_P2;  /* main excluded */
 
     (void)argc; (void)argv;
 
     load_avrt();
 
-    printf("===============================================\n");
-    printf("  NSPA RT priority test — Wine pid %lu\n", pid);
-    printf("===============================================\n\n");
-    printf("Query with (in another terminal):\n");
-    printf("  ps -eLo pid,tid,class,rtprio,nice,comm | grep -E 'POL|nspa_rt_test\\.ex'\n\n");
-    fflush(stdout);
+    print_banner("priority", "v1/v2 priority mapping test");
+    print_section("parameters");
+    print_kv("process pid",      "%lu", (unsigned long)pid);
+    print_kv("phase 1",          "3 threads at default (NORMAL) process class");
+    print_kv("phase 2",          "%d threads after SetPriorityClass(REALTIME)", (int)NUM_PRIO_P2);
+    print_kv("total workers",    "%d (+ main thread)", total_workers);
+    print_kv("sleep per worker", "%d s (for external ps/chrt observation)", PRIO_SLEEP_SECS);
+    print_kv("observe cmd",      "ps -eLo pid,tid,class,rtprio,nice,comm | grep -E 'POL|nspa_rt_test'");
+    printf("\n");
+    printf("  Expected scheduling with NSPA_RT_PRIO=80 NSPA_RT_POLICY=FF:\n");
+    printf("    [P1-TC]      -> FF 80   [P1-MCSS]    -> FF 80   [P1-NORM] -> TS / FF 73\n");
+    printf("    [P2-IDLE]    -> FF 65   [P2-LOWEST]  -> FF 71   [P2-BELOW] -> FF 72\n");
+    printf("    [P2-NORMAL]  -> FF 73   [P2-ABOVE]   -> FF 74   [P2-HIGHEST] -> FF 75\n");
+    printf("    [P2-TC]      -> FF 80\n");
 
-    /* Phase 1 */
-    printf("── Phase 1: default class (Tier 1 lenient path) ──\n");
+    print_section("phase 1: default class (Tier 1 lenient path)");
     fflush(stdout);
-    ph1[0] = CreateThread(NULL, 0, prio_p1_tc,   NULL, 0, NULL);
-    ph1[1] = CreateThread(NULL, 0, prio_p1_mcss, NULL, 0, NULL);
-    ph1[2] = CreateThread(NULL, 0, prio_p1_norm, NULL, 0, NULL);
+    ph1[0] = CreateThread(NULL, 0, prio_p1_tc,   NULL, 0, NULL); if (!ph1[0]) spawn_fail++;
+    ph1[1] = CreateThread(NULL, 0, prio_p1_mcss, NULL, 0, NULL); if (!ph1[1]) spawn_fail++;
+    ph1[2] = CreateThread(NULL, 0, prio_p1_norm, NULL, 0, NULL); if (!ph1[2]) spawn_fail++;
     Sleep(500);
 
-    /* Phase 2 */
-    printf("\n── Phase 2: elevating process to REALTIME_PRIORITY_CLASS ──\n");
-    fflush(stdout);
-    if (!SetPriorityClass(GetCurrentProcess(), REALTIME_PRIORITY_CLASS))
+    print_section("phase 2: elevating process to REALTIME_PRIORITY_CLASS");
+    rt_class_ok = SetPriorityClass(GetCurrentProcess(), REALTIME_PRIORITY_CLASS);
+    if (!rt_class_ok)
     {
-        DWORD e = GetLastError();
-        printf("  SetPriorityClass(REALTIME) FAILED: err=%lu\n", e);
+        rt_class_err = GetLastError();
+        printf("  SetPriorityClass(REALTIME) FAILED  err=%lu\n", (unsigned long)rt_class_err);
     }
     else
     {
@@ -272,19 +282,44 @@ static int cmd_priority(int argc, char **argv)
     }
     fflush(stdout);
 
-    for (i = 0; i < (int)NUM_PRIO_P2; i++)
+    for (i = 0; i < (int)NUM_PRIO_P2; i++) {
         ph2[i] = CreateThread(NULL, 0, prio_p2_thread, &prio_p2_cases[i], 0, NULL);
+        if (!ph2[i]) spawn_fail++;
+    }
 
     Sleep(500);
-    printf("\n── All 11 threads (main + 3 P1 + 7 P2) now sleeping %d seconds ──\n", PRIO_SLEEP_SECS);
-    printf("── Query ps now ──\n\n");
+    print_section("all workers sleeping -- query ps NOW");
+    printf("  all %d workers sleeping %d seconds for external inspection\n",
+           total_workers, PRIO_SLEEP_SECS);
     fflush(stdout);
 
-    for (i = 0; i < 3; i++)              WaitForSingleObject(ph1[i], INFINITE);
-    for (i = 0; i < (int)NUM_PRIO_P2; i++) WaitForSingleObject(ph2[i], INFINITE);
-    for (i = 0; i < 3; i++)              CloseHandle(ph1[i]);
-    for (i = 0; i < (int)NUM_PRIO_P2; i++) CloseHandle(ph2[i]);
-    return 0;
+    for (i = 0; i < 3; i++)                if (ph1[i]) WaitForSingleObject(ph1[i], INFINITE);
+    for (i = 0; i < (int)NUM_PRIO_P2; i++) if (ph2[i]) WaitForSingleObject(ph2[i], INFINITE);
+    for (i = 0; i < 3; i++)                if (ph1[i]) CloseHandle(ph1[i]);
+    for (i = 0; i < (int)NUM_PRIO_P2; i++) if (ph2[i]) CloseHandle(ph2[i]);
+
+    print_section("results (info only - PASS/FAIL based on structural integrity)");
+    print_kv("workers created",  "%d / %d", total_workers - spawn_fail, total_workers);
+    print_kv("spawn failures",   "%d", spawn_fail);
+    print_kv("REALTIME class",   "%s", rt_class_ok ? "OK" : "FAILED");
+    if (!rt_class_ok)
+        print_kv("REALTIME err",  "%lu", (unsigned long)rt_class_err);
+
+    /* Verdict: structural integrity only. Observed Linux scheduling
+     * classes/priorities are the user's task (via ps/chrt during the
+     * 90-second sleep window). If any thread failed to spawn or the
+     * RT class change failed, something is structurally wrong. */
+    if (spawn_fail == 0 && rt_class_ok) {
+        print_verdict(1, NULL);
+        return 0;
+    } else {
+        char reason[128];
+        snprintf(reason, sizeof(reason),
+                 "structural integrity (spawn_fail=%d, rt_class=%s)",
+                 spawn_fail, rt_class_ok ? "OK" : "FAILED");
+        print_verdict(0, reason);
+        return 1;
+    }
 }
 
 /* ════════════════════════════════════════════════════════════════════════
@@ -441,34 +476,25 @@ static int cmd_cs_contention(int argc, char **argv)
     g_stop_load = 0;
     g_wait_count = 0;
 
-    printf("==========================================================\n");
-    printf("  NSPA RT CS contention test — CS-PI v2.3 validation\n");
-    printf("==========================================================\n\n");
-    printf("Config:\n");
-    printf("  SCHED_OTHER background load threads:  %d\n", CS_LOAD_THREADS);
-    printf("  CS work iterations per hold:          %lld\n", CS_WORK_ITERS);
-    printf("  Iterations:                           %d\n", CS_ITERATIONS);
-    printf("\n");
-    printf("This test spawns %d infinite-busyloop SCHED_OTHER load threads to\n", CS_LOAD_THREADS);
-    printf("create CPU contention, then has a SCHED_OTHER holder thread acquire\n");
-    printf("a shared CRITICAL_SECTION and do a fixed-count CPU-bound work loop\n");
-    printf("inside the CS. A SCHED_FIFO (TIME_CRITICAL) waiter blocks on the CS.\n\n");
-    printf("Under NSPA_RT_PRIO with CS-PI v2.3 active, the kernel's FUTEX_LOCK_PI\n");
-    printf("chain should temporarily boost the holder to the waiter's priority\n");
-    printf("(SCHED_FIFO 87), letting it preempt the load threads and complete\n");
-    printf("the work in uncontended-core time (~1-2s). Without the env var the\n");
-    printf("holder shares CPU with the load threads, taking proportionally\n");
-    printf("longer, which the waiter sees as a longer wait time.\n\n");
-    fflush(stdout);
+    print_banner("cs-contention", "CS-PI v2.3 validation / priority inversion test");
+    print_section("parameters");
+    print_kv("load threads",     "%d SCHED_OTHER background busyloops", CS_LOAD_THREADS);
+    print_kv("CS iterations",    "%d", CS_ITERATIONS);
+    print_kv("work per hold",    "%lld loop iters (~1 s on an idle core)", CS_WORK_ITERS);
+    print_kv("holder policy",    "SCHED_OTHER (no explicit promotion)");
+    print_kv("waiter policy",    "SCHED_FIFO 87 via TIME_CRITICAL");
+    print_kv("process pid",      "%lu", (unsigned long)GetCurrentProcessId());
+    print_kv("observe cmd",      "chrt -p <holder_tid>   /proc/<holder_tid>/status");
+
+    print_section("startup");
 
     /* Spawn load threads. */
     for (i = 0; i < CS_LOAD_THREADS; i++)
     {
         DWORD tid;
         load_h[i] = CreateThread(NULL, 0, cs_load_thread, NULL, 0, &tid);
-        printf("[CS-load]    win32_tid=%lu  infinite SCHED_OTHER busyloop\n", tid);
+        print_worker_start("load", tid, "infinite SCHED_OTHER busyloop");
     }
-    fflush(stdout);
 
     /* Give the load threads a moment to ramp up. */
     Sleep(200);
@@ -478,12 +504,7 @@ static int cmd_cs_contention(int argc, char **argv)
     holder_h = CreateThread(NULL, 0, cs_holder_thread, NULL, 0, NULL);
     waiter_h = CreateThread(NULL, 0, cs_waiter_thread, NULL, 0, NULL);
 
-    printf("\nDuring each iteration (while the holder is inside the CS), run\n");
-    printf("this in another terminal to see the kernel's view of the holder:\n\n");
-    printf("  chrt -p <holder_tid>\n");
-    printf("  cat /proc/<holder_tid>/status | grep -E '^Name|^State|^Policy'\n\n");
-    printf("Expected with NSPA_RT_PRIO=80:  policy=SCHED_FIFO, priority=87 during hold\n");
-    printf("Expected without NSPA_RT_PRIO:  policy=SCHED_OTHER, priority=0 throughout\n\n");
+    print_section("iterations");
     fflush(stdout);
 
     WaitForSingleObject(holder_h, INFINITE);
@@ -500,6 +521,7 @@ static int cmd_cs_contention(int argc, char **argv)
     CloseHandle(waiter_h);
 
     /* Summary. */
+    print_section("results (info only - PASS/FAIL based on sample capture)");
     if (g_wait_count > 0)
     {
         min_w = max_w = g_wait_samples[0];
@@ -511,26 +533,43 @@ static int cmd_cs_contention(int argc, char **argv)
             sum_w += w;
         }
 
-        printf("\n── Summary ────────────────────────────────────────────────\n");
-        printf("  Samples:  %d\n", g_wait_count);
-        printf("  Min wait: %4lld ms\n", min_w);
-        printf("  Max wait: %4lld ms\n", max_w);
-        printf("  Avg wait: %4lld ms\n", sum_w / g_wait_count);
-        printf("\n");
-        printf("Interpretation:\n");
-        printf("  Run twice and compare (same machine, same build):\n");
-        printf("    $ NSPA_RT_PRIO=80 ./wine nspa_rt_test.exe cs-contention\n");
-        printf("    $                 ./wine nspa_rt_test.exe cs-contention\n");
-        printf("  CS-PI is working when:\n");
-        printf("    - with-PI avg wait is close to uncontended work time\n");
-        printf("    - without-PI avg wait is materially larger\n");
-        printf("    - the ratio (without/with) grows with CS_LOAD_THREADS\n");
+        print_kv("samples captured",  "%d of %d expected", g_wait_count, CS_ITERATIONS);
+        print_kv("min wait",          "%lld ms", min_w);
+        print_kv("max wait",          "%lld ms", max_w);
+        print_kv("avg wait",          "%lld ms", sum_w / g_wait_count);
+    } else {
+        print_kv("samples captured",  "0 of %d expected", CS_ITERATIONS);
     }
+
+    print_section("interpretation (manual comparison)");
+    printf("  Run twice with/without NSPA_RT_PRIO on the same machine and compare:\n");
+    printf("    $ NSPA_RT_PRIO=80 ./wine nspa_rt_test.exe cs-contention\n");
+    printf("    $                 ./wine nspa_rt_test.exe cs-contention\n");
+    printf("  CS-PI is working when:\n");
+    printf("    - with-PI avg wait is close to uncontended work time (~1 s)\n");
+    printf("    - without-PI avg wait is materially larger\n");
+    printf("    - the ratio (without/with) grows with CS_LOAD_THREADS\n");
 
     DeleteCriticalSection(&g_cs);
     CloseHandle(g_holder_in_cs);
     CloseHandle(g_waiter_done);
-    return 0;
+
+    /* Verdict: test passed iff we captured all expected samples. That
+     * proves the holder released the CS and the waiter acquired it on
+     * every iteration — no deadlock, no lost wakeup, no hang. The wait
+     * time numbers above are informational; machine speed dominates
+     * them and they are not a pass/fail axis. */
+    if (g_wait_count == CS_ITERATIONS) {
+        print_verdict(1, NULL);
+        return 0;
+    } else {
+        char reason[128];
+        snprintf(reason, sizeof(reason),
+                 "captured %d/%d samples (possible deadlock or lost wakeup)",
+                 g_wait_count, CS_ITERATIONS);
+        print_verdict(0, reason);
+        return 1;
+    }
 }
 
 /* ════════════════════════════════════════════════════════════════════════
@@ -1300,7 +1339,7 @@ static int cmd_help(int argc, char **argv)
         printf("  %-15s %s\n", commands[i].name, commands[i].description);
     printf("\n");
     printf("Environment:\n");
-    printf("  NSPA_RT_PRIO     enables v1 RT promotion (anchor FIFO priority)\n");
+    printf("  NSPA_RT_PRIO     enables v1 RT promotion (ceiling FIFO priority for TIME_CRITICAL)\n");
     printf("  NSPA_RT_POLICY   FF | RR | TS  — scheduler policy for lower RT band\n");
     printf("\n");
     printf("Examples:\n");

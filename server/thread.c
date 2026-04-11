@@ -787,6 +787,17 @@ static void *nspa_request_shm_thread( void *param )
     request_shm = thread->request_shm;
     pthread_mutex_unlock( &global_lock );
 
+    /* NSPA v2.4: publish our Linux TID to the shm so the client can boost
+     * us via sched_setscheduler when it's blocked on a reply at a higher
+     * RT priority than our own. Release ordering pairs with the client's
+     * acquire load in nspa_shm_pi_boost. Written once per dispatch thread
+     * lifetime — we never clear it, which is fine because the client only
+     * reads it while this thread is still servicing the shm. */
+    if (request_shm)
+        __atomic_store_n( &request_shm->server_dispatch_tid,
+                          (int)syscall( __NR_gettid ),
+                          __ATOMIC_RELEASE );
+
     for (;;)
     {
         int val;

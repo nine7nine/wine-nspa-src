@@ -89,6 +89,7 @@
 
 #include "coreaudio.h"
 #include "unixlib.h"
+#include <rtpi.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(midi);
 
@@ -125,11 +126,11 @@ static UINT num_dests, num_srcs;
 static struct midi_dest *dests;
 static struct midi_src *srcs;
 
-static pthread_mutex_t midi_in_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pi_mutex_t midi_in_mutex = PI_MUTEX_INIT(0);
 
 #define NOTIFY_BUFFER_SIZE 64 + 1 /* + 1 for the sentinel */
-static pthread_mutex_t notify_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t notify_cond = PTHREAD_COND_INITIALIZER;
+static pi_mutex_t notify_mutex = PI_MUTEX_INIT(0);
+static pi_cond_t notify_cond = PI_COND_INIT(0);
 static BOOL notify_quit;
 static struct notify_context notify_buffer[NOTIFY_BUFFER_SIZE];
 static struct notify_context *notify_read, *notify_write;
@@ -138,8 +139,8 @@ static struct notify_context *notify_read, *notify_write;
 
 static void midi_in_lock(BOOL lock)
 {
-    if (lock) pthread_mutex_lock(&midi_in_mutex);
-    else pthread_mutex_unlock(&midi_in_mutex);
+    if (lock) pi_mutex_lock(&midi_in_mutex);
+    else pi_mutex_unlock(&midi_in_mutex);
 }
 
 static void set_in_notify(struct notify_context *notify, struct midi_src *src, WORD dev_id, WORD msg,
@@ -196,13 +197,13 @@ static BOOL notify_buffer_remove(struct notify_context *notify)
 
 static void notify_post(struct notify_context *notify)
 {
-    pthread_mutex_lock(&notify_mutex);
+    pi_mutex_lock(&notify_mutex);
 
     if (notify) notify_buffer_add(notify);
     else notify_quit = TRUE;
-    pthread_cond_signal(&notify_cond);
+    pi_cond_signal(&notify_cond, &notify_mutex);
 
-    pthread_mutex_unlock(&notify_mutex);
+    pi_mutex_unlock(&notify_mutex);
 }
 
 /*
@@ -314,10 +315,10 @@ NTSTATUS unix_midi_init(void *args)
     OSStatus sc;
     UINT i;
 
-    pthread_mutex_lock(&notify_mutex);
+    pi_mutex_lock(&notify_mutex);
     notify_quit = FALSE;
     notify_read = notify_write = notify_buffer;
-    pthread_mutex_unlock(&notify_mutex);
+    pi_mutex_unlock(&notify_mutex);
 
     sc = MIDIClientCreate(name, NULL /* FIXME use notify proc */, NULL, &midi_client);
     CFRelease(name);
@@ -1250,15 +1251,15 @@ NTSTATUS unix_midi_notify_wait(void *args)
 {
     struct midi_notify_wait_params *params = args;
 
-    pthread_mutex_lock(&notify_mutex);
+    pi_mutex_lock(&notify_mutex);
 
     while (!notify_quit && notify_buffer_empty())
-        pthread_cond_wait(&notify_cond, &notify_mutex);
+        pi_cond_wait(&notify_cond, &notify_mutex);
 
     *params->quit = notify_quit;
     if (!notify_quit) notify_buffer_remove(params->notify);
 
-    pthread_mutex_unlock(&notify_mutex);
+    pi_mutex_unlock(&notify_mutex);
 
     return STATUS_SUCCESS;
 }

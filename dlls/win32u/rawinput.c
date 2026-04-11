@@ -33,6 +33,7 @@
 #include "wine/hid.h"
 #include "wine/server.h"
 #include "wine/debug.h"
+#include <rtpi.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(rawinput);
 
@@ -64,7 +65,7 @@ struct device
 static RAWINPUTDEVICE *registered_devices;
 static unsigned int registered_device_count;
 static struct list devices = LIST_INIT( devices );
-static pthread_mutex_t rawinput_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pi_mutex_t rawinput_mutex = PI_MUTEX_INIT(0);
 
 static struct device *add_device( HKEY key, DWORD type )
 {
@@ -343,7 +344,7 @@ UINT WINAPI NtUserGetRawInputDeviceList( RAWINPUTDEVICELIST *device_list, UINT *
         return ~0u;
     }
 
-    pthread_mutex_lock( &rawinput_mutex );
+    pi_mutex_lock( &rawinput_mutex );
 
     rawinput_update_device_list( FALSE );
 
@@ -355,7 +356,7 @@ UINT WINAPI NtUserGetRawInputDeviceList( RAWINPUTDEVICELIST *device_list, UINT *
         device_list++;
     }
 
-    pthread_mutex_unlock( &rawinput_mutex );
+    pi_mutex_unlock( &rawinput_mutex );
 
     if (!device_list)
     {
@@ -397,11 +398,11 @@ UINT WINAPI NtUserGetRawInputDeviceInfo( HANDLE handle, UINT command, void *data
         return ~0u;
     }
 
-    pthread_mutex_lock( &rawinput_mutex );
+    pi_mutex_lock( &rawinput_mutex );
 
     if (!(device = find_device_from_handle( handle, TRUE )))
     {
-        pthread_mutex_unlock( &rawinput_mutex );
+        pi_mutex_unlock( &rawinput_mutex );
         RtlSetLastWin32Error( ERROR_INVALID_HANDLE );
         return ~0u;
     }
@@ -434,7 +435,7 @@ UINT WINAPI NtUserGetRawInputDeviceInfo( HANDLE handle, UINT command, void *data
         break;
     }
 
-    pthread_mutex_unlock( &rawinput_mutex );
+    pi_mutex_unlock( &rawinput_mutex );
 
     if (!data)
         return 0;
@@ -574,7 +575,7 @@ BOOL process_rawinput_message( MSG *msg, UINT hw_id, const struct hardware_msg_d
         BOOL refresh = msg->wParam == GIDC_ARRIVAL;
         struct device *device;
 
-        pthread_mutex_lock( &rawinput_mutex );
+        pi_mutex_lock( &rawinput_mutex );
         if ((device = find_device_from_handle( UlongToHandle( msg_data->rawinput.device ), refresh )))
         {
             if (msg->wParam == GIDC_REMOVAL)
@@ -585,7 +586,7 @@ BOOL process_rawinput_message( MSG *msg, UINT hw_id, const struct hardware_msg_d
                 free( device );
             }
         }
-        pthread_mutex_unlock( &rawinput_mutex );
+        pi_mutex_unlock( &rawinput_mutex );
     }
     else
     {
@@ -695,18 +696,18 @@ BOOL WINAPI NtUserRegisterRawInputDevices( const RAWINPUTDEVICE *devices, UINT d
             FIXME( "Unhandled flags %#x for device %u.\n", devices[i].dwFlags, i );
     }
 
-    pthread_mutex_lock( &rawinput_mutex );
+    pi_mutex_lock( &rawinput_mutex );
 
     if (!registered_device_count && !device_count)
     {
-        pthread_mutex_unlock( &rawinput_mutex );
+        pi_mutex_unlock( &rawinput_mutex );
         return TRUE;
     }
 
     size = (SIZE_T)device_size * (registered_device_count + device_count);
     if (!(new_registered_devices = realloc( registered_devices, size )))
     {
-        pthread_mutex_unlock( &rawinput_mutex );
+        pi_mutex_unlock( &rawinput_mutex );
         RtlSetLastWin32Error( ERROR_OUTOFMEMORY );
         return FALSE;
     }
@@ -719,7 +720,7 @@ BOOL WINAPI NtUserRegisterRawInputDevices( const RAWINPUTDEVICE *devices, UINT d
     if (!(device_count = registered_device_count)) server_devices = NULL;
     else if (!(server_devices = malloc( device_count * sizeof(*server_devices) )))
     {
-        pthread_mutex_unlock( &rawinput_mutex );
+        pi_mutex_unlock( &rawinput_mutex );
         RtlSetLastWin32Error( ERROR_OUTOFMEMORY );
         return FALSE;
     }
@@ -740,7 +741,7 @@ BOOL WINAPI NtUserRegisterRawInputDevices( const RAWINPUTDEVICE *devices, UINT d
 
     free( server_devices );
 
-    pthread_mutex_unlock( &rawinput_mutex );
+    pi_mutex_unlock( &rawinput_mutex );
 
     return ret;
 }
@@ -760,14 +761,14 @@ UINT WINAPI NtUserGetRegisteredRawInputDevices( RAWINPUTDEVICE *devices, UINT *d
         return ~0u;
     }
 
-    pthread_mutex_lock( &rawinput_mutex );
+    pi_mutex_lock( &rawinput_mutex );
 
     capacity = *device_count * device_size;
     *device_count = registered_device_count;
     size = (SIZE_T)device_size * *device_count;
     if (devices && capacity >= size) memcpy( devices, registered_devices, size );
 
-    pthread_mutex_unlock( &rawinput_mutex );
+    pi_mutex_unlock( &rawinput_mutex );
 
     if (!devices) return 0;
 

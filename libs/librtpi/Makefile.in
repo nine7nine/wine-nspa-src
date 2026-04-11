@@ -1,0 +1,19 @@
+# libs/librtpi/Makefile.in — Wine-NSPA RT v2.0
+#
+# Header-only Wine-internal implementation of the librtpi API surface.
+#
+# NO BUILD TARGET. This directory exists only to host rtpi.h. Consumers
+# include it via -I$(top_srcdir)/libs/librtpi on the Unix-side compile
+# line of each DLL/tool that needs pi_mutex_t / pi_cond_t.
+#
+# The header implements pi_mutex_* and pi_cond_* as inline functions
+# on top of the FUTEX_LOCK_PI / FUTEX_UNLOCK_PI / FUTEX_WAIT / FUTEX_WAKE
+# syscalls. See the header preamble for design details.
+#
+# For the sweep that rewrites pthread_* → pi_* across Wine's Unix side,
+# see nspa/librtpi_sweep.py.
+#
+# History: this replaces the earlier attempt to vendor upstream librtpi
+# sources as a static lib. Upstream librtpi is Unix-native and has no
+# Wine build precedent — the header-only shim avoids the autotools
+# problem entirely while preserving the librtpi public API surface.

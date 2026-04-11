@@ -260,12 +260,21 @@ static int nspa_rt_prio_base = -1;          /* parsed from NSPA_RT_PRIO; -1 = RT
 static int nspa_srv_rt_policy = SCHED_FIFO;  /* parsed from NSPA_SRV_RT_POLICY */
 static int nspa_srv_rt_prio   = -1;          /* parsed from NSPA_SRV_RT_PRIO or derived; -1 = disabled */
 
-/* Map an NT priority in [1..31] to a SCHED_FIFO priority, anchored at NT 24
- * (THREAD_PRIORITY_NORMAL within PROCESS_PRIOCLASS_REALTIME). Linear shape
- * preserves the Win32 5-step gap from HIGHEST (26) to TIME_CRITICAL (31). */
+/* NSPA RT v1.2: transient flag set by DECL_HANDLER(set_thread_info) when the
+ * client has already applied the sched class via ntdll Tier 1 or v1.2 cross-
+ * thread map. apply_thread_priority() reads it and skips both the RT promote
+ * path AND the maybe_demote path, preventing Tier 2 from clobbering the
+ * client's work. Safe as a static because wineserver dispatches under
+ * global_lock — one DECL_HANDLER runs at a time. */
+static int nspa_rt_skip_apply;
+
+/* Map an NT priority in [1..31] to a SCHED_FIFO priority, with NSPA_RT_PRIO
+ * as the ceiling (NT 31 = TIME_CRITICAL maps to exactly NSPA_RT_PRIO).
+ * Lower NT bands fall linearly below the ceiling, preserving the Win32
+ * relative spacing. */
 static int nspa_rt_map_prio( int nt_band )
 {
-    int fifo = nspa_rt_prio_base + (nt_band - 24);
+    int fifo = nspa_rt_prio_base - (HIGH_PRIORITY - nt_band);
     int fmin = sched_get_priority_min( SCHED_FIFO );
     int fmax = sched_get_priority_max( SCHED_FIFO ) - 1;  /* reserve 99 for kernel */
     if (fifo < fmin) fifo = fmin;
@@ -293,13 +302,13 @@ static void nspa_rt_apply( int unix_tid, int nt_band )
     {
         static int warned;
         if (debug_level || !warned++)
-            fprintf( stderr, "wine: NSPA RT: sched_setscheduler(tid=%d, prio=%d) failed: %s\n",
+            fprintf( stderr, "wine: NSPA RT:Threads: sched_setscheduler(tid=%d, prio=%d) failed: %s\n",
                      unix_tid, param.sched_priority, strerror(errno) );
     }
     else if (debug_level > 1)
     {
         const char *pname = policy == SCHED_FIFO ? "FF" : policy == SCHED_RR ? "RR" : "?";
-        fprintf( stderr, "wine: NSPA RT: tid=%d nt_band=%d -> %s/%d\n",
+        fprintf( stderr, "wine: NSPA RT:Threads: tid=%d nt_band=%d -> %s/%d\n",
                  unix_tid, nt_band, pname, param.sched_priority );
     }
 }
@@ -334,7 +343,7 @@ static void nspa_rt_init(void)
     val = atoi( prio_env );
     if (val < fmin || val >= fmax)
     {
-        fprintf( stderr, "wine: NSPA_RT_PRIO=%d out of range [%d..%d); RT disabled\n",
+        fprintf( stderr, "wine: NSPA RT:Threads: NSPA_RT_PRIO=%d out of range [%d..%d); RT disabled\n",
                  val, fmin, fmax );
         return;
     }
@@ -344,33 +353,39 @@ static void nspa_rt_init(void)
     {
         if      (!strcmp( policy_env, "FF" )) nspa_rt_policy = SCHED_FIFO;
         else if (!strcmp( policy_env, "RR" )) nspa_rt_policy = SCHED_RR;
-        else fprintf( stderr, "wine: NSPA_RT_POLICY=%s unrecognized (expected FF or RR), using FF\n",
+        /* TS = conservative mode: only TIME_CRITICAL (NT 31) gets promoted to
+         * SCHED_FIFO; lower RT band (NT 16..30) falls through to the upstream
+         * nice-based path. Useful for users who want audio RT without forcing
+         * every realtime-class thread to SCHED_FIFO. */
+        else if (!strcmp( policy_env, "TS" )) nspa_rt_policy = SCHED_OTHER;
+        else fprintf( stderr, "wine: NSPA RT:Threads: NSPA_RT_POLICY=%s unrecognized (expected FF, RR, or TS), using FF\n",
                       policy_env );
     }
 
     /* Print RT status unconditionally so users can see v1 is active without
      * needing WINEDEBUG. One line, stderr. */
     {
-        const char *pname = nspa_rt_policy == SCHED_FIFO ? "FF" :
-                            nspa_rt_policy == SCHED_RR   ? "RR" : "?";
-        fprintf( stderr, "wine: NSPA RT v1 enabled: lower_band=%s prio_base=%d "
-                         "(NT 16->%d, NT 24->%d, NT 31->FF 87 target=%d)\n",
+        const char *pname = nspa_rt_policy == SCHED_FIFO  ? "FF" :
+                            nspa_rt_policy == SCHED_RR    ? "RR" :
+                            nspa_rt_policy == SCHED_OTHER ? "TS" : "?";
+        fprintf( stderr, "wine: NSPA RT:Threads: lower_band=%s ceiling=%d "
+                         "(NT 31->FF %d, NT 24->%d, NT 16->%d)\n",
                  pname, nspa_rt_prio_base,
-                 nspa_rt_map_prio( LOW_REALTIME_PRIORITY ),
+                 nspa_rt_map_prio( HIGH_PRIORITY ),
                  nspa_rt_map_prio( 24 ),
-                 nspa_rt_map_prio( HIGH_PRIORITY ) );
+                 nspa_rt_map_prio( LOW_REALTIME_PRIORITY ) );
     }
 
     /* Soft NTSync dependency: warn if missing, but still apply RT. */
     if (access( "/dev/ntsync", F_OK ) != 0)
-        fprintf( stderr, "wine: NSPA RT: /dev/ntsync unavailable; wait paths will not be end-to-end RT\n" );
+        fprintf( stderr, "wine: NSPA RT:NTSync: /dev/ntsync unavailable; wait paths will not be end-to-end RT\n" );
 
     /* NSPA RT v1.1: optionally promote wineserver itself to RT, at a priority
      * BELOW the audio callback band so audio callbacks always preempt the
      * server. Shmem dispatcher threads (v1.5) inherit via pthread default
      * PTHREAD_INHERIT_SCHED and will come along at the same priority.
      *
-     * Default derivation: nspa_rt_prio_base - 5, clamped to >= 1.
+     * Default derivation: ceiling - 16 (just below NT 16 at ceiling - 15).
      * Override via NSPA_SRV_RT_PRIO (integer) + NSPA_SRV_RT_POLICY (FF|RR).
      * Gated on NSPA_RT_PRIO being set (since we only reach here if it is). */
     {
@@ -379,24 +394,27 @@ static void nspa_rt_init(void)
         int audio_fifo = nspa_rt_map_prio( HIGH_PRIORITY );
         struct sched_param param;
 
-        /* Derive wineserver priority: explicit env override or NSPA_RT_PRIO - 5. */
+        /* Derive wineserver priority: explicit env override or ceiling - 16.
+         * NT 16 (lowest RT band) maps to ceiling - 15, so ceiling - 16 places
+         * wineserver just below the entire RT thread band. */
         if (srv_prio_env && *srv_prio_env)
         {
             int val = atoi( srv_prio_env );
             if (val < 1 || val >= fmax)
             {
-                fprintf( stderr, "wine: NSPA_SRV_RT_PRIO=%d out of range [1..%d); "
+                fprintf( stderr, "wine: NSPA RT:Server: NSPA_SRV_RT_PRIO=%d out of range [1..%d); "
                                  "wineserver stays SCHED_OTHER\n", val, fmax );
                 return;
             }
-            if (val >= audio_fifo)
-                fprintf( stderr, "wine: NSPA_SRV_RT_PRIO=%d >= audio callback prio %d; "
-                                 "may cause audio starvation\n", val, audio_fifo );
+            if (val >= nspa_rt_map_prio( LOW_REALTIME_PRIORITY ))
+                fprintf( stderr, "wine: NSPA RT:Server: NSPA_SRV_RT_PRIO=%d overlaps RT thread band [%d..%d]; "
+                                 "wineserver may preempt RT threads\n",
+                         val, nspa_rt_map_prio( LOW_REALTIME_PRIORITY ), audio_fifo );
             nspa_srv_rt_prio = val;
         }
         else
         {
-            nspa_srv_rt_prio = nspa_rt_prio_base - 5;
+            nspa_srv_rt_prio = nspa_rt_prio_base - 16;
             if (nspa_srv_rt_prio < 1) nspa_srv_rt_prio = 1;
         }
 
@@ -404,7 +422,7 @@ static void nspa_rt_init(void)
         {
             if      (!strcmp( srv_pol_env, "FF" )) nspa_srv_rt_policy = SCHED_FIFO;
             else if (!strcmp( srv_pol_env, "RR" )) nspa_srv_rt_policy = SCHED_RR;
-            else fprintf( stderr, "wine: NSPA_SRV_RT_POLICY=%s unrecognized "
+            else fprintf( stderr, "wine: NSPA RT:Server: NSPA_SRV_RT_POLICY=%s unrecognized "
                                   "(expected FF or RR), using FF\n", srv_pol_env );
         }
 
@@ -416,7 +434,7 @@ static void nspa_rt_init(void)
         param.sched_priority = nspa_srv_rt_prio;
         if (sched_setscheduler( 0, nspa_srv_rt_policy | SCHED_RESET_ON_FORK, &param ) == -1)
         {
-            fprintf( stderr, "wine: NSPA RT v1.1: wineserver sched_setscheduler(%s/%d) "
+            fprintf( stderr, "wine: NSPA RT:Server: sched_setscheduler(%s/%d) "
                              "failed: %s (wineserver stays at current policy)\n",
                      nspa_srv_rt_policy == SCHED_FIFO ? "FF" : "RR",
                      nspa_srv_rt_prio, strerror(errno) );
@@ -424,8 +442,8 @@ static void nspa_rt_init(void)
         }
         else
         {
-            fprintf( stderr, "wine: NSPA RT v1.1 enabled: wineserver promoted to %s/%d "
-                             "(audio callback target=%d, gap=%d)\n",
+            fprintf( stderr, "wine: NSPA RT:Server: wineserver promoted to %s/%d "
+                             "(audio ceiling=%d, gap=%d)\n",
                      nspa_srv_rt_policy == SCHED_FIFO ? "FF" : "RR",
                      nspa_srv_rt_prio, audio_fifo, audio_fifo - nspa_srv_rt_prio );
         }
@@ -460,15 +478,33 @@ static void apply_thread_priority( struct thread *thread )
 
     /* NSPA RT: if enabled and the thread is in the NT realtime band, use
      * SCHED_FIFO/RR via sched_setscheduler and return. Otherwise fall through
-     * to the existing nice-based path, demoting first if needed. */
-    if (nspa_rt_prio_base >= 0)
+     * to the existing nice-based path, demoting first if needed.
+     *
+     * v1.2: if nspa_rt_skip_apply is set, the client already applied the
+     * sched class (via ntdll Tier 1 or cross-thread map). Don't touch the
+     * thread's sched class — just fall through to the nice path, which is
+     * a no-op for SCHED_FIFO/RR threads.
+     *
+     * v1.2 TS mode: when NSPA_RT_POLICY=TS, only TIME_CRITICAL (effective
+     * priority == HIGH_PRIORITY = 31) gets promoted. Lower RT band falls
+     * through to the upstream nice-based mapping. */
+    if (nspa_rt_prio_base >= 0 && !nspa_rt_skip_apply)
     {
         if (effective_priority >= LOW_REALTIME_PRIORITY)
         {
-            nspa_rt_apply( thread->unix_tid, effective_priority );
-            return;
+            int can_promote = (nspa_rt_policy != SCHED_OTHER ||
+                               effective_priority >= HIGH_PRIORITY);
+            if (can_promote)
+            {
+                nspa_rt_apply( thread->unix_tid, effective_priority );
+                return;
+            }
+            /* TS + lower RT band: fall through to nice path (with clamp below). */
         }
-        nspa_rt_maybe_demote( thread->unix_tid );
+        else
+        {
+            nspa_rt_maybe_demote( thread->unix_tid );
+        }
     }
 
     if (nice_limit >= 0) return;
@@ -1313,6 +1349,13 @@ void set_thread_disable_boost( struct thread *thread, int disable_boost )
 static void set_thread_info( struct thread *thread,
                              const struct set_thread_info_request *req )
 {
+    /* NSPA RT v1.2: honor the client's "I already applied sched class" flag.
+     * Set the file-static so apply_thread_priority() skips its RT promote /
+     * demote logic for THIS request. Reset to 0 after the priority calls so
+     * other code paths (e.g. init_thread calling set_thread_base_priority)
+     * see normal behavior. */
+    nspa_rt_skip_apply = req->nspa_rt_override;
+
     if (req->mask & SET_THREAD_INFO_PRIORITY)
     {
         unsigned int status = set_thread_priority( thread, req->priority );
@@ -1323,6 +1366,8 @@ static void set_thread_info( struct thread *thread,
         unsigned int status = set_thread_base_priority( thread, req->base_priority );
         if (status) set_error( status );
     }
+
+    nspa_rt_skip_apply = 0;
     if (req->mask & SET_THREAD_INFO_AFFINITY)
     {
         if ((req->affinity & thread->process->affinity) != req->affinity)

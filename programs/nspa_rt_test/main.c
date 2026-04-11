@@ -19,7 +19,13 @@
  *   philosophers   Dining philosophers with 5 phils + 5 chopsticks. Phil 0 is
  *                  TIME_CRITICAL, phils 1-4 load. Background busyloop threads
  *                  starve the OTHER phils for CPU to exercise transitive PI
- *                  (RT → holder → holder-of-holder chain boost).
+ *                  (RT -> holder -> holder-of-holder chain boost).
+ *   fork-mutex     Rapid-fire CreateProcess stress (default 100 spawns) that
+ *                  validates Wine's spawn path and the librtpi sweep's
+ *                  dlls/ntdll/unix/process.c opt-out. Each child runs the
+ *                  internal child-quickexit subcommand.
+ *   child-quickexit Internal helper used by fork-mutex — prints a marker
+ *                  line and exits with code 42.
  *   help           show usage
  *
  * Build:
@@ -69,6 +75,15 @@ static LONGLONG now_ms(void)
     if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&c);
     return (c.QuadPart * 1000) / freq.QuadPart;
+}
+
+static LONGLONG now_us(void)
+{
+    static LARGE_INTEGER freq;
+    LARGE_INTEGER c;
+    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&c);
+    return (c.QuadPart * 1000000) / freq.QuadPart;
 }
 
 /* ════════════════════════════════════════════════════════════════════════
@@ -1018,6 +1033,240 @@ static int cmd_philosophers(int argc, char **argv)
 }
 
 /* ════════════════════════════════════════════════════════════════════════
+ *   Subcommand: fork-mutex  (CreateProcess opt-out validation)
+ *
+ *   Spawns N copies of itself via CreateProcess, each running the internal
+ *   `child-quickexit` subcommand, waits for each, verifies exit code.
+ *   Purpose: validate that Wine's process-spawn path (dlls/ntdll/unix/
+ *   process.c) is not regressed and that the librtpi_sweep opt-out for
+ *   that file is load-bearing. process.c is in EXCLUDE_FILES because
+ *   pi_mutex_t stores the Linux owner TID in the futex word, and a child
+ *   that inherited a swept mutex held by the parent thread would see a
+ *   corrupted mutex (ESRCH/EPERM on subsequent ops). This test rapidly
+ *   exercises the spawn path; any regression in that path or in anything
+ *   it touches (pthread_atfork, process.c, wineserver process registration)
+ *   manifests as spawn failures, child hangs, or wrong exit codes.
+ *
+ *   ── What bugs this test catches ───────────────────────────────────────
+ *
+ *   (1) process.c accidentally converted by the sweep.
+ *       If EXCLUDE_FILES loses dlls/ntdll/unix/process.c (e.g. someone
+ *       edits the list without reading the opt-out memory), the sweep
+ *       rewrites pthread_* → pi_* in the fork path. The child inherits
+ *       a pi_mutex with the parent's TID. Depending on which mutex and
+ *       when the child touches it, result is either a hang or an EPERM
+ *       crash before exec. Caught: child wait timeout or nonzero/wrong
+ *       exit code.
+ *
+ *   (2) pthread_atfork handler regression.
+ *       If we ever add atfork handlers for swept mutexes and one of
+ *       them is buggy (e.g. deadlocks in prepare, or fails to re-init
+ *       in child), the spawn either hangs in the parent or the child
+ *       fails to start. Caught: parent wait timeout.
+ *
+ *   (3) Wine process-spawn race or handle-leak regression.
+ *       Independent of the sweep — if Wine's own CreateProcess has a
+ *       race with wineserver or leaks process handles, running 100
+ *       spawns in rapid succession exposes it. A single spawn might
+ *       work; the 37th might not. Caught: any iteration fails.
+ *
+ *   (4) Wineserver process-registration limit or state corruption.
+ *       Every CreateProcess registers the new process with wineserver.
+ *       If wineserver has an off-by-one in a process table, a race in
+ *       process list traversal, or a leak, repeated spawns surface it.
+ *       Caught: later iterations fail while earlier ones succeed.
+ *
+ *   (5) ntdll/unix/loader.c posix_spawn regression.
+ *       Wine uses posix_spawn for the preloader step. A bug there
+ *       (which might be triggered by RT scheduling interacting with
+ *       exec*) would cause spawns to silently fail. Caught: spawn
+ *       returns FALSE.
+ *
+ *   ── PASS / FAIL criteria ──────────────────────────────────────────────
+ *
+ *   PASS iff: every iteration successfully spawned, waited, and returned
+ *             the expected FORK_CHILD_EXIT_CODE.
+ *   FAIL:     any spawn failure, wait timeout, or exit code mismatch.
+ *             The result block tallies each category so the failure
+ *             mode is immediately visible.
+ *
+ *   Spawn-time and child-total-time numbers are printed as INFORMATION
+ *   (regression-diffable across Wine versions, not a pass/fail axis).
+ *
+ *   ── Usage ─────────────────────────────────────────────────────────────
+ *
+ *   fork-mutex [count]     default 100
+ *
+ *   The child subcommand `child-quickexit` is listed in the help output
+ *   as an internal helper; it's not intended for direct use by the user
+ *   but is safe to run standalone (it just prints a line and exits 42).
+ * ════════════════════════════════════════════════════════════════════════ */
+
+#define FORK_DEFAULT_COUNT      100
+#define FORK_MAX_COUNT          10000
+#define FORK_CHILD_TIMEOUT_MS   5000
+#define FORK_CHILD_EXIT_CODE    42
+
+static int cmd_child_quickexit(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    /* Minimal child routine used by fork-mutex. Prints a marker line
+     * (stdout is inherited from parent by default, so the parent sees
+     * it) and exits with a known code. If this line never prints, the
+     * spawn itself reached ExitProcess before main() ran — which points
+     * at a broken startup path. */
+    printf("  child-quickexit: pid=%lu ok\n",
+           (unsigned long)GetCurrentProcessId());
+    fflush(stdout);
+    return FORK_CHILD_EXIT_CODE;
+}
+
+static int cmd_fork_mutex(int argc, char **argv)
+{
+    char exe_path[MAX_PATH];
+    int count = FORK_DEFAULT_COUNT;
+    int i;
+    int spawned = 0, waited = 0, ok_exit = 0;
+    int spawn_fail = 0, wait_timeout = 0, exit_mismatch = 0;
+    LONGLONG min_spawn = -1, max_spawn = 0, sum_spawn = 0;
+    LONGLONG min_wait  = -1, max_wait  = 0, sum_wait  = 0;
+    LONGLONG test_start, test_end;
+
+    if (argc > 1) count = atoi(argv[1]);
+    if (count < 1) count = 1;
+    if (count > FORK_MAX_COUNT) count = FORK_MAX_COUNT;
+
+    if (!GetModuleFileNameA(NULL, exe_path, sizeof(exe_path))) {
+        printf("GetModuleFileName failed\n");
+        return 1;
+    }
+
+    print_banner("fork-mutex", "CreateProcess opt-out validation");
+    print_section("parameters");
+    print_kv("spawn count",       "%d", count);
+    print_kv("per-child timeout", "%d ms", FORK_CHILD_TIMEOUT_MS);
+    print_kv("expected exit",     "%d", FORK_CHILD_EXIT_CODE);
+    print_kv("exe path",          "%s", exe_path);
+    print_kv("parent pid",        "%lu", (unsigned long)GetCurrentProcessId());
+
+    print_section("spawning");
+    fflush(stdout);
+
+    test_start = now_us();
+
+    for (i = 0; i < count; i++) {
+        STARTUPINFOA si;
+        PROCESS_INFORMATION pi;
+        char cmdline[MAX_PATH + 64];
+        LONGLONG t0, t1, t2;
+        BOOL ok;
+        DWORD wait_ret = 0, exit_code = 0;
+
+        memset(&si, 0, sizeof(si));
+        si.cb = sizeof(si);
+        memset(&pi, 0, sizeof(pi));
+        snprintf(cmdline, sizeof(cmdline),
+                 "\"%s\" child-quickexit %d", exe_path, i);
+
+        t0 = now_us();
+        ok = CreateProcessA(NULL, cmdline, NULL, NULL, FALSE,
+                            0, NULL, NULL, &si, &pi);
+        t1 = now_us();
+
+        if (!ok) {
+            spawn_fail++;
+            printf("  [iter %4d] CreateProcess FAILED (GetLastError=%lu)\n",
+                   i, (unsigned long)GetLastError());
+            fflush(stdout);
+            continue;
+        }
+        spawned++;
+        {
+            LONGLONG s = t1 - t0;
+            sum_spawn += s;
+            if (min_spawn < 0 || s < min_spawn) min_spawn = s;
+            if (s > max_spawn) max_spawn = s;
+        }
+
+        wait_ret = WaitForSingleObject(pi.hProcess, FORK_CHILD_TIMEOUT_MS);
+        t2 = now_us();
+
+        if (wait_ret == WAIT_TIMEOUT) {
+            wait_timeout++;
+            printf("  [iter %4d] child TIMEOUT after %d ms — terminating\n",
+                   i, FORK_CHILD_TIMEOUT_MS);
+            fflush(stdout);
+            TerminateProcess(pi.hProcess, 99);
+            WaitForSingleObject(pi.hProcess, 1000);
+        } else {
+            LONGLONG w = t2 - t1;
+            waited++;
+            sum_wait += w;
+            if (min_wait < 0 || w < min_wait) min_wait = w;
+            if (w > max_wait) max_wait = w;
+            if (GetExitCodeProcess(pi.hProcess, &exit_code)) {
+                if (exit_code == FORK_CHILD_EXIT_CODE) {
+                    ok_exit++;
+                } else {
+                    exit_mismatch++;
+                    printf("  [iter %4d] child exit code %lu (expected %d)\n",
+                           i, (unsigned long)exit_code, FORK_CHILD_EXIT_CODE);
+                    fflush(stdout);
+                }
+            }
+        }
+
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+
+        /* Progress every 25 iters so the user can see the test is alive. */
+        if (((i + 1) % 25 == 0) || ((i + 1) == count)) {
+            printf("  [progress] %d/%d  (ok=%d fail=%d)\n",
+                   i + 1, count, ok_exit,
+                   spawn_fail + wait_timeout + exit_mismatch);
+            fflush(stdout);
+        }
+    }
+
+    test_end = now_us();
+
+    print_section("results (info only - PASS/FAIL based on spawn/exit integrity)");
+    print_kv("total elapsed",    "%lld ms", (test_end - test_start) / 1000);
+    print_kv("spawned ok",       "%d / %d", spawned, count);
+    print_kv("waited ok",        "%d", waited);
+    print_kv("exit code ok",     "%d / %d", ok_exit, count);
+    if (spawn_fail)
+        print_kv("spawn failures",   "%d", spawn_fail);
+    if (wait_timeout)
+        print_kv("wait timeouts",    "%d  (possible child hang)", wait_timeout);
+    if (exit_mismatch)
+        print_kv("exit mismatches",  "%d  (child crashed or wrong exit code)", exit_mismatch);
+
+    if (spawned > 0) {
+        print_kv("spawn time min",   "%lld us", min_spawn);
+        print_kv("spawn time max",   "%lld us", max_spawn);
+        print_kv("spawn time avg",   "%lld us", sum_spawn / spawned);
+    }
+    if (waited > 0) {
+        print_kv("child total min",  "%lld us", min_wait);
+        print_kv("child total max",  "%lld us", max_wait);
+        print_kv("child total avg",  "%lld us", sum_wait / waited);
+    }
+
+    if (ok_exit == count) {
+        print_verdict(1, NULL);
+        return 0;
+    } else {
+        char reason[256];
+        snprintf(reason, sizeof(reason),
+                 "%d/%d children failed (spawn_fail=%d, wait_timeout=%d, exit_mismatch=%d)",
+                 count - ok_exit, count, spawn_fail, wait_timeout, exit_mismatch);
+        print_verdict(0, reason);
+        return 1;
+    }
+}
+
+/* ════════════════════════════════════════════════════════════════════════
  *   Command dispatch
  * ════════════════════════════════════════════════════════════════════════ */
 
@@ -1032,9 +1281,11 @@ static int cmd_help(int argc, char **argv);
 static struct command commands[] = {
     { "priority",     "v1/v2 priority mapping test (11 threads, Phase 1 + Phase 2)",    cmd_priority      },
     { "cs-contention","v2.3 CS-PI contention test (SCHED_FIFO vs SCHED_OTHER holder)",  cmd_cs_contention },
-    { "rapidmutex",   "CRITICAL_SECTION stress (1 RT + N-1 load, tight EnterCS loop)", cmd_rapidmutex    },
-    { "philosophers", "dining philosophers (transitive PI chain test, 5 phils)",       cmd_philosophers  },
-    { "help",         "show this help",                                                  cmd_help          },
+    { "rapidmutex",      "CRITICAL_SECTION stress (1 RT + N-1 load, tight EnterCS loop)",   cmd_rapidmutex    },
+    { "philosophers",    "dining philosophers (transitive PI chain test, 5 phils)",         cmd_philosophers  },
+    { "fork-mutex",      "spawn N child processes (validate process.c opt-out, default 100)", cmd_fork_mutex    },
+    { "child-quickexit", "internal helper — used by fork-mutex (prints a line, exits 42)",    cmd_child_quickexit },
+    { "help",            "show this help",                                                  cmd_help          },
     { NULL, NULL, NULL }
 };
 

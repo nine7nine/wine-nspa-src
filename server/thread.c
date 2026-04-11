@@ -235,6 +235,124 @@ static struct list thread_list = LIST_INIT(thread_list);
 #if defined(__linux__) && defined(RLIMIT_NICE)
 static int nice_limit;
 
+/* NSPA RT v1: SCHED_FIFO/RR support for the NT realtime band [16..31].
+ * Gated on NSPA_RT_PRIO being set at wineserver startup. When unset,
+ * nspa_rt_prio_base stays -1 and the RT path is dormant, leaving the
+ * existing nice-based behavior unchanged.
+ */
+#ifndef SCHED_RESET_ON_FORK
+# define SCHED_RESET_ON_FORK 0x40000000
+#endif
+
+static int nspa_rt_policy    = SCHED_FIFO;  /* parsed from NSPA_RT_POLICY; applies to NT [16..30] only */
+static int nspa_rt_prio_base = -1;          /* parsed from NSPA_RT_PRIO; -1 = RT disabled */
+
+/* Map an NT priority in [1..31] to a SCHED_FIFO priority, anchored at NT 24
+ * (THREAD_PRIORITY_NORMAL within PROCESS_PRIOCLASS_REALTIME). Linear shape
+ * preserves the Win32 5-step gap from HIGHEST (26) to TIME_CRITICAL (31). */
+static int nspa_rt_map_prio( int nt_band )
+{
+    int fifo = nspa_rt_prio_base + (nt_band - 24);
+    int fmin = sched_get_priority_min( SCHED_FIFO );
+    int fmax = sched_get_priority_max( SCHED_FIFO ) - 1;  /* reserve 99 for kernel */
+    if (fifo < fmin) fifo = fmin;
+    if (fifo > fmax) fifo = fmax;
+    return fifo;
+}
+
+/* Choose scheduling policy based on NT band: TIME_CRITICAL (NT 31) is always
+ * SCHED_FIFO (strict priority ordering required for audio callbacks and
+ * similar run-until-block workloads). Lower RT band (NT 16..30) uses the
+ * NSPA_RT_POLICY env var choice (FF or RR). */
+static int nspa_rt_policy_for_band( int nt_band )
+{
+    if (nt_band >= HIGH_PRIORITY) return SCHED_FIFO;
+    return nspa_rt_policy;
+}
+
+/* Apply NSPA RT scheduling to a unix tid. Idempotent. */
+static void nspa_rt_apply( int unix_tid, int nt_band )
+{
+    struct sched_param param = { .sched_priority = nspa_rt_map_prio( nt_band ) };
+    int policy = nspa_rt_policy_for_band( nt_band );
+
+    if (sched_setscheduler( unix_tid, policy | SCHED_RESET_ON_FORK, &param ) == -1)
+    {
+        static int warned;
+        if (debug_level || !warned++)
+            fprintf( stderr, "wine: NSPA RT: sched_setscheduler(tid=%d, prio=%d) failed: %s\n",
+                     unix_tid, param.sched_priority, strerror(errno) );
+    }
+    else if (debug_level > 1)
+    {
+        const char *pname = policy == SCHED_FIFO ? "FF" : policy == SCHED_RR ? "RR" : "?";
+        fprintf( stderr, "wine: NSPA RT: tid=%d nt_band=%d -> %s/%d\n",
+                 unix_tid, nt_band, pname, param.sched_priority );
+    }
+}
+
+/* If a thread was previously RT-promoted but is now dropping into the nice
+ * band, reset its scheduling class to SCHED_OTHER before falling through to
+ * the setpriority() path. Cheap: one sched_getscheduler() on the common path,
+ * one sched_setscheduler() only on actual transitions. */
+static void nspa_rt_maybe_demote( int unix_tid )
+{
+    int cur = sched_getscheduler( unix_tid );
+    if (cur == SCHED_FIFO || cur == SCHED_RR)
+    {
+        struct sched_param zero = {0};
+        sched_setscheduler( unix_tid, SCHED_OTHER, &zero );
+    }
+}
+
+/* Parse NSPA_RT_POLICY / NSPA_RT_PRIO. Called once from init_threading(). */
+static void nspa_rt_init(void)
+{
+    const char *policy_env = getenv( "NSPA_RT_POLICY" );
+    const char *prio_env   = getenv( "NSPA_RT_PRIO" );
+    int fmin, fmax, val;
+
+    if (!prio_env || !*prio_env) return;  /* RT dormant */
+
+    fmin = sched_get_priority_min( SCHED_FIFO );
+    fmax = sched_get_priority_max( SCHED_FIFO );
+    if (fmin < 0 || fmax < 0) return;
+
+    val = atoi( prio_env );
+    if (val < fmin || val >= fmax)
+    {
+        fprintf( stderr, "wine: NSPA_RT_PRIO=%d out of range [%d..%d); RT disabled\n",
+                 val, fmin, fmax );
+        return;
+    }
+    nspa_rt_prio_base = val;
+
+    if (policy_env)
+    {
+        if      (!strcmp( policy_env, "FF" )) nspa_rt_policy = SCHED_FIFO;
+        else if (!strcmp( policy_env, "RR" )) nspa_rt_policy = SCHED_RR;
+        else fprintf( stderr, "wine: NSPA_RT_POLICY=%s unrecognized (expected FF or RR), using FF\n",
+                      policy_env );
+    }
+
+    /* Print RT status unconditionally so users can see v1 is active without
+     * needing WINEDEBUG. One line, stderr. */
+    {
+        const char *pname = nspa_rt_policy == SCHED_FIFO ? "FF" :
+                            nspa_rt_policy == SCHED_RR   ? "RR" : "?";
+        fprintf( stderr, "wine: NSPA RT v1 enabled: lower_band=%s prio_base=%d "
+                         "(NT 16->%d, NT 24->%d, NT 31->FF 87 target=%d)\n",
+                 pname, nspa_rt_prio_base,
+                 nspa_rt_map_prio( LOW_REALTIME_PRIORITY ),
+                 nspa_rt_map_prio( 24 ),
+                 nspa_rt_map_prio( HIGH_PRIORITY ) );
+    }
+
+    /* Soft NTSync dependency: warn if missing, but still apply RT. */
+    if (access( "/dev/ntsync", F_OK ) != 0)
+        fprintf( stderr, "wine: NSPA RT: /dev/ntsync unavailable; wait paths will not be end-to-end RT\n" );
+}
+
 void init_threading(void)
 {
     struct rlimit rlimit;
@@ -252,12 +370,27 @@ void init_threading(void)
         if (nice_limit >= 0 && debug_level) fprintf(stderr, "wine: RLIMIT_NICE is <= 20, unable to use setpriority safely\n");
     }
     if (nice_limit < 0 && debug_level) fprintf(stderr, "wine: Using setpriority to control niceness in the [%d,%d] range\n", nice_limit, -nice_limit );
+
+    nspa_rt_init();
 }
 
 static void apply_thread_priority( struct thread *thread )
 {
     int min = -nice_limit, max = nice_limit, range = max - min, niceness;
     int effective_priority = get_effective_thread_priority( thread );
+
+    /* NSPA RT: if enabled and the thread is in the NT realtime band, use
+     * SCHED_FIFO/RR via sched_setscheduler and return. Otherwise fall through
+     * to the existing nice-based path, demoting first if needed. */
+    if (nspa_rt_prio_base >= 0)
+    {
+        if (effective_priority >= LOW_REALTIME_PRIORITY)
+        {
+            nspa_rt_apply( thread->unix_tid, effective_priority );
+            return;
+        }
+        nspa_rt_maybe_demote( thread->unix_tid );
+    }
 
     if (nice_limit >= 0) return;
 

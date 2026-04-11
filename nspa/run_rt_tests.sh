@@ -52,6 +52,7 @@ tests=(
     "philosophers 50 4"
     "fork-mutex 100"
     "cs-contention"
+    "signal-recursion 4 500"
 )
 if [[ "$INCLUDE_PRIORITY" == "1" ]]; then
     tests+=("priority")

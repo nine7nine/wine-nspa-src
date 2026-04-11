@@ -35,6 +35,7 @@
 #include "d3dkmdt.h"
 #include "wine/wingdi16.h"
 #include "wine/server.h"
+#include <rtpi.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(system);
 
@@ -163,7 +164,7 @@ static struct list sources = LIST_INIT(sources);
 static struct list monitors = LIST_INIT(monitors);
 static INT64 last_query_display_time;
 static UINT64 monitor_update_serial;
-static pthread_mutex_t display_lock = PTHREAD_MUTEX_INITIALIZER;
+static pi_mutex_t display_lock = PI_MUTEX_INIT(0);
 
 static BOOL emulate_modeset;
 BOOL decorated_mode = TRUE;
@@ -297,21 +298,21 @@ static RECT work_area;
 static DWORD process_layout = ~0u;
 
 static HDC display_dc;
-static pthread_mutex_t display_dc_lock = PTHREAD_MUTEX_INITIALIZER;
+static pi_mutex_t display_dc_lock = PI_MUTEX_INIT(0);
 
-static pthread_mutex_t user_mutex;
+static pi_mutex_t user_mutex;
 static unsigned int user_lock_thread, user_lock_rec;
 
 void user_lock(void)
 {
-    pthread_mutex_lock( &user_mutex );
+    pi_mutex_lock( &user_mutex );
     if (!user_lock_rec++) user_lock_thread = GetCurrentThreadId();
 }
 
 void user_unlock(void)
 {
     if (!--user_lock_rec) user_lock_thread = 0;
-    pthread_mutex_unlock( &user_mutex );
+    pi_mutex_unlock( &user_mutex );
 }
 
 void user_check_not_lock(void)
@@ -2830,9 +2831,9 @@ static UINT64 get_monitor_update_serial(void)
 
 void reset_monitor_update_serial(void)
 {
-    pthread_mutex_lock( &display_lock );
+    pi_mutex_lock( &display_lock );
     monitor_update_serial = 0;
-    pthread_mutex_unlock( &display_lock );
+    pi_mutex_unlock( &display_lock );
 }
 
 static BOOL lock_display_devices( BOOL force )
@@ -2851,7 +2852,7 @@ static BOOL lock_display_devices( BOOL force )
 
     init_display_driver(); /* make sure to load the driver before anything else */
 
-    pthread_mutex_lock( &display_lock );
+    pi_mutex_lock( &display_lock );
 
     serial = get_monitor_update_serial();
     if (!force && monitor_update_serial >= serial) return TRUE;
@@ -2881,14 +2882,14 @@ static BOOL lock_display_devices( BOOL force )
     if (!ret)
     {
         ERR( "Failed to read display config.\n" );
-        pthread_mutex_unlock( &display_lock );
+        pi_mutex_unlock( &display_lock );
     }
     return ret;
 }
 
 static void unlock_display_devices(void)
 {
-    pthread_mutex_unlock( &display_lock );
+    pi_mutex_unlock( &display_lock );
 }
 
 BOOL update_display_cache( BOOL force )
@@ -2900,14 +2901,14 @@ BOOL update_display_cache( BOOL force )
 
 static HDC get_display_dc(void)
 {
-    pthread_mutex_lock( &display_dc_lock );
+    pi_mutex_lock( &display_dc_lock );
     if (!display_dc)
     {
         HDC dc;
 
-        pthread_mutex_unlock( &display_dc_lock );
+        pi_mutex_unlock( &display_dc_lock );
         dc = NtGdiOpenDCW( NULL, NULL, NULL, 0, TRUE, NULL, NULL, NULL );
-        pthread_mutex_lock( &display_dc_lock );
+        pi_mutex_lock( &display_dc_lock );
         if (display_dc)
             NtGdiDeleteObjectApp( dc );
         else
@@ -2924,7 +2925,7 @@ HBITMAP get_display_bitmap(void)
     HBITMAP ret;
 
     virtual_rect = get_virtual_screen_rect( 0, MDT_DEFAULT );
-    pthread_mutex_lock( &display_dc_lock );
+    pi_mutex_lock( &display_dc_lock );
     if (!EqualRect( &old_virtual_rect, &virtual_rect ))
     {
         if (hbitmap) NtGdiDeleteObjectApp( hbitmap );
@@ -2933,13 +2934,13 @@ HBITMAP get_display_bitmap(void)
         old_virtual_rect = virtual_rect;
     }
     ret = hbitmap;
-    pthread_mutex_unlock( &display_dc_lock );
+    pi_mutex_unlock( &display_dc_lock );
     return ret;
 }
 
 static void release_display_dc( HDC hdc )
 {
-    pthread_mutex_unlock( &display_dc_lock );
+    pi_mutex_unlock( &display_dc_lock );
 }
 
 /* display_lock must be held, keep in sync with server/window.c */
@@ -5884,7 +5885,7 @@ void sysparams_init(void)
 
     pthread_mutexattr_init( &attr );
     pthread_mutexattr_settype( &attr, PTHREAD_MUTEX_RECURSIVE );
-    pthread_mutex_init( &user_mutex, &attr );
+    pi_mutex_init(&user_mutex, NSPA_RTPI_MUTEX_RECURSIVE);
     pthread_mutexattr_destroy( &attr );
 
     if ((hkey = reg_create_ascii_key( hkcu_key, "Keyboard Layout\\Preload", 0, NULL )))

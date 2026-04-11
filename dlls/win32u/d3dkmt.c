@@ -35,6 +35,7 @@
 #include <d3d10.h>
 #include <d3d11.h>
 #include <d3d12.h>
+#include <rtpi.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(d3dkmt);
 
@@ -181,7 +182,7 @@ struct d3dkmt_vidpn_source
     struct list entry;                      /* List entry */
 };
 
-static pthread_mutex_t d3dkmt_lock = PTHREAD_MUTEX_INITIALIZER;
+static pi_mutex_t d3dkmt_lock = PI_MUTEX_INIT(0);
 static struct list d3dkmt_vidpn_sources = LIST_INIT( d3dkmt_vidpn_sources );   /* VidPN source information list */
 
 static struct d3dkmt_object **objects, **objects_end, **objects_next;
@@ -235,7 +236,7 @@ static NTSTATUS alloc_object_handle( struct d3dkmt_object *object )
 {
     struct d3dkmt_object **entry;
 
-    pthread_mutex_lock( &d3dkmt_lock );
+    pi_mutex_lock( &d3dkmt_lock );
     if (!objects && init_handle_table()) goto done;
 
     for (entry = objects_next; entry < objects_end; entry++) if (!*entry) break;
@@ -250,7 +251,7 @@ static NTSTATUS alloc_object_handle( struct d3dkmt_object *object )
     *entry = object;
 
 done:
-    pthread_mutex_unlock( &d3dkmt_lock );
+    pi_mutex_unlock( &d3dkmt_lock );
     return object->local ? STATUS_SUCCESS : STATUS_NO_MEMORY;
 }
 
@@ -259,11 +260,11 @@ static void free_object_handle( struct d3dkmt_object *object )
 {
     unsigned int index = handle_to_index( object->local );
 
-    pthread_mutex_lock( &d3dkmt_lock );
+    pi_mutex_lock( &d3dkmt_lock );
     assert( objects + index < objects_end && objects[index] == object );
     objects[index] = NULL;
     object->local = 0;
-    pthread_mutex_unlock( &d3dkmt_lock );
+    pi_mutex_unlock( &d3dkmt_lock );
 }
 
 /* return a pointer to a d3dkmt object from its local handle */
@@ -272,10 +273,10 @@ static void *get_d3dkmt_object( D3DKMT_HANDLE local, enum d3dkmt_type type )
     unsigned int index = handle_to_index( local );
     struct d3dkmt_object *object;
 
-    pthread_mutex_lock( &d3dkmt_lock );
+    pi_mutex_lock( &d3dkmt_lock );
     if (objects + index >= objects_end) object = NULL;
     else object = objects[index];
-    pthread_mutex_unlock( &d3dkmt_lock );
+    pi_mutex_unlock( &d3dkmt_lock );
 
     if (!object || object->local != local || (type != -1 && object->type != type)) return NULL;
     return object;
@@ -815,7 +816,7 @@ NTSTATUS WINAPI NtGdiDdDDISetVidPnSourceOwner( const D3DKMT_SETVIDPNSOURCEOWNER 
     if (!desc || !desc->hDevice || (desc->VidPnSourceCount && (!desc->pType || !desc->pVidPnSourceId)))
         return STATUS_INVALID_PARAMETER;
 
-    pthread_mutex_lock( &d3dkmt_lock );
+    pi_mutex_lock( &d3dkmt_lock );
 
     /* Check parameters */
     for (i = 0; i < desc->VidPnSourceCount; ++i)
@@ -833,7 +834,7 @@ NTSTATUS WINAPI NtGdiDdDDISetVidPnSourceOwner( const D3DKMT_SETVIDPNSOURCEOWNER 
                         (source->type == D3DKMT_VIDPNSOURCEOWNER_EMULATED &&
                          desc->pType[i] == D3DKMT_VIDPNSOURCEOWNER_EXCLUSIVE))
                     {
-                        pthread_mutex_unlock( &d3dkmt_lock );
+                        pi_mutex_unlock( &d3dkmt_lock );
                         return STATUS_INVALID_PARAMETER;
                     }
                 }
@@ -844,7 +845,7 @@ NTSTATUS WINAPI NtGdiDdDDISetVidPnSourceOwner( const D3DKMT_SETVIDPNSOURCEOWNER 
                         (desc->pType[i] == D3DKMT_VIDPNSOURCEOWNER_EXCLUSIVE ||
                          desc->pType[i] == D3DKMT_VIDPNSOURCEOWNER_EMULATED))
                     {
-                        pthread_mutex_unlock( &d3dkmt_lock );
+                        pi_mutex_unlock( &d3dkmt_lock );
                         return STATUS_GRAPHICS_VIDPN_SOURCE_IN_USE;
                     }
                 }
@@ -855,14 +856,14 @@ NTSTATUS WINAPI NtGdiDdDDISetVidPnSourceOwner( const D3DKMT_SETVIDPNSOURCEOWNER 
          * D3DKMT_VIDPNSOURCEOWNER_SHARED come back STATUS_GRAPHICS_VIDPN_SOURCE_IN_USE */
         if (desc->pType[i] == D3DKMT_VIDPNSOURCEOWNER_SHARED)
         {
-            pthread_mutex_unlock( &d3dkmt_lock );
+            pi_mutex_unlock( &d3dkmt_lock );
             return STATUS_GRAPHICS_VIDPN_SOURCE_IN_USE;
         }
 
         /* FIXME: D3DKMT_VIDPNSOURCEOWNER_EXCLUSIVEGDI unsupported */
         if (desc->pType[i] == D3DKMT_VIDPNSOURCEOWNER_EXCLUSIVEGDI || desc->pType[i] > D3DKMT_VIDPNSOURCEOWNER_EMULATED)
         {
-            pthread_mutex_unlock( &d3dkmt_lock );
+            pi_mutex_unlock( &d3dkmt_lock );
             return STATUS_INVALID_PARAMETER;
         }
     }
@@ -879,7 +880,7 @@ NTSTATUS WINAPI NtGdiDdDDISetVidPnSourceOwner( const D3DKMT_SETVIDPNSOURCEOWNER 
             }
         }
 
-        pthread_mutex_unlock( &d3dkmt_lock );
+        pi_mutex_unlock( &d3dkmt_lock );
         return STATUS_SUCCESS;
     }
 
@@ -902,7 +903,7 @@ NTSTATUS WINAPI NtGdiDdDDISetVidPnSourceOwner( const D3DKMT_SETVIDPNSOURCEOWNER 
             source = malloc( sizeof(*source) );
             if (!source)
             {
-                pthread_mutex_unlock( &d3dkmt_lock );
+                pi_mutex_unlock( &d3dkmt_lock );
                 return STATUS_NO_MEMORY;
             }
 
@@ -913,7 +914,7 @@ NTSTATUS WINAPI NtGdiDdDDISetVidPnSourceOwner( const D3DKMT_SETVIDPNSOURCEOWNER 
         }
     }
 
-    pthread_mutex_unlock( &d3dkmt_lock );
+    pi_mutex_unlock( &d3dkmt_lock );
     return STATUS_SUCCESS;
 }
 
@@ -934,18 +935,18 @@ NTSTATUS WINAPI NtGdiDdDDICheckVidPnExclusiveOwnership( const D3DKMT_CHECKVIDPNE
 
     if (!desc || !desc->hAdapter) return STATUS_INVALID_PARAMETER;
 
-    pthread_mutex_lock( &d3dkmt_lock );
+    pi_mutex_lock( &d3dkmt_lock );
 
     LIST_FOR_EACH_ENTRY( source, &d3dkmt_vidpn_sources, struct d3dkmt_vidpn_source, entry )
     {
         if (source->id == desc->VidPnSourceId && source->type == D3DKMT_VIDPNSOURCEOWNER_EXCLUSIVE)
         {
-            pthread_mutex_unlock( &d3dkmt_lock );
+            pi_mutex_unlock( &d3dkmt_lock );
             return STATUS_GRAPHICS_PRESENT_OCCLUDED;
         }
     }
 
-    pthread_mutex_unlock( &d3dkmt_lock );
+    pi_mutex_unlock( &d3dkmt_lock );
     return STATUS_SUCCESS;
 }
 
@@ -1473,9 +1474,9 @@ NTSTATUS d3dkmt_destroy_mutex( D3DKMT_HANDLE local )
 
     if (!(mutex = get_d3dkmt_object( local, D3DKMT_MUTEX ))) return STATUS_INVALID_PARAMETER;
 
-    pthread_mutex_lock( &d3dkmt_lock );
+    pi_mutex_lock( &d3dkmt_lock );
     owned = mutex->owned;
-    pthread_mutex_unlock( &d3dkmt_lock );
+    pi_mutex_unlock( &d3dkmt_lock );
 
     if (owned)
     {
@@ -1613,9 +1614,9 @@ NTSTATUS WINAPI NtGdiDdDDIAcquireKeyedMutex2( D3DKMT_ACQUIREKEYEDMUTEX2 *params 
 
     if (!status)
     {
-        pthread_mutex_lock( &d3dkmt_lock );
+        pi_mutex_lock( &d3dkmt_lock );
         mutex->owned = TRUE;
-        pthread_mutex_unlock( &d3dkmt_lock );
+        pi_mutex_unlock( &d3dkmt_lock );
     }
     return status;
 }
@@ -1664,9 +1665,9 @@ NTSTATUS WINAPI NtGdiDdDDIReleaseKeyedMutex2( D3DKMT_RELEASEKEYEDMUTEX2 *params 
 
     if (!status)
     {
-        pthread_mutex_lock( &d3dkmt_lock );
+        pi_mutex_lock( &d3dkmt_lock );
         mutex->owned = FALSE;
-        pthread_mutex_unlock( &d3dkmt_lock );
+        pi_mutex_unlock( &d3dkmt_lock );
     }
 
     return status;

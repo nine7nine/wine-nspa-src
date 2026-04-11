@@ -37,6 +37,7 @@
 #include "ntuser_private.h"
 #include "wine/server.h"
 #include "wine/debug.h"
+#include <rtpi.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(winstation);
 WINE_DECLARE_DEBUG_CHANNEL(win);
@@ -68,7 +69,7 @@ struct session_block
     SIZE_T      size;       /* size of the mmaped data */
 };
 
-static pthread_mutex_t session_lock = PTHREAD_MUTEX_INITIALIZER;
+static pi_mutex_t session_lock = PI_MUTEX_INIT(0);
 static struct list session_blocks = LIST_INIT(session_blocks);
 const session_shm_t *shared_session;
 
@@ -149,14 +150,14 @@ static NTSTATUS find_shared_session_block( SIZE_T offset, SIZE_T size, struct se
 
     assert( offset + size > offset );
 
-    pthread_mutex_lock( &session_lock );
+    pi_mutex_lock( &session_lock );
 
     LIST_FOR_EACH_ENTRY( block, &session_blocks, struct session_block, entry )
     {
         if (block->offset < offset && offset + size <= block->offset + block->size)
         {
             *ret = block;
-            pthread_mutex_unlock( &session_lock );
+            pi_mutex_unlock( &session_lock );
             return STATUS_SUCCESS;
         }
     }
@@ -167,7 +168,7 @@ static NTSTATUS find_shared_session_block( SIZE_T offset, SIZE_T size, struct se
             wine_dbgstr_longlong(offset), wine_dbgstr_longlong(size), status );
     }
 
-    pthread_mutex_unlock( &session_lock );
+    pi_mutex_unlock( &session_lock );
 
     return status;
 }

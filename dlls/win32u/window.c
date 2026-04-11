@@ -31,6 +31,7 @@
 #include "wine/opengl_driver.h"
 #include "wine/server.h"
 #include "wine/debug.h"
+#include <rtpi.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(win);
 
@@ -270,7 +271,7 @@ void *free_user_handle( HANDLE handle, unsigned short type )
     return ptr;
 }
 
-static pthread_mutex_t surfaces_lock = PTHREAD_MUTEX_INITIALIZER;
+static pi_mutex_t surfaces_lock = PI_MUTEX_INIT(0);
 static struct list client_surfaces = LIST_INIT( client_surfaces );
 
 void detach_client_surfaces( HWND hwnd )
@@ -278,7 +279,7 @@ void detach_client_surfaces( HWND hwnd )
     struct list detached = LIST_INIT( detached );
     struct client_surface *surface, *next;
 
-    pthread_mutex_lock( &surfaces_lock );
+    pi_mutex_lock( &surfaces_lock );
 
     LIST_FOR_EACH_ENTRY_SAFE( surface, next, &client_surfaces, struct client_surface, entry )
     {
@@ -292,7 +293,7 @@ void detach_client_surfaces( HWND hwnd )
         surface->hwnd = NULL;
     }
 
-    pthread_mutex_unlock( &surfaces_lock );
+    pi_mutex_unlock( &surfaces_lock );
 
     LIST_FOR_EACH_ENTRY_SAFE( surface, next, &detached, struct client_surface, entry )
     {
@@ -305,7 +306,7 @@ static void update_client_surfaces( HWND hwnd )
 {
     struct client_surface *surface, *next;
 
-    pthread_mutex_lock( &surfaces_lock );
+    pi_mutex_lock( &surfaces_lock );
 
     LIST_FOR_EACH_ENTRY_SAFE( surface, next, &client_surfaces, struct client_surface, entry )
     {
@@ -314,7 +315,7 @@ static void update_client_surfaces( HWND hwnd )
         InterlockedExchange( &surface->updated, 1 );
     }
 
-    pthread_mutex_unlock( &surfaces_lock );
+    pi_mutex_unlock( &surfaces_lock );
 }
 
 void *client_surface_create( UINT size, const struct client_surface_funcs *funcs, HWND hwnd )
@@ -344,13 +345,13 @@ void client_surface_release( struct client_surface *surface )
 
     if (!ref)
     {
-        pthread_mutex_lock( &surfaces_lock );
+        pi_mutex_lock( &surfaces_lock );
         if (surface->hwnd)
         {
             surface->funcs->detach( surface );
             list_remove( &surface->entry );
         }
-        pthread_mutex_unlock( &surfaces_lock );
+        pi_mutex_unlock( &surfaces_lock );
 
         surface->funcs->destroy( surface );
         free( surface );
@@ -362,32 +363,32 @@ void client_surface_present( struct client_surface *surface )
     HDC hdc = 0;
     HWND hwnd;
 
-    pthread_mutex_lock( &surfaces_lock );
+    pi_mutex_lock( &surfaces_lock );
     if ((hwnd = surface->hwnd))
     {
         if (surface->offscreen) hdc = NtUserGetDCEx( hwnd, 0, DCX_CACHE | DCX_USESTYLE );
         surface->funcs->present( surface, hdc );
         if (hdc) NtUserReleaseDC( hwnd, hdc );
     }
-    pthread_mutex_unlock( &surfaces_lock );
+    pi_mutex_unlock( &surfaces_lock );
 }
 
 void client_surface_update( struct client_surface *surface )
 {
-    pthread_mutex_lock( &surfaces_lock );
+    pi_mutex_lock( &surfaces_lock );
     if (surface->hwnd) surface->funcs->update( surface );
-    pthread_mutex_unlock( &surfaces_lock );
+    pi_mutex_unlock( &surfaces_lock );
 }
 
 void add_window_client_surface( HWND hwnd, struct client_surface *surface )
 {
-    pthread_mutex_lock( &surfaces_lock );
+    pi_mutex_lock( &surfaces_lock );
 
     surface->hwnd = hwnd;
     list_add_tail( &client_surfaces, &surface->entry );
     surface->funcs->update( surface );
 
-    pthread_mutex_unlock( &surfaces_lock );
+    pi_mutex_unlock( &surfaces_lock );
 }
 
 BOOL is_client_surface_window( struct client_surface *surface, HWND hwnd )
@@ -395,10 +396,10 @@ BOOL is_client_surface_window( struct client_surface *surface, HWND hwnd )
     BOOL ret;
 
     if (!surface) return FALSE;
-    pthread_mutex_lock( &surfaces_lock );
+    pi_mutex_lock( &surfaces_lock );
     if (hwnd) ret = surface->hwnd == hwnd;
     else ret = surface->hwnd != NULL;
-    pthread_mutex_unlock( &surfaces_lock );
+    pi_mutex_unlock( &surfaces_lock );
 
     return ret;
 }

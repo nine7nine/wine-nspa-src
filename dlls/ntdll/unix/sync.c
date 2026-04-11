@@ -134,6 +134,32 @@ static inline int futex_wake_one( const LONG *addr )
     return syscall( __NR_futex, addr, FUTEX_WAKE_PRIVATE, 1, NULL, 0, 0 );
 }
 
+/* NSPA CS-PI helpers — raw FUTEX_LOCK_PI / FUTEX_UNLOCK_PI around a word the
+ * caller owns. The kernel enforces the rt_mutex PI protocol on the word: owner
+ * TID in the low 30 bits, FUTEX_OWNER_DIED in bit 30, FUTEX_WAITERS in bit 31.
+ * See: Documentation/locking/rt-mutex.txt, futex(2) man page.
+ *
+ * These are called from PE-side ntdll via Nt-style syscalls
+ * (NtNspaLockCriticalSectionPI / NtNspaUnlockCriticalSectionPI) — the PE side
+ * publishes its own TID in the fast path, then invokes these syscalls only on
+ * contention. */
+#ifndef FUTEX_LOCK_PI_PRIVATE
+#define FUTEX_LOCK_PI_PRIVATE   (FUTEX_LOCK_PI   | FUTEX_PRIVATE_FLAG)
+#endif
+#ifndef FUTEX_UNLOCK_PI_PRIVATE
+#define FUTEX_UNLOCK_PI_PRIVATE (FUTEX_UNLOCK_PI | FUTEX_PRIVATE_FLAG)
+#endif
+
+static inline int futex_lock_pi( LONG *addr )
+{
+    return syscall( __NR_futex, addr, FUTEX_LOCK_PI_PRIVATE, 0, NULL, 0, 0 );
+}
+
+static inline int futex_unlock_pi( LONG *addr )
+{
+    return syscall( __NR_futex, addr, FUTEX_UNLOCK_PI_PRIVATE, 0, NULL, 0, 0 );
+}
+
 #elif defined(__APPLE__)
 
 #define USE_FUTEX
@@ -3577,6 +3603,108 @@ static LONGLONG update_timeout( ULONGLONG end )
     return timeleft;
 }
 #endif
+
+
+/***********************************************************************
+ *             NtNspaGetUnixTid (NTDLL.@)
+ *
+ * NSPA RT v2.3 — return the calling thread's Linux kernel TID.
+ *
+ * The PE side cannot call syscall(SYS_gettid) directly (no libc, no raw
+ * syscall access). CS-PI's fast-path CAS needs the kernel TID (not the
+ * Win32 TID, which is wineserver-assigned and unrelated) because
+ * FUTEX_LOCK_PI validates the owner field against the kernel's task list.
+ *
+ * PE side caches this in a __thread variable per thread, so this syscall
+ * fires at most once per thread (on first CS acquire).
+ */
+ULONG WINAPI NtNspaGetUnixTid(void)
+{
+#ifdef __linux__
+    struct ntdll_thread_data *thread_data = ntdll_get_thread_data();
+    if (!thread_data->nspa_unix_tid)
+        thread_data->nspa_unix_tid = (DWORD)syscall( SYS_gettid );
+    return thread_data->nspa_unix_tid;
+#else
+    return 0;
+#endif
+}
+
+
+/***********************************************************************
+ *             NtNspaLockCriticalSectionPI (NTDLL.@)
+ *
+ * NSPA RT v2.3 — slow-path entry for CS-PI. The caller (PE-side
+ * RtlEnterCriticalSection) has already tried to claim the futex word via a
+ * user-space CAS of its Linux TID and failed (contention). Hand the word to
+ * the kernel's rt_mutex PI chain via FUTEX_LOCK_PI_PRIVATE — the kernel will
+ * temporarily boost the current holder to the caller's scheduling priority,
+ * run it until it releases the CS, then transfer ownership to us.
+ *
+ * On return, the futex word holds our TID (possibly with FUTEX_WAITERS set if
+ * further waiters have arrived while we were blocked). The PE side then sets
+ * OwningThread/RecursionCount bookkeeping and returns to the app.
+ *
+ * Return values:
+ *   STATUS_SUCCESS      — lock acquired
+ *   STATUS_NOT_SUPPORTED— kernel lacks FUTEX_LOCK_PI (old/stripped kernel)
+ *   STATUS_UNSUCCESSFUL — any other futex(2) error
+ *
+ * On NOT_SUPPORTED the PE-side caller falls back to the legacy keyed-event
+ * wait path, making CS-PI a soft dependency on kernel FUTEX_LOCK_PI support.
+ */
+NTSTATUS WINAPI NtNspaLockCriticalSectionPI( void *address )
+{
+#ifdef USE_FUTEX
+    LONG *futex = address;
+    int ret;
+
+    if (!futex) return STATUS_INVALID_PARAMETER;
+
+    do {
+        ret = futex_lock_pi( futex );
+    } while (ret == -1 && errno == EINTR);
+
+    if (ret == 0) return STATUS_SUCCESS;
+    if (errno == ENOSYS) return STATUS_NOT_SUPPORTED;
+    return STATUS_UNSUCCESSFUL;
+#else
+    return STATUS_NOT_SUPPORTED;
+#endif
+}
+
+
+/***********************************************************************
+ *             NtNspaUnlockCriticalSectionPI (NTDLL.@)
+ *
+ * NSPA RT v2.3 — release-path entry for CS-PI. Called from PE-side
+ * RtlLeaveCriticalSection when we are releasing a PI-locked CS and the
+ * FUTEX_WAITERS bit is set (i.e. at least one thread is blocked on us via
+ * FUTEX_LOCK_PI). Hands off ownership to the highest-priority waiter via
+ * FUTEX_UNLOCK_PI_PRIVATE — the kernel drops our priority boost and transfers
+ * the futex word's TID field to the chosen waiter.
+ *
+ * Uncontended release (no waiters) is handled entirely in user space on the
+ * PE side via a direct CAS on the futex word; this syscall is only used when
+ * the kernel needs to be involved for the PI chain hand-off.
+ */
+NTSTATUS WINAPI NtNspaUnlockCriticalSectionPI( void *address )
+{
+#ifdef USE_FUTEX
+    LONG *futex = address;
+    int ret;
+
+    if (!futex) return STATUS_INVALID_PARAMETER;
+
+    ret = futex_unlock_pi( futex );
+
+    if (ret == 0) return STATUS_SUCCESS;
+    if (errno == ENOSYS) return STATUS_NOT_SUPPORTED;
+    return STATUS_UNSUCCESSFUL;
+#else
+    return STATUS_NOT_SUPPORTED;
+#endif
+}
 
 
 /***********************************************************************

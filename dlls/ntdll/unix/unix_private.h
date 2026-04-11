@@ -139,6 +139,9 @@ struct ntdll_thread_data
     int                           request_shm_fd;  /* NSPA v1.5: shared memory fd */
     volatile struct request_shm  *request_shm;     /* NSPA v1.5: shared memory mapping */
 #endif
+    DWORD                         nspa_unix_tid;   /* NSPA v2.3: cached Linux kernel TID
+                                                    * for CS-PI fast path. 0 = uninitialized.
+                                                    * Populated on first NtNspaGetUnixTid call. */
 };
 
 C_ASSERT( sizeof(struct ntdll_thread_data) <= sizeof(((TEB *)0)->GdiTebBatch) );
@@ -150,6 +153,18 @@ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct ntdll_thread_data, sys
 C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct ntdll_thread_data, syscall_table ) == 0x214 );
 C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct ntdll_thread_data, syscall_frame ) == 0x218 );
 C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct ntdll_thread_data, syscall_trace ) == 0x21c );
+#endif
+
+/* NSPA v2.3 — offset of nspa_unix_tid from the start of GdiTebBatch.
+ * PE-side code (which cannot include unix_private.h) needs this as a
+ * literal constant. The PE-side value is hardcoded in dlls/ntdll/sync.c
+ * (see NSPA_UNIX_TID_OFFSET). The C_ASSERTs below verify that the PE
+ * literal matches the real struct layout — if the struct changes, the
+ * build fails and both sides need updating in sync. */
+#ifdef _WIN64
+C_ASSERT( offsetof( struct ntdll_thread_data, nspa_unix_tid ) == 0x108 );
+#else
+C_ASSERT( offsetof( struct ntdll_thread_data, nspa_unix_tid ) == 0x88 );
 #endif
 
 static inline struct ntdll_thread_data *ntdll_get_thread_data(void)

@@ -36,6 +36,7 @@
  */
 
 #include <windows.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -65,6 +66,81 @@ static LONGLONG now_ms(void)
     if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&c);
     return (c.QuadPart * 1000) / freq.QuadPart;
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+ *   Shared output formatting helpers
+ *
+ *   All subcommands should use these so the harness produces consistent,
+ *   human-readable output. See memory/feedback_test_output_formatting.md
+ *   for the style rules. In short:
+ *
+ *     - banner at the top of each test
+ *     - "Parameters:" block listing key inputs
+ *     - "-- <section> --" subsection dividers
+ *     - aligned key/value lines via print_kv
+ *     - tables with dashed underlines
+ *     - PASS / FAIL: <reason>  verdict at the end
+ * ════════════════════════════════════════════════════════════════════════ */
+
+#define BANNER_WIDTH 72
+
+static void print_banner(const char *title, const char *tagline)
+{
+    int i;
+    printf("\n");
+    for (i = 0; i < BANNER_WIDTH; i++) putchar('=');
+    putchar('\n');
+    printf("  %s", title);
+    if (tagline && *tagline) printf(" - %s", tagline);
+    printf("\n");
+    for (i = 0; i < BANNER_WIDTH; i++) putchar('=');
+    putchar('\n');
+    fflush(stdout);
+}
+
+static void print_section(const char *title)
+{
+    printf("\n-- %s --\n", title);
+    fflush(stdout);
+}
+
+/* Aligned key/value line. Key is left-padded to 20 chars so columns line up
+ * across consecutive calls. Usage: print_kv("nthreads", "%d", 4); */
+static void print_kv(const char *key, const char *fmt, ...)
+{
+    va_list ap;
+    printf("  %-20s : ", key);
+    va_start(ap, fmt);
+    vprintf(fmt, ap);
+    va_end(ap);
+    putchar('\n');
+    fflush(stdout);
+}
+
+/* Single-thread startup line: role tag + win32 tid + optional note.
+ * Printed from the worker before it starts its loop. */
+static void print_worker_start(const char *role, DWORD tid, const char *note)
+{
+    if (note && *note)
+        printf("  [%-6s] win32_tid=%-6lu  %s\n", role, (unsigned long)tid, note);
+    else
+        printf("  [%-6s] win32_tid=%lu\n", role, (unsigned long)tid);
+    fflush(stdout);
+}
+
+/* Verdict line — always the last thing a subcommand prints. */
+static void print_verdict(int pass, const char *reason)
+{
+    printf("\n");
+    if (pass)
+        printf("  PASS\n");
+    else if (reason && *reason)
+        printf("  FAIL: %s\n", reason);
+    else
+        printf("  FAIL\n");
+    printf("\n");
+    fflush(stdout);
 }
 
 /* ════════════════════════════════════════════════════════════════════════
@@ -503,9 +579,7 @@ static DWORD WINAPI rapid_worker(void *arg)
     if (s->is_rt)
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 
-    printf("[rapidmutex] %-5s worker  win32_tid=%lu\n",
-           s->is_rt ? "RT" : "load", (unsigned long)s->win32_tid);
-    fflush(stdout);
+    print_worker_start(s->is_rt ? "RT" : "load", s->win32_tid, NULL);
 
     start = rapid_qpc_us();
     for (i = 0; i < s->iters; i++) {
@@ -553,13 +627,15 @@ static int cmd_rapidmutex(int argc, char **argv)
     rapid_shared_counter = 0;
     InitializeCriticalSection(&cs);
 
-    printf("[rapidmutex] %d threads (1 RT + %d load), %d iters each\n",
-           nthreads, nthreads - 1, iters);
-    printf("[rapidmutex] process pid=%lu\n", (unsigned long)GetCurrentProcessId());
-    printf("[rapidmutex] tight EnterCS/LeaveCS stress on a shared CRITICAL_SECTION\n");
-    printf("[rapidmutex] observe via: ps -eLo pid,tid,class,rtprio,nice,comm | grep nspa_rt_test\n\n");
-    fflush(stdout);
+    print_banner("rapidmutex", "CRITICAL_SECTION stress test");
+    print_section("parameters");
+    print_kv("nthreads",       "%d  (1 RT + %d load)", nthreads, nthreads - 1);
+    print_kv("iters/thread",   "%d", iters);
+    print_kv("total iters",    "%d", nthreads * iters);
+    print_kv("process pid",    "%lu", (unsigned long)GetCurrentProcessId());
+    print_kv("observe cmd",    "ps -eLo pid,tid,class,rtprio,nice,comm | grep nspa_rt_test");
 
+    print_section("startup");
     memset(states, 0, sizeof(states));
     total_start = rapid_qpc_us();
 
@@ -581,22 +657,22 @@ static int cmd_rapidmutex(int argc, char **argv)
     DeleteCriticalSection(&cs);
 
     expected = (LONG)nthreads * (LONG)iters;
-    printf("\n=== results ===\n");
-    printf("total elapsed       : %lld ms\n", total_us / 1000);
-    printf("aggregate throughput: %lld ops/sec\n",
-           total_us ? (total_done * 1000000LL / total_us) : 0);
-    printf("shared counter      : %ld (expected %ld)  %s\n",
-           (long)rapid_shared_counter, (long)expected,
-           (rapid_shared_counter == expected) ? "OK" : "MISMATCH — CS broken!");
+    print_section("results");
+    print_kv("total elapsed",  "%lld ms", total_us / 1000);
+    print_kv("throughput",     "%lld ops/sec",
+             total_us ? (total_done * 1000000LL / total_us) : 0);
+    print_kv("shared counter", "%ld (expected %ld) %s",
+             (long)rapid_shared_counter, (long)expected,
+             (rapid_shared_counter == expected) ? "OK" : "MISMATCH");
 
-    printf("\nper-thread:\n");
-    printf("  %-5s  %-10s  %8s  %10s  %10s  %10s\n",
-           "role", "win32_tid", "iters", "max_wait", "avg_wait", "elapsed");
-    printf("  %-5s  %-10s  %8s  %10s  %10s  %10s\n",
-           "----", "---------", "-----", "--------", "--------", "-------");
+    print_section("per-thread");
+    printf("  %-6s  %-10s  %10s  %14s  %14s  %12s\n",
+           "role", "win32_tid", "iters", "max_wait(us)", "avg_wait(us)", "elapsed(ms)");
+    printf("  %-6s  %-10s  %10s  %14s  %14s  %12s\n",
+           "------", "---------", "----------", "------------", "------------", "-----------");
     for (i = 0; i < nthreads; i++) {
         LONGLONG avg = states[i].iters_done ? states[i].total_wait_us / states[i].iters_done : 0;
-        printf("  %-5s  %-10lu  %8d  %7lld us  %7lld us  %7lld ms\n",
+        printf("  %-6s  %-10lu  %10d  %14lld  %14lld  %12lld\n",
                states[i].is_rt ? "RT" : "load",
                (unsigned long)states[i].win32_tid,
                states[i].iters_done,
@@ -604,8 +680,18 @@ static int cmd_rapidmutex(int argc, char **argv)
                avg,
                states[i].elapsed_us / 1000);
     }
-    printf("\n");
-    return (rapid_shared_counter == expected) ? 0 : 1;
+
+    if (rapid_shared_counter == expected) {
+        print_verdict(1, NULL);
+        return 0;
+    } else {
+        char reason[128];
+        snprintf(reason, sizeof(reason),
+                 "counter mismatch: got %ld, expected %ld (CRITICAL_SECTION broken)",
+                 (long)rapid_shared_counter, (long)expected);
+        print_verdict(0, reason);
+        return 1;
+    }
 }
 
 static int cmd_philosophers(int argc, char **argv)

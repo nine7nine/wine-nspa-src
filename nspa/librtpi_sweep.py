@@ -84,12 +84,14 @@ DEFAULT_SCOPE = [
     'dlls/winecoreaudio.drv',
     'dlls/wineoss.drv',
     'dlls/opengl32',
-    'dlls/winemac.drv',
     'dlls/winebus.sys',
     'dlls/wineusb.sys',
-    'dlls/wineandroid.drv',
     'dlls/nsiproxy.sys',
 ]
+# winemac.drv and wineandroid.drv are excluded from scope per user:
+# Wine-NSPA targets Linux (and possibly *BSD/Wayland). macOS and Android
+# builds are not maintained here. Their Makefile.in files and sources
+# are left untouched by the sweep.
 
 # ----------------------------------------------------------------------------
 # Opt-out lists.

@@ -774,9 +774,14 @@ static void *nspa_request_shm_thread( void *param )
             goto done_locked;
         }
 
-        __asm__ __volatile__ ("" ::: "memory");
+        /* aarch64-correct memory barriers: compiler fences alone are
+         * insufficient on weakly-ordered architectures. Ensure all writes
+         * made by the client before FUTEX_WAKE are visible to us before
+         * we dispatch, and all our writes are visible before we transition
+         * the futex back to 0. */
+        __atomic_thread_fence( __ATOMIC_SEQ_CST );
         nspa_handle_shm_request( thread, (struct request_shm *)request_shm );
-        __asm__ __volatile__ ("" ::: "memory");
+        __atomic_thread_fence( __ATOMIC_SEQ_CST );
 
         request_shm_fd = thread->request_shm_fd;
         request_shm = thread->request_shm;
@@ -895,11 +900,39 @@ struct thread *create_thread( int fd, struct process *process, const struct secu
 
 #ifdef __linux__
     /* Create per-thread shared memory + dispatcher pthread. Failure is soft:
-     * the thread falls back to socket IPC. */
+     * the thread falls back to socket IPC.
+     *
+     * v1.1 note: if wineserver RT is active (nspa_srv_rt_prio > 0), the
+     * dispatcher is created with explicit FIFO scheduling attrs via
+     * PTHREAD_EXPLICIT_SCHED. This bypasses inheritance and ensures the
+     * child is born RT even when the parent has SCHED_RESET_ON_FORK set.
+     * Without explicit attrs the child would start at SCHED_OTHER because
+     * reset-on-fork applies to clone()/pthread_create too, not just
+     * fork() — which would cause priority inversion when an audio-class
+     * client thread waits on a wineserver reply dispatched by a
+     * SCHED_OTHER pthread. */
     if (create_request_shm( &thread->request_shm_fd, (struct request_shm **)&thread->request_shm ))
     {
+        pthread_attr_t attr;
+        pthread_attr_t *pattr = NULL;
+        int created;
+
+        if (nspa_srv_rt_prio > 0)
+        {
+            struct sched_param shm_param = { .sched_priority = nspa_srv_rt_prio };
+            pthread_attr_init( &attr );
+            pthread_attr_setinheritsched( &attr, PTHREAD_EXPLICIT_SCHED );
+            pthread_attr_setschedpolicy( &attr, nspa_srv_rt_policy );
+            pthread_attr_setschedparam( &attr, &shm_param );
+            pthread_attr_setscope( &attr, PTHREAD_SCOPE_SYSTEM );
+            pattr = &attr;
+        }
+
         grab_object( thread );  /* hold for the dispatcher pthread */
-        if (pthread_create( &pthread, NULL, nspa_request_shm_thread, thread ) == 0)
+        created = pthread_create( &pthread, pattr, nspa_request_shm_thread, thread );
+        if (pattr) pthread_attr_destroy( &attr );
+
+        if (created == 0)
         {
             pthread_detach( pthread );
             thread->request_shm_thread_running = 1;

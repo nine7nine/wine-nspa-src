@@ -310,7 +310,10 @@ static unsigned int nspa_send_request_shm( const struct __server_request_info *r
         }
     }
 
-    /* Publish: transition futex 0 -> 1 and wake the dispatcher. */
+    /* Publish: transition futex 0 -> 1 and wake the dispatcher. The fence
+     * ensures all writes above are visible to the dispatcher before it sees
+     * the state change (required on aarch64; no-op on x86). */
+    __atomic_thread_fence( __ATOMIC_SEQ_CST );
     while (__sync_val_compare_and_swap( &request_shm->futex, 0, 1 ) != 0)
         sched_yield();
     syscall( __NR_futex, &request_shm->futex, NSPA_FUTEX_WAKE, 1, NULL, NULL, 0 );
@@ -330,6 +333,9 @@ static inline unsigned int nspa_wait_reply_shm( struct __server_request_info *re
         if (val == -1) abort_thread( 0 );  /* teardown */
         syscall( __NR_futex, &request_shm->futex, NSPA_FUTEX_WAIT, val, NULL, NULL, 0 );
     }
+    /* aarch64-correct memory barrier: ensure we observe all of the
+     * dispatcher's writes (reply data) before we read the reply body. */
+    __atomic_thread_fence( __ATOMIC_SEQ_CST );
 
     memcpy( &req->u.reply, (void *)&request_shm->u.reply, sizeof(req->u.reply) );
     if (req->u.reply.reply_header.reply_size)

@@ -56,8 +56,6 @@ HANDLE WINAPI AvSetMmThreadCharacteristicsA(const char *name, DWORD *index)
 
 HANDLE WINAPI AvSetMmThreadCharacteristicsW(const WCHAR *name, DWORD *index)
 {
-    FIXME("(%s,%p): stub\n", debugstr_w(name), index);
-
     if (!name)
     {
         SetLastError(ERROR_INVALID_TASK_NAME);
@@ -68,6 +66,31 @@ HANDLE WINAPI AvSetMmThreadCharacteristicsW(const WCHAR *name, DWORD *index)
     {
         SetLastError(ERROR_INVALID_HANDLE);
         return NULL;
+    }
+
+    /* NSPA RT call-site hint: MCSS task classes that correspond to audio
+     * workloads get promoted to TIME_CRITICAL. Under NSPA_RT_PRIO, this
+     * hits the Tier 1 self-promotion fast path in ntdll and lands the
+     * calling thread on SCHED_FIFO. Window Manager is explicitly clamped
+     * to NORMAL because MCSS classifies it as non-audio-critical and
+     * leaving it at whatever the caller had can cause it to compete with
+     * real audio threads. */
+    if (!wcscmp(name, L"Audio") || !wcscmp(name, L"Pro Audio"))
+    {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+        TRACE("NSPA RT:Avrt: %s -> TIME_CRITICAL (tid=%04lx)\n",
+              debugstr_w(name), GetCurrentThreadId());
+    }
+    else if (!wcscmp(name, L"Window Manager"))
+    {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+        TRACE("NSPA RT:Avrt: %s -> NORMAL (tid=%04lx)\n",
+              debugstr_w(name), GetCurrentThreadId());
+    }
+    else
+    {
+        FIXME("NSPA RT:Avrt: unhandled task class %s (tid=%04lx)\n",
+              debugstr_w(name), GetCurrentThreadId());
     }
 
     return (HANDLE)0x12345678;
@@ -81,13 +104,20 @@ BOOL WINAPI AvQuerySystemResponsiveness(HANDLE AvrtHandle, ULONG *value)
 
 BOOL WINAPI AvRevertMmThreadCharacteristics(HANDLE AvrtHandle)
 {
-    FIXME("(%p): stub\n", AvrtHandle);
+    /* NSPA RT: revert the call-site hint from AvSetMmThreadCharacteristicsW.
+     * SetThreadPriority(NORMAL) will go through the standard wineserver path;
+     * Tier 2 in server/thread.c will demote the thread back to SCHED_OTHER
+     * via nspa_rt_maybe_demote() when the NT priority drops out of the RT
+     * band. No special handling needed here. */
+    TRACE("NSPA RT:Avrt: revert -> NORMAL (tid=%04lx)\n", GetCurrentThreadId());
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+
     return TRUE;
 }
 
 BOOL WINAPI AvSetMmThreadPriority(HANDLE AvrtHandle, AVRT_PRIORITY prio)
 {
-    FIXME("(%p)->(%u) stub\n", AvrtHandle, prio);
+    TRACE("NSPA RT:Avrt: SetMmThreadPriority(%u) (tid=%04lx)\n", prio, GetCurrentThreadId());
     return TRUE;
 }
 

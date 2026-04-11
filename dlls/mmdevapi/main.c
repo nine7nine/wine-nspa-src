@@ -358,6 +358,13 @@ static DWORD WINAPI notify_thread( void *p )
     BOOL quit;
 
     SetThreadDescription( GetCurrentThread(), L"mmdevapi_midi_notify" );
+    /* NSPA RT call-site hint: MIDI notify thread needs low jitter to keep
+     * up with device events. Promoted to TIME_CRITICAL hits the Tier 1
+     * self-promotion fast path in ntdll when NSPA_RT_PRIO is set. This
+     * single hook covers alsa/oss/coreaudio via the MIDI_CALL dispatch
+     * below; no per-driver hint is needed. */
+    SetThreadPriority( GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL );
+
     params.notify = &notify;
     params.quit = &quit;
 

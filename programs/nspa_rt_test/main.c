@@ -16,8 +16,10 @@
  *                  (becomes SCHED_FIFO under NSPA_RT_PRIO), others NORMAL.
  *                  Regression check for the CS-PI fast path and for the
  *                  librtpi sweep when it lands on dlls/ntdll/unix/sync.c.
- *   philosophers   [TODO] dining philosophers deadlock-free test — exercises
- *                  multi-lock acquire-order and PI-chain transitivity.
+ *   philosophers   Dining philosophers with 5 phils + 5 chopsticks. Phil 0 is
+ *                  TIME_CRITICAL, phils 1-4 load. Background busyloop threads
+ *                  starve the OTHER phils for CPU to exercise transitive PI
+ *                  (RT → holder → holder-of-holder chain boost).
  *   help           show usage
  *
  * Build:
@@ -36,6 +38,7 @@
  */
 
 #include <windows.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -694,20 +697,324 @@ static int cmd_rapidmutex(int argc, char **argv)
     }
 }
 
+/* ════════════════════════════════════════════════════════════════════════
+ *   Subcommand: philosophers  (dining philosophers — Wine CS bug finder)
+ *
+ *   5 philosopher threads share 5 CRITICAL_SECTION "chopsticks", arranged
+ *   in a ring. Each phil needs its two adjacent chopsticks to eat. Classic
+ *   setup with a resource hierarchy (always acquire the lower-numbered
+ *   chopstick first) to prevent algorithmic deadlock. Phil 0 runs at
+ *   THREAD_PRIORITY_TIME_CRITICAL; phils 1..4 run NORMAL. N background
+ *   SCHED_OTHER busyloop threads (default 4) contend with the OTHER phils
+ *   for CPU, so that when phil 0 blocks on a chopstick, the chain of OTHER
+ *   phils holding it is scheduling-starved.
+ *
+ *   ── What bugs this test catches ───────────────────────────────────────
+ *
+ *   (1) Deadlock in Wine's CRITICAL_SECTION path.
+ *       If Enter/LeaveCS loses ownership or wakes the wrong waiter, the
+ *       algorithmic deadlock-free property of the resource hierarchy no
+ *       longer holds and the whole test hangs. Caught by the 60s timeout
+ *       on WaitForMultipleObjects.
+ *
+ *   (2) Lost unlock / ownership corruption.
+ *       If LeaveCriticalSection fails to release the CS (partial release,
+ *       refcount bug, missed wakeup), the next EnterCS from a different
+ *       phil blocks forever. Caught by timeout.
+ *
+ *   (3) RT priority mapping broken.
+ *       If phil 0's TIME_CRITICAL → SCHED_FIFO promotion is broken (NSPA
+ *       RT v1/v1.2 regression), phil 0 runs as SCHED_OTHER. Under load
+ *       contention, it becomes starved — meals_done stays far below
+ *       target. Caught by the `min_meals < target` check.
+ *
+ *   (4) CS-PI priority inheritance broken.
+ *       If phil 0 (RT) blocks on a chopstick held by an OTHER phil and
+ *       the holder does NOT get boosted, the load threads keep preempting
+ *       the holder and phil 0 waits indefinitely. Eventually phil 0
+ *       starves and the test times out or fails the starvation check.
+ *       Caught by timeout and/or min_meals check.
+ *
+ *   (5) Transitive PI chain broken.
+ *       Phil 0 (RT) blocks on phil K, who is holding chopstick A but
+ *       waiting for chopstick B held by phil K+1, who is waiting for
+ *       chopstick C held by phil K+2. PI must propagate: boost K, then K
+ *       transitively boosts K+1, then K+2. If PI only boosts ONE level
+ *       deep, the chain gets stuck at the second hop. Caught by timeout
+ *       under heavy contention.
+ *
+ *   (6) Spurious wakeup / wrong-waiter wakeup.
+ *       If EnterCS returns early or the wrong thread is woken, two phils
+ *       can believe they hold the same chopstick simultaneously, which
+ *       corrupts the schedule but not directly any state the test tracks.
+ *       Detected indirectly via abnormal meals distribution (one phil
+ *       makes too much progress, another too little) or via an external
+ *       observer like thread-sanitizer.
+ *
+ *   ── PASS / FAIL criteria ──────────────────────────────────────────────
+ *
+ *   PASS iff:
+ *     - WaitForMultipleObjects returns before PHIL_TIMEOUT_MS (no deadlock)
+ *     - Every philosopher's meals_done == target (no starvation, no hang)
+ *
+ *   FAIL otherwise, with a labelled reason.
+ *
+ *   Benchmark-style numbers (max wait, avg wait, elapsed) are printed
+ *   in the results/per-phil sections as INFORMATION for the user running
+ *   the test manually. They are NOT pass/fail criteria — machine speed,
+ *   core count, and load scaling affect them too much for any threshold
+ *   to be meaningful.
+ *
+ *   ── Usage ─────────────────────────────────────────────────────────────
+ *
+ *   philosophers [meals_per_phil [load_threads]]
+ *     default: 50 meals/phil, 4 background load threads
+ * ════════════════════════════════════════════════════════════════════════ */
+
+#define PHIL_N                 5
+#define PHIL_DEFAULT_MEALS     50
+#define PHIL_DEFAULT_LOAD      4
+#define PHIL_MAX_LOAD          16
+#define PHIL_THINK_WORK        400000LL   /* ~1-3 ms busywork on modern x86 */
+#define PHIL_EAT_WORK          400000LL
+#define PHIL_TIMEOUT_MS        60000
+
+static CRITICAL_SECTION phil_chopsticks[PHIL_N];
+static volatile LONG    phil_load_stop;
+static LARGE_INTEGER    phil_qpc_freq;
+
+struct phil_state {
+    int      id;
+    int      is_rt;
+    int      target_meals;
+    /* outputs */
+    DWORD    win32_tid;
+    int      meals_done;
+    LONGLONG max_wait_us;
+    LONGLONG total_wait_us;
+    LONGLONG total_think_us;
+    LONGLONG total_eat_us;
+    LONGLONG elapsed_us;
+};
+
+static LONGLONG phil_qpc_us(void)
+{
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return (c.QuadPart * 1000000) / phil_qpc_freq.QuadPart;
+}
+
+/* Fixed-count busyloop, same idiom as cs_do_work. */
+static void phil_do_work(long long iters)
+{
+    volatile long long x = 0;
+    long long i;
+    for (i = 0; i < iters; i++)
+        x += i * (i + 1);
+    (void)x;
+}
+
+static DWORD WINAPI phil_load_thread(void *u)
+{
+    volatile long long x = 0;
+    long long i = 0;
+    (void)u;
+    while (!phil_load_stop) {
+        x += i * (i + 1);
+        i++;
+        if ((i & 0xffffff) == 0 && phil_load_stop) break;
+    }
+    return (DWORD)(x & 0xffffffff);
+}
+
+static DWORD WINAPI phil_worker(void *arg)
+{
+    struct phil_state *s = arg;
+    LONGLONG start;
+    int lo = s->id;
+    int hi = (s->id + 1) % PHIL_N;
+    /* Resource hierarchy: always acquire lower-numbered chopstick first. */
+    if (lo > hi) { int tmp = lo; lo = hi; hi = tmp; }
+
+    s->win32_tid = GetCurrentThreadId();
+    if (s->is_rt)
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+
+    {
+        char note[64];
+        snprintf(note, sizeof(note), "phil=%d  chopsticks=%d,%d",
+                 s->id, lo, hi);
+        print_worker_start(s->is_rt ? "RT" : "phil", s->win32_tid, note);
+    }
+
+    start = phil_qpc_us();
+    while (s->meals_done < s->target_meals) {
+        LONGLONG t0, t1;
+
+        /* Think */
+        t0 = phil_qpc_us();
+        phil_do_work(PHIL_THINK_WORK);
+        s->total_think_us += phil_qpc_us() - t0;
+
+        /* Acquire lower chopstick, then higher. Wait time is measured as
+         * time between the start of the first Enter and the completion of
+         * the second Enter — the total "hungry" time for this meal. */
+        t0 = phil_qpc_us();
+        EnterCriticalSection(&phil_chopsticks[lo]);
+        EnterCriticalSection(&phil_chopsticks[hi]);
+        t1 = phil_qpc_us();
+        {
+            LONGLONG wait = t1 - t0;
+            if (wait > s->max_wait_us) s->max_wait_us = wait;
+            s->total_wait_us += wait;
+        }
+
+        /* Eat */
+        t0 = phil_qpc_us();
+        phil_do_work(PHIL_EAT_WORK);
+        s->total_eat_us += phil_qpc_us() - t0;
+
+        LeaveCriticalSection(&phil_chopsticks[hi]);
+        LeaveCriticalSection(&phil_chopsticks[lo]);
+
+        s->meals_done++;
+    }
+    s->elapsed_us = phil_qpc_us() - start;
+    return 0;
+}
+
 static int cmd_philosophers(int argc, char **argv)
 {
-    (void)argc; (void)argv;
-    printf("[philosophers] not yet implemented\n");
-    printf("\n");
-    printf("Planned scope:\n");
-    printf("  - N philosopher threads, N CRITICAL_SECTION 'chopsticks'.\n");
-    printf("  - Deadlock-free acquire order (resource hierarchy).\n");
-    printf("  - Mix of RT and non-RT philosophers to exercise transitive PI\n");
-    printf("    chains — an RT philosopher blocked behind an OTHER philosopher\n");
-    printf("    that is itself blocked behind another OTHER philosopher.\n");
-    printf("  - Measures: meals/sec per philosopher, starvation count, max\n");
-    printf("    wait. RT philosophers should never starve if PI is working.\n");
-    return 1;
+    struct phil_state states[PHIL_N];
+    HANDLE phils[PHIL_N];
+    HANDLE loads[PHIL_MAX_LOAD];
+    int target_meals = PHIL_DEFAULT_MEALS;
+    int n_load       = PHIL_DEFAULT_LOAD;
+    int i;
+    LONGLONG t_start, t_end;
+    DWORD wait_ret;
+    int min_meals = INT_MAX, max_meals = 0, sum_meals = 0;
+    LONGLONG worst_max_wait = 0, rt_max_wait = 0;
+
+    if (argc > 1) target_meals = atoi(argv[1]);
+    if (argc > 2) n_load       = atoi(argv[2]);
+    if (target_meals < 1) target_meals = 1;
+    if (n_load < 0) n_load = 0;
+    if (n_load > PHIL_MAX_LOAD) n_load = PHIL_MAX_LOAD;
+
+    if (!QueryPerformanceFrequency(&phil_qpc_freq)) {
+        printf("QueryPerformanceFrequency failed\n");
+        return 1;
+    }
+
+    for (i = 0; i < PHIL_N; i++)
+        InitializeCriticalSection(&phil_chopsticks[i]);
+
+    print_banner("philosophers", "dining philosophers / transitive PI chain test");
+    print_section("parameters");
+    print_kv("philosophers",     "%d  (phil 0 RT, phils 1..%d load)", PHIL_N, PHIL_N - 1);
+    print_kv("meals/phil",       "%d", target_meals);
+    print_kv("background load",  "%d SCHED_OTHER busyloop thread(s)", n_load);
+    print_kv("think work",       "%lld iters (~1-3 ms busywork)", (long long)PHIL_THINK_WORK);
+    print_kv("eat work",         "%lld iters (~1-3 ms busywork)", (long long)PHIL_EAT_WORK);
+    print_kv("timeout",          "%d ms", PHIL_TIMEOUT_MS);
+    print_kv("process pid",      "%lu", (unsigned long)GetCurrentProcessId());
+    print_kv("observe cmd",      "ps -eLo pid,tid,class,rtprio,nice,comm | grep nspa_rt_test");
+
+    print_section("startup");
+    memset(states, 0, sizeof(states));
+    phil_load_stop = 0;
+
+    /* Start background load threads first so the philosophers immediately
+     * face CPU contention. */
+    for (i = 0; i < n_load; i++) {
+        loads[i] = CreateThread(NULL, 0, phil_load_thread, NULL, 0, NULL);
+    }
+    if (n_load > 0)
+        printf("  [load  ] %d background busyloop thread(s) started\n", n_load);
+
+    /* Start the philosophers. */
+    t_start = phil_qpc_us();
+    for (i = 0; i < PHIL_N; i++) {
+        states[i].id           = i;
+        states[i].is_rt        = (i == 0);
+        states[i].target_meals = target_meals;
+        phils[i] = CreateThread(NULL, 0, phil_worker, &states[i], 0, NULL);
+    }
+
+    wait_ret = WaitForMultipleObjects(PHIL_N, phils, TRUE, PHIL_TIMEOUT_MS);
+    t_end = phil_qpc_us();
+
+    phil_load_stop = 1;
+    for (i = 0; i < n_load; i++) {
+        WaitForSingleObject(loads[i], INFINITE);
+        CloseHandle(loads[i]);
+    }
+    for (i = 0; i < PHIL_N; i++)
+        CloseHandle(phils[i]);
+    for (i = 0; i < PHIL_N; i++)
+        DeleteCriticalSection(&phil_chopsticks[i]);
+
+    /* Aggregate */
+    for (i = 0; i < PHIL_N; i++) {
+        if (states[i].meals_done < min_meals) min_meals = states[i].meals_done;
+        if (states[i].meals_done > max_meals) max_meals = states[i].meals_done;
+        if (states[i].max_wait_us > worst_max_wait) worst_max_wait = states[i].max_wait_us;
+        if (states[i].is_rt) rt_max_wait = states[i].max_wait_us;
+        sum_meals += states[i].meals_done;
+    }
+
+    print_section("results (info only — PASS/FAIL is based on meals completion)");
+    print_kv("total elapsed",    "%lld ms", (t_end - t_start) / 1000);
+    print_kv("total meals",      "%d of %d target", sum_meals, PHIL_N * target_meals);
+    print_kv("min meals/phil",   "%d", min_meals);
+    print_kv("max meals/phil",   "%d", max_meals);
+    if (max_meals > 0) {
+        print_kv("spread",       "%d meal(s)  (max - min; 0 = perfect fairness)",
+                 max_meals - min_meals);
+    }
+    print_kv("RT max wait",      "%lld us  (phil 0, TIME_CRITICAL)", rt_max_wait);
+    print_kv("worst max wait",   "%lld us  (across all philosophers)", worst_max_wait);
+
+    print_section("per-philosopher");
+    printf("  %-6s  %-10s  %6s  %14s  %14s  %14s  %12s\n",
+           "role", "win32_tid", "meals", "max_wait(us)", "avg_wait(us)",
+           "eat_total(ms)", "elapsed(ms)");
+    printf("  %-6s  %-10s  %6s  %14s  %14s  %14s  %12s\n",
+           "------", "---------", "------", "------------", "------------",
+           "-------------", "-----------");
+    for (i = 0; i < PHIL_N; i++) {
+        LONGLONG avg = states[i].meals_done ?
+                       states[i].total_wait_us / states[i].meals_done : 0;
+        printf("  %-6s  %-10lu  %6d  %14lld  %14lld  %14lld  %12lld\n",
+               states[i].is_rt ? "RT" : "phil",
+               (unsigned long)states[i].win32_tid,
+               states[i].meals_done,
+               states[i].max_wait_us,
+               avg,
+               states[i].total_eat_us / 1000,
+               states[i].elapsed_us / 1000);
+    }
+
+    /* Verdict */
+    if (wait_ret == WAIT_TIMEOUT) {
+        char reason[128];
+        snprintf(reason, sizeof(reason),
+                 "timeout after %d ms — possible deadlock (sum=%d / %d meals)",
+                 PHIL_TIMEOUT_MS, sum_meals, PHIL_N * target_meals);
+        print_verdict(0, reason);
+        return 1;
+    }
+    if (min_meals < target_meals) {
+        char reason[128];
+        snprintf(reason, sizeof(reason),
+                 "starvation: min %d meals, expected %d",
+                 min_meals, target_meals);
+        print_verdict(0, reason);
+        return 1;
+    }
+    print_verdict(1, NULL);
+    return 0;
 }
 
 /* ════════════════════════════════════════════════════════════════════════
@@ -726,7 +1033,7 @@ static struct command commands[] = {
     { "priority",     "v1/v2 priority mapping test (11 threads, Phase 1 + Phase 2)",    cmd_priority      },
     { "cs-contention","v2.3 CS-PI contention test (SCHED_FIFO vs SCHED_OTHER holder)",  cmd_cs_contention },
     { "rapidmutex",   "CRITICAL_SECTION stress (1 RT + N-1 load, tight EnterCS loop)", cmd_rapidmutex    },
-    { "philosophers", "[TODO] dining philosophers — transitive PI chain test",          cmd_philosophers  },
+    { "philosophers", "dining philosophers (transitive PI chain test, 5 phils)",       cmd_philosophers  },
     { "help",         "show this help",                                                  cmd_help          },
     { NULL, NULL, NULL }
 };

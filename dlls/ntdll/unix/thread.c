@@ -85,6 +85,87 @@ pthread_key_t teb_key = 0;
 
 static LONG nb_threads = 1;
 
+/* NSPA RT: client-side self-promotion fast path for TIME_CRITICAL.
+ *
+ * When NSPA_RT_PRIO is set in the environment, a thread that calls
+ * SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL)
+ * short-circuits to a local sched_setscheduler(0, SCHED_FIFO, ...) before
+ * the wineserver round-trip. This is the hot path for audio callbacks
+ * (avrt "Pro Audio", mmdevapi notif thread, winealsa midi notify).
+ *
+ * Scope: Tier 1 only fires on TIME_CRITICAL self-promotion. Other priority
+ * values fall through to the standard wineserver path where Tier 2 in
+ * server/thread.c handles them with strict Win32 semantics (requires
+ * PROCESS_PRIOCLASS_REALTIME for the [16..30] band).
+ *
+ * Policy: TIME_CRITICAL is unconditionally SCHED_FIFO here, matching the
+ * "TC = FIFO always" rule in the plan (audio callbacks need run-until-block
+ * ordering; round-robin would inject jitter at the worst place). The
+ * NSPA_RT_POLICY env var applies only to the lower RT band, which Tier 1
+ * does not touch.
+ *
+ * The wineserver call still runs afterward so cross-process
+ * GetThreadPriority sees the correct Win32 value.
+ */
+#ifndef SCHED_RESET_ON_FORK
+# define SCHED_RESET_ON_FORK 0x40000000
+#endif
+#ifndef NSPA_RT_TIME_CRITICAL
+# define NSPA_RT_TIME_CRITICAL 15  /* THREAD_PRIORITY_TIME_CRITICAL from winnt.h */
+#endif
+
+/* -2 = not yet probed, -1 = disabled, >=0 = FIFO priority to use for TC */
+static int nspa_rt_tc_fifo_prio = -2;
+
+static int nspa_rt_get_tc_prio(void)
+{
+    const char *env;
+    int val, fmin, fmax;
+
+    if (nspa_rt_tc_fifo_prio != -2) return nspa_rt_tc_fifo_prio;
+
+    env = getenv( "NSPA_RT_PRIO" );
+    if (!env || !*env) { nspa_rt_tc_fifo_prio = -1; return -1; }
+
+    fmin = sched_get_priority_min( SCHED_FIFO );
+    fmax = sched_get_priority_max( SCHED_FIFO );
+    if (fmin < 0 || fmax < 0) { nspa_rt_tc_fifo_prio = -1; return -1; }
+
+    val = atoi( env );
+    if (val < fmin || val >= fmax) { nspa_rt_tc_fifo_prio = -1; return -1; }
+
+    /* TC maps to NT 31, which is base + 7 in the linear mapping used by
+     * server/thread.c:nspa_rt_map_prio(). Clamp to leave 99 for the kernel. */
+    val += 7;
+    if (val >= fmax) val = fmax - 1;
+
+    nspa_rt_tc_fifo_prio = val;
+    return val;
+}
+
+/* Promote the calling thread to SCHED_FIFO. Called only when the target is
+ * GetCurrentThread() and base_priority == THREAD_PRIORITY_TIME_CRITICAL. */
+static void nspa_rt_apply_self(void)
+{
+    int prio = nspa_rt_get_tc_prio();
+    struct sched_param param;
+
+    if (prio < 0) return;  /* RT dormant or env invalid */
+
+    param.sched_priority = prio;
+    if (sched_setscheduler( 0, SCHED_FIFO | SCHED_RESET_ON_FORK, &param ) == -1)
+    {
+        static int warned;
+        if (!warned++)
+            WARN( "NSPA RT: sched_setscheduler(self, FIFO/%d) failed: %s\n",
+                  prio, strerror(errno) );
+    }
+    else
+    {
+        TRACE( "NSPA RT: self promoted to SCHED_FIFO/%d\n", prio );
+    }
+}
+
 static inline int get_unix_exit_code( NTSTATUS status )
 {
     /* prevent a nonzero exit code to end up truncated to zero in unix */
@@ -2466,6 +2547,13 @@ NTSTATUS WINAPI NtSetInformationThread( HANDLE handle, THREADINFOCLASS class,
     {
         const DWORD *base_priority = data;
         if (length != sizeof(DWORD)) return STATUS_INVALID_PARAMETER;
+
+        /* NSPA RT Tier 1: client-side self-promotion for TIME_CRITICAL.
+         * Applies only to GetCurrentThread() + TC; lower priorities fall
+         * through to the wineserver path where Tier 2 handles them. */
+        if (handle == GetCurrentThread() && (LONG)*base_priority == NSPA_RT_TIME_CRITICAL)
+            nspa_rt_apply_self();
+
         SERVER_START_REQ( set_thread_info )
         {
             req->handle         = wine_server_obj_handle( handle );

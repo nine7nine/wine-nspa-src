@@ -11,8 +11,11 @@
  *                  Measures wait time; with PI it should approximate the
  *                  holder's idle-core work time, without PI it should
  *                  scale with the load.
- *   rapidmutex     [TODO] rapid lock/unlock stress — compares Win32 Mutex,
- *                  CRITICAL_SECTION, SRWLOCK, maybe raw futex paths.
+ *   rapidmutex     Stress test — N threads hammer a shared CRITICAL_SECTION
+ *                  in a tight EnterCS/LeaveCS loop. Thread 0 is TIME_CRITICAL
+ *                  (becomes SCHED_FIFO under NSPA_RT_PRIO), others NORMAL.
+ *                  Regression check for the CS-PI fast path and for the
+ *                  librtpi sweep when it lands on dlls/ntdll/unix/sync.c.
  *   philosophers   [TODO] dining philosophers deadlock-free test — exercises
  *                  multi-lock acquire-order and PI-chain transitivity.
  *   help           show usage
@@ -34,6 +37,7 @@
 
 #include <windows.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ════════════════════════════════════════════════════════════════════════
@@ -439,20 +443,169 @@ static int cmd_cs_contention(int argc, char **argv)
  *   Subcommand stubs — planned tests to flesh out over time
  * ════════════════════════════════════════════════════════════════════════ */
 
+/* ════════════════════════════════════════════════════════════════════════
+ *   Subcommand: rapidmutex  (CRITICAL_SECTION stress test)
+ *
+ *   N threads (default 4) hammer a single shared CRITICAL_SECTION in a
+ *   tight EnterCS/LeaveCS loop. Thread 0 runs at THREAD_PRIORITY_TIME_CRITICAL
+ *   (so under NSPA_RT_PRIO=XX it becomes SCHED_FIFO); other threads run at
+ *   NORMAL. The CS body is a single increment of a shared counter — tight
+ *   enough to keep contention high.
+ *
+ *   Per-thread metrics: max wait-for-lock time, average wait, iteration
+ *   count, wall elapsed. Aggregate: total throughput (ops/sec), counter
+ *   integrity check (shared_counter == N * iters).
+ *
+ *   Expected behavior:
+ *     - shared_counter == N * iters   (CS is holding atomicity)
+ *     - Without NSPA_RT_PRIO: all threads see comparable max-wait
+ *     - With NSPA_RT_PRIO=XX + CS-PI: thread 0's max-wait is bounded by
+ *       the CS body time, not by load-thread scheduling. Load threads
+ *       still see long max-wait under contention.
+ *
+ *   Usage: rapidmutex [n_threads [iters_per_thread]]
+ *            default: 4 threads, 500000 iters each
+ * ════════════════════════════════════════════════════════════════════════ */
+
+#define RAPIDMUTEX_DEFAULT_THREADS 4
+#define RAPIDMUTEX_DEFAULT_ITERS   500000
+#define RAPIDMUTEX_MAX_THREADS     16
+
+static volatile LONG  rapid_shared_counter; /* protected by the CS */
+static LARGE_INTEGER  rapid_qpc_freq;
+
+struct rapid_state {
+    CRITICAL_SECTION *cs;
+    int      iters;
+    int      is_rt;
+    /* outputs */
+    DWORD    win32_tid;
+    LONGLONG max_wait_us;
+    LONGLONG total_wait_us;
+    LONGLONG elapsed_us;
+    int      iters_done;
+};
+
+static LONGLONG rapid_qpc_us(void)
+{
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return (c.QuadPart * 1000000) / rapid_qpc_freq.QuadPart;
+}
+
+static DWORD WINAPI rapid_worker(void *arg)
+{
+    struct rapid_state *s = arg;
+    LONGLONG start, max_wait = 0, total_wait = 0;
+    int i;
+
+    s->win32_tid = GetCurrentThreadId();
+    if (s->is_rt)
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+
+    printf("[rapidmutex] %-5s worker  win32_tid=%lu\n",
+           s->is_rt ? "RT" : "load", (unsigned long)s->win32_tid);
+    fflush(stdout);
+
+    start = rapid_qpc_us();
+    for (i = 0; i < s->iters; i++) {
+        LONGLONG t0 = rapid_qpc_us();
+        LONGLONG wait;
+        EnterCriticalSection(s->cs);
+        wait = rapid_qpc_us() - t0;
+        if (wait > max_wait) max_wait = wait;
+        total_wait += wait;
+
+        rapid_shared_counter++;
+
+        LeaveCriticalSection(s->cs);
+    }
+
+    s->iters_done    = i;
+    s->max_wait_us   = max_wait;
+    s->total_wait_us = total_wait;
+    s->elapsed_us    = rapid_qpc_us() - start;
+    return 0;
+}
+
 static int cmd_rapidmutex(int argc, char **argv)
 {
-    (void)argc; (void)argv;
-    printf("[rapidmutex] not yet implemented\n");
+    CRITICAL_SECTION cs;
+    struct rapid_state states[RAPIDMUTEX_MAX_THREADS];
+    HANDLE threads[RAPIDMUTEX_MAX_THREADS];
+    int nthreads = RAPIDMUTEX_DEFAULT_THREADS;
+    int iters    = RAPIDMUTEX_DEFAULT_ITERS;
+    LONGLONG total_start, total_end, total_us;
+    LONG     expected, total_done = 0;
+    int i;
+
+    if (argc > 1) nthreads = atoi(argv[1]);
+    if (argc > 2) iters    = atoi(argv[2]);
+    if (nthreads < 1) nthreads = 1;
+    if (nthreads > RAPIDMUTEX_MAX_THREADS) nthreads = RAPIDMUTEX_MAX_THREADS;
+    if (iters    < 1) iters    = 1;
+
+    if (!QueryPerformanceFrequency(&rapid_qpc_freq)) {
+        printf("[rapidmutex] QueryPerformanceFrequency failed\n");
+        return 1;
+    }
+
+    rapid_shared_counter = 0;
+    InitializeCriticalSection(&cs);
+
+    printf("[rapidmutex] %d threads (1 RT + %d load), %d iters each\n",
+           nthreads, nthreads - 1, iters);
+    printf("[rapidmutex] process pid=%lu\n", (unsigned long)GetCurrentProcessId());
+    printf("[rapidmutex] tight EnterCS/LeaveCS stress on a shared CRITICAL_SECTION\n");
+    printf("[rapidmutex] observe via: ps -eLo pid,tid,class,rtprio,nice,comm | grep nspa_rt_test\n\n");
+    fflush(stdout);
+
+    memset(states, 0, sizeof(states));
+    total_start = rapid_qpc_us();
+
+    for (i = 0; i < nthreads; i++) {
+        states[i].cs    = &cs;
+        states[i].iters = iters;
+        states[i].is_rt = (i == 0);
+        threads[i] = CreateThread(NULL, 0, rapid_worker, &states[i], 0, NULL);
+    }
+
+    WaitForMultipleObjects(nthreads, threads, TRUE, INFINITE);
+    total_end = rapid_qpc_us();
+    total_us  = total_end - total_start;
+
+    for (i = 0; i < nthreads; i++) {
+        CloseHandle(threads[i]);
+        total_done += states[i].iters_done;
+    }
+    DeleteCriticalSection(&cs);
+
+    expected = (LONG)nthreads * (LONG)iters;
+    printf("\n=== results ===\n");
+    printf("total elapsed       : %lld ms\n", total_us / 1000);
+    printf("aggregate throughput: %lld ops/sec\n",
+           total_us ? (total_done * 1000000LL / total_us) : 0);
+    printf("shared counter      : %ld (expected %ld)  %s\n",
+           (long)rapid_shared_counter, (long)expected,
+           (rapid_shared_counter == expected) ? "OK" : "MISMATCH — CS broken!");
+
+    printf("\nper-thread:\n");
+    printf("  %-5s  %-10s  %8s  %10s  %10s  %10s\n",
+           "role", "win32_tid", "iters", "max_wait", "avg_wait", "elapsed");
+    printf("  %-5s  %-10s  %8s  %10s  %10s  %10s\n",
+           "----", "---------", "-----", "--------", "--------", "-------");
+    for (i = 0; i < nthreads; i++) {
+        LONGLONG avg = states[i].iters_done ? states[i].total_wait_us / states[i].iters_done : 0;
+        printf("  %-5s  %-10lu  %8d  %7lld us  %7lld us  %7lld ms\n",
+               states[i].is_rt ? "RT" : "load",
+               (unsigned long)states[i].win32_tid,
+               states[i].iters_done,
+               states[i].max_wait_us,
+               avg,
+               states[i].elapsed_us / 1000);
+    }
     printf("\n");
-    printf("Planned scope:\n");
-    printf("  - Tight acquire/release loop on a shared CS and on a Win32 Mutex.\n");
-    printf("  - N contenders, M iterations each, measure throughput and 99p\n");
-    printf("    latency under both primitives.\n");
-    printf("  - Compare RT vs non-RT contenders to quantify CS-PI overhead on\n");
-    printf("    the fast path (should be ~1 extra atomic CAS per acquire).\n");
-    printf("  - Optionally compare against raw FUTEX_LOCK_PI via a new syscall\n");
-    printf("    wrapper to isolate librtpi/CS-PI overhead from CS bookkeeping.\n");
-    return 1;
+    return (rapid_shared_counter == expected) ? 0 : 1;
 }
 
 static int cmd_philosophers(int argc, char **argv)
@@ -486,7 +639,7 @@ static int cmd_help(int argc, char **argv);
 static struct command commands[] = {
     { "priority",     "v1/v2 priority mapping test (11 threads, Phase 1 + Phase 2)",    cmd_priority      },
     { "cs-contention","v2.3 CS-PI contention test (SCHED_FIFO vs SCHED_OTHER holder)",  cmd_cs_contention },
-    { "rapidmutex",   "[TODO] rapid lock/unlock stress",                                cmd_rapidmutex    },
+    { "rapidmutex",   "CRITICAL_SECTION stress (1 RT + N-1 load, tight EnterCS loop)", cmd_rapidmutex    },
     { "philosophers", "[TODO] dining philosophers — transitive PI chain test",          cmd_philosophers  },
     { "help",         "show this help",                                                  cmd_help          },
     { NULL, NULL, NULL }

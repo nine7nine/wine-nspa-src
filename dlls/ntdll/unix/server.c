@@ -37,6 +37,7 @@
 #ifdef HAVE_PWD_H
 # include <pwd.h>
 #endif
+#include <sched.h>  /* NSPA v2.4: sched_{get,set}scheduler for shmem-IPC PI boost */
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -289,9 +290,92 @@ static inline unsigned int wait_reply( int reply_fd, struct __server_request_inf
  *   0 (idle)    → 1 (request pending): client wrote request, woke dispatcher
  *   1 (pending) → 0 (reply ready):    dispatcher wrote reply, woke client
  *   anything    → -1 (terminated):    teardown, either side should exit
+ *
+ * NSPA v2.4 layered on top of v1.5: manual priority inheritance for the
+ * dispatch thread. When a high-priority (SCHED_FIFO/SCHED_RR) client is
+ * blocked on a reply, we boost the wineserver dispatch thread to match
+ * our policy+priority for the duration of the wait, then restore. This
+ * prevents priority inversion where an intermediate-priority RT thread
+ * would otherwise preempt the dispatch thread while the client waits.
+ *
+ * Same pattern as NSPA RT v2.3 CS-PI (manual boost via sched_setscheduler),
+ * just applied to the shmem IPC dispatch thread instead of a CRITICAL_SECTION
+ * holder. The dispatch thread's Linux TID is published in
+ * request_shm->server_dispatch_tid by nspa_request_shm_thread() at startup.
  */
 #define NSPA_FUTEX_WAIT 0
 #define NSPA_FUTEX_WAKE 1
+
+/* Saved scheduling state for restore after an shm-ipc wait. */
+struct nspa_shm_boost_state
+{
+    int tid;     /* server dispatch TID (0 = no boost happened) */
+    int policy;  /* original scheduling class */
+    int prio;    /* original rt_priority */
+};
+
+/* Boost the wineserver dispatch thread to match our own RT priority
+ * iff (a) we are SCHED_FIFO or SCHED_RR, (b) the server's TID has been
+ * published to the shm, and (c) the server's current priority is below
+ * ours. On failure (e.g. server is already at/above our priority, or
+ * we're not RT), leaves saved->tid == 0 so nspa_shm_pi_unboost is a no-op. */
+static void nspa_shm_pi_boost( volatile struct request_shm *shm,
+                                struct nspa_shm_boost_state *saved )
+{
+    struct sched_param my_param, srv_param;
+    int my_policy, srv_policy, srv_tid;
+
+    saved->tid = 0;
+
+    /* Fast out: only bother if we're RT. SCHED_OTHER clients don't need
+     * the wineserver boosted; it's already running at SCHED_FIFO (v1.1). */
+    my_policy = sched_getscheduler( 0 );
+    if (my_policy != SCHED_FIFO && my_policy != SCHED_RR)
+        return;
+    if (sched_getparam( 0, &my_param ) < 0)
+        return;
+    if (my_param.sched_priority <= 0)
+        return;
+
+    /* Acquire pairs with the dispatch thread's release store. */
+    srv_tid = __atomic_load_n( &shm->server_dispatch_tid, __ATOMIC_ACQUIRE );
+    if (srv_tid <= 0)
+        return;
+
+    srv_policy = sched_getscheduler( srv_tid );
+    if (srv_policy < 0)
+        return;
+    if (sched_getparam( srv_tid, &srv_param ) < 0)
+        return;
+
+    /* Skip the boost if the server is already at-or-above our priority in
+     * the same RT class. This matches the POSIX PI semantics: no lowering. */
+    if ((srv_policy == SCHED_FIFO || srv_policy == SCHED_RR) &&
+        srv_param.sched_priority >= my_param.sched_priority)
+        return;
+
+    /* Stash original state so we can restore it. */
+    saved->tid    = srv_tid;
+    saved->policy = srv_policy;
+    saved->prio   = srv_param.sched_priority;
+
+    /* Boost to MATCH our policy (FIFO or RR) and our priority. */
+    if (sched_setscheduler( srv_tid, my_policy, &my_param ) < 0)
+    {
+        /* Most likely EPERM — not enough caps. Treat as "no boost done"
+         * so restore is a no-op. Wine should have RLIMIT_RTPRIO from
+         * v1 setup, so this shouldn't normally happen. */
+        saved->tid = 0;
+    }
+}
+
+static void nspa_shm_pi_unboost( struct nspa_shm_boost_state *saved )
+{
+    struct sched_param param;
+    if (saved->tid == 0) return;
+    param.sched_priority = saved->prio;
+    sched_setscheduler( saved->tid, saved->policy, &param );
+}
 
 static unsigned int nspa_send_request_shm( const struct __server_request_info *req )
 {
@@ -325,14 +409,27 @@ static inline unsigned int nspa_wait_reply_shm( struct __server_request_info *re
     volatile struct request_shm *request_shm = get_thread_data()->request_shm;
     char *data_ptr = (char *)(request_shm + 1) + req->u.req.request_header.request_size;
     unsigned int copy_limit = (char *)request_shm + NSPA_REQUEST_SHM_SIZE - data_ptr;
+    struct nspa_shm_boost_state boost;
     int val;
+
+    /* NSPA v2.4: boost the dispatch thread for priority inheritance while
+     * we're blocked. No-op if we're not RT or the server is already at/
+     * above our priority. Paired with nspa_shm_pi_unboost after the wait. */
+    nspa_shm_pi_boost( request_shm, &boost );
 
     /* Wait for dispatcher to transition futex 1 -> 0. */
     while ((val = request_shm->futex) != 0)
     {
-        if (val == -1) abort_thread( 0 );  /* teardown */
+        if (val == -1)
+        {
+            nspa_shm_pi_unboost( &boost );
+            abort_thread( 0 );  /* teardown */
+        }
         syscall( __NR_futex, &request_shm->futex, NSPA_FUTEX_WAIT, val, NULL, NULL, 0 );
     }
+
+    nspa_shm_pi_unboost( &boost );
+
     /* aarch64-correct memory barrier: ensure we observe all of the
      * dispatcher's writes (reply data) before we read the reply body. */
     __atomic_thread_fence( __ATOMIC_SEQ_CST );

@@ -247,6 +247,13 @@ static int nice_limit;
 static int nspa_rt_policy    = SCHED_FIFO;  /* parsed from NSPA_RT_POLICY; applies to NT [16..30] only */
 static int nspa_rt_prio_base = -1;          /* parsed from NSPA_RT_PRIO; -1 = RT disabled */
 
+/* NSPA RT v1.1: wineserver main thread scheduling class. Exposed to the
+ * v1.5 shmem dispatcher creation site so pthread_attr can be set up with
+ * matching SCHED_FIFO/RR priority — otherwise PTHREAD_EXPLICIT_SCHED
+ * would need to inherit, which is defeated by SCHED_RESET_ON_FORK. */
+static int nspa_srv_rt_policy = SCHED_FIFO;  /* parsed from NSPA_SRV_RT_POLICY */
+static int nspa_srv_rt_prio   = -1;          /* parsed from NSPA_SRV_RT_PRIO or derived; -1 = disabled */
+
 /* Map an NT priority in [1..31] to a SCHED_FIFO priority, anchored at NT 24
  * (THREAD_PRIORITY_NORMAL within PROCESS_PRIOCLASS_REALTIME). Linear shape
  * preserves the Win32 5-step gap from HIGHEST (26) to TIME_CRITICAL (31). */
@@ -351,6 +358,66 @@ static void nspa_rt_init(void)
     /* Soft NTSync dependency: warn if missing, but still apply RT. */
     if (access( "/dev/ntsync", F_OK ) != 0)
         fprintf( stderr, "wine: NSPA RT: /dev/ntsync unavailable; wait paths will not be end-to-end RT\n" );
+
+    /* NSPA RT v1.1: optionally promote wineserver itself to RT, at a priority
+     * BELOW the audio callback band so audio callbacks always preempt the
+     * server. Shmem dispatcher threads (v1.5) will use pthread_attr with
+     * explicit scheduling to match this class — see create_thread(). */
+    {
+        const char *srv_pol_env  = getenv( "NSPA_SRV_RT_POLICY" );
+        const char *srv_prio_env = getenv( "NSPA_SRV_RT_PRIO" );
+        int audio_fifo = nspa_rt_map_prio( HIGH_PRIORITY );
+        struct sched_param param;
+
+        /* Derive wineserver priority: explicit env override or NSPA_RT_PRIO - 5. */
+        if (srv_prio_env && *srv_prio_env)
+        {
+            int val = atoi( srv_prio_env );
+            if (val < 1 || val >= fmax)
+            {
+                fprintf( stderr, "wine: NSPA_SRV_RT_PRIO=%d out of range [1..%d); "
+                                 "wineserver stays SCHED_OTHER\n", val, fmax );
+                return;
+            }
+            if (val >= audio_fifo)
+                fprintf( stderr, "wine: NSPA_SRV_RT_PRIO=%d >= audio callback prio %d; "
+                                 "may cause audio starvation\n", val, audio_fifo );
+            nspa_srv_rt_prio = val;
+        }
+        else
+        {
+            nspa_srv_rt_prio = nspa_rt_prio_base - 5;
+            if (nspa_srv_rt_prio < 1) nspa_srv_rt_prio = 1;
+        }
+
+        if (srv_pol_env)
+        {
+            if      (!strcmp( srv_pol_env, "FF" )) nspa_srv_rt_policy = SCHED_FIFO;
+            else if (!strcmp( srv_pol_env, "RR" )) nspa_srv_rt_policy = SCHED_RR;
+            else fprintf( stderr, "wine: NSPA_SRV_RT_POLICY=%s unrecognized "
+                                  "(expected FF or RR), using FF\n", srv_pol_env );
+        }
+
+        /* SCHED_RESET_ON_FORK is safe here: shmem dispatcher pthreads (v1.5)
+         * will be created with PTHREAD_EXPLICIT_SCHED, so their class is set
+         * explicitly, not inherited — reset-on-fork doesn't affect them. */
+        param.sched_priority = nspa_srv_rt_prio;
+        if (sched_setscheduler( 0, nspa_srv_rt_policy | SCHED_RESET_ON_FORK, &param ) == -1)
+        {
+            fprintf( stderr, "wine: NSPA RT v1.1: wineserver sched_setscheduler(%s/%d) "
+                             "failed: %s (wineserver stays at current policy)\n",
+                     nspa_srv_rt_policy == SCHED_FIFO ? "FF" : "RR",
+                     nspa_srv_rt_prio, strerror(errno) );
+            nspa_srv_rt_prio = -1;  /* mark disabled so dispatchers don't try */
+        }
+        else
+        {
+            fprintf( stderr, "wine: NSPA RT v1.1 enabled: wineserver promoted to %s/%d "
+                             "(audio callback target=%d, gap=%d)\n",
+                     nspa_srv_rt_policy == SCHED_FIFO ? "FF" : "RR",
+                     nspa_srv_rt_prio, audio_fifo, audio_fifo - nspa_srv_rt_prio );
+        }
+    }
 }
 
 void init_threading(void)

@@ -1,0 +1,6 @@
+MODULE    = nspa_rt_test.exe
+
+EXTRADLLFLAGS = -mconsole
+
+SOURCES = \
+	main.c

@@ -75,6 +75,7 @@
 #include "wine/server.h"
 #include "wine/debug.h"
 #include "unix_private.h"
+#include <rtpi.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(thread);
 WINE_DECLARE_DEBUG_CHANNEL(seh);
@@ -155,7 +156,7 @@ struct nspa_rt_map_entry
     int    unix_tid;
 };
 static struct nspa_rt_map_entry nspa_rt_map[NSPA_RT_MAP_SIZE];
-static pthread_mutex_t nspa_rt_map_lock = PTHREAD_MUTEX_INITIALIZER;
+static pi_mutex_t nspa_rt_map_lock = PI_MUTEX_INIT(0);
 
 static inline unsigned int nspa_rt_map_hash( HANDLE h )
 {
@@ -166,7 +167,7 @@ static void nspa_rt_map_add( HANDLE handle, int tid )
 {
     unsigned int i, p;
     if (!handle || tid <= 0) return;
-    pthread_mutex_lock( &nspa_rt_map_lock );
+    pi_mutex_lock( &nspa_rt_map_lock );
     i = nspa_rt_map_hash( handle );
     for (p = 0; p < NSPA_RT_MAP_SIZE; p++)
     {
@@ -178,7 +179,7 @@ static void nspa_rt_map_add( HANDLE handle, int tid )
             break;
         }
     }
-    pthread_mutex_unlock( &nspa_rt_map_lock );
+    pi_mutex_unlock( &nspa_rt_map_lock );
 }
 
 static int nspa_rt_map_lookup( HANDLE handle )
@@ -186,7 +187,7 @@ static int nspa_rt_map_lookup( HANDLE handle )
     unsigned int i, p;
     int tid = -1;
     if (!handle) return -1;
-    pthread_mutex_lock( &nspa_rt_map_lock );
+    pi_mutex_lock( &nspa_rt_map_lock );
     i = nspa_rt_map_hash( handle );
     for (p = 0; p < NSPA_RT_MAP_SIZE; p++)
     {
@@ -198,7 +199,7 @@ static int nspa_rt_map_lookup( HANDLE handle )
             break;
         }
     }
-    pthread_mutex_unlock( &nspa_rt_map_lock );
+    pi_mutex_unlock( &nspa_rt_map_lock );
     return tid;
 }
 
@@ -206,7 +207,7 @@ void nspa_rt_map_remove( HANDLE handle )
 {
     unsigned int i, p;
     if (!handle) return;
-    pthread_mutex_lock( &nspa_rt_map_lock );
+    pi_mutex_lock( &nspa_rt_map_lock );
     i = nspa_rt_map_hash( handle );
     for (p = 0; p < NSPA_RT_MAP_SIZE; p++)
     {
@@ -219,7 +220,7 @@ void nspa_rt_map_remove( HANDLE handle )
             break;
         }
     }
-    pthread_mutex_unlock( &nspa_rt_map_lock );
+    pi_mutex_unlock( &nspa_rt_map_lock );
 }
 
 /* Probe env vars once. Thread-safe via idempotency — multiple calls

@@ -1353,6 +1353,11 @@ static DWORD WINAPI notif_thread_proc(void *user)
     DWORD size;
 
     SetThreadDescription(GetCurrentThread(), L"wine_mmdevapi_notification");
+    /* NSPA RT call-site hint: the device notification thread needs to stay
+     * responsive to audio endpoint changes under load. Promoted to
+     * TIME_CRITICAL here hits the Tier 1 self-promotion fast path in ntdll
+     * when NSPA_RT_PRIO is set. No-op otherwise. */
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 
     lstrcpyW(reg_key, drv_keyW);
     lstrcatW(reg_key, L"\\");

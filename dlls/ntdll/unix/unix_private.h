@@ -28,6 +28,7 @@
 #include "wine/server.h"
 #include "wine/list.h"
 #include "wine/debug.h"
+#include <rtpi.h>
 
 struct msghdr;
 
@@ -250,7 +251,7 @@ extern HANDLE keyed_event;
 extern int inproc_device_fd;
 extern timeout_t server_start_time;
 extern sigset_t server_block_set;
-extern pthread_mutex_t fd_cache_mutex;
+extern pi_mutex_t fd_cache_mutex;
 extern struct _KUSER_SHARED_DATA *user_shared_data;
 extern ULONG process_cookie;
 
@@ -278,8 +279,8 @@ extern ULONG_PTR redirect_arm64ec_rva( void *module, ULONG_PTR rva, const IMAGE_
 extern void start_server( BOOL debug );
 
 extern unsigned int server_call_unlocked( void *req_ptr );
-extern void server_enter_uninterrupted_section( pthread_mutex_t *mutex, sigset_t *sigset );
-extern void server_leave_uninterrupted_section( pthread_mutex_t *mutex, sigset_t *sigset );
+extern void server_enter_uninterrupted_section( pi_mutex_t *mutex, sigset_t *sigset );
+extern void server_leave_uninterrupted_section( pi_mutex_t *mutex, sigset_t *sigset );
 extern unsigned int server_select( const union select_op *select_op, data_size_t size, UINT flags,
                                    timeout_t abs_timeout, struct context_data *context, struct user_apc *user_apc );
 extern unsigned int server_wait( const union select_op *select_op, data_size_t size, UINT flags,
@@ -503,14 +504,14 @@ static inline BOOL is_ec_code( ULONG_PTR ptr )
     return (map[page / 64] >> (page & 63)) & 1;
 }
 
-static inline void mutex_lock( pthread_mutex_t *mutex )
+static inline void mutex_lock( pi_mutex_t *mutex )
 {
-    if (!process_exiting) pthread_mutex_lock( mutex );
+    if (!process_exiting) pi_mutex_lock( mutex );
 }
 
-static inline void mutex_unlock( pthread_mutex_t *mutex )
+static inline void mutex_unlock( pi_mutex_t *mutex )
 {
-    if (!process_exiting) pthread_mutex_unlock( mutex );
+    if (!process_exiting) pi_mutex_unlock( mutex );
 }
 
 static inline struct async_data server_async( HANDLE handle, struct async_fileio *user, HANDLE event,

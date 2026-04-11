@@ -368,105 +368,30 @@ def is_mutex_param_type(type_spelling):
     return ('pthread_mutex_t' in type_spelling or 'pi_mutex_t' in type_spelling)
 
 def propagate_mutex_taint(files, cdb, recursive_exprs, recursive_names):
-    """Transitively propagate recursive-mutex taint.
+    """Historical taint propagation — now a no-op.
 
-    Starting from the initial set of recursive mutexes, find all
-    functions called with a recursive mutex as a pthread_mutex_t
-    parameter, mark those functions as "cannot rewrite signature", and
-    add all OTHER mutex args passed to those functions to the tainted
-    mutex set. Repeat until fixpoint.
+    When this sweep was first designed, any function that touched a
+    recursive mutex became "tainted" (had to stay on pthread_mutex_t)
+    because pi_mutex_t couldn't represent recursion. The transitive
+    fixpoint would poison every mutex that shared a wrapper with a
+    recursive one, leaving them all as pthread.
 
-    Returns (recursive_exprs, recursive_names, tainted_funcs) where
-    tainted_funcs is the set of function names whose pthread_mutex_t
-    parameters MUST remain pthread_mutex_t after the sweep."""
-    # Functions that are the sweep's rewrite targets — never taint these.
-    # They're the leaf primitives that become pi_*, regardless of what
-    # mutex is passed to them.
-    NEVER_TAINT_FUNCS = set(SIMPLE_CALL_RENAMES.keys()) | {
-        'pthread_mutex_init', 'pthread_cond_init',
-        'pthread_mutex_signal', 'pthread_cond_signal', 'pthread_cond_broadcast',
-    }
-    tainted_funcs = set()
-    index = Index.create()
+    NSPA RT v2.0.1 added NSPA_RTPI_MUTEX_RECURSIVE to rtpi.h: pi_mutex_t
+    now carries a recursion flag inside the struct, and pi_mutex_lock
+    handles both recursive and non-recursive mutexes at runtime via
+    that flag. Wrapper functions can therefore take `pi_mutex_t *` and
+    work for both kinds — no distinction needed at the type level.
 
-    while True:
-        changed = False
-        for f in files:
-            args = cdb.args_for(f)
-            try:
-                tu = index.parse(f, args=args)
-            except clang.cindex.TranslationUnitLoadError:
-                continue
+    Consequence: the propagation is no longer necessary. We still need
+    the INITIAL set of recursive mutex names (from Phase 0 — the
+    PTHREAD_MUTEX_RECURSIVE attr+init pattern) so that
+    _rewrite_mutex_init can pass NSPA_RTPI_MUTEX_RECURSIVE for those
+    specific mutexes. Everything else is freely convertible.
 
-            for c in tu.cursor.walk_preorder():
-                if c.kind != CursorKind.CALL_EXPR:
-                    continue
-                fname = cursor_function_name(c)
-                if not fname:
-                    continue
-                call_args = list(c.get_arguments())
-                if not call_args:
-                    continue
-                fn_decl = c.referenced
-                param_types = param_type_names(fn_decl)
-
-                # Does any mutex arg correspond to a recursive mutex?
-                has_recursive_arg = False
-                for i, arg in enumerate(call_args):
-                    if i >= len(param_types):
-                        break
-                    if not is_mutex_param_type(param_types[i]):
-                        continue
-                    arg_text = cursor_text(arg).strip()
-                    if arg_text in recursive_exprs:
-                        has_recursive_arg = True
-                        break
-
-                # Never-taint targets (the leaf primitives) — treat as
-                # transparent: don't add to tainted_funcs, don't propagate.
-                if fname in NEVER_TAINT_FUNCS:
-                    continue
-
-                # A call is tainted if either:
-                #  (a) it passes a recursive mutex to a mutex param, OR
-                #  (b) the callee itself is already in tainted_funcs
-                if not has_recursive_arg and fname not in tainted_funcs:
-                    continue
-
-                # Taint the function
-                if fname not in tainted_funcs:
-                    tainted_funcs.add(fname)
-                    changed = True
-
-                # Taint ALL mutex args passed to this call, but only if
-                # they look like concrete expressions (address-of a named
-                # variable) — NOT formal parameters being passed through.
-                for i, arg in enumerate(call_args):
-                    if i >= len(param_types):
-                        break
-                    if not is_mutex_param_type(param_types[i]):
-                        continue
-                    arg_text = cursor_text(arg).strip()
-                    if not arg_text or arg_text in recursive_exprs:
-                        continue
-                    # Skip bare identifiers (parameter pass-throughs) —
-                    # we only taint concrete mutex expressions that start
-                    # with & (address-of a named variable or struct field).
-                    if not arg_text.startswith('&'):
-                        continue
-                    recursive_exprs.add(arg_text)
-                    bare = arg_text.lstrip('&').strip()
-                    if '->' in bare:
-                        bare = bare.rsplit('->', 1)[-1]
-                    if '.' in bare:
-                        bare = bare.rsplit('.', 1)[-1]
-                    recursive_names.add(bare)
-                    changed = True
-
-        if not changed:
-            break
-
-    return recursive_exprs, recursive_names, tainted_funcs
+    Returns (recursive_exprs, recursive_names, tainted_funcs) with
+    tainted_funcs always empty — same tuple shape as before so callers
+    don't need to change."""
+    return recursive_exprs, recursive_names, set()
 
 
 def find_recursive_mutexes(files, cdb):
@@ -625,13 +550,15 @@ class FileRewriter:
         # nothing else processes them.
         if kind in (CursorKind.VAR_DECL, CursorKind.FIELD_DECL, CursorKind.PARM_DECL):
             decl_name = cursor.spelling
-            skip_recursive = bool(decl_name and decl_name in self.recursive_names)
-            # Also skip if this is a parameter of a tainted function
-            if not skip_recursive and kind == CursorKind.PARM_DECL:
-                parent = cursor.semantic_parent
-                if parent and parent.kind == CursorKind.FUNCTION_DECL:
-                    if parent.spelling in self.tainted_funcs:
-                        skip_recursive = True
+            # Historical: we used to skip declarations whose mutex name was in
+            # recursive_names (so the declaration would keep pthread_mutex_t).
+            # NSPA_RTPI_MUTEX_RECURSIVE makes that unnecessary — recursive and
+            # non-recursive mutexes both become pi_mutex_t, and the distinction
+            # is stored at init time via the flag (see _rewrite_mutex_init).
+            # Similarly tainted_funcs is always empty in the relaxed design, so
+            # the "parameter of tainted function" branch never fires.
+            skip_recursive = False
+            _ = decl_name  # still computed for potential future use
 
             # Process TYPE_REF child (the declared type)
             for child in cursor.get_children():
@@ -704,28 +631,19 @@ class FileRewriter:
             return
 
     def _rewrite_simple_call(self, cursor, fn):
-        # Skip if this call is inside the body of a tainted function —
-        # the wrapper's internal pthread_mutex_* calls must stay as
-        # pthread, because the wrapper's parameter is pthread_mutex_t*.
+        # Historical: we used to skip calls inside tainted-function bodies
+        # and skip calls whose mutex arg was recursive. NSPA_RTPI_MUTEX_RECURSIVE
+        # makes both unnecessary — pi_mutex_lock handles recursion at runtime
+        # via the flag stored in the mutex struct, so every pthread_mutex_*
+        # call site can be uniformly rewritten. The _tainted_body_ranges
+        # list is always empty now (propagate_mutex_taint is a no-op), so
+        # this loop no longer excludes anything — left in place only as a
+        # defensive check in case a future change reintroduces taint.
         cstart = cursor.extent.start.offset
         cend = cursor.extent.end.offset
         for bstart, bend in self._tainted_body_ranges:
             if bstart <= cstart and cend <= bend:
                 return
-        if fn.startswith('pthread_mutex_'):
-            args = list(cursor.get_arguments())
-            if args:
-                mutex_text = cursor_text(args[0]).strip()
-                if mutex_text in self.recursive:
-                    return
-        if fn.startswith('pthread_cond_'):
-            args = list(cursor.get_arguments())
-            # pthread_cond_wait(c, m) / pthread_cond_timedwait(c, m, t) —
-            # if the mutex arg is in the recursive set, skip.
-            if fn in ('pthread_cond_wait', 'pthread_cond_timedwait') and len(args) >= 2:
-                mutex_text = cursor_text(args[1]).strip()
-                if mutex_text in self.recursive:
-                    return
         callee = call_callee_extent(cursor)
         if not callee:
             return
@@ -736,11 +654,13 @@ class FileRewriter:
         if len(args) != 2:
             return
         mutex_text = cursor_text(args[0]).strip()
-        if mutex_text in self.recursive:
-            return
         start = cursor.extent.start.offset
         end = cursor.extent.end.offset
-        replacement = f'pi_mutex_init({mutex_text}, 0)'
+        # Recursive mutexes get NSPA_RTPI_MUTEX_RECURSIVE in the flags
+        # argument so pi_mutex_lock/unlock will honor re-entry.
+        # Non-recursive mutexes get 0.
+        flag = 'NSPA_RTPI_MUTEX_RECURSIVE' if mutex_text in self.recursive else '0'
+        replacement = f'pi_mutex_init({mutex_text}, {flag})'
         self.add_edit(start, end, replacement)
 
     def _rewrite_cond_init(self, cursor):
@@ -779,16 +699,48 @@ class FileRewriter:
 
 
 def inject_rtpi_include(src_bytes):
-    """Inject #include <rtpi.h> after the last existing #include line."""
+    """Inject #include <rtpi.h> into a source file.
+
+    Two rules, in order:
+
+      1. If the file already #includes "unix_private.h" (the Wine ntdll
+         internal header, which itself includes <rtpi.h>), don't inject
+         anything — the types are already visible transitively. This
+         avoids cluttering ntdll/unix/*.c files with a redundant
+         <rtpi.h> that might land inside an #ifdef block.
+
+      2. Otherwise, inject after the LAST include in the first contiguous
+         block of includes at the top of the file. This keeps the new
+         include in the "header section" rather than deep in the file
+         where conditional #include blocks live (e.g. #ifdef __APPLE__
+         or #ifdef sun sections that pull in platform-specific headers
+         late in the source).
+    """
+    # Rule 1: skip if unix_private.h is already pulled in (it includes rtpi.h).
+    if b'"unix_private.h"' in src_bytes or b'<unix_private.h>' in src_bytes:
+        return src_bytes
+
     lines = src_bytes.split(b'\n')
-    last_include = -1
+    first_block_end = -1
+    in_block = False
     for i, line in enumerate(lines):
         stripped = line.lstrip()
         if stripped.startswith(b'#include'):
-            last_include = i
-    if last_include < 0:
-        last_include = 0
-    lines.insert(last_include + 1, b'#include <rtpi.h>')
+            first_block_end = i
+            in_block = True
+            continue
+        # A blank line or a non-include does NOT end the block yet — we
+        # allow blank lines between include groups. But a non-comment,
+        # non-blank, non-preprocessor line DOES end the block.
+        if not stripped or stripped.startswith(b'//') or stripped.startswith(b'/*') \
+                or stripped.startswith(b'*') or stripped.startswith(b'#'):
+            continue
+        if in_block:
+            break
+
+    if first_block_end < 0:
+        first_block_end = 0
+    lines.insert(first_block_end + 1, b'#include <rtpi.h>')
     return b'\n'.join(lines)
 
 
@@ -881,18 +833,14 @@ def main():
     else:
         print('no recursive mutexes detected')
 
-    print('\n=== Phase 0b: transitive taint propagation ===')
+    print('\n=== Phase 0b: taint propagation (no-op since NSPA_RTPI_MUTEX_RECURSIVE) ===')
     recursive_exprs, recursive_names, tainted_funcs = propagate_mutex_taint(
         files, cdb, recursive_exprs, recursive_names)
-    print(f'after propagation: {len(recursive_exprs)} tainted mutexes, '
-          f'{len(tainted_funcs)} tainted functions')
+    print(f'recursive mutexes to flag at init: {len(recursive_exprs)}')
+    print(f'tainted functions: {len(tainted_funcs)} (always 0 in relaxed mode)')
     if args.verbose or (len(recursive_exprs) < 50 and recursive_exprs):
-        print('tainted mutexes:')
         for m in sorted(recursive_exprs):
-            print(f'  {m}')
-        print('tainted functions:')
-        for fn in sorted(tainted_funcs):
-            print(f'  {fn}')
+            print(f'  {m}  (will get NSPA_RTPI_MUTEX_RECURSIVE at init)')
 
     print('\n=== Phase 1: cond_wait pairing discovery ===')
     pairings = discover_pairings(files, cdb)

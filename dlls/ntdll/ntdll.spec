@@ -444,6 +444,9 @@
 @ stdcall -syscall=0x002a NtUnmapViewOfSection(long ptr)
 @ stdcall -syscall NtUnmapViewOfSectionEx(long ptr long)
 # @ stub NtVdmControl
+@ stdcall -syscall NtNspaGetUnixTid()
+@ stdcall -syscall NtNspaLockCriticalSectionPI(ptr)
+@ stdcall -syscall NtNspaUnlockCriticalSectionPI(ptr)
 @ stdcall -syscall NtWaitForAlertByThreadId(ptr ptr)
 @ stdcall -syscall NtWaitForDebugEvent(long long ptr ptr)
 @ stdcall -syscall NtWaitForKeyedEvent(long ptr long ptr)

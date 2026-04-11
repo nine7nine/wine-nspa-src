@@ -157,6 +157,9 @@ struct teb_data
     SYSTEM_SERVICE_TABLE     *syscall_table; /* 214/0370 syscall table */
     struct syscall_frame     *syscall_frame; /* 218/0378 current syscall frame */
     int                       syscall_trace; /* 21c/0380 syscall trace flag */
+    DWORD                     nspa_unix_tid; /* NSPA v2.3: cached Linux kernel TID
+                                              * for CS-PI fast path. 0 = uninitialized.
+                                              * Populated on first NtNspaGetUnixTid call. */
 };
 
 C_ASSERT( sizeof(struct teb_data) <= sizeof(((TEB *)0)->GdiTebBatch) );
@@ -169,6 +172,31 @@ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct teb_data, syscall_tabl
 C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct teb_data, syscall_frame ) == 0x218 );
 C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct teb_data, syscall_trace ) == 0x21c );
 #endif
+
+/* NSPA v2.3 — offset of nspa_unix_tid from the start of GdiTebBatch.
+ * PE-side code (which cannot include unix_private.h) needs this as a
+ * literal constant. The PE-side value is hardcoded in dlls/ntdll/sync.c
+ * (see NSPA_UNIX_TID_OFFSET). The C_ASSERTs below verify that the PE
+ * literal matches the real struct layout — if the struct changes, the
+ * build fails and both sides need updating in sync. */
+#ifdef _WIN64
+C_ASSERT( offsetof( struct teb_data, nspa_unix_tid ) == 0x94 );
+#else
+C_ASSERT( offsetof( struct teb_data, nspa_unix_tid ) == 0x4c );
+#endif
+
+/* NSPA: compat alias for code that uses the old wine-11.6 struct name.
+ * The new wine-11.8 layout split fields between struct thread_data
+ * (signal stack, FDs, request_shm) and struct teb_data (TEB->GdiTebBatch,
+ * syscall + NSPA PE-accessible fields). Code accessing nspa_unix_tid /
+ * nspa_rt_cached_* uses ntdll_get_thread_data(); code accessing FDs or
+ * request_shm uses get_thread_data(). */
+#define ntdll_thread_data teb_data
+
+static inline struct teb_data *ntdll_get_thread_data(void)
+{
+    return (struct teb_data *)&NtCurrentTeb()->GdiTebBatch;
+}
 
 /* returns TRUE if the async is complete; FALSE if it should be restarted */
 typedef BOOL async_callback_t( void *user, ULONG_PTR *info, unsigned int *status );

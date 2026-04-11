@@ -166,7 +166,7 @@ static const BYTE VIRTUAL_Win32Flags[16] =
 };
 
 static struct wine_rb_tree views_tree;
-static pthread_mutex_t virtual_mutex;
+static pi_mutex_t virtual_mutex;
 
 static const UINT page_shift = 12;
 static const UINT_PTR page_mask = 0xfff;
@@ -3659,7 +3659,7 @@ void virtual_init(void)
 
     pthread_mutexattr_init( &attr );
     pthread_mutexattr_settype( &attr, PTHREAD_MUTEX_RECURSIVE );
-    pthread_mutex_init( &virtual_mutex, &attr );
+    pi_mutex_init(&virtual_mutex, NSPA_RTPI_MUTEX_RECURSIVE);
     pthread_mutexattr_destroy( &attr );
 
 #ifdef __aarch64__

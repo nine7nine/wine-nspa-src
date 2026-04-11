@@ -17,6 +17,7 @@
  */
 
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 
 #include "wine/debug.h"
@@ -31,15 +32,27 @@ WINE_DEFAULT_DEBUG_CHANNEL(msvcrt);
 
 typedef struct
 {
-  BOOL             bInit;
+  /* NSPA: atomic_bool instead of BOOL so the double-checked-locking
+   * pattern in _lock() has C11 acquire/release ordering. With a plain
+   * BOOL, the compiler and CPU are free to reorder the store of TRUE
+   * relative to the InitializeCriticalSectionEx() above it, which
+   * means another thread can observe bInit == TRUE before the CS is
+   * fully constructed and call EnterCriticalSection() on half-
+   * initialized state. On x86 TSO this is mostly masked, but under
+   * contention (e.g. a DAW's main thread + audio callback both
+   * hitting _lock(LOCK_FILE) for the first time) it still causes
+   * CS corruption or hangs. atomic_store with release pairs with
+   * atomic_load with acquire in _lock() below to establish proper
+   * happens-before. */
+  atomic_bool      bInit;
   CRITICAL_SECTION crit;
 } LOCKTABLEENTRY;
 
 static LOCKTABLEENTRY lock_table[ _TOTAL_LOCKS ];
 
-static inline void msvcrt_mlock_set_entry_initialized( int locknum, BOOL initialized )
+static inline void msvcrt_mlock_set_entry_initialized( int locknum, bool initialized )
 {
-  lock_table[ locknum ].bInit = initialized;
+  atomic_store( &lock_table[ locknum ].bInit, initialized );
 }
 
 static inline void msvcrt_initialize_mlock( int locknum )
@@ -86,14 +99,16 @@ void CDECL _lock( int locknum )
 {
   TRACE( "(%d)\n", locknum );
 
-  /* If the lock doesn't exist yet, create it */
-  if( lock_table[ locknum ].bInit == FALSE )
+  /* If the lock doesn't exist yet, create it. NSPA: use atomic_load
+   * so the double-checked locking has proper acquire semantics — this
+   * is the thread-side of the fix (see LOCKTABLEENTRY comment). */
+  if( !atomic_load( &lock_table[ locknum ].bInit ) )
   {
     /* Lock while we're changing the lock table */
     _lock( _LOCKTAB_LOCK );
 
     /* Check again if we've got a bit of a race on lock creation */
-    if( lock_table[ locknum ].bInit == FALSE )
+    if( !atomic_load( &lock_table[ locknum ].bInit ) )
     {
       TRACE( ": creating lock #%d\n", locknum );
       msvcrt_initialize_mlock( locknum );
@@ -155,7 +170,7 @@ void msvcrt_free_locks(void)
   /* Uninitialize the table */
   for( i=0; i < _TOTAL_LOCKS; i++ )
   {
-    if( lock_table[ i ].bInit )
+    if( atomic_load( &lock_table[ i ].bInit ) )
     {
       msvcrt_uninitialize_mlock( i );
     }

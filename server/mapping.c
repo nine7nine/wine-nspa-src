@@ -1587,6 +1587,28 @@ struct object *create_user_data_mapping( struct object *root, const struct unico
     return &mapping->obj;
 }
 
+#ifdef __linux__
+/* NSPA v1.5 shmem IPC: create a per-thread shared memory region for the
+ * fast-path request/reply channel. Size is REQUEST_SHM_SIZE (1 MB).
+ * Backing is a temp file that both wineserver and the client mmap.
+ * Returns 1 on success, 0 on failure with set_error() called. */
+int create_request_shm( int *fd, struct request_shm **ptr )
+{
+    if ((*fd = create_temp_file( REQUEST_SHM_SIZE )) == -1) return 0;
+
+    *ptr = mmap( NULL, REQUEST_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, *fd, 0 );
+    if (*ptr == MAP_FAILED)
+    {
+        close( *fd );
+        *fd = -1;
+        *ptr = NULL;
+        set_error( STATUS_NO_MEMORY );
+        return 0;
+    }
+    return 1;
+}
+#endif
+
 /* create a file mapping */
 DECL_HANDLER(create_mapping)
 {

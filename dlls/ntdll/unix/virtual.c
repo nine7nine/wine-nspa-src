@@ -4031,6 +4031,10 @@ static TEB *init_teb( void *ptr, BOOL is_wow )
     thread_data->wait_fd[0] = -1;
     thread_data->wait_fd[1] = -1;
     thread_data->alert_fd   = -1;
+#ifdef __linux__
+    thread_data->request_shm_fd = -1;  /* NSPA v1.5 */
+    thread_data->request_shm    = NULL;
+#endif
     list_add_head( &teb_list, &thread_data->entry );
     return teb;
 }

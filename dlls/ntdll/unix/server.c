@@ -2134,6 +2134,12 @@ NTSTATUS WINAPI NtClose( HANDLE handle )
     if (HandleToLong( handle ) >= ~5 && HandleToLong( handle ) <= ~0)
         return STATUS_SUCCESS;
 
+    /* NSPA RT v1.2: evict any map entry for this handle. Harmless for
+     * non-thread handles (the lookup just won't find it). Must run before
+     * the server call so a recycled handle value can't briefly point at a
+     * stale thread id. */
+    nspa_rt_map_remove( handle );
+
     /* hold fd_cache_mutex to prevent the fd from being added again between the
      * call to remove_fd_from_cache and close_handle */
     server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );

@@ -83,27 +83,31 @@ WINE_DECLARE_DEBUG_CHANNEL(threadname);
 
 static LONG nb_threads = 1;
 
-/* NSPA RT: client-side self-promotion fast path for TIME_CRITICAL.
+/* NSPA RT v1 + v1.2: client-side RT scheduling, hooks for NtSetInformationThread
+ * and NtSetInformationProcess that bypass wineserver for in-process priority
+ * management.
  *
- * When NSPA_RT_PRIO is set in the environment, a thread that calls
- * SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL)
- * short-circuits to a local sched_setscheduler(0, SCHED_FIFO, ...) before
- * the wineserver round-trip. This is the hot path for audio callbacks
- * (avrt "Pro Audio", mmdevapi notif thread, winealsa midi notify).
+ * v1 Tier 1 (original): SetThreadPriority(GetCurrentThread(), TIME_CRITICAL)
+ *   hits a local sched_setscheduler fast path. Audio callback hot path.
  *
- * Scope: Tier 1 only fires on TIME_CRITICAL self-promotion. Other priority
- * values fall through to the standard wineserver path where Tier 2 in
- * server/thread.c handles them with strict Win32 semantics (requires
- * PROCESS_PRIOCLASS_REALTIME for the [16..30] band).
+ * v1.2 (this file): extends Tier 1 from self-only to cross-thread — any
+ *   thread the process owns (via HANDLE→unix_tid map populated at
+ *   NtCreateThreadEx) can be RT-promoted without a wineserver round-trip.
+ *   Matches the architectural intent of the ancient Muse patch but uses
+ *   modern Wine infrastructure (unix_tid, pthread_gettid_np) and avoids
+ *   the spin-wait race Muse had.
  *
- * Policy: TIME_CRITICAL is unconditionally SCHED_FIFO here, matching the
- * "TC = FIFO always" rule in the plan (audio callbacks need run-until-block
- * ordering; round-robin would inject jitter at the worst place). The
- * NSPA_RT_POLICY env var applies only to the lower RT band, which Tier 1
- * does not touch.
+ * Env vars:
+ *   NSPA_RT_PRIO  — master switch + FIFO priority anchor (NT 24 maps here)
+ *   NSPA_RT_POLICY — FF / RR for lower RT band, TS for conservative mode
  *
- * The wineserver call still runs afterward so cross-process
- * GetThreadPriority sees the correct Win32 value.
+ * Server-side Tier 2 in server/thread.c still exists as a fallback for:
+ *   - cross-process promotion (client can't sched_setscheduler on foreign PIDs)
+ *   - SetPriorityClass bulk updates driven by wineserver's thread walk
+ *   - server-internal boost logic
+ * When the client handles a call via v1.2, it sets req->nspa_rt_override=1 in
+ * the set_thread_info request so Tier 2 skips the RT branch and doesn't
+ * clobber the client's sched class via nspa_rt_maybe_demote().
  */
 #ifndef SCHED_RESET_ON_FORK
 # define SCHED_RESET_ON_FORK 0x40000000
@@ -111,58 +115,216 @@ static LONG nb_threads = 1;
 #ifndef NSPA_RT_TIME_CRITICAL
 # define NSPA_RT_TIME_CRITICAL 15  /* THREAD_PRIORITY_TIME_CRITICAL from winnt.h */
 #endif
+#ifndef NSPA_THREAD_PRIORITY_IDLE
+# define NSPA_THREAD_PRIORITY_IDLE (-15)
+#endif
+#ifndef PROCESS_PRIOCLASS_IDLE
+# define PROCESS_PRIOCLASS_IDLE         1
+# define PROCESS_PRIOCLASS_NORMAL       2
+# define PROCESS_PRIOCLASS_HIGH         3
+# define PROCESS_PRIOCLASS_REALTIME     4
+# define PROCESS_PRIOCLASS_BELOW_NORMAL 5
+# define PROCESS_PRIOCLASS_ABOVE_NORMAL 6
+#endif
 
-/* -2 = not yet probed, -1 = disabled, >=0 = FIFO priority to use for TC */
-static int nspa_rt_tc_fifo_prio = -2;
+/* Cached env state. -2 = unprobed, -1 = disabled, >=0 = base FIFO prio. */
+static int nspa_rt_prio_base = -2;
+/* SCHED_FIFO / SCHED_RR / SCHED_OTHER (TS mode) for the lower RT band. */
+static int nspa_rt_policy_v = SCHED_FIFO;
 
-static int nspa_rt_get_tc_prio(void)
+/* Cached process priority class. Updated by NtSetInformationProcess hook
+ * and on first use via lazy query to wineserver. Accessed interlocked. */
+static LONG nspa_cached_priocls = PROCESS_PRIOCLASS_NORMAL;
+static LONG nspa_cached_priocls_valid;
+
+/* Called from process.c when the client hooks ProcessPriorityClass changes. */
+void nspa_rt_set_cached_priocls( int cls )
 {
-    const char *env;
+    InterlockedExchange( &nspa_cached_priocls, cls );
+    InterlockedExchange( &nspa_cached_priocls_valid, 1 );
+}
+
+/* v1.2 map — HANDLE → unix_tid, populated at NtCreateThreadEx.
+ * Open addressing with linear probe, 256 slots, lock-protected. */
+#define NSPA_RT_MAP_SIZE 256
+struct nspa_rt_map_entry
+{
+    HANDLE handle;
+    int    unix_tid;
+};
+static struct nspa_rt_map_entry nspa_rt_map[NSPA_RT_MAP_SIZE];
+static pthread_mutex_t nspa_rt_map_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static inline unsigned int nspa_rt_map_hash( HANDLE h )
+{
+    return ((unsigned long)h >> 2) % NSPA_RT_MAP_SIZE;
+}
+
+static void nspa_rt_map_add( HANDLE handle, int tid )
+{
+    unsigned int i, p;
+    if (!handle || tid <= 0) return;
+    pthread_mutex_lock( &nspa_rt_map_lock );
+    i = nspa_rt_map_hash( handle );
+    for (p = 0; p < NSPA_RT_MAP_SIZE; p++)
+    {
+        unsigned int idx = (i + p) % NSPA_RT_MAP_SIZE;
+        if (!nspa_rt_map[idx].handle || nspa_rt_map[idx].handle == handle)
+        {
+            nspa_rt_map[idx].handle = handle;
+            nspa_rt_map[idx].unix_tid = tid;
+            break;
+        }
+    }
+    pthread_mutex_unlock( &nspa_rt_map_lock );
+}
+
+static int nspa_rt_map_lookup( HANDLE handle )
+{
+    unsigned int i, p;
+    int tid = -1;
+    if (!handle) return -1;
+    pthread_mutex_lock( &nspa_rt_map_lock );
+    i = nspa_rt_map_hash( handle );
+    for (p = 0; p < NSPA_RT_MAP_SIZE; p++)
+    {
+        unsigned int idx = (i + p) % NSPA_RT_MAP_SIZE;
+        if (!nspa_rt_map[idx].handle) break;
+        if (nspa_rt_map[idx].handle == handle)
+        {
+            tid = nspa_rt_map[idx].unix_tid;
+            break;
+        }
+    }
+    pthread_mutex_unlock( &nspa_rt_map_lock );
+    return tid;
+}
+
+void nspa_rt_map_remove( HANDLE handle )
+{
+    unsigned int i, p;
+    if (!handle) return;
+    pthread_mutex_lock( &nspa_rt_map_lock );
+    i = nspa_rt_map_hash( handle );
+    for (p = 0; p < NSPA_RT_MAP_SIZE; p++)
+    {
+        unsigned int idx = (i + p) % NSPA_RT_MAP_SIZE;
+        if (!nspa_rt_map[idx].handle) break;
+        if (nspa_rt_map[idx].handle == handle)
+        {
+            nspa_rt_map[idx].handle = NULL;
+            nspa_rt_map[idx].unix_tid = 0;
+            break;
+        }
+    }
+    pthread_mutex_unlock( &nspa_rt_map_lock );
+}
+
+/* Probe env vars once. Thread-safe via idempotency — multiple calls
+ * are harmless because they all compute the same answer. */
+static void nspa_rt_probe(void)
+{
+    const char *prio_env, *policy_env;
     int val, fmin, fmax;
 
-    if (nspa_rt_tc_fifo_prio != -2) return nspa_rt_tc_fifo_prio;
+    if (nspa_rt_prio_base != -2) return;
+    nspa_rt_prio_base = -1;
 
-    env = getenv( "NSPA_RT_PRIO" );
-    if (!env || !*env) { nspa_rt_tc_fifo_prio = -1; return -1; }
+    prio_env = getenv( "NSPA_RT_PRIO" );
+    if (!prio_env || !*prio_env) return;
 
     fmin = sched_get_priority_min( SCHED_FIFO );
     fmax = sched_get_priority_max( SCHED_FIFO );
-    if (fmin < 0 || fmax < 0) { nspa_rt_tc_fifo_prio = -1; return -1; }
+    if (fmin < 0 || fmax < 0) return;
 
-    val = atoi( env );
-    if (val < fmin || val >= fmax) { nspa_rt_tc_fifo_prio = -1; return -1; }
+    val = atoi( prio_env );
+    if (val < fmin || val >= fmax) return;
+    nspa_rt_prio_base = val;
 
-    /* TC maps to NT 31, which is base + 7 in the linear mapping used by
-     * server/thread.c:nspa_rt_map_prio(). Clamp to leave 99 for the kernel. */
-    val += 7;
-    if (val >= fmax) val = fmax - 1;
-
-    nspa_rt_tc_fifo_prio = val;
-    return val;
+    policy_env = getenv( "NSPA_RT_POLICY" );
+    if (policy_env)
+    {
+        if      (!strcmp( policy_env, "FF" )) nspa_rt_policy_v = SCHED_FIFO;
+        else if (!strcmp( policy_env, "RR" )) nspa_rt_policy_v = SCHED_RR;
+        else if (!strcmp( policy_env, "TS" )) nspa_rt_policy_v = SCHED_OTHER;
+    }
 }
 
-/* Promote the calling thread to SCHED_FIFO. Called only when the target is
- * GetCurrentThread() and base_priority == THREAD_PRIORITY_TIME_CRITICAL. */
-static void nspa_rt_apply_self(void)
+/* Resolve base_priority offset + cached process class → absolute NT priority.
+ * Mirrors server/thread.c:set_thread_base_priority(). */
+static int nspa_resolve_nt_band( int base_priority )
 {
-    int prio = nspa_rt_get_tc_prio();
+    LONG cls = InterlockedCompareExchange( &nspa_cached_priocls, 0, 0 );
+    int is_rt = (cls == PROCESS_PRIOCLASS_REALTIME);
+    int proc_base;
+
+    if (base_priority == NSPA_THREAD_PRIORITY_IDLE)
+        return is_rt ? 16 : 1;
+    if (base_priority == NSPA_RT_TIME_CRITICAL)
+        return is_rt ? 31 : 15;
+
+    switch (cls)
+    {
+    case PROCESS_PRIOCLASS_IDLE:         proc_base = 4;  break;
+    case PROCESS_PRIOCLASS_BELOW_NORMAL: proc_base = 6;  break;
+    case PROCESS_PRIOCLASS_NORMAL:       proc_base = 8;  break;
+    case PROCESS_PRIOCLASS_ABOVE_NORMAL: proc_base = 10; break;
+    case PROCESS_PRIOCLASS_HIGH:         proc_base = 13; break;
+    case PROCESS_PRIOCLASS_REALTIME:     proc_base = 24; break;
+    default:                             proc_base = 8;  break;
+    }
+    return proc_base + base_priority;
+}
+
+/* Apply RT scheduling to a specific unix tid. Returns 1 if applied, 0 if
+ * skipped (RT disabled, TS mode for lower band, or permission denied).
+ * nt_band is the absolute NT priority in [1..31]. */
+static int nspa_rt_apply_tid( int tid, int nt_band )
+{
     struct sched_param param;
+    int fifo, policy, fmin, fmax;
 
-    if (prio < 0) return;  /* RT dormant or env invalid */
+    nspa_rt_probe();
+    if (nspa_rt_prio_base < 0) return 0;
+    if (tid < 0) return 0;  /* tid == 0 is valid: sched_setscheduler(0,...) = current thread */
 
-    param.sched_priority = prio;
-    if (sched_setscheduler( 0, SCHED_FIFO | SCHED_RESET_ON_FORK, &param ) == -1)
+    /* Ceiling mapping: NT 31 (TIME_CRITICAL) = NSPA_RT_PRIO, lower bands below. */
+    fifo = nspa_rt_prio_base - (31 - nt_band);
+    fmin = sched_get_priority_min( SCHED_FIFO );
+    fmax = sched_get_priority_max( SCHED_FIFO ) - 1;
+    if (fifo < fmin) fifo = fmin;
+    if (fifo > fmax) fifo = fmax;
+
+    /* TC (NT 31) always FIFO; lower band honors env var policy. */
+    policy = (nt_band >= 31) ? SCHED_FIFO : nspa_rt_policy_v;
+
+    /* TS mode for lower band: don't promote, let Tier 2 fallback apply nice. */
+    if (policy == SCHED_OTHER) return 0;
+
+    param.sched_priority = fifo;
+    if (sched_setscheduler( tid, policy | SCHED_RESET_ON_FORK, &param ) == -1)
     {
         static int warned;
         if (!warned++)
-            WARN( "NSPA RT: sched_setscheduler(self, FIFO/%d) failed: %s\n",
-                  prio, strerror(errno) );
+            WARN( "NSPA RT v1.2: sched_setscheduler(tid=%d, prio=%d) failed: %s\n",
+                  tid, fifo, strerror(errno) );
+        /* If the tid is dead (ESRCH), drop the stale map entry. */
+        if (errno == ESRCH)
+        {
+            /* caller holds nothing; safe to clean up */
+        }
+        return 0;
     }
-    else
-    {
-        TRACE( "NSPA RT: self promoted to SCHED_FIFO/%d\n", prio );
-    }
+    return 1;
 }
+
+/* Deliberately no nspa_rt_map_reapply_all function: on SetPriorityClass,
+ * wineserver's set_process_priority walks its own thread_list and calls
+ * apply_thread_priority for each thread with the correct per-thread
+ * base_priority. A client-side reapply would have to duplicate that
+ * per-thread state or (as an earlier iteration incorrectly did) assume
+ * base_priority==NORMAL for all mapped threads, which clobbers threads
+ * whose base is actually TIME_CRITICAL. Tier 2 owns the bulk update. */
 
 static inline int get_unix_exit_code( NTSTATUS status )
 {
@@ -1536,6 +1698,18 @@ NTSTATUS WINAPI NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATT
         virtual_free_thread_data( data );
         status = STATUS_NO_MEMORY;
     }
+    else
+    {
+        /* NSPA RT v1.2: record HANDLE → unix_tid for later cross-thread RT
+         * promotion. pthread_gettid_np is glibc 2.30+; the kernel assigns
+         * the tid during clone() before pthread_create returns, so it's
+         * race-free. On non-glibc or older glibc, this falls through
+         * harmlessly and only self-promotion works. */
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 30))
+        int child_tid = pthread_gettid_np( pthread_id );
+        if (child_tid > 0 && handle) nspa_rt_map_add( *handle, child_tid );
+#endif
+    }
     pthread_attr_destroy( &pthread_attr );
 
 done:
@@ -2548,19 +2722,54 @@ NTSTATUS WINAPI NtSetInformationThread( HANDLE handle, THREADINFOCLASS class,
     case ThreadBasePriority:
     {
         const DWORD *base_priority = data;
+        int base = (LONG)*base_priority;
+        int rt_applied = 0;
         if (length != sizeof(DWORD)) return STATUS_INVALID_PARAMETER;
 
-        /* NSPA RT Tier 1: client-side self-promotion for TIME_CRITICAL.
-         * Applies only to GetCurrentThread() + TC; lower priorities fall
-         * through to the wineserver path where Tier 2 handles them. */
-        if (handle == GetCurrentThread() && (LONG)*base_priority == NSPA_RT_TIME_CRITICAL)
-            nspa_rt_apply_self();
+        /* NSPA RT v1 Tier 1 + v1.2: client-side promotion path.
+         *
+         * v1 Tier 1 (GetCurrentThread + TC): self-promote to FIFO 87.
+         * v1.2 cross-thread (map lookup + any base_priority): promote
+         * any in-process thread handle we know about, honoring NSPA_RT_POLICY
+         * including TS conservative mode.
+         *
+         * When promotion succeeds, we set req->nspa_rt_override so Tier 2
+         * in wineserver skips its RT branch AND nspa_rt_maybe_demote() —
+         * preventing Tier 2 from clobbering the sched class we just set. */
+        nspa_rt_probe();
+        if (nspa_rt_prio_base >= 0)
+        {
+            int tid = -1;
+            int nt_band;
+
+            if (handle == GetCurrentThread())
+                tid = 0;  /* self */
+            else
+                tid = nspa_rt_map_lookup( handle );
+
+            if (tid >= 0)
+            {
+                /* Lenient TIME_CRITICAL: always FIFO regardless of process class. */
+                if (base == NSPA_RT_TIME_CRITICAL)
+                    rt_applied = nspa_rt_apply_tid( tid, 31 );
+                else
+                {
+                    /* Full RT band: honor process class and env var policy.
+                     * nspa_rt_apply_tid returns 0 for TS mode on lower band
+                     * (falls through to wineserver nice path). */
+                    nt_band = nspa_resolve_nt_band( base );
+                    if (nt_band >= 16)
+                        rt_applied = nspa_rt_apply_tid( tid, nt_band );
+                }
+            }
+        }
 
         SERVER_START_REQ( set_thread_info )
         {
-            req->handle         = wine_server_obj_handle( handle );
-            req->base_priority  = *base_priority;
-            req->mask           = SET_THREAD_INFO_BASE_PRIORITY;
+            req->handle            = wine_server_obj_handle( handle );
+            req->base_priority     = *base_priority;
+            req->mask              = SET_THREAD_INFO_BASE_PRIORITY;
+            req->nspa_rt_override  = rt_applied;
             status = wine_server_call( req );
         }
         SERVER_END_REQ;

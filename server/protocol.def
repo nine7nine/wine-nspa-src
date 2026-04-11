@@ -1315,6 +1315,7 @@ typedef volatile struct
     client_ptr_t entry_point;  /* thread entry point */
     obj_handle_t token;        /* impersonation token */
     int          disable_boost;/* disable thread priority boost */
+    int          nspa_rt_override; /* NSPA RT v1.2: client already applied sched class; skip server-side RT logic */
     unsigned int mask;         /* setting mask (see below) */
     VARARG(desc,unicode_str);  /* description string */
 @END

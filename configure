@@ -24448,6 +24448,7 @@ wine_fn_config_makefile programs/netsh enable_netsh
 wine_fn_config_makefile programs/netstat enable_netstat
 wine_fn_config_makefile programs/ngen enable_ngen
 wine_fn_config_makefile programs/notepad enable_notepad
+wine_fn_config_makefile programs/nspa_rt_test enable_nspa_rt_test
 wine_fn_config_makefile programs/odbcad32 enable_odbcad32
 wine_fn_config_makefile programs/oleview enable_oleview
 wine_fn_config_makefile programs/ping enable_ping

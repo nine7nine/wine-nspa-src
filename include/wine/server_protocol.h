@@ -33,6 +33,9 @@ typedef unsigned __int64 affinity_t;
 typedef unsigned __int64 object_id_t;
 typedef client_ptr_t mod_handle_t;
 
+
+#define REQUEST_SHM_SIZE (1 * 1024 * 1024)
+
 struct request_header
 {
     int          req;
@@ -1182,9 +1185,9 @@ struct init_first_thread_reply
     timeout_t    server_start;
     unsigned int session_id;
     obj_handle_t inproc_device;
+    int          has_request_shm;
     data_size_t  info_size;
     /* VARARG(machines,ushorts); */
-    char __pad_36[4];
 };
 
 
@@ -1202,7 +1205,7 @@ struct init_thread_reply
 {
     struct reply_header __header;
     int          suspend;
-    char __pad_12[4];
+    int          has_request_shm;
 };
 
 
@@ -7096,6 +7099,6 @@ union generic_reply
     struct d3dkmt_mutex_release_reply d3dkmt_mutex_release_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 931
+#define SERVER_PROTOCOL_VERSION 932
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

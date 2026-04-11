@@ -49,6 +49,9 @@ typedef unsigned __int64 affinity_t;
 typedef unsigned __int64 object_id_t;
 typedef client_ptr_t mod_handle_t;
 
+/* NSPA v1.5 shmem IPC: per-thread shared memory region size. */
+#define REQUEST_SHM_SIZE (1 * 1024 * 1024)
+
 struct request_header
 {
     int          req;          /* request code */
@@ -1160,6 +1163,7 @@ typedef volatile struct
     timeout_t    server_start; /* server start time */
     unsigned int session_id;   /* process session id */
     obj_handle_t inproc_device;/* inproc device fd in flight with this handle */
+    int          has_request_shm; /* NSPA v1.5: request shared memory fd in flight with reply->tid */
     data_size_t  info_size;    /* total size of startup info */
     VARARG(machines,ushorts);  /* array of supported machines */
 @END
@@ -1174,6 +1178,7 @@ typedef volatile struct
     client_ptr_t entry;        /* entry point (in thread address space) */
 @REPLY
     int          suspend;      /* is thread suspended? */
+    int          has_request_shm; /* NSPA v1.5: request shared memory fd in flight with current thread id */
 @END
 
 

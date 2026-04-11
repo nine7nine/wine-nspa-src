@@ -98,6 +98,25 @@ static inline BOOL is_arm64ec(void)
             main_image_info.Machine == IMAGE_FILE_MACHINE_AMD64);
 }
 
+#ifdef __linux__
+/* NSPA v1.5 shmem IPC: mirror of server-side struct request_shm layout.
+ * Must match server/thread.h exactly. See request.c send_request_shm /
+ * wait_reply_shm for the state machine. */
+#ifndef NSPA_REQUEST_SHM_SIZE
+# define NSPA_REQUEST_SHM_SIZE (1 * 1024 * 1024)
+#endif
+struct request_shm
+{
+    int futex;
+    int pad;
+    union
+    {
+        union generic_request req;
+        union generic_reply   reply;
+    } u;
+};
+#endif
+
 /* thread private data, stored in NtCurrentTeb()->GdiTebBatch */
 struct ntdll_thread_data
 {
@@ -116,6 +135,10 @@ struct ntdll_thread_data
     PRTL_THREAD_START_ROUTINE start;         /* thread entry point */
     void                     *param;         /* thread entry point parameter */
     void                     *jmp_buf;       /* setjmp buffer for exception handling */
+#ifdef __linux__
+    int                           request_shm_fd;  /* NSPA v1.5: shared memory fd */
+    volatile struct request_shm  *request_shm;     /* NSPA v1.5: shared memory mapping */
+#endif
 };
 
 C_ASSERT( sizeof(struct ntdll_thread_data) <= sizeof(((TEB *)0)->GdiTebBatch) );

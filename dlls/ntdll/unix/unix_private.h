@@ -109,7 +109,14 @@ static inline BOOL is_arm64ec(void)
 struct request_shm
 {
     int futex;
-    int pad;
+    int server_dispatch_tid;  /* NSPA v2.4: Linux TID of the wineserver
+                               * dispatch thread for this shm. Written
+                               * once by that thread on startup. The
+                               * client reads this to manually boost
+                               * the server's scheduling priority while
+                               * blocked on a reply (manual PI, same
+                               * pattern as CS-PI v2.3). 0 = not set.
+                               * Must match server/thread.h exactly. */
     union
     {
         union generic_request req;

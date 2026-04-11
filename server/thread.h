@@ -66,7 +66,15 @@ struct inflight_fd
 struct request_shm
 {
     int futex;
-    int pad;
+    int server_dispatch_tid;  /* NSPA v2.4: Linux TID of the wineserver
+                               * dispatch thread for this request_shm,
+                               * written once by that thread on startup.
+                               * The client reads this to boost the
+                               * server's scheduling priority while
+                               * blocked on a reply (manual PI, same
+                               * pattern as CS-PI v2.3). 0 = not yet
+                               * written. See nspa_shm_pi_boost in
+                               * dlls/ntdll/unix/server.c. */
     union
     {
         union generic_request req;

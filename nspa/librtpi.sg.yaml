@@ -1,0 +1,249 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+#
+# nspa/librtpi.sg.yaml
+# Wine-NSPA RT v2.1 — ast-grep rule for pthread → librtpi conversion on Unix-side
+#                      pthread users.
+#
+# Purpose
+# -------
+# Automate the tree-wide pthread → librtpi conversion that was previously carried
+# as a hand-curated 1131-line patch (wine-librtpi/0100-librtpi-PI_Support.mypatch).
+# Every Wine release sync, re-run ast-grep instead of rebasing 108 hunks by hand:
+#
+#   ast-grep scan --rule nspa/librtpi.sg.yaml --update-all dlls/ntdll/unix/
+#   ast-grep scan --rule nspa/librtpi.sg.yaml --update-all server/
+#   ast-grep scan --rule nspa/librtpi.sg.yaml --update-all dlls/win32u/
+#   ... etc
+#
+# Add --dry-run first to preview changes without writing (or just run without
+# --update-all to get the diff preview by default).
+#
+# Tool choice
+# -----------
+# Coccinelle (spatch) is the gold-standard for this kind of semantic C rewrite,
+# but as of 2026-04-11 it doesn't build on modern Arch (OCaml toolchain issues).
+# ast-grep is a tree-sitter-based alternative — Rust binary, actively maintained,
+# clean YAML rule syntax. Already installed on user's box at /usr/bin/ast-grep.
+#
+# The original Coccinelle rule is preserved as nspa/librtpi.cocci for reference
+# and in case spatch becomes available.
+#
+# Pattern form notes
+# ------------------
+# Single-argument call patterns (pthread_mutex_lock($M) etc.) don't reliably
+# match in ast-grep's bare expression form when the argument is a compound
+# expression like `&m` (pointer_expression). The workaround is `context +
+# selector`: give ast-grep a full statement context that parses correctly, then
+# select the inner call_expression. Two-argument calls (cond_wait, init)
+# match directly without this workaround.
+#
+# Correctness strategy (see memory/plan_wine_rt_v2.md section 10)
+# ---------------------------------------------------------------
+# 1. AST-aware — ast-grep parses C via tree-sitter, not text. No false matches
+#    inside comments, string literals, or identifiers.
+# 2. Compile-time backstop — the type rewrite pthread_mutex_t → pi_mutex_t
+#    causes any leftover pthread_mutex_* calls to fail to compile via type
+#    mismatch, catching any missed conversion automatically.
+# 3. Paired-mutex recovery — ast-grep lacks cocci's semantic metavariable for
+#    "nearest enclosing pthread_mutex_lock", so pthread_cond_signal and
+#    pthread_cond_broadcast are REWRITTEN to pi_cond_signal(C, NULL) with an
+#    inline FIXME comment. Hand-audit via:
+#
+#      grep -rn 'FIXME-librtpi' dlls/ server/ libs/ > /tmp/librtpi-fixmes.txt
+#
+#    Every FIXME must be hand-resolved before commit. The NULL mutex arg will
+#    cause librtpi to return EINVAL at runtime on any site that isn't fixed,
+#    which serves as a second safety net during smoke tests.
+# 4. Recursive-mutex audit — run BEFORE the ast-grep sweep:
+#
+#      grep -rn 'PTHREAD_MUTEX_RECURSIVE' dlls/ server/ libs/ > /tmp/recursive.txt
+#
+#    Any sites need hand-review (librtpi has no recursive-mutex support).
+# 5. Differential verification — run the rule against the 2022-era tree that
+#    0100 was authored against, diff against 0100, investigate discrepancies.
+# 6. Full Wine test suite after sweep + nspa_rt_test real-world check.
+#
+# Scope
+# -----
+# This rule targets Unix-side pthread users. PE-side files (e.g.
+# dlls/ntdll/sync.c) don't use pthread and are unaffected. CS-PI (v2.3) uses
+# raw FUTEX_LOCK_PI via a new Unixlib entry, not librtpi — they're disjoint.
+
+# ============================================================================
+# Type rewrites
+# ============================================================================
+
+# Type identifiers in declarations are tree-sitter `type_identifier` nodes,
+# not bare identifier expressions. Match by kind+regex to catch them.
+
+id: pthread-mutex-t-type
+language: c
+rule:
+  kind: type_identifier
+  regex: '^pthread_mutex_t$'
+fix: 'pi_mutex_t'
+
+---
+id: pthread-cond-t-type
+language: c
+rule:
+  kind: type_identifier
+  regex: '^pthread_cond_t$'
+fix: 'pi_cond_t'
+
+# ============================================================================
+# Static initializers
+# ============================================================================
+
+---
+id: mutex-initializer
+language: c
+rule:
+  pattern: PTHREAD_MUTEX_INITIALIZER
+fix: 'PI_MUTEX_INIT(0)'
+
+---
+id: cond-initializer
+language: c
+rule:
+  pattern: PTHREAD_COND_INITIALIZER
+fix: 'PI_COND_INIT(0)'
+
+# ============================================================================
+# Single-argument calls (need context+selector to match compound-expression
+# arguments like `&m`)
+# ============================================================================
+
+---
+id: mutex-lock
+language: c
+rule:
+  pattern:
+    context: 'int _x = pthread_mutex_lock($M);'
+    selector: call_expression
+fix: 'pi_mutex_lock($M)'
+
+---
+id: mutex-unlock
+language: c
+rule:
+  pattern:
+    context: 'int _x = pthread_mutex_unlock($M);'
+    selector: call_expression
+fix: 'pi_mutex_unlock($M)'
+
+---
+id: mutex-destroy
+language: c
+rule:
+  pattern:
+    context: 'int _x = pthread_mutex_destroy($M);'
+    selector: call_expression
+fix: 'pi_mutex_destroy($M)'
+
+---
+id: mutex-trylock
+language: c
+rule:
+  pattern:
+    context: 'int _x = pthread_mutex_trylock($M);'
+    selector: call_expression
+fix: 'pi_mutex_trylock($M)'
+
+---
+id: cond-destroy
+language: c
+rule:
+  pattern:
+    context: 'int _x = pthread_cond_destroy($C);'
+    selector: call_expression
+fix: 'pi_cond_destroy($C)'
+
+# ============================================================================
+# Two-argument and three-argument calls (direct pattern match works)
+# ============================================================================
+
+---
+id: cond-wait
+language: c
+rule:
+  pattern: pthread_cond_wait($C, $M)
+fix: 'pi_cond_wait($C, $M)'
+
+---
+id: cond-timedwait
+language: c
+rule:
+  pattern: pthread_cond_timedwait($C, $M, $T)
+fix: 'pi_cond_timedwait($C, $M, $T)'
+
+# ============================================================================
+# Init calls — flatten attr to 0 (librtpi takes uint32_t flags, not
+# pthread_*attr_t)
+# ============================================================================
+#
+# NULL-form must match before generic-form in file order. Both produce the
+# same result (pi_*_init($X, 0)) so the order-dependence is cosmetic but
+# cleaner to do it this way.
+
+---
+id: mutex-init-null
+language: c
+rule:
+  pattern: pthread_mutex_init($M, NULL)
+fix: 'pi_mutex_init($M, 0)'
+
+---
+id: mutex-init-attr
+language: c
+rule:
+  pattern: pthread_mutex_init($M, $A)
+fix: 'pi_mutex_init($M, 0)'
+
+---
+id: cond-init-null
+language: c
+rule:
+  pattern: pthread_cond_init($C, NULL)
+fix: 'pi_cond_init($C, 0)'
+
+---
+id: cond-init-attr
+language: c
+rule:
+  pattern: pthread_cond_init($C, $A)
+fix: 'pi_cond_init($C, 0)'
+
+# ============================================================================
+# cond_signal / cond_broadcast — FIXME rewrites
+# ============================================================================
+#
+# ast-grep cannot recover the paired mutex from enclosing scope in the way
+# Coccinelle can. The rewrite produces pi_cond_signal($C, NULL) with an
+# inline FIXME comment. librtpi's pi_cond_signal does not accept NULL for
+# the mutex arg (returns EINVAL at runtime), so the site MUST be fixed by
+# hand before the code runs correctly. Use grep to produce the shortlist:
+#
+#   grep -rn 'FIXME-librtpi' dlls/ server/ libs/ > /tmp/librtpi-fixmes.txt
+
+---
+id: cond-signal-fixme
+language: c
+rule:
+  pattern:
+    context: 'int _x = pthread_cond_signal($C);'
+    selector: call_expression
+fix: 'pi_cond_signal($C, /* FIXME-librtpi: recover paired mutex */ NULL)'
+
+---
+id: cond-broadcast-fixme
+language: c
+rule:
+  pattern:
+    context: 'int _x = pthread_cond_broadcast($C);'
+    selector: call_expression
+fix: 'pi_cond_broadcast($C, /* FIXME-librtpi: recover paired mutex */ NULL)'
+
+# ============================================================================
+# END OF RULES
+# ============================================================================

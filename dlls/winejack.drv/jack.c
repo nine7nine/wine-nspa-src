@@ -54,6 +54,13 @@ extern NTSTATUS jack_midi_out_message(void *args);
 extern NTSTATUS jack_midi_in_message(void *args);
 extern NTSTATUS jack_midi_notify_wait(void *args);
 
+/* Called by jackmidi.c to get the shared JACK client + ensure activation */
+extern jack_client_t *jack_get_client(void);
+extern BOOL jack_ensure_activated(void);
+
+/* Called from the unified process callback to handle MIDI I/O */
+extern int jack_midi_process(jack_nframes_t nframes);
+
 /* ════════════════════════════════════════════════════════════════════════
  *   JACK audio client (singleton, shared by all streams)
  * ════════════════════════════════════════════════════════════════════════ */
@@ -452,6 +459,7 @@ static int jack_audio_process_cb(jack_nframes_t nframes, void *arg)
     int i;
     (void)arg;
 
+    /* Audio streams */
     for (i = 0; i < num_active_streams; i++)
     {
         struct jack_stream *s = active_streams[i];
@@ -462,6 +470,11 @@ static int jack_audio_process_cb(jack_nframes_t nframes, void *arg)
         else
             jack_process_capture(s, nframes);
     }
+
+    /* MIDI ports (shared client — same RT callback) */
+    if (jack_midi_available)
+        jack_midi_process(nframes);
+
     return 0;
 }
 
@@ -487,7 +500,7 @@ static BOOL ensure_audio_client(void)
     if (audio_client) { pi_mutex_unlock(&audio_client_lock); return TRUE; }
 
     TRACE("ensure_audio_client: opening client\n");
-    audio_client = jack_client_open("wine-audio", JackNoStartServer, &status);
+    audio_client = jack_client_open("wine-nspa", JackNoStartServer, &status);
     if (!audio_client)
     {
         WARN("Cannot connect to JACK for audio (%d)\n", status);
@@ -534,6 +547,17 @@ static BOOL activate_audio_client(void)
     TRACE("JACK audio client activated: rate=%u bufsize=%u\n", jack_rate, jack_buf_frames);
     pi_mutex_unlock(&audio_client_lock);
     return TRUE;
+}
+
+/* Accessors for jackmidi.c — shared JACK client */
+jack_client_t *jack_get_client(void)
+{
+    return audio_client;
+}
+
+BOOL jack_ensure_activated(void)
+{
+    return ensure_audio_client() && activate_audio_client();
 }
 
 /* ════════════════════════════════════════════════════════════════════════
@@ -1662,6 +1686,15 @@ static NTSTATUS jack_midi_get_driver(void *args)
     return STATUS_SUCCESS;
 }
 
+extern UINT jack_midi_init_ex(void);  /* in jackmidi.c */
+
+static NTSTATUS jack_midi_init_handler(void *args)
+{
+    struct midi_init_params *params = args;
+    *params->err = jack_midi_init_ex();
+    return STATUS_SUCCESS;
+}
+
 /* ════════════════════════════════════════════════════════════════════════
  *   Function table
  * ════════════════════════════════════════════════════════════════════════ */
@@ -1699,7 +1732,7 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
     jack_is_started,                /* is_started */
     jack_get_prop_value,            /* get_prop_value */
     jack_midi_get_driver,           /* midi_get_driver */
-    jack_not_implemented,           /* midi_init */
+    jack_midi_init_handler,         /* midi_init */
     jack_midi_release,              /* midi_release */
     jack_midi_out_message,          /* midi_out_message */
     jack_midi_in_message,           /* midi_in_message */
@@ -1961,7 +1994,7 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
     jack_is_started,
     jack_wow64_get_prop_value,
     jack_midi_get_driver,
-    jack_not_implemented,               /* midi_init */
+    jack_midi_init_handler,             /* midi_init */
     jack_midi_release,
     jack_midi_out_message,              /* TODO: wow64 midi thunks */
     jack_midi_in_message,

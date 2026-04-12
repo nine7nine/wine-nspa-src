@@ -1620,6 +1620,19 @@ DECL_HANDLER(create_mapping)
 
     if (!objattr) return;
 
+    /* NSPA: SEC_LARGE_PAGES requires SeLockMemoryPrivilege per Windows
+     * semantics. The privilege is granted to admin tokens by default in
+     * server/token.c::token_create_admin. Apps that haven't impersonated
+     * an admin token (or called RtlAdjustPrivilege to enable it on the
+     * default user token) will get STATUS_PRIVILEGE_NOT_HELD. */
+    if ((req->flags & SEC_LARGE_PAGES)
+        && !thread_single_check_privilege( current, SeLockMemoryPrivilege ))
+    {
+        if (root) release_object( root );
+        set_error( STATUS_PRIVILEGE_NOT_HELD );
+        return;
+    }
+
     if ((mapping = create_mapping( root, &name, objattr->attributes, req->size, req->flags,
                                    req->file_handle, req->file_access, sd )))
     {

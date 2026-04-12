@@ -3013,16 +3013,21 @@ NTSTATUS WINAPI NtCreateSection( HANDLE *handle, ACCESS_MASK access, const OBJEC
     /* NSPA: SEC_LARGE_PAGES validation per Windows semantics:
      *  - The size argument is required (not NULL)
      *  - The size must be a multiple of LargePageMinimum
-     *  - The mapping cannot be backed by a file (anonymous only)
+     *  - The mapping cannot be backed by a file (anonymous only).
+     *    "No file" can be expressed as either NULL or INVALID_HANDLE_VALUE
+     *    (kernel32's CreateFileMapping passes INVALID_HANDLE_VALUE for
+     *    pagefile-backed mappings; both are valid here).
      *  - LargePageMinimum must be non-zero (host has hugepages configured)
-     * The wineserver-side check (commit 0074 cmt 1/5) handles
+     * The wineserver-side check (commit 0074 cmt 1/8) handles
      * SeLockMemoryPrivilege; this is the client-side parameter sanity. */
     if (sec_flags & SEC_LARGE_PAGES)
     {
         extern struct _KUSER_SHARED_DATA *user_shared_data;
         SIZE_T min_size = user_shared_data->LargePageMinimum;
 
-        if (file != NULL || size == NULL) return STATUS_INVALID_PARAMETER;
+        if (file != NULL && file != INVALID_HANDLE_VALUE)
+            return STATUS_INVALID_PARAMETER;
+        if (size == NULL) return STATUS_INVALID_PARAMETER;
         if (min_size == 0 || size->QuadPart == 0 ||
             (size->QuadPart % min_size) != 0)
             return STATUS_INVALID_PARAMETER;

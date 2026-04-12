@@ -3672,6 +3672,29 @@ static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_P
     }
 
     base = *addr_ptr;
+
+    /* NSPA: SEC_LARGE_PAGES validation and address alignment for the
+     * map step. Without this, map_view picks a 64 KB-aligned address
+     * (granularity_mask) and the subsequent map_file_into_view's
+     * MAP_FIXED mmap of the hugetlbfs-backed fd fails with EINVAL
+     * (hugetlbfs requires LargePageMinimum-byte alignment). The fix
+     * is twofold:
+     *  - Validate size/base alignment up front (matches the patch's
+     *    intent in commit 0074 cmt 5/8 — caught here at virtual_map_section
+     *    rather than later at the failing mmap)
+     *  - Pass align_mask = LargePageMinimum - 1 to map_view below so
+     *    the chosen address is hugepage-aligned, and the MAP_FIXED in
+     *    map_file_into_view succeeds.
+     * The size_ptr check uses *size_ptr (the requested size); if it
+     * is 0 the caller wants the full file size, in which case the
+     * validation happens after `size = full_size - offset.QuadPart`. */
+    if (sec_flags & SEC_LARGE_PAGES)
+    {
+        SIZE_T min_size = user_shared_data->LargePageMinimum;
+        if (min_size == 0) return STATUS_INVALID_PARAMETER;
+        if (base && ((UINT_PTR)base % min_size) != 0) return STATUS_INVALID_PARAMETER;
+    }
+
     if (offset.QuadPart >= full_size) return STATUS_INVALID_PARAMETER;
     if (*size_ptr)
     {
@@ -3690,6 +3713,11 @@ static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_P
     }
     if (!(size = ROUND_SIZE( 0, size, page_mask ))) return STATUS_INVALID_PARAMETER;  /* wrap-around */
 
+    /* NSPA: now that `size` is the final committed size, verify it's a
+     * multiple of LargePageMinimum for SEC_LARGE_PAGES mappings. */
+    if ((sec_flags & SEC_LARGE_PAGES) && (size % user_shared_data->LargePageMinimum) != 0)
+        return STATUS_INVALID_PARAMETER;
+
     get_vprot_flags( protect, &vprot, FALSE );
     vprot |= sec_flags;
     if (!(sec_flags & SEC_RESERVE)) vprot |= VPROT_COMMITTED;
@@ -3698,7 +3726,12 @@ static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_P
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
 
-    res = map_view( &view, base, size, alloc_type, vprot, limit_low, limit_high, 0 );
+    /* NSPA: large-page sections need a hugepage-aligned base address so
+     * the subsequent map_file_into_view's MAP_FIXED mmap of the hugetlbfs
+     * backing fd succeeds. Pass align_mask = LargePageMinimum - 1 in that
+     * case; map_view's existing align logic does the right thing. */
+    res = map_view( &view, base, size, alloc_type, vprot, limit_low, limit_high,
+                    (sec_flags & SEC_LARGE_PAGES) ? (user_shared_data->LargePageMinimum - 1) : 0 );
     if (res) goto done;
 
     TRACE( "handle=%p size=%lx offset=%s\n", handle, size, wine_dbgstr_longlong(offset.QuadPart) );

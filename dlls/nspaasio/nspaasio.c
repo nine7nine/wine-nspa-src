@@ -16,6 +16,9 @@
  */
 
 #define COBJMACROS
+#ifdef __SSE2__
+#include <emmintrin.h>
+#endif
 #include <windows.h>
 #include <initguid.h>
 #include <objbase.h>
@@ -217,24 +220,78 @@ static unsigned __stdcall play_thread(void *arg)
         int src_idx = d->buf_index;  /* host just filled this one */
         BYTE **src_bufs = src_idx == 0 ? d->buf_a : d->buf_b;
 
-        /* Copy ASIO per-channel buffers → interleaved WASAPI buffer */
+        /* Copy ASIO per-channel buffers → interleaved WASAPI buffer.
+         * Stereo F32 SSE2 fast path for the common JACK-backed case. */
         hr = IAudioRenderClient_GetBuffer(d->render_client, d->buf_size, &wasapi_buf);
         if (SUCCEEDED(hr))
         {
             long i;
-            int ch;
-            BYTE *dst = wasapi_buf;
+            int ch, bps = d->bytes_per_sample, nch = d->wasapi_channels;
 
-            for (i = 0; i < d->buf_size; i++)
+#ifdef __SSE2__
+            if (bps == 4 && nch == 2 && d->out_map_count >= 2)
             {
-                for (ch = 0; ch < d->wasapi_channels; ch++)
+                /* SSE2 stereo F32 interleave: 4 frames per iteration */
+                const float *src_l = (const float *)src_bufs[d->out_map[0]];
+                const float *src_r = (const float *)src_bufs[d->out_map[1]];
+                float *dst = (float *)wasapi_buf;
+                long j = 0;
+                for (; j + 4 <= d->buf_size; j += 4)
                 {
-                    if (ch < d->out_map_count)
-                        memcpy(dst, src_bufs[d->out_map[ch]] + i * d->bytes_per_sample, d->bytes_per_sample);
-                    else
-                        memset(dst, 0, d->bytes_per_sample);
-                    dst += d->bytes_per_sample;
+                    __m128 l = _mm_loadu_ps(src_l + j);
+                    __m128 r = _mm_loadu_ps(src_r + j);
+                    __m128 lo = _mm_unpacklo_ps(l, r);  /* L0 R0 L1 R1 */
+                    __m128 hi = _mm_unpackhi_ps(l, r);  /* L2 R2 L3 R3 */
+                    _mm_storeu_ps(dst + j * 2, lo);
+                    _mm_storeu_ps(dst + j * 2 + 4, hi);
                 }
+                for (; j < d->buf_size; j++)
+                {
+                    dst[j * 2] = src_l[j];
+                    dst[j * 2 + 1] = src_r[j];
+                }
+            }
+            else if (bps == 4 && nch == 1 && d->out_map_count >= 1)
+            {
+                /* SSE2 mono F32: straight copy, 4 samples per iteration */
+                const float *src_m = (const float *)src_bufs[d->out_map[0]];
+                float *dst = (float *)wasapi_buf;
+                long j = 0;
+                for (; j + 4 <= d->buf_size; j += 4)
+                    _mm_storeu_ps(dst + j, _mm_loadu_ps(src_m + j));
+                for (; j < d->buf_size; j++)
+                    dst[j] = src_m[j];
+            }
+            else
+#endif
+            if (bps == 4)  /* float32 or int32 — general channel count */
+            {
+                float *dst = (float *)wasapi_buf;
+                for (i = 0; i < d->buf_size; i++)
+                    for (ch = 0; ch < nch; ch++)
+                        dst[i * nch + ch] = (ch < d->out_map_count)
+                            ? ((float *)src_bufs[d->out_map[ch]])[i] : 0.0f;
+            }
+            else if (bps == 2)  /* int16 */
+            {
+                INT16 *dst = (INT16 *)wasapi_buf;
+                for (i = 0; i < d->buf_size; i++)
+                    for (ch = 0; ch < nch; ch++)
+                        dst[i * nch + ch] = (ch < d->out_map_count)
+                            ? ((INT16 *)src_bufs[d->out_map[ch]])[i] : 0;
+            }
+            else  /* int24 or other — fallback to byte copy */
+            {
+                BYTE *dst = wasapi_buf;
+                for (i = 0; i < d->buf_size; i++)
+                    for (ch = 0; ch < nch; ch++)
+                    {
+                        if (ch < d->out_map_count)
+                            memcpy(dst, src_bufs[d->out_map[ch]] + i * bps, bps);
+                        else
+                            memset(dst, 0, bps);
+                        dst += bps;
+                    }
             }
             IAudioRenderClient_ReleaseBuffer(d->render_client, d->buf_size, 0);
         }
@@ -278,15 +335,17 @@ static HRESULT ASIOMETHODCALLTYPE asio_QueryInterface(IASIO *iface, REFIID riid,
 }
 
 static ULONG ASIOMETHODCALLTYPE asio_AddRef(IASIO *iface)
-{ TRACE("'%s' called (iface=%p)\n", __FUNCTION__, iface);
+{
     nspaASIODriver *d = (nspaASIODriver *)iface;
+    TRACE("AddRef (iface=%p)\n", iface);
     return InterlockedIncrement(&d->ref);
 }
 
 static ULONG ASIOMETHODCALLTYPE asio_Release(IASIO *iface)
-{ TRACE("'%s' called (iface=%p)\n", __FUNCTION__, iface);
+{
     nspaASIODriver *d = (nspaASIODriver *)iface;
     ULONG ref = InterlockedDecrement(&d->ref);
+    TRACE("Release (iface=%p, ref=%lu)\n", iface, ref);
     if (ref == 0)
     {
         /* ASIO drivers are singletons — apps expect the driver to persist
@@ -425,8 +484,9 @@ static void ASIOMETHODCALLTYPE asio_getErrorMessage(IASIO *iface, char *string)
 }
 
 static ASIOError ASIOMETHODCALLTYPE asio_start(IASIO *iface)
-{ TRACE("'%s' called (iface=%p)\n", __FUNCTION__, iface);
+{
     nspaASIODriver *d = (nspaASIODriver *)iface;
+    TRACE("start (iface=%p)\n", iface);
 
     if (d->state != STATE_PREPARED)
         return ASE_InvalidMode;
@@ -445,8 +505,9 @@ static ASIOError ASIOMETHODCALLTYPE asio_start(IASIO *iface)
 }
 
 static ASIOError ASIOMETHODCALLTYPE asio_stop(IASIO *iface)
-{ TRACE("'%s' called (iface=%p)\n", __FUNCTION__, iface);
+{
     nspaASIODriver *d = (nspaASIODriver *)iface;
+    TRACE("stop (iface=%p)\n", iface);
 
     if (d->state != STATE_RUNNING)
         return ASE_OK;
@@ -495,9 +556,9 @@ static ASIOError ASIOMETHODCALLTYPE asio_getBufferSize(IASIO *iface, long *minSi
                                                        long *preferredSize, long *granularity)
 {
     nspaASIODriver *d = (nspaASIODriver *)iface;
-    TRACE("getBufferSize called (iface=%p)\n", iface);
     REFERENCE_TIME def_period = 0, min_period = 0;
     long min_frames, pref;
+    TRACE("getBufferSize (iface=%p)\n", iface);
 
     if (d->audio_client)
         IAudioClient_GetDevicePeriod(d->audio_client, &def_period, &min_period);
@@ -523,21 +584,21 @@ static ASIOError ASIOMETHODCALLTYPE asio_getBufferSize(IASIO *iface, long *minSi
 }
 
 static ASIOError ASIOMETHODCALLTYPE asio_canSampleRate(IASIO *iface, ASIOSampleRate rate)
-{ TRACE("'%s' called (iface=%p)\n", __FUNCTION__, iface);
+{
     nspaASIODriver *d = (nspaASIODriver *)iface;
     /* We only support the WASAPI device's native rate */
     return (long)rate == (long)d->sample_rate ? ASE_OK : ASE_NoClock;
 }
 
 static ASIOError ASIOMETHODCALLTYPE asio_getSampleRate(IASIO *iface, ASIOSampleRate *rate)
-{ TRACE("'%s' called (iface=%p)\n", __FUNCTION__, iface);
+{
     nspaASIODriver *d = (nspaASIODriver *)iface;
     if (rate) *rate = d->sample_rate;
     return ASE_OK;
 }
 
 static ASIOError ASIOMETHODCALLTYPE asio_setSampleRate(IASIO *iface, ASIOSampleRate rate)
-{ TRACE("'%s' called (iface=%p)\n", __FUNCTION__, iface);
+{
     nspaASIODriver *d = (nspaASIODriver *)iface;
     if ((long)rate != (long)d->sample_rate)
         return ASE_NoClock;
@@ -545,7 +606,7 @@ static ASIOError ASIOMETHODCALLTYPE asio_setSampleRate(IASIO *iface, ASIOSampleR
 }
 
 static ASIOError ASIOMETHODCALLTYPE asio_getClockSources(IASIO *iface, ASIOClockSource *clocks, long *numSources)
-{ TRACE("'%s' called (iface=%p)\n", __FUNCTION__, iface);
+{
     if (clocks && numSources && *numSources > 0)
     {
         clocks[0].index = 0;
@@ -559,12 +620,12 @@ static ASIOError ASIOMETHODCALLTYPE asio_getClockSources(IASIO *iface, ASIOClock
 }
 
 static ASIOError ASIOMETHODCALLTYPE asio_setClockSource(IASIO *iface, long reference)
-{ TRACE("'%s' called (iface=%p)\n", __FUNCTION__, iface);
+{
     return reference == 0 ? ASE_OK : ASE_InvalidParameter;
 }
 
 static ASIOError ASIOMETHODCALLTYPE asio_getSamplePosition(IASIO *iface, ASIOSamples *sPos, ASIOTimeStamp *tStamp)
-{ TRACE("'%s' called (iface=%p)\n", __FUNCTION__, iface);
+{
     nspaASIODriver *d = (nspaASIODriver *)iface;
     if (sPos) *sPos = d->sample_position;
     if (tStamp)
@@ -577,7 +638,7 @@ static ASIOError ASIOMETHODCALLTYPE asio_getSamplePosition(IASIO *iface, ASIOSam
 }
 
 static ASIOError ASIOMETHODCALLTYPE asio_getChannelInfo(IASIO *iface, ASIOChannelInfo *info)
-{ TRACE("'%s' called (iface=%p)\n", __FUNCTION__, iface);
+{
     nspaASIODriver *d = (nspaASIODriver *)iface;
 
     if (info->isInput)
@@ -685,9 +746,10 @@ static ASIOError ASIOMETHODCALLTYPE asio_createBuffers(IASIO *iface, ASIOBufferI
 }
 
 static ASIOError ASIOMETHODCALLTYPE asio_disposeBuffers(IASIO *iface)
-{ TRACE("'%s' called (iface=%p)\n", __FUNCTION__, iface);
+{
     nspaASIODriver *d = (nspaASIODriver *)iface;
     int i;
+    TRACE("disposeBuffers (iface=%p)\n", iface);
 
     if (d->state == STATE_RUNNING)
         asio_stop(iface);
@@ -778,10 +840,7 @@ typedef struct {
     LONG ref;
 } nspaASIOFactory;
 
-static inline nspaASIOFactory *impl_from_IClassFactory(IClassFactory *iface)
-{
-    return CONTAINING_RECORD(iface, nspaASIOFactory, IClassFactory_iface);
-}
+
 
 static HRESULT STDMETHODCALLTYPE factory_QueryInterface(IClassFactory *iface, REFIID riid, void **ppv)
 {

@@ -29,7 +29,6 @@
 #include "wine/server.h"
 #include "wine/list.h"
 #include "wine/debug.h"
-#include <rtpi.h>
 
 struct msghdr;
 

@@ -531,10 +531,14 @@ BOOLEAN WINAPI KeSetTimerEx( KTIMER *timer, LARGE_INTEGER duetime, LONG period, 
 
     EnterCriticalSection( &sync_cs );
 
-    if ((ret = timer->Header.Inserted))
-        KeCancelTimer(timer);
-
+    ret = timer->Header.Inserted;
     timer->Header.Inserted = TRUE;
+    timer->Header.SignalState = FALSE;
+    if (timer->Header.WaitListHead.Blink && !*((ULONG_PTR *)&timer->Header.WaitListHead.Flink))
+    {
+        CloseHandle(timer->Header.WaitListHead.Blink);
+        timer->Header.WaitListHead.Blink = NULL;
+    }
 
     if (!timer->TimerListEntry.Blink)
         timer->TimerListEntry.Blink = (void *)CreateThreadpoolTimer(ke_timer_complete_proc, timer, NULL);
@@ -816,6 +820,34 @@ LIST_ENTRY * WINAPI ExInterlockedRemoveHeadList( LIST_ENTRY *list, KSPIN_LOCK *l
     return ret;
 }
 
+/***********************************************************************
+ *           ExInterlockedInsertTailList   (NTOSKRNL.EXE.@)
+ */
+LIST_ENTRY * WINAPI ExInterlockedInsertTailList( LIST_ENTRY *head, LIST_ENTRY *entry, KSPIN_LOCK *lock )
+{
+    LIST_ENTRY *ret;
+    KIRQL irql;
+
+    TRACE( "(%p %p %p)\n", head, entry, lock );
+
+    if ( !head || !entry || !lock )
+        return NULL;
+
+    KeAcquireSpinLock( lock, &irql );
+
+    if ( !head->Blink )
+    {
+        KeReleaseSpinLock( lock, irql );
+        return NULL;
+    }
+
+    ret = head->Blink;
+    InsertTailList( head, entry );
+
+    KeReleaseSpinLock( lock, irql );
+
+    return ret;
+}
 
 /***********************************************************************
  *           InterlockedPopEntrySList   (NTOSKRNL.EXE.@)

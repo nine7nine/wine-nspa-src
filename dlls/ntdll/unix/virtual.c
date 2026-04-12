@@ -7165,7 +7165,26 @@ NTSTATUS WINAPI NtWriteVirtualMemory( HANDLE process, void *addr, const void *bu
 {
     unsigned int status;
 
-    if (virtual_check_buffer_for_read( buffer, size ))
+    if (!virtual_check_buffer_for_read( buffer, size ))
+    {
+        status = STATUS_PARTIAL_COPY;
+        size = 0;
+    }
+    else if (process == GetCurrentProcess())
+    {
+        __TRY
+        {
+            memmove( addr, buffer, size );
+            status = STATUS_SUCCESS;
+        }
+        __EXCEPT
+        {
+            status = STATUS_PARTIAL_COPY;
+            size = 0;
+        }
+        __ENDTRY
+    }
+    else
     {
         SERVER_START_REQ( write_process_memory )
         {
@@ -7176,11 +7195,6 @@ NTSTATUS WINAPI NtWriteVirtualMemory( HANDLE process, void *addr, const void *bu
             size = reply->written;
         }
         SERVER_END_REQ;
-    }
-    else
-    {
-        status = STATUS_PARTIAL_COPY;
-        size = 0;
     }
     if (bytes_written) *bytes_written = size;
     return status;

@@ -22242,6 +22242,19 @@ printf "%s\n" "#define HAVE_STRUCT_MTGET_MT_BLKNO 1" >>confdefs.h
 fi
 
 
+ac_fn_c_check_member "$LINENO" "struct pm_scan_arg" "size" "ac_cv_member_struct_pm_scan_arg_size" "#ifdef HAVE_LINUX_FS_H
+#include <linux/fs.h>
+#endif
+"
+if test "x$ac_cv_member_struct_pm_scan_arg_size" = xyes
+then :
+
+printf "%s\n" "#define HAVE_STRUCT_PM_SCAN_ARG_SIZE 1" >>confdefs.h
+
+
+fi
+
+
 ac_fn_c_check_member "$LINENO" "struct stat" "st_mtim" "ac_cv_member_struct_stat_st_mtim" "$ac_includes_default"
 if test "x$ac_cv_member_struct_stat_st_mtim" = xyes
 then :

@@ -2192,6 +2192,14 @@ AC_CHECK_MEMBERS([struct mtget.mt_blksiz, struct mtget.mt_gstat, struct mtget.mt
 #include <sys/mtio.h>
 #endif])
 
+dnl Check for struct pm_scan_arg (Linux 6.7+, PAGEMAP_SCAN ioctl).
+dnl Used by ntdll's MemoryWorkingSetExInformation path to report
+dnl per-page LargePage attribute via PAGE_IS_HUGE.
+AC_CHECK_MEMBERS([struct pm_scan_arg.size],,,
+[#ifdef HAVE_LINUX_FS_H
+#include <linux/fs.h>
+#endif])
+
 dnl Check for stat.st_blocks and ns-resolved times
 AC_CHECK_MEMBERS([
 	struct stat.st_mtim,

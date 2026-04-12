@@ -447,6 +447,9 @@
 /* Define to 1 if 'mt_gstat' is a member of 'struct mtget'. */
 #undef HAVE_STRUCT_MTGET_MT_GSTAT
 
+/* Define to 1 if 'size' is a member of 'struct pm_scan_arg'. */
+#undef HAVE_STRUCT_PM_SCAN_ARG_SIZE
+
 /* Define to 1 if 'sin6_scope_id' is a member of 'struct sockaddr_in6'. */
 #undef HAVE_STRUCT_SOCKADDR_IN6_SIN6_SCOPE_ID
 

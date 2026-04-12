@@ -445,20 +445,19 @@ static inline BOOL alloc_pioinfo_block(int fd)
     for(i=0; i<MSVCRT_FD_BLOCK_SIZE; i++)
     {
         block[i].handle = INVALID_HANDLE_VALUE;
-        if (ioinfo_is_crit_init(&block[i]))
-        {
-            /* Initialize crit section on block allocation for _MSVC_VER >= 140,
-             * ioinfo_is_crit_init() is always TRUE. */
-            InitializeCriticalSection(&block[i].crit);
-        }
+        /* NSPA: Always pre-initialize per-fd critical sections at block
+         * allocation time, matching _MSVCR_VER >= 140 behavior for all CRT
+         * versions.  This eliminates the LOCK_FILES() call inside
+         * init_ioinfo_cs(), so the fread/fwrite -> get_ioinfo() hot path
+         * never touches the global MSVCRT_file_cs — removing a priority-
+         * inversion source for RT audio threads. */
+        InitializeCriticalSection(&block[i].crit);
+        ioinfo_set_crit_init(&block[i]);
     }
     if(InterlockedCompareExchangePointer((void**)&MSVCRT___pioinfo[fd/MSVCRT_FD_BLOCK_SIZE], block, NULL))
     {
-        if (ioinfo_is_crit_init(&block[0]))
-        {
-            for(i = 0; i < MSVCRT_FD_BLOCK_SIZE; ++i)
-                DeleteCriticalSection(&block[i].crit);
-        }
+        for(i = 0; i < MSVCRT_FD_BLOCK_SIZE; ++i)
+            DeleteCriticalSection(&block[i].crit);
         free(block);
     }
     return TRUE;
@@ -4258,11 +4257,18 @@ FILE * CDECL _wfsopen(const wchar_t *path, const wchar_t *mode, int share)
   if (msvcrt_get_flags(mode, &open_flags, &stream_flags) == -1)
       return NULL;
 
-  LOCK_FILES();
+  /* NSPA: Open the fd OUTSIDE the global file-table lock.  _wsopen calls
+   * CreateFileW (a wineserver round-trip that can block for milliseconds)
+   * and allocates an fd slot via per-fd TryEnterCriticalSection — both are
+   * already thread-safe without MSVCRT_file_cs.  Holding the global lock
+   * during the syscall caused priority-inversion stalls in RT audio threads
+   * whose fread/fwrite path (via init_ioinfo_cs) needed the same lock. */
   fd = _wsopen(path, open_flags, share, _S_IREAD | _S_IWRITE);
   if (fd < 0)
-    file = NULL;
-  else if ((file = msvcrt_alloc_fp()) && msvcrt_init_fp(file, fd, stream_flags)
+    return NULL;
+
+  LOCK_FILES();
+  if ((file = msvcrt_alloc_fp()) && msvcrt_init_fp(file, fd, stream_flags)
    != -1)
     TRACE(":fd (%d) mode (%s) FILE* (%p)\n", fd, debugstr_w(mode), file);
   else if (file)
@@ -4272,9 +4278,9 @@ FILE * CDECL _wfsopen(const wchar_t *path, const wchar_t *mode, int share)
   }
 
   TRACE(":got (%p)\n",file);
-  if (fd >= 0 && !file)
-    _close(fd);
   UNLOCK_FILES();
+  if (!file)
+    _close(fd);
   return file;
 }
 

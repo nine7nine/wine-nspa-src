@@ -3067,7 +3067,9 @@ static void test_ioinfo_flags(void)
     info = &__pioinfo[(tempfd + 4) / MSVCRT_FD_BLOCK_SIZE][(tempfd + 4) % MSVCRT_FD_BLOCK_SIZE];
     ok(!!info, "NULL info.\n");
     ok(info->handle == INVALID_HANDLE_VALUE, "Unexpected handle %p.\n", info->handle);
-    ok(!info->exflag, "Unexpected exflag %#x.\n", info->exflag);
+    /* NSPA: per-fd critical sections are pre-initialized at block allocation
+     * time, so unused slots have EF_CRIT_INIT set (upstream lazily inits). */
+    ok(info->exflag == EF_CRIT_INIT, "Unexpected exflag %#x.\n", info->exflag);
 
     unlink(tempf);
     free(tempf);

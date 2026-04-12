@@ -2724,6 +2724,8 @@ KAFFINITY WINAPI KeQueryActiveProcessors( void )
     return affinity_mask;
 }
 
+volatile CCHAR KeNumberProcessors = 0;
+
 ULONG WINAPI KeQueryActiveProcessorCountEx(USHORT group_number)
 {
     TRACE("group_number %u.\n", group_number);
@@ -2925,8 +2927,22 @@ PVOID WINAPI MmAllocateContiguousMemorySpecifyCache( SIZE_T size,
                                                      PHYSICAL_ADDRESS BoundaryAddressMultiple,
                                                      MEMORY_CACHING_TYPE CacheType )
 {
-    FIXME(": stub\n");
-    return NULL;
+    DWORD protect = PAGE_READWRITE;
+    FIXME( ": ( %Iu %s %s %s %x ) semi-stub\n", size, wine_dbgstr_longlong(lowest_valid_address.QuadPart),
+                                            wine_dbgstr_longlong(highest_valid_address.QuadPart),
+                                            wine_dbgstr_longlong(BoundaryAddressMultiple.QuadPart), CacheType );
+    switch (CacheType)
+    {
+        case MmNonCached:
+            protect |= PAGE_NOCACHE;
+            break;
+        case MmWriteCombined:
+            protect |= PAGE_WRITECOMBINE;
+            break;
+        default:
+            break;
+    }
+    return VirtualAlloc( NULL, size, MEM_RESERVE|MEM_COMMIT, protect );
 }
 
 /***********************************************************************
@@ -3004,8 +3020,8 @@ PHYSICAL_ADDRESS WINAPI MmGetPhysicalAddress(void *virtual_address)
  */
 PVOID WINAPI MmMapIoSpace( PHYSICAL_ADDRESS PhysicalAddress, DWORD NumberOfBytes, DWORD CacheType )
 {
-    FIXME( "stub: 0x%08lx%08lx, %ld, %ld\n", PhysicalAddress.HighPart, PhysicalAddress.LowPart, NumberOfBytes, CacheType );
-    return NULL;
+    FIXME( "semi-stub: 0x%08lx%08lx, %ld, %ld\n", PhysicalAddress.HighPart, PhysicalAddress.LowPart, NumberOfBytes, CacheType );
+    return (PVOID)(ULONG_PTR)(PhysicalAddress.QuadPart);
 }
 
 
@@ -3821,6 +3837,23 @@ NTSTATUS WINAPI CmUnRegisterCallback(LARGE_INTEGER cookie)
 }
 
 /***********************************************************************
+ *           KeRegisterProcessorChangeCallback  (NTOSKRNL.EXE.@)
+ */
+void * WINAPI KeRegisterProcessorChangeCallback(PROCESSOR_CALLBACK_FUNCTION *function, void *context, ULONG flags)
+{
+    FIXME("(%p %p %lu) stub\n", function, context, flags);
+    return (void *)0xdeadbeef;
+}
+
+/***********************************************************************
+ *           KeDeregisterProcessorChangeCallback  (NTOSKRNL.EXE.@)
+ */
+void WINAPI KeDeregisterProcessorChangeCallback(void *handle)
+{
+    FIXME("%p stub\n", handle);
+}
+
+/***********************************************************************
  *           IoAttachDevice  (NTOSKRNL.EXE.@)
  */
 NTSTATUS WINAPI IoAttachDevice(DEVICE_OBJECT *source, UNICODE_STRING *target, DEVICE_OBJECT *attached)
@@ -4554,6 +4587,16 @@ BOOLEAN WINAPI KdRefreshDebuggerNotPresent(void)
     return !KdDebuggerEnabled;
 }
 
+/***********************************************************************
+ *           KeIpiGenericCall  (NTOSKRNL.EXE.@)
+ */
+ULONG_PTR WINAPI KeIpiGenericCall(KIPI_BROADCAST_WORKER *worker, ULONG_PTR context)
+{
+    FIXME("semi-stub: %p %Ix\n", worker, context);
+
+    return worker(context);
+}
+
 struct generic_call_dpc_context
 {
     DEFERRED_REVERSE_BARRIER *reverse_barrier;
@@ -4816,6 +4859,7 @@ BOOL WINAPI DllMain( HINSTANCE inst, DWORD reason, LPVOID reserved )
         NtBuildNumber = NtCurrentTeb()->Peb->OSBuildNumber;
         ntoskrnl_heap = HeapCreate( HEAP_CREATE_ENABLE_EXECUTE, 0, 0 );
         dpc_call_tls_index = TlsAlloc();
+        KeNumberProcessors = (CCHAR)min( 64UL, KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS) );
         LdrRegisterDllNotification( 0, ldr_notify_callback, NULL, &ldr_notify_cookie );
         break;
     case DLL_PROCESS_DETACH:

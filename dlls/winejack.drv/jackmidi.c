@@ -155,12 +155,24 @@ static void notify_post(struct notify_context *notify)
 int jack_midi_process(jack_nframes_t nframes)
 {
     unsigned int i;
+    int had_input = 0;
+    void *dest_bufs[MAX_MIDI_PORTS];
 
+    /* Cache and clear output port buffers in one pass */
     for (i = 0; i < num_dests; i++)
+    {
         if (dests[i].port)
-            jack_midi_clear_buffer(jack_port_get_buffer(dests[i].port, nframes));
+        {
+            dest_bufs[i] = jack_port_get_buffer(dests[i].port, nframes);
+            jack_midi_clear_buffer(dest_bufs[i]);
+        }
+        else
+            dest_bufs[i] = NULL;
+    }
 
-    while (jack_ringbuffer_read_space(out_rb) >= RB_HDR_SIZE) {
+    /* Drain output ringbuffer → JACK MIDI port buffers */
+    while (jack_ringbuffer_read_space(out_rb) >= RB_HDR_SIZE)
+    {
         unsigned char hdr[RB_HDR_SIZE], data[4096];
         uint8_t dev_id; uint16_t len;
         if (jack_ringbuffer_peek(out_rb, (char *)hdr, RB_HDR_SIZE) < RB_HDR_SIZE) break;
@@ -169,26 +181,40 @@ int jack_midi_process(jack_nframes_t nframes)
         if (jack_ringbuffer_read_space(out_rb) < (size_t)(RB_HDR_SIZE + len)) break;
         jack_ringbuffer_read_advance(out_rb, RB_HDR_SIZE);
         jack_ringbuffer_read(out_rb, (char *)data, len);
-        if (dev_id < num_dests && dests[dev_id].port)
-            jack_midi_event_write(jack_port_get_buffer(dests[dev_id].port, nframes), 0, data, len);
+        if (dev_id < num_dests && dest_bufs[dev_id])
+            jack_midi_event_write(dest_bufs[dev_id], 0, data, len);
     }
 
-    for (i = 0; i < num_srcs; i++) {
+    /* Read JACK MIDI input → input ringbuffer.
+     * Batch the wakeup pipe write: one write() syscall per period,
+     * not per event. Syscalls in the RT callback are expensive. */
+    for (i = 0; i < num_srcs; i++)
+    {
         void *buf; uint32_t count, j;
         if (!srcs[i].port || srcs[i].state != 1) continue;
         buf = jack_port_get_buffer(srcs[i].port, nframes);
         count = jack_midi_get_event_count(buf);
-        for (j = 0; j < count; j++) {
+        for (j = 0; j < count; j++)
+        {
             jack_midi_event_t ev; unsigned char in_hdr[RB_HDR_SIZE];
             if (jack_midi_event_get(&ev, buf, j) != 0 || ev.size == 0 || ev.size > 4096) continue;
             in_hdr[0] = (unsigned char)i; in_hdr[1] = ev.size & 0xFF; in_hdr[2] = (ev.size >> 8) & 0xFF;
-            if (jack_ringbuffer_write_space(in_rb) >= (size_t)(RB_HDR_SIZE + ev.size)) {
+            if (jack_ringbuffer_write_space(in_rb) >= (size_t)(RB_HDR_SIZE + ev.size))
+            {
                 jack_ringbuffer_write(in_rb, (char *)in_hdr, RB_HDR_SIZE);
                 jack_ringbuffer_write(in_rb, (char *)ev.buffer, ev.size);
-                if (wakeup_pipe[1] >= 0) { char x = 1; (void)write(wakeup_pipe[1], &x, 1); }
+                had_input = 1;
             }
         }
     }
+
+    /* Single wakeup write for the entire period */
+    if (had_input && wakeup_pipe[1] >= 0)
+    {
+        char x = 1;
+        (void)write(wakeup_pipe[1], &x, 1);
+    }
+
     return 0;
 }
 
@@ -444,7 +470,7 @@ static void *in_notify_thread(void *arg)
     struct pollfd pfd; (void)arg;
     pfd.fd = wakeup_pipe[0]; pfd.events = POLLIN;
     while (!in_notify_quit) {
-        if (poll(&pfd, 1, 200) <= 0) continue;
+        if (poll(&pfd, 1, 10) <= 0) continue;  /* 10ms max latency for MIDI input */
         { char dr[64]; (void)read(wakeup_pipe[0], dr, sizeof(dr)); }
         while (jack_ringbuffer_read_space(in_rb) >= RB_HDR_SIZE) {
             unsigned char hdr[RB_HDR_SIZE], data[4096];

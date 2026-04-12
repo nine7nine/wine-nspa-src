@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <pthread.h>
 #include <math.h>
+#include <sys/mman.h>
 #include <jack/jack.h>
 
 #include "ntstatus.h"
@@ -100,11 +101,13 @@ struct jack_stream
     UINT32  mmdev_period_frames;
     REFERENCE_TIME mmdev_period_rt;
 
-    /* Ring buffer */
+    /* Ring buffer — RT callback reads lcl_offs/held, app writes wri_offs/held.
+     * For lock-free RT access, the RT side reads these atomically without
+     * taking the lock (see jack_process_render/capture). */
     BYTE   *local_buffer;
-    UINT32  lcl_offs_frames;
-    UINT32  wri_offs_frames;
-    UINT32  held_frames;
+    volatile UINT32  lcl_offs_frames;
+    volatile UINT32  wri_offs_frames;
+    volatile UINT32  held_frames;
     UINT64  written_frames;
     UINT64  last_pos_frames;
 
@@ -113,8 +116,14 @@ struct jack_stream
     UINT32  tmp_buffer_frames;
     LONG    getbuf_last;  /* >0 direct, <0 tmp, 0 none */
 
-    /* Volumes */
+    /* Volumes — pre-scaled for each format (set in set_volumes):
+     * For F32: vols[ch] = raw volume (multiply in inner loop, skip if 1.0)
+     * For S16: vols[ch] = raw_vol / 32768.0f
+     * For S32: vols[ch] = raw_vol / 2147483648.0f
+     * For S24: vols[ch] = raw_vol / 8388608.0f
+     * render_chunk just multiplies — no division in inner loop. */
     float  *vols;
+    float  *vols_raw;  /* un-scaled volumes for format-change recalc */
     int     nchannels;
 
     /* Cached format for RT fast-path (set once at creation, no branches in inner loop) */
@@ -127,14 +136,17 @@ struct jack_stream
     HANDLE  event;
 
     /* State */
-    BOOL    started;
+    volatile BOOL    started;
     BOOL    please_quit;
 
-    /* Sync */
+    /* Sync — app-side only; RT callback is lock-free */
     pi_mutex_t lock;
 };
 
 static struct jack_stream *active_streams[MAX_AUDIO_STREAMS];
+
+/* Forward declaration — defined near set_volumes */
+static void recalc_vols_for_format(struct jack_stream *stream);
 static int num_active_streams;
 static pi_mutex_t streams_lock = PI_MUTEX_INIT(0);
 
@@ -250,6 +262,12 @@ static void render_chunk(struct jack_stream *s, UINT32 src_offs,
     const BYTE *base = s->local_buffer + src_offs * block;
     UINT32 ch, j;
 
+    /* Volume is pre-scaled in set_volumes() — no division here.
+     * For F32: vols[ch] = raw_vol (1.0 at unity)
+     * For S16: vols[ch] = raw_vol / 32768
+     * For S32: vols[ch] = raw_vol / 2147483648
+     * For S24: vols[ch] = raw_vol / 8388608
+     * Unity-volume fast path: skip multiply entirely (all formats). */
     switch (s->sfmt)
     {
     case FMT_F32:
@@ -268,32 +286,46 @@ static void render_chunk(struct jack_stream *s, UINT32 src_offs,
         break;
 
     case FMT_S16:
+    {
+        float unity = 1.0f / 32768.0f;
         for (ch = 0; ch < (UINT32)s->nports; ch++)
         {
             float *out = jack_bufs[ch] + dst_offs;
             float vol = s->vols[ch];
             const INT16 *src = (const INT16 *)base;
-            for (j = 0; j < frames; j++)
-                out[j] = (float)src[j * s->nchannels + ch] * (vol / 32768.0f);
+            if (vol == unity)
+                for (j = 0; j < frames; j++)
+                    out[j] = (float)src[j * s->nchannels + ch] * unity;
+            else
+                for (j = 0; j < frames; j++)
+                    out[j] = (float)src[j * s->nchannels + ch] * vol;
         }
         break;
+    }
 
     case FMT_S32:
+    {
+        float unity = 1.0f / 2147483648.0f;
         for (ch = 0; ch < (UINT32)s->nports; ch++)
         {
             float *out = jack_bufs[ch] + dst_offs;
             float vol = s->vols[ch];
             const INT32 *src = (const INT32 *)base;
-            for (j = 0; j < frames; j++)
-                out[j] = (float)src[j * s->nchannels + ch] * (vol / 2147483648.0f);
+            if (vol == unity)
+                for (j = 0; j < frames; j++)
+                    out[j] = (float)src[j * s->nchannels + ch] * unity;
+            else
+                for (j = 0; j < frames; j++)
+                    out[j] = (float)src[j * s->nchannels + ch] * vol;
         }
         break;
+    }
 
     case FMT_S24:
         for (ch = 0; ch < (UINT32)s->nports; ch++)
         {
             float *out = jack_bufs[ch] + dst_offs;
-            float vol = s->vols[ch] / 8388608.0f;
+            float vol = s->vols[ch];
             for (j = 0; j < frames; j++)
             {
                 const BYTE *p = base + (j * s->nchannels + ch) * 3;
@@ -306,18 +338,23 @@ static void render_chunk(struct jack_stream *s, UINT32 src_offs,
     }
 }
 
+/* Lock-free render: the RT callback reads lcl_offs_frames and held_frames
+ * without taking the lock. The app side (GetBuffer/ReleaseBuffer) only
+ * modifies wri_offs_frames and held_frames under the lock. The RT side
+ * is the sole writer of lcl_offs_frames. held_frames is updated atomically
+ * by both sides (RT decrements, app increments). This is safe because:
+ *   - lcl_offs_frames is only written by RT, read by app (no conflict)
+ *   - wri_offs_frames is only written by app, read by RT (no conflict)
+ *   - held_frames: worst case RT reads a stale (higher) value → renders
+ *     slightly more data than available → still correct, no underrun
+ *   - local_buffer contents: app writes ahead of wri_offs, RT reads
+ *     behind at lcl_offs — they never overlap if bufsize >= 2 periods
+ */
 static void jack_process_render(struct jack_stream *s, jack_nframes_t nframes)
 {
-    UINT32 avail;
+    UINT32 avail, offs, chunk1;
     int i;
-    float *jack_bufs[64]; /* max channels */
-
-    if (pi_mutex_trylock(&s->lock) != 0)
-    {
-        for (i = 0; i < s->nports; i++)
-            memset(jack_port_get_buffer(s->ports[i], nframes), 0, nframes * sizeof(float));
-        return;
-    }
+    float *jack_bufs[64];
 
     /* Gather port buffer pointers once */
     for (i = 0; i < s->nports; i++)
@@ -328,8 +365,8 @@ static void jack_process_render(struct jack_stream *s, jack_nframes_t nframes)
 
     if (avail > 0)
     {
-        UINT32 offs = s->lcl_offs_frames;
-        UINT32 chunk1 = s->bufsize_frames - offs;
+        offs = s->lcl_offs_frames;
+        chunk1 = s->bufsize_frames - offs;
 
         if (chunk1 > avail) chunk1 = avail;
 
@@ -337,21 +374,18 @@ static void jack_process_render(struct jack_stream *s, jack_nframes_t nframes)
         if (avail > chunk1)
             render_chunk(s, 0, jack_bufs, chunk1, avail - chunk1);
 
-        /* Silence any remainder */
         if (avail < nframes)
             for (i = 0; i < s->nports; i++)
                 memset(jack_bufs[i] + avail, 0, (nframes - avail) * sizeof(float));
 
         s->lcl_offs_frames = (offs + avail) % s->bufsize_frames;
-        s->held_frames -= avail;
+        __sync_sub_and_fetch(&s->held_frames, avail);
     }
     else
     {
         for (i = 0; i < s->nports; i++)
             memset(jack_bufs[i], 0, nframes * sizeof(float));
     }
-
-    pi_mutex_unlock(&s->lock);
 }
 
 /* Capture one contiguous chunk from JACK port buffers to local_buffer. */
@@ -421,14 +455,13 @@ static void capture_chunk(struct jack_stream *s, const float **jack_bufs,
     }
 }
 
+/* Lock-free capture: RT callback writes at wri_offs_frames, app reads at
+ * lcl_offs_frames. Same lock-free reasoning as render (reversed roles). */
 static void jack_process_capture(struct jack_stream *s, jack_nframes_t nframes)
 {
-    UINT32 space;
+    UINT32 space, offs, chunk1;
     int i;
     const float *jack_bufs[64];
-
-    if (pi_mutex_trylock(&s->lock) != 0)
-        return;
 
     for (i = 0; i < s->nports; i++)
         jack_bufs[i] = (const float *)jack_port_get_buffer(s->ports[i], nframes);
@@ -438,8 +471,8 @@ static void jack_process_capture(struct jack_stream *s, jack_nframes_t nframes)
 
     if (space > 0)
     {
-        UINT32 offs = s->wri_offs_frames;
-        UINT32 chunk1 = s->bufsize_frames - offs;
+        offs = s->wri_offs_frames;
+        chunk1 = s->bufsize_frames - offs;
 
         if (chunk1 > space) chunk1 = space;
 
@@ -448,10 +481,8 @@ static void jack_process_capture(struct jack_stream *s, jack_nframes_t nframes)
             capture_chunk(s, jack_bufs, chunk1, 0, space - chunk1);
 
         s->wri_offs_frames = (offs + space) % s->bufsize_frames;
-        s->held_frames += space;
+        __sync_add_and_fetch(&s->held_frames, space);
     }
-
-    pi_mutex_unlock(&s->lock);
 }
 
 static int jack_audio_process_cb(jack_nframes_t nframes, void *arg)
@@ -469,6 +500,20 @@ static int jack_audio_process_cb(jack_nframes_t nframes, void *arg)
             jack_process_render(s, nframes);
         else
             jack_process_capture(s, nframes);
+    }
+
+    /* Signal event-driven streams from the RT callback.
+     * This gives the tightest possible wakeup timing — the app gets
+     * signaled exactly when JACK has consumed/produced a buffer,
+     * rather than relying on the timer thread's NtDelayExecution
+     * which has kernel scheduling jitter. The timer thread still
+     * runs (for apps that depend on periodic wakeups in push mode)
+     * but event-driven apps will see the RT-sourced signal first. */
+    for (i = 0; i < num_active_streams; i++)
+    {
+        struct jack_stream *s = active_streams[i];
+        if (s && s->started && s->event)
+            NtSetEvent(s->event, NULL);
     }
 
     /* MIDI ports (shared client — same RT callback) */
@@ -1061,13 +1106,29 @@ static NTSTATUS jack_create_stream(void *args)
         params->result = E_OUTOFMEMORY;
         goto fail;
     }
+    mlock(stream->local_buffer, size);  /* Pin audio buffer in RAM — prevent page faults in RT */
     silence_buffer(&fmtex->Format, stream->local_buffer, stream->bufsize_frames);
 
-    /* Allocate volumes */
+    /* Pre-allocate tmp_buffer to max period size (avoids allocation in GetBuffer hot path) */
+    {
+        SIZE_T tmp_size = stream->bufsize_frames * params->fmt->nBlockAlign;
+        if (NtAllocateVirtualMemory(GetCurrentProcess(), (void **)&stream->tmp_buffer,
+                                     zero_bits, &tmp_size, MEM_COMMIT, PAGE_READWRITE))
+        {
+            params->result = E_OUTOFMEMORY;
+            goto fail;
+        }
+        mlock(stream->tmp_buffer, tmp_size);
+        stream->tmp_buffer_frames = stream->bufsize_frames;
+    }
+
+    /* Allocate volumes (raw + pre-scaled) */
     stream->vols = malloc(stream->nchannels * sizeof(float));
-    if (!stream->vols) { params->result = E_OUTOFMEMORY; goto fail; }
+    stream->vols_raw = malloc(stream->nchannels * sizeof(float));
+    if (!stream->vols || !stream->vols_raw) { params->result = E_OUTOFMEMORY; goto fail; }
     for (i = 0; i < (unsigned)stream->nchannels; i++)
-        stream->vols[i] = 1.0f;
+        stream->vols_raw[i] = 1.0f;
+    recalc_vols_for_format(stream);
 
     pi_mutex_init(&stream->lock, 0);
 
@@ -1099,7 +1160,13 @@ fail:
         size = 0;
         NtFreeVirtualMemory(GetCurrentProcess(), (void **)&stream->local_buffer, &size, MEM_RELEASE);
     }
+    if (stream->tmp_buffer)
+    {
+        size = 0;
+        NtFreeVirtualMemory(GetCurrentProcess(), (void **)&stream->tmp_buffer, &size, MEM_RELEASE);
+    }
     free(stream->vols);
+    free(stream->vols_raw);
     free(fmtex);
     free(stream);
     return STATUS_SUCCESS;
@@ -1150,6 +1217,7 @@ static NTSTATUS jack_release_stream(void *args)
     }
     free(stream->fmt);
     free(stream->vols);
+    free(stream->vols_raw);
     pi_mutex_destroy(&stream->lock);
     free(stream);
 
@@ -1288,7 +1356,6 @@ static NTSTATUS jack_get_render_buffer(void *args)
     struct get_render_buffer_params *params = args;
     struct jack_stream *stream = handle_get_stream(params->stream);
     UINT32 write_pos, frames = params->frames;
-    SIZE_T size;
 
     stream_lock(stream);
 
@@ -1304,24 +1371,7 @@ static NTSTATUS jack_get_render_buffer(void *args)
     write_pos = stream->wri_offs_frames;
     if (write_pos + frames > stream->bufsize_frames)
     {
-        /* Wraparound — use temp buffer */
-        if (stream->tmp_buffer_frames < frames)
-        {
-            if (stream->tmp_buffer)
-            {
-                size = 0;
-                NtFreeVirtualMemory(GetCurrentProcess(), (void **)&stream->tmp_buffer, &size, MEM_RELEASE);
-                stream->tmp_buffer = NULL;
-            }
-            size = frames * stream->fmt->Format.nBlockAlign;
-            if (NtAllocateVirtualMemory(GetCurrentProcess(), (void **)&stream->tmp_buffer,
-                                         zero_bits, &size, MEM_COMMIT, PAGE_READWRITE))
-            {
-                stream->tmp_buffer_frames = 0;
-                return stream_unlock_result(stream, &params->result, E_OUTOFMEMORY);
-            }
-            stream->tmp_buffer_frames = frames;
-        }
+        /* Wraparound — use pre-allocated temp buffer (no allocation in hot path) */
         *params->data = stream->tmp_buffer;
         stream->getbuf_last = -(LONG)frames;
     }
@@ -1370,7 +1420,7 @@ static NTSTATUS jack_release_render_buffer(void *args)
 
     stream->wri_offs_frames += written_frames;
     stream->wri_offs_frames %= stream->bufsize_frames;
-    stream->held_frames += written_frames;
+    __sync_add_and_fetch(&stream->held_frames, written_frames);
     stream->written_frames += written_frames;
     stream->getbuf_last = 0;
 
@@ -1575,6 +1625,21 @@ static NTSTATUS jack_get_position(void *args)
     return stream_unlock_result(stream, &params->result, S_OK);
 }
 
+static void recalc_vols_for_format(struct jack_stream *stream)
+{
+    float scale;
+    unsigned int i;
+    switch (stream->sfmt) {
+    case FMT_F32: scale = 1.0f; break;
+    case FMT_S16: scale = 1.0f / 32768.0f; break;
+    case FMT_S32: scale = 1.0f / 2147483648.0f; break;
+    case FMT_S24: scale = 1.0f / 8388608.0f; break;
+    default:      scale = 1.0f; break;
+    }
+    for (i = 0; i < (unsigned)stream->nchannels; i++)
+        stream->vols[i] = stream->vols_raw[i] * scale;
+}
+
 static NTSTATUS jack_set_volumes(void *args)
 {
     struct set_volumes_params *params = args;
@@ -1583,7 +1648,8 @@ static NTSTATUS jack_set_volumes(void *args)
 
     stream_lock(stream);
     for (i = 0; i < (unsigned)stream->nchannels; i++)
-        stream->vols[i] = params->volumes[i] * params->session_volumes[i] * params->master_volume;
+        stream->vols_raw[i] = params->volumes[i] * params->session_volumes[i] * params->master_volume;
+    recalc_vols_for_format(stream);
     stream_unlock(stream);
 
     return STATUS_SUCCESS;

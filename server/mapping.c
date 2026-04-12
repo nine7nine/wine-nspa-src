@@ -381,32 +381,70 @@ static int check_current_dir_for_exec(void)
  *    supported (Linux < 4.16). NSPA targets Linux 5.x+ for NTSync, so
  *    this fallback is dead code. Worse, silently downgrading would lie
  *    to the caller about getting large pages.
- *  - Uses grow_file() (Wine's existing pwrite+ftruncate helper) instead
- *    of posix_fallocate, matching Wine's existing memfd path. grow_file
- *    works for both regular and HUGETLB memfds — for HUGETLB the pwrite
- *    forces the kernel to allocate huge pages from the reserve pool. */
+ *
+ * Sizing strategy:
+ *  - Non-HUGETLB memfd: use Wine's existing grow_file (pwrite + ftruncate)
+ *    matching the prior simple memfd path.
+ *  - MFD_HUGETLB memfd: use posix_fallocate. hugetlbfs does NOT support
+ *    pwrite (it only allows mmap-based access — pwrite returns EINVAL),
+ *    which is what grow_file uses internally. fallocate IS supported by
+ *    hugetlbfs since Linux 4.3 and pre-allocates the actual huge pages
+ *    from the reserve pool, surfacing "out of huge pages" as an error
+ *    at create-time instead of SIGBUS at access-time. */
 static int create_memfd( unsigned int sec_flags, file_pos_t size )
 {
     int fd;
     unsigned int memfd_flags = 0;
     char memfd_name[64];
+    int large_pages = 0;
 
 #ifdef MFD_EXEC
     memfd_flags |= MFD_EXEC;
 #endif
 #ifdef MFD_HUGETLB
     if (sec_flags & SEC_LARGE_PAGES)
+    {
         memfd_flags |= MFD_HUGETLB;
+        large_pages = 1;
+    }
 #endif
 
     snprintf( memfd_name, sizeof(memfd_name), "wine-mapping-%x", sec_flags );
     fd = memfd_create( memfd_name, memfd_flags );
     if (fd == -1) return -1;
 
-    if (!grow_file( fd, size ))
+    if (large_pages)
     {
-        close( fd );
-        return -1;
+#ifdef HAVE_POSIX_FALLOCATE
+        /* hugetlbfs doesn't accept pwrite (used by grow_file), so use
+         * posix_fallocate which goes through the fs's fallocate op.
+         * Returns 0 on success, errno value on failure (does NOT set errno). */
+        int rc = posix_fallocate( fd, 0, size );
+        if (rc != 0)
+        {
+            errno = rc;
+            close( fd );
+            return -1;
+        }
+#else
+        /* No posix_fallocate available — try ftruncate as a last resort.
+         * On hugetlbfs this sets the file size but pages get allocated
+         * on first access (potentially SIGBUSing if reserves are exhausted). */
+        if (ftruncate( fd, size ) == -1)
+        {
+            close( fd );
+            return -1;
+        }
+#endif
+    }
+    else
+    {
+        /* Non-HUGETLB memfd — use Wine's standard grow_file helper. */
+        if (!grow_file( fd, size ))
+        {
+            close( fd );
+            return -1;
+        }
     }
     return fd;
 }

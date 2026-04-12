@@ -53,6 +53,7 @@ tests=(
     "fork-mutex 100"
     "cs-contention"
     "signal-recursion 4 500"
+    "large-pages"
 )
 if [[ "$INCLUDE_PRIORITY" == "1" ]]; then
     tests+=("priority")

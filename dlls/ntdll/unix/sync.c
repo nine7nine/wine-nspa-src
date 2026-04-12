@@ -607,7 +607,7 @@ static struct inproc_sync *cache_inproc_sync( HANDLE handle, struct inproc_sync 
         else
         {
             static const size_t size = INPROC_SYNC_CACHE_BLOCK_SIZE * sizeof(struct inproc_sync);
-            void *ptr = anon_mmap_alloc( size, PROT_READ | PROT_WRITE );
+            void *ptr = anon_mmap_alloc( size, PROT_READ | PROT_WRITE, LARGE_PAGES_NONE );
             if (ptr == MAP_FAILED) return sync;
             inproc_sync_cache[entry] = ptr;
         }
@@ -3010,6 +3010,24 @@ NTSTATUS WINAPI NtCreateSection( HANDLE *handle, ACCESS_MASK access, const OBJEC
 
     *handle = 0;
 
+    /* NSPA: SEC_LARGE_PAGES validation per Windows semantics:
+     *  - The size argument is required (not NULL)
+     *  - The size must be a multiple of LargePageMinimum
+     *  - The mapping cannot be backed by a file (anonymous only)
+     *  - LargePageMinimum must be non-zero (host has hugepages configured)
+     * The wineserver-side check (commit 0074 cmt 1/5) handles
+     * SeLockMemoryPrivilege; this is the client-side parameter sanity. */
+    if (sec_flags & SEC_LARGE_PAGES)
+    {
+        extern struct _KUSER_SHARED_DATA *user_shared_data;
+        SIZE_T min_size = user_shared_data->LargePageMinimum;
+
+        if (file != NULL || size == NULL) return STATUS_INVALID_PARAMETER;
+        if (min_size == 0 || size->QuadPart == 0 ||
+            (size->QuadPart % min_size) != 0)
+            return STATUS_INVALID_PARAMETER;
+    }
+
     switch (protect & 0xff)
     {
     case PAGE_READONLY:
@@ -3468,7 +3486,7 @@ static union tid_alert_entry *get_tid_alert_entry( HANDLE tid )
     if (!tid_alert_blocks[block_idx])
     {
         static const size_t size = TID_ALERT_BLOCK_SIZE * sizeof(union tid_alert_entry);
-        void *ptr = anon_mmap_alloc( size, PROT_READ | PROT_WRITE );
+        void *ptr = anon_mmap_alloc( size, PROT_READ | PROT_WRITE, LARGE_PAGES_NONE );
         if (ptr == MAP_FAILED) return NULL;
         if (InterlockedCompareExchangePointer( (void **)&tid_alert_blocks[block_idx], ptr, NULL ))
             munmap( ptr, size ); /* someone beat us to it */

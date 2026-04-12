@@ -2421,24 +2421,10 @@ static NTSTATUS alsa_get_prop_value(void *args)
     return STATUS_SUCCESS;
 }
 
-/* NSPA: midi_get_driver — delegate MIDI to winejack.drv when NSPA_JACK_MIDI
- * is set.  This lets ALSA remain the audio driver while JACK handles MIDI
- * directly, bypassing the ALSA sequencer (and its JACK bridge overhead). */
 static NTSTATUS alsa_midi_get_driver(void *args)
 {
     WCHAR *name = args;
-    const char *env = getenv("NSPA_JACK_MIDI");
-
-    if (env && *env && *env != '0')
-    {
-        /* Tell mmdevapi to load winejack.drv for MIDI */
-        static const WCHAR jackW[] = {'j','a','c','k',0};
-        memcpy(name, jackW, sizeof(jackW));
-        ERR("NSPA RT:MIDI: delegating MIDI to winejack.drv (NSPA_JACK_MIDI)\n");
-    }
-    else
-        name[0] = 0; /* empty = use same driver (ALSA MIDI) */
-
+    name[0] = 0; /* use same driver for MIDI */
     return STATUS_SUCCESS;
 }
 

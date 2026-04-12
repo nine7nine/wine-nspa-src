@@ -145,12 +145,23 @@ BOOL WINAPI DECLSPEC_HOTPATCH FlushInstructionCache( HANDLE process, LPCVOID add
 }
 
 
+/* NSPA: KUSER_SHARED_DATA is mapped at the well-known fixed user address
+ * 0x7ffe0000 on all Windows architectures. Same pattern as
+ * dlls/kernelbase/sync.c::user_shared_data. Used by GetLargePageMinimum
+ * to read the actual hugepage size discovered by wineserver from
+ * /sys/kernel/mm/hugepages (see server/mapping.c::create_user_data_mapping). */
+static const struct _KUSER_SHARED_DATA *user_shared_data = (struct _KUSER_SHARED_DATA *)0x7ffe0000;
+
 /***********************************************************************
  *          GetLargePageMinimum   (kernelbase.@)
  */
 SIZE_T WINAPI GetLargePageMinimum(void)
 {
-    return 2 * 1024 * 1024;
+    /* NSPA: read the kernel's actual hugepage size as discovered by
+     * wineserver, instead of returning a hardcoded 2 MB. Returns 0 if
+     * no hugepages are configured on the host — apps that check this
+     * will know to take their fallback path. */
+    return user_shared_data->LargePageMinimum;
 }
 
 

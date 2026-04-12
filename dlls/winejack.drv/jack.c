@@ -469,7 +469,8 @@ static int jack_bufsize_changed_cb(jack_nframes_t nframes, void *arg)
 {
     (void)arg;
     jack_buf_frames = nframes;
-    TRACE("JACK buffer size changed to %u\n", nframes);
+    /* No TRACE here — this callback runs on a JACK thread with no TEB,
+     * so Wine debug functions would segfault. */
     return 0;
 }
 
@@ -743,12 +744,11 @@ static NTSTATUS jack_get_device_period(void *args)
 
     if (params->def_period)
     {
-        /* Default period: use JACK's period rounded to nearest standard Windows
-         * period.  Must be >= min_period for the WASAPI contract. */
-        if (jack_period >= 200000)
+        /* Default period: 10ms (standard Windows default).  If JACK's period
+         * is larger than 10ms, use JACK's period directly since that's the
+         * real hardware constraint and we can't service faster. */
+        if (jack_period > 100000)
             *params->def_period = jack_period;
-        else if (jack_period > 100000)
-            *params->def_period = 200000;
         else
             *params->def_period = 100000;
     }
@@ -943,6 +943,7 @@ static NTSTATUS jack_create_stream(void *args)
     stream->mmdev_period_rt = params->period;
     stream->mmdev_period_frames = muldiv(params->fmt->nSamplesPerSec,
                                           params->period, 10000000);
+
     if (!stream->mmdev_period_frames)
     {
         free(stream);

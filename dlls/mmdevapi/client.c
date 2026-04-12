@@ -154,10 +154,12 @@ static HRESULT adjust_timing(struct audio_client *client, const BOOLEAN force_de
             else if (flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK) {
                 if (*duration != *period)
                     return AUDCLNT_E_BUFDURATION_PERIOD_NOT_EQUAL;
-
-                FIXME("EXCLUSIVE mode with EVENTCALLBACK\n");
-
-                return AUDCLNT_E_DEVICE_IN_USE;
+                /* NSPA: allow exclusive + event-driven (the standard
+                 * Windows low-latency path). All backends handle this:
+                 * winejack uses the JACK process callback as the RT
+                 * event source; winealsa uses the same timer_loop that
+                 * already drives shared+event mode. duration == period
+                 * gives a single-period buffer. */
             } else if (*duration < 8 * *period)
                 *duration = 8 * *period; /* May grow above 2s. */
         }

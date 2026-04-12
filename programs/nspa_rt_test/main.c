@@ -72,6 +72,26 @@ WINBASEAPI SIZE_T WINAPI GetLargePageMinimum(void);
 typedef NTSTATUS (WINAPI *PFN_NtAllocateVirtualMemoryEx)(
     HANDLE, PVOID *, SIZE_T *, ULONG, ULONG, MEM_EXTENDED_PARAMETER *, ULONG );
 WINBASEAPI NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE, PVOID *, SIZE_T *, ULONG );
+/* QueryWorkingSetEx — K32QueryWorkingSetEx in kernel32.dll.
+ * We define our own struct to avoid pulling in <psapi.h> or <winternl.h>
+ * which would conflict with our existing STATUS_* defines. */
+typedef union {
+    ULONG_PTR Flags;
+    struct {
+        ULONG_PTR Valid : 1;
+        ULONG_PTR ShareCount : 3;
+        ULONG_PTR Win32Protection : 11;
+        ULONG_PTR Shared : 1;
+        ULONG_PTR Node : 6;
+        ULONG_PTR Locked : 1;
+        ULONG_PTR LargePage : 1;
+    };
+} NSPA_WSE_BLOCK;
+typedef struct {
+    PVOID          VirtualAddress;
+    NSPA_WSE_BLOCK VirtualAttributes;
+} NSPA_WSE_INFO;
+typedef BOOL (WINAPI *PFN_K32QueryWorkingSetEx)( HANDLE, PVOID, DWORD );
 
 /* ════════════════════════════════════════════════════════════════════════
  *   Shared helpers
@@ -1845,6 +1865,68 @@ static int cmd_large_pages( int argc, char **argv )
         VirtualFree( addr, 0, MEM_RELEASE );
         print_verdict( 0, fail_reason );
         return 1;
+    }
+
+    /* ─────── QueryWorkingSetEx LargePage flag check ─────
+     *
+     * With the allocation still live and pages touched (so they're definitely
+     * present in the page tables), ask the kernel via PAGEMAP_SCAN whether it
+     * sees them as huge pages. This validates commit F's fill_working_set_info
+     * PAGEMAP_SCAN path that sets VirtualAttributes.LargePage from PAGE_IS_HUGE.
+     *
+     * We load K32QueryWorkingSetEx dynamically so the test binary still links
+     * even on older Wine builds that don't export it. */
+    print_section( "QueryWorkingSetEx LargePage flag" );
+    {
+        HMODULE hk32 = GetModuleHandleA( "kernel32.dll" );
+        PFN_K32QueryWorkingSetEx p_QWSEx = hk32
+            ? (PFN_K32QueryWorkingSetEx)GetProcAddress( hk32, "K32QueryWorkingSetEx" )
+            : NULL;
+
+        if (!p_QWSEx)
+        {
+            print_kv( "skip", "K32QueryWorkingSetEx not available" );
+        }
+        else
+        {
+            NSPA_WSE_INFO wse;
+            memset( &wse, 0, sizeof(wse) );
+            wse.VirtualAddress = addr;
+
+            if (!p_QWSEx( GetCurrentProcess(), &wse, sizeof(wse) ))
+            {
+                print_kv( "QueryWorkingSetEx", "call failed, GetLastError=%lu",
+                          (unsigned long)GetLastError() );
+                /* Non-fatal: the allocation itself is confirmed good. */
+            }
+            else
+            {
+                print_kv( "Valid",     "%llu", (unsigned long long)wse.VirtualAttributes.Valid );
+                print_kv( "LargePage", "%llu", (unsigned long long)wse.VirtualAttributes.LargePage );
+                print_kv( "Shared",    "%llu", (unsigned long long)wse.VirtualAttributes.Shared );
+
+                if (!wse.VirtualAttributes.Valid)
+                {
+                    print_kv( "warning", "page not marked Valid — kernel may not have"
+                              " faulted it into the page table yet (unusual after touch)" );
+                }
+                else if (!wse.VirtualAttributes.LargePage)
+                {
+                    snprintf( fail_reason, sizeof(fail_reason),
+                              "QueryWorkingSetEx reports Valid=1 but LargePage=0 for a "
+                              "MEM_LARGE_PAGES allocation — fill_working_set_info is not "
+                              "reporting PAGE_IS_HUGE (PAGEMAP_SCAN path may be missing or "
+                              "falling back to pread)" );
+                    VirtualFree( addr, 0, MEM_RELEASE );
+                    print_verdict( 0, fail_reason );
+                    return 1;
+                }
+                else
+                {
+                    print_kv( "result", "LargePage=1 — PAGEMAP_SCAN path confirmed" );
+                }
+            }
+        }
     }
 
     /* Free and verify HugePages_Free is restored. */

@@ -73,12 +73,14 @@
 #undef host_page_size
 #endif
 
-#if defined(HAVE_LINUX_USERFAULTFD_H) && defined(HAVE_LINUX_FS_H) && !defined(__ANDROID__)
-# include <linux/userfaultfd.h>
+#if defined(HAVE_LINUX_FS_H) && !defined(__ANDROID__)
 # include <linux/fs.h>
-#if defined(UFFD_FEATURE_WP_ASYNC) && defined(PM_SCAN_WP_MATCHING)
-#define USE_UFFD_WRITEWATCH
-#endif
+# if defined(HAVE_LINUX_USERFAULTFD_H)
+#  include <linux/userfaultfd.h>
+#  if defined(UFFD_FEATURE_WP_ASYNC) && defined(PM_SCAN_WP_MATCHING)
+#   define USE_UFFD_WRITEWATCH
+#  endif
+# endif
 #endif
 
 #include "ntstatus.h"
@@ -6121,13 +6123,118 @@ static void fill_working_set_info( struct fill_working_set_info_data *d, struct 
 #else
 static int pagemap_fd = -2;
 
+#ifdef HAVE_STRUCT_PM_SCAN_ARG_SIZE
+/* Process-wide PAGEMAP_SCAN support state.
+ *   0  untried (next call probes by attempting a real scan)
+ *   1  supported (kernel >= 6.7 with PAGEMAP_SCAN ioctl)
+ *  -1  unsupported (kernel rejected the ioctl; fall back to /proc/self/pagemap pread)
+ *
+ * The probe is the first real scan: if it succeeds, we record the verdict and
+ * use the result. If it fails, we record "unsupported" and use pread for the
+ * remainder of this call and every future call. */
+static int pm_scan_supported = 0;
+#endif
+
 struct fill_working_set_info_data
 {
+    /* Read-bulk pagemap fallback (kernel < 6.7 or HAVE_STRUCT_PM_SCAN_ARG_SIZE
+     * undefined): 256-entry buffer of /proc/self/pagemap rows. */
     UINT64 pm_buffer[256];
     SIZE_T buffer_start;
     ssize_t buffer_len;
     SIZE_T end_page;
+#ifdef HAVE_STRUCT_PM_SCAN_ARG_SIZE
+    /* PAGEMAP_SCAN region cache. Each ioctl call writes a vector of
+     * struct page_region (start,end,categories) into pm_regions. The cache
+     * persists across multiple fill_working_set_info() invocations within a
+     * single get_working_set_ex() call, much like pm_buffer above. */
+    struct page_region pm_regions[256];
+    unsigned int pm_regions_count;   /* number of valid entries in pm_regions */
+    unsigned int pm_regions_idx;     /* monotonic cursor into pm_regions */
+    UINT64       pm_walk_end;        /* end address of the most recent scan */
+    char        *pm_scan_end;        /* end of the full address range to scan */
+    int          pm_scan_state;      /* per-call mirror of pm_scan_supported */
+#endif
 };
+
+#ifdef HAVE_STRUCT_PM_SCAN_ARG_SIZE
+/* Issue a PAGEMAP_SCAN ioctl starting at `from` and refill pm_regions[].
+ * Returns 1 on success, 0 if the ioctl was rejected (e.g. kernel < 6.7). */
+static int pm_scan_load( struct fill_working_set_info_data *d, char *from )
+{
+    struct pm_scan_arg arg;
+    int ret;
+
+    memset( &arg, 0, sizeof(arg) );
+    arg.size = sizeof(arg);
+    arg.start = (UINT64)(UINT_PTR)from;
+    arg.end = (UINT64)(UINT_PTR)d->pm_scan_end;
+    arg.vec = (UINT64)(UINT_PTR)d->pm_regions;
+    arg.vec_len = ARRAY_SIZE(d->pm_regions);
+    /* Match every page (anyof_mask=0 ⇒ no anyof filter; mask=0 ⇒ no required
+     * categories) so even fully-empty regions advance walk_end. We only care
+     * about three flags in the returned categories field. */
+    arg.return_mask = PAGE_IS_PRESENT | PAGE_IS_FILE | PAGE_IS_HUGE;
+
+    ret = ioctl( pagemap_fd, PAGEMAP_SCAN, &arg );
+    if (ret < 0) return 0;
+    d->pm_regions_count = ret;
+    d->pm_regions_idx = 0;
+    d->pm_walk_end = arg.walk_end;
+    return 1;
+}
+
+/* Look up the categories for the page at `addr`, refilling pm_regions[] from
+ * the kernel as needed. Returns 0 (all flags clear) if `addr` is not in any
+ * categorized region, or if PAGEMAP_SCAN fails (in which case pm_scan_state
+ * is also set to -1 so the caller falls back to pread). Addresses must be
+ * supplied in monotonically non-decreasing order.
+ *
+ * The fast path handles consecutive pages within the same region in two
+ * branches and a load — important because get_working_set_ex is called
+ * frequently by some Windows apps for large ranges. */
+static inline UINT64 pm_scan_categories( struct fill_working_set_info_data *d, char *addr )
+{
+    UINT64 a = (UINT64)(UINT_PTR)addr;
+    const struct page_region *r;
+
+    /* Fast path: addr falls in the same region as the previous lookup. */
+    if (d->pm_regions_idx < d->pm_regions_count)
+    {
+        r = &d->pm_regions[d->pm_regions_idx];
+        if (a < r->end && a >= r->start) return r->categories;
+    }
+
+    /* Slow path: refill / advance / search. */
+    if (a >= d->pm_walk_end)
+    {
+        if (a >= (UINT64)(UINT_PTR)d->pm_scan_end) return 0;
+        if (!pm_scan_load( d, addr ))
+        {
+            d->pm_scan_state = -1;
+            return 0;
+        }
+        if (a >= d->pm_walk_end)
+        {
+            /* Scan made no forward progress (shouldn't happen with vec_len=256
+             * over a non-empty range). Bail to the pread path. */
+            d->pm_scan_state = -1;
+            return 0;
+        }
+    }
+
+    while (d->pm_regions_idx < d->pm_regions_count
+           && d->pm_regions[d->pm_regions_idx].end <= a)
+        d->pm_regions_idx++;
+
+    if (d->pm_regions_idx < d->pm_regions_count)
+    {
+        r = &d->pm_regions[d->pm_regions_idx];
+        if (r->start <= a && a < r->end) return r->categories;
+    }
+    return 0;
+}
+#endif /* HAVE_STRUCT_PM_SCAN_ARG_SIZE */
 
 static void init_fill_working_set_info_data( struct fill_working_set_info_data *d, char *end )
 {
@@ -6135,6 +6242,13 @@ static void init_fill_working_set_info_data( struct fill_working_set_info_data *
     d->buffer_len = 0;
     d->end_page = (UINT_PTR)end / host_page_size;
     memset( d->pm_buffer, 0, sizeof(d->pm_buffer) );
+#ifdef HAVE_STRUCT_PM_SCAN_ARG_SIZE
+    d->pm_regions_count = 0;
+    d->pm_regions_idx = 0;
+    d->pm_walk_end = 0;
+    d->pm_scan_end = end;
+    d->pm_scan_state = pm_scan_supported;
+#endif
 
     if (pagemap_fd != -2) return;
 
@@ -6160,6 +6274,63 @@ static void fill_working_set_info( struct fill_working_set_info_data *d, struct 
     SIZE_T i, page;
     ssize_t len;
 
+#ifdef HAVE_STRUCT_PM_SCAN_ARG_SIZE
+    /* Preferred path: PAGEMAP_SCAN ioctl (Linux 6.7+).
+     *
+     * Compared to /proc/self/pagemap pread, this gives us PAGE_IS_HUGE — the
+     * one piece of information that lets us populate VirtualAttributes.LargePage
+     * — and is also incrementally cheaper because the kernel returns runs of
+     * pages with the same flags rather than one row per page.
+     *
+     * The first call doubles as a probe: if the ioctl is rejected, we mark
+     * pm_scan_supported = -1 process-wide and fall through to pread. */
+    if (d->pm_scan_state >= 0 && pagemap_fd >= 0)
+    {
+        /* All vprot/view-derived attributes are constant for the duration of
+         * this fill_working_set_info() call (one (view, vprot) pair). Hoist. */
+        const int vprot_alive = !(vprot & VPROT_GUARD) && (vprot & 0x0f);
+        const int view_shared = !is_view_valloc( view );
+        const DWORD win32_prot = get_win32_prot( vprot, view->protect );
+        SIZE_T scanned;
+
+        for (scanned = 0; scanned < count; ++scanned)
+        {
+            UINT64 cats;
+            int valid;
+
+            p = &info[ref[scanned].orig_index];
+            cats = pm_scan_categories( d, ref[scanned].addr );
+            if (d->pm_scan_state < 0) break;
+
+            valid = vprot_alive && !!(cats & PAGE_IS_PRESENT);
+            p->VirtualAttributes.Valid = valid;
+            p->VirtualAttributes.Shared = view_shared && !!(cats & PAGE_IS_FILE);
+            p->VirtualAttributes.LargePage = !!(cats & PAGE_IS_HUGE);
+            if (p->VirtualAttributes.Shared && valid)
+                p->VirtualAttributes.ShareCount = 1; /* FIXME */
+            if (valid)
+                p->VirtualAttributes.Win32Protection = win32_prot;
+        }
+
+        if (d->pm_scan_state >= 0)
+        {
+            /* First successful scan promotes the verdict process-wide. */
+            if (pm_scan_supported == 0) pm_scan_supported = 1;
+            return;
+        }
+
+        /* Probe failed (kernel doesn't support PAGEMAP_SCAN). Mark
+         * unsupported process-wide and fall through to pread for the pages
+         * we haven't filled yet. Anything filled before the failure already
+         * has correct attributes. */
+        if (pm_scan_supported == 0) pm_scan_supported = -1;
+        ref += scanned;
+        count -= scanned;
+    }
+#endif /* HAVE_STRUCT_PM_SCAN_ARG_SIZE */
+
+    /* /proc/self/pagemap pread fallback. Reads bit 63 (Present) and bit 61
+     * (File/Shared); cannot report LargePage. */
     for (i = 0; i < count; ++i)
     {
         page = (UINT_PTR)ref[i].addr / host_page_size;

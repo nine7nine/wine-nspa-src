@@ -29,6 +29,12 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#ifdef __linux__
+/* NSPA: for linux_get_min_hugepage_size() — scans /sys/kernel/mm/hugepages */
+#include <dirent.h>
+#include <errno.h>
+#include <limits.h>
+#endif
 #ifdef HAVE_LINUX_MEMFD_H
 # include <linux/memfd.h>
 #endif
@@ -1574,6 +1580,64 @@ struct obj_locator get_shared_object_locator( volatile void *object_shm )
     return locator;
 }
 
+#ifdef __linux__
+/* NSPA: scan /sys/kernel/mm/hugepages and return the SMALLEST configured
+ * hugepage size in bytes. Returns 0 if no hugepages are configured (or the
+ * directory can't be opened, e.g. on a kernel without hugetlbfs).
+ *
+ * Used to populate KUSER_SHARED_DATA::LargePageMinimum so that
+ * GetLargePageMinimum() in apps returns the actual smallest huge page the
+ * kernel can give us, rather than the hardcoded 2 MB Wine used to return.
+ * On a typical x86_64 system this returns 2*1024*1024 (2 MB) — the directory
+ * "hugepages-2048kB" exists when nr_hugepages-2048kB > 0. */
+static size_t linux_get_min_hugepage_size( void )
+{
+    DIR *sysfs_hugepages;
+    struct dirent *supported_size;
+    size_t min_size = 0;
+    size_t total_supported_sizes = 0;
+
+    sysfs_hugepages = opendir( "/sys/kernel/mm/hugepages" );
+    if (sysfs_hugepages == NULL) return 0;
+
+    while ((supported_size = readdir( sysfs_hugepages )) != NULL)
+    {
+        long hugepage_size;
+        char *endptr;
+
+        if (strncmp( supported_size->d_name, "hugepages-", 10 ) != 0)
+            continue;
+
+        errno = 0;
+        hugepage_size = strtol( &supported_size->d_name[10], &endptr, 10 );
+        /* Valid entry name format: "hugepages-NNNNkB". The number must
+         * parse cleanly and the suffix must start with 'k' (kilobytes). */
+        if (errno != 0 || endptr == &supported_size->d_name[10] || *endptr != 'k')
+            continue;
+        if (hugepage_size <= 0)
+            continue;
+
+        hugepage_size *= 1024;  /* directory uses kB; we want bytes */
+
+        if (total_supported_sizes == 0 || (size_t)hugepage_size < min_size)
+            min_size = hugepage_size;
+        total_supported_sizes++;
+    }
+
+    closedir( sysfs_hugepages );
+    return min_size;
+}
+#endif /* __linux__ */
+
+static size_t get_min_large_page_size( void )
+{
+#ifdef __linux__
+    return linux_get_min_hugepage_size();
+#else
+    return 0;
+#endif
+}
+
 struct object *create_user_data_mapping( struct object *root, const struct unicode_str *name,
                                         unsigned int attr, const struct security_descriptor *sd )
 {
@@ -1583,7 +1647,22 @@ struct object *create_user_data_mapping( struct object *root, const struct unico
     if (!(mapping = create_mapping( root, name, attr, sizeof(KUSER_SHARED_DATA),
                                     SEC_COMMIT, 0, FILE_READ_DATA | FILE_WRITE_DATA, sd ))) return NULL;
     ptr = mmap( NULL, mapping->size, PROT_WRITE, MAP_SHARED, get_unix_fd( mapping->fd ), 0 );
-    if (ptr != MAP_FAILED) user_shared_data = ptr;
+    if (ptr != MAP_FAILED)
+    {
+        size_t min_large_page_size;
+
+        user_shared_data = ptr;
+        /* NSPA: populate LargePageMinimum from the kernel's actual
+         * hugepage configuration. 0 means no hugepages reserved →
+         * GetLargePageMinimum() will return 0 → apps know to fall back. */
+        min_large_page_size = get_min_large_page_size();
+        if (min_large_page_size != 0)
+        {
+            user_shared_data->LargePageMinimum = min_large_page_size;
+            fprintf( stderr, "wine: NSPA RT:LargePages: hugepage size %u MB\n",
+                     (unsigned)(min_large_page_size / (1024 * 1024)) );
+        }
+    }
     return &mapping->obj;
 }
 

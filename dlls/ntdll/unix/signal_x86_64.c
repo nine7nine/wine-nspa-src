@@ -540,7 +540,7 @@ static inline TEB *get_current_teb(void)
 
 extern void __wine_syscall_dispatcher_instrumentation(void);
 static void *instrumentation_callback;
-static pthread_mutex_t instrumentation_callback_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pi_mutex_t instrumentation_callback_mutex = PI_MUTEX_INIT(0);
 
 void set_process_instrumentation_callback( void *callback )
 {

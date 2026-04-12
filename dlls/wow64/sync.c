@@ -1904,3 +1904,34 @@ NTSTATUS WINAPI wow64_NtConvertBetweenAuxiliaryCounterAndPerformanceCounter( UIN
 
     return NtConvertBetweenAuxiliaryCounterAndPerformanceCounter( flags, from, to, error );
 }
+
+
+/**********************************************************************
+ *           wow64_NtNspaGetUnixTid
+ */
+NTSTATUS WINAPI wow64_NtNspaGetUnixTid( UINT *args )
+{
+    return NtNspaGetUnixTid();
+}
+
+
+/**********************************************************************
+ *           wow64_NtNspaLockCriticalSectionPI
+ */
+NTSTATUS WINAPI wow64_NtNspaLockCriticalSectionPI( UINT *args )
+{
+    void *address = get_ptr( &args );
+
+    return NtNspaLockCriticalSectionPI( address );
+}
+
+
+/**********************************************************************
+ *           wow64_NtNspaUnlockCriticalSectionPI
+ */
+NTSTATUS WINAPI wow64_NtNspaUnlockCriticalSectionPI( UINT *args )
+{
+    void *address = get_ptr( &args );
+
+    return NtNspaUnlockCriticalSectionPI( address );
+}

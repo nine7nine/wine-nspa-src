@@ -229,7 +229,7 @@ NTSTATUS WINAPI NtNspaUnlockCriticalSectionPI( void *address );
  * version (~200-500 ns), this is ~100x faster on the steady state.
  */
 #ifdef _WIN64
-# define NSPA_UNIX_TID_OFFSET 0x108
+# define NSPA_UNIX_TID_OFFSET 0xf8
 #else
 # define NSPA_UNIX_TID_OFFSET 0x88
 #endif

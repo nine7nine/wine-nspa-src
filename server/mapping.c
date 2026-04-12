@@ -368,20 +368,76 @@ static int check_current_dir_for_exec(void)
     return (ret != MAP_FAILED);
 }
 
-/* create a temp file for anonymous mappings */
-static int create_temp_file( file_pos_t size )
+#ifdef HAVE_MEMFD_CREATE
+/* NSPA: memfd-backed temp file with optional MFD_HUGETLB for SEC_LARGE_PAGES.
+ *
+ * Significantly simplified vs the original misc-nspa/0074 patch:
+ *  - No seals: the original patch's fcntl(F_ADD_SEALS) call had a bug
+ *    (passed 4 args to fcntl when F_ADD_SEALS takes 3), so the
+ *    carefully-computed seal_flags was never actually applied.
+ *    Wine's existing memfd path doesn't use seals either.
+ *  - No MFD_HUGETLB→non-HUGETLB silent fallback: the patch fell back
+ *    to a non-huge-page memfd if MFD_HUGETLB|MFD_ALLOW_SEALING wasn't
+ *    supported (Linux < 4.16). NSPA targets Linux 5.x+ for NTSync, so
+ *    this fallback is dead code. Worse, silently downgrading would lie
+ *    to the caller about getting large pages.
+ *  - Uses grow_file() (Wine's existing pwrite+ftruncate helper) instead
+ *    of posix_fallocate, matching Wine's existing memfd path. grow_file
+ *    works for both regular and HUGETLB memfds — for HUGETLB the pwrite
+ *    forces the kernel to allocate huge pages from the reserve pool. */
+static int create_memfd( unsigned int sec_flags, file_pos_t size )
+{
+    int fd;
+    unsigned int memfd_flags = 0;
+    char memfd_name[64];
+
+#ifdef MFD_EXEC
+    memfd_flags |= MFD_EXEC;
+#endif
+#ifdef MFD_HUGETLB
+    if (sec_flags & SEC_LARGE_PAGES)
+        memfd_flags |= MFD_HUGETLB;
+#endif
+
+    snprintf( memfd_name, sizeof(memfd_name), "wine-mapping-%x", sec_flags );
+    fd = memfd_create( memfd_name, memfd_flags );
+    if (fd == -1) return -1;
+
+    if (!grow_file( fd, size ))
+    {
+        close( fd );
+        return -1;
+    }
+    return fd;
+}
+#endif /* HAVE_MEMFD_CREATE */
+
+/* create a temp file for anonymous mappings.
+ * NSPA: signature now takes sec_flags so SEC_LARGE_PAGES requests can
+ * route to memfd_create(MFD_HUGETLB). Callers without large-page needs
+ * pass 0 for sec_flags. */
+static int create_temp_file( unsigned int sec_flags, file_pos_t size )
 {
     static int temp_dir_fd = -1;
     char tmpfn[16];
     int fd;
 
-#if defined(HAVE_MEMFD_CREATE) && defined(MFD_EXEC)
-    if ((fd = memfd_create( "wine-mapping", MFD_EXEC )) != -1)
+#ifdef HAVE_MEMFD_CREATE
+    fd = create_memfd( sec_flags, size );
+    if (fd != -1) return fd;
+    /* If the caller specifically asked for SEC_LARGE_PAGES and memfd
+     * couldn't satisfy it, propagate the failure. Falling back to a
+     * regular tmpfile would silently downgrade large-page mappings to
+     * normal pages — the caller would think they got large pages when
+     * they didn't. Better to fail loudly so the caller's fallback path
+     * can take over. */
+    if (sec_flags & SEC_LARGE_PAGES)
     {
-        if (grow_file( fd, size )) return fd;
-        close( fd );
+        file_set_error();
+        return -1;
     }
 #endif
+
     if (temp_dir_fd == -1)
     {
         temp_dir_fd = server_dir_fd;
@@ -666,7 +722,7 @@ static int build_shared_mapping( struct mapping *mapping, size_t align_mask, int
 
     /* create a temp file for the mapping */
 
-    if ((shared_fd = create_temp_file( total_size )) == -1) return 0;
+    if ((shared_fd = create_temp_file( 0, total_size )) == -1) return 0;
     if (!(file = create_file_for_fd( shared_fd, FILE_GENERIC_READ|FILE_GENERIC_WRITE, 0 ))) return 0;
 
     if (!(buffer = malloc( max_size ))) goto error;
@@ -1209,7 +1265,7 @@ static struct mapping *create_mapping( struct object *root, const struct unicode
         }
         if ((flags & SEC_RESERVE) && !(mapping->committed = create_ranges())) goto error;
         mapping->size = round_size( mapping->size, page_mask );
-        if ((unix_fd = create_temp_file( mapping->size )) == -1) goto error;
+        if ((unix_fd = create_temp_file( flags, mapping->size )) == -1) goto error;
         if (!(mapping->fd = create_anonymous_fd( &mapping_fd_ops, unix_fd, &mapping->obj,
                                                  FILE_SYNCHRONOUS_IO_NONALERT ))) goto error;
         allow_fd_caching( mapping->fd );
@@ -1673,7 +1729,7 @@ struct object *create_user_data_mapping( struct object *root, const struct unico
  * Returns 1 on success, 0 on failure with set_error() called. */
 int create_request_shm( int *fd, struct request_shm **ptr )
 {
-    if ((*fd = create_temp_file( REQUEST_SHM_SIZE )) == -1) return 0;
+    if ((*fd = create_temp_file( 0, REQUEST_SHM_SIZE )) == -1) return 0;
 
     *ptr = mmap( NULL, REQUEST_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, *fd, 0 );
     if (*ptr == MAP_FAILED)

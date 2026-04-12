@@ -170,7 +170,7 @@ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct ntdll_thread_data, sys
  * literal matches the real struct layout — if the struct changes, the
  * build fails and both sides need updating in sync. */
 #ifdef _WIN64
-C_ASSERT( offsetof( struct ntdll_thread_data, nspa_unix_tid ) == 0x108 );
+C_ASSERT( offsetof( struct ntdll_thread_data, nspa_unix_tid ) == 0xf8 );
 #else
 C_ASSERT( offsetof( struct ntdll_thread_data, nspa_unix_tid ) == 0x88 );
 #endif

@@ -65,6 +65,7 @@
 @ stub KeSetTimeUpdateNotifyRoutine
 @ stub KefAcquireSpinLockAtDpcLevel
 @ stub KefReleaseSpinLockFromDpcLevel
+@ stdcall KeIpiGenericCall(ptr long)
 @ stdcall KeGenericCallDpc(ptr ptr)
 @ stdcall KeSignalCallDpcDone(ptr)
 @ stdcall KeSignalCallDpcSynchronize(ptr)
@@ -174,7 +175,7 @@
 @ stub ExInterlockedExtendZone
 @ stub ExInterlockedIncrementLong
 @ stub ExInterlockedInsertHeadList
-@ stub ExInterlockedInsertTailList
+@ stdcall ExInterlockedInsertTailList(ptr ptr ptr)
 @ stub ExInterlockedPopEntryList
 @ stub ExInterlockedPushEntryList
 @ stdcall ExInterlockedRemoveHeadList(ptr ptr)
@@ -605,7 +606,7 @@
 @ stdcall KeLeaveCriticalRegion()
 @ stub KeLoaderBlock
 @ stdcall -arch=x86_64 KeLowerIrql(long)
-@ stub KeNumberProcessors
+@ extern KeNumberProcessors
 @ stub KeProfileInterrupt
 @ stub KeProfileInterruptWithSource
 @ stub KePulseEvent
@@ -632,6 +633,8 @@
 @ stub KeReadStateTimer
 @ stub KeRegisterBugCheckCallback
 @ stub KeRegisterBugCheckReasonCallback
+@ stdcall KeRegisterProcessorChangeCallback(ptr ptr long)
+@ stdcall KeDeregisterProcessorChangeCallback(ptr)
 @ stub KeReleaseInterruptSpinLock
 @ stub KeReleaseMutant
 @ stdcall KeReleaseMutex(ptr long)

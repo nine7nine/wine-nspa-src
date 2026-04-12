@@ -55,6 +55,24 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* NSPA: minimal forward declarations for things winternl.h would
+ * normally pull in. Avoiding the full <winternl.h> + <ntstatus.h>
+ * include dance keeps the existing STATUS_GUARD_PAGE_VIOLATION macro
+ * (from winnt.h via windows.h) intact for the signal-recursion test. */
+#ifndef NTSTATUS
+typedef LONG NTSTATUS;
+#endif
+#ifndef STATUS_SUCCESS
+#define STATUS_SUCCESS ((NTSTATUS)0x00000000L)
+#endif
+WINBASEAPI SIZE_T WINAPI GetLargePageMinimum(void);
+/* NtAllocateVirtualMemoryEx — for the 1 GB huge-page sub-test in
+ * cmd_large_pages. Win10 1709+ API; not always declared by mingw's
+ * windows.h, so forward-declare via the same shape as winternl.h. */
+typedef NTSTATUS (WINAPI *PFN_NtAllocateVirtualMemoryEx)(
+    HANDLE, PVOID *, SIZE_T *, ULONG, ULONG, MEM_EXTENDED_PARAMETER *, ULONG );
+WINBASEAPI NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE, PVOID *, SIZE_T *, ULONG );
+
 /* ════════════════════════════════════════════════════════════════════════
  *   Shared helpers
  * ════════════════════════════════════════════════════════════════════════ */
@@ -1586,6 +1604,614 @@ static int cmd_signal_recursion(int argc, char **argv)
 }
 
 /* ════════════════════════════════════════════════════════════════════════
+ *   Subcommand: large-pages  (VirtualAlloc(MEM_LARGE_PAGES) end-to-end)
+ *
+ *   Validates the NSPA RT v2.5 large-pages port (misc-nspa/0074 commits
+ *   1-5 of 8). The path under test:
+ *
+ *     RtlAdjustPrivilege(SE_LOCK_MEMORY_PRIVILEGE)
+ *       → token now has the privilege enabled
+ *     VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE)
+ *       → wineserver create_mapping checks privilege → permits
+ *       → ntdll allocate_virtual_memory → map_view_large_pages
+ *       → mmap(MAP_PRIVATE | MAP_ANON | MAP_HUGETLB | MAP_LOCKED)
+ *       → mlock for explicit Windows-MEM_LARGE_PAGES semantics
+ *
+ *   The KEY validation is cross-checking /proc/meminfo before/after to
+ *   confirm the kernel ACTUALLY consumed huge pages. Without that
+ *   check, we'd only know that VirtualAlloc returned non-NULL — could
+ *   be a normal-page allocation (silent regression).
+ *
+ *   ── What bugs this test catches ──────────────────────────────────────
+ *
+ *   (1) commit 0074 cmt 5/5 (the big virtual.c port) regression:
+ *       map_view_large_pages broken or never reached → VirtualAlloc
+ *       returns non-NULL but kernel HugePages_Free does NOT decrement.
+ *   (2) commit 0074 cmt 1/5 server-side privilege gate broken:
+ *       create_mapping rejects with STATUS_PRIVILEGE_NOT_HELD even
+ *       though we enabled SeLockMemoryPrivilege. Caught: VirtualAlloc
+ *       returns NULL with GetLastError == ERROR_PRIVILEGE_NOT_HELD.
+ *   (3) commit 0074 cmt 3/5 GetLargePageMinimum broken:
+ *       returns 0 even though /proc/sys/vm/nr_hugepages > 0.
+ *       Caught: explicit GetLargePageMinimum call before alloc.
+ *   (4) Memory not actually accessible after alloc: write/read
+ *       round-trip on the returned pointer. SEGV → caught.
+ *   (5) HugePages_Free not restored after VirtualFree: leak detection.
+ *
+ *   ── Skip conditions ──────────────────────────────────────────────────
+ *
+ *   - /proc/meminfo not readable (non-Linux host or sandbox) → skip
+ *   - HugePages_Total == 0 (no hugepages reserved on host) → skip
+ *   - GetLargePageMinimum returns 0 → skip
+ *   - RtlAdjustPrivilege(SE_LOCK_MEMORY_PRIVILEGE) fails → skip
+ *
+ *   "Skip" produces a PASS verdict (the feature is correctly absent).
+ *   Failures during the actual alloc/touch/free cycle produce FAIL.
+ * ════════════════════════════════════════════════════════════════════════ */
+
+#define LP_TEST_NUM_PAGES 4   /* allocate 4 large pages = 8 MB on x86_64 */
+#define SE_LOCK_MEMORY_PRIVILEGE 4
+
+typedef NTSTATUS (WINAPI *PFN_RtlAdjustPrivilege)(ULONG, BOOLEAN, BOOLEAN, PBOOLEAN);
+
+/* Read a SIZE_T value from /proc/meminfo by key (e.g. "HugePages_Free").
+ * Returns the value if found, or (SIZE_T)-1 on any failure (file not
+ * readable, key not found, parse error). */
+static SIZE_T lp_read_meminfo( const char *key )
+{
+    HANDLE h;
+    char buf[8192];
+    DWORD bytes_read = 0;
+    char *p;
+    SIZE_T value = (SIZE_T)-1;
+
+    /* Z: drive maps to / in Wine. */
+    h = CreateFileA( "Z:\\proc\\meminfo", GENERIC_READ, FILE_SHARE_READ,
+                     NULL, OPEN_EXISTING, 0, NULL );
+    if (h == INVALID_HANDLE_VALUE) return (SIZE_T)-1;
+
+    if (!ReadFile( h, buf, sizeof(buf) - 1, &bytes_read, NULL ))
+    {
+        CloseHandle( h );
+        return (SIZE_T)-1;
+    }
+    CloseHandle( h );
+    buf[bytes_read] = '\0';
+
+    /* Find "Key:" at line start. /proc/meminfo lines look like:
+     *   HugePages_Free:      550     */
+    {
+        char needle[64];
+        snprintf( needle, sizeof(needle), "%s:", key );
+        p = strstr( buf, needle );
+    }
+    if (!p) return (SIZE_T)-1;
+    p += strlen( key ) + 1;
+
+    /* skip whitespace, then strtoul the number */
+    while (*p == ' ' || *p == '\t') p++;
+    value = (SIZE_T)strtoul( p, NULL, 10 );
+    return value;
+}
+
+static int cmd_large_pages( int argc, char **argv )
+{
+    HMODULE hntdll;
+    PFN_RtlAdjustPrivilege p_RtlAdjustPrivilege;
+    SIZE_T page_size, alloc_size;
+    BOOLEAN was_enabled;
+    NTSTATUS nt_status;
+    void *addr;
+    SIZE_T meminfo_total, meminfo_free_before, meminfo_free_during, meminfo_free_after;
+    DWORD last_err;
+    char fail_reason[256];
+    volatile char *test_ptr;
+    SIZE_T i;
+    BOOL accessible;
+
+    (void)argc; (void)argv;
+
+    print_banner( "large-pages", "VirtualAlloc(MEM_LARGE_PAGES) end-to-end validation" );
+
+    print_section( "preflight" );
+
+    /* Check /proc/meminfo for hugepage configuration first. */
+    meminfo_total = lp_read_meminfo( "HugePages_Total" );
+    meminfo_free_before = lp_read_meminfo( "HugePages_Free" );
+    if (meminfo_total == (SIZE_T)-1 || meminfo_free_before == (SIZE_T)-1)
+    {
+        print_kv( "/proc/meminfo", "not readable (non-Linux host or sandbox)" );
+        print_kv( "verdict", "SKIP — large pages cannot be tested without /proc/meminfo" );
+        print_verdict( 1, NULL );
+        return 0;
+    }
+    print_kv( "HugePages_Total",  "%llu", (unsigned long long)meminfo_total );
+    print_kv( "HugePages_Free",   "%llu  (before alloc)", (unsigned long long)meminfo_free_before );
+
+    if (meminfo_total == 0)
+    {
+        print_kv( "verdict", "SKIP — host has no hugepages reserved (nr_hugepages = 0)" );
+        print_verdict( 1, NULL );
+        return 0;
+    }
+
+    /* Get the page size from GetLargePageMinimum — this exercises the
+     * NSPA cmt 3/5 path that reads from KUSER_SHARED_DATA. */
+    page_size = GetLargePageMinimum();
+    print_kv( "GetLargePageMinimum", "%llu bytes (%llu KB)",
+              (unsigned long long)page_size, (unsigned long long)(page_size / 1024) );
+    if (page_size == 0)
+    {
+        snprintf( fail_reason, sizeof(fail_reason),
+                  "GetLargePageMinimum returned 0 but HugePages_Total=%llu — "
+                  "wineserver KUSER_SHARED_DATA::LargePageMinimum is 0",
+                  (unsigned long long)meminfo_total );
+        print_verdict( 0, fail_reason );
+        return 1;
+    }
+
+    alloc_size = page_size * LP_TEST_NUM_PAGES;
+    print_kv( "alloc size",       "%llu bytes (%d pages)",
+              (unsigned long long)alloc_size, LP_TEST_NUM_PAGES );
+
+    /* Enable SE_LOCK_MEMORY_PRIVILEGE on our token. */
+    hntdll = GetModuleHandleA( "ntdll.dll" );
+    p_RtlAdjustPrivilege = (PFN_RtlAdjustPrivilege)
+        GetProcAddress( hntdll, "RtlAdjustPrivilege" );
+    if (!p_RtlAdjustPrivilege)
+    {
+        print_kv( "verdict", "SKIP — RtlAdjustPrivilege not available" );
+        print_verdict( 1, NULL );
+        return 0;
+    }
+    nt_status = p_RtlAdjustPrivilege( SE_LOCK_MEMORY_PRIVILEGE, TRUE, FALSE, &was_enabled );
+    if (nt_status != STATUS_SUCCESS)
+    {
+        snprintf( fail_reason, sizeof(fail_reason),
+                  "RtlAdjustPrivilege(SE_LOCK_MEMORY_PRIVILEGE) failed (NTSTATUS=0x%lx)",
+                  (unsigned long)nt_status );
+        print_kv( "verdict", "SKIP — token cannot be granted SE_LOCK_MEMORY_PRIVILEGE" );
+        print_verdict( 1, NULL );
+        return 0;
+    }
+    print_kv( "SeLockMemory",     "enabled (was: %s)", was_enabled ? "yes" : "no" );
+
+    /* The actual VirtualAlloc(MEM_LARGE_PAGES) call. SetLastError to a
+     * sentinel before so we can tell whether the success path actually
+     * touched LastError. */
+    print_section( "alloc" );
+    SetLastError( 0xdeadbeef );
+    addr = VirtualAlloc( NULL, alloc_size,
+                         MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES,
+                         PAGE_READWRITE );
+    last_err = GetLastError();
+    if (last_err == 0xdeadbeef)
+        print_kv( "VirtualAlloc",     "%p  (LastError unchanged — success)", addr );
+    else
+        print_kv( "VirtualAlloc",     "%p  (GetLastError=%lu)", addr, (unsigned long)last_err );
+
+    if (!addr)
+    {
+        snprintf( fail_reason, sizeof(fail_reason),
+                  "VirtualAlloc(MEM_LARGE_PAGES) returned NULL, GetLastError=%lu",
+                  (unsigned long)last_err );
+        print_verdict( 0, fail_reason );
+        return 1;
+    }
+
+    /* Cross-check /proc/meminfo: HugePages_Free should have decremented
+     * by at least LP_TEST_NUM_PAGES (the kernel may also have committed
+     * other pages around the same time, so allow some slack). */
+    meminfo_free_during = lp_read_meminfo( "HugePages_Free" );
+    print_kv( "HugePages_Free",   "%llu  (after alloc, was %llu, delta %lld)",
+              (unsigned long long)meminfo_free_during,
+              (unsigned long long)meminfo_free_before,
+              (long long)((SSIZE_T)meminfo_free_before - (SSIZE_T)meminfo_free_during) );
+
+    if (meminfo_free_during > meminfo_free_before ||
+        (meminfo_free_before - meminfo_free_during) < (SIZE_T)LP_TEST_NUM_PAGES)
+    {
+        snprintf( fail_reason, sizeof(fail_reason),
+                  "HugePages_Free did not decrement by at least %d after alloc "
+                  "(before=%llu, after=%llu) — VirtualAlloc returned a pointer but "
+                  "the kernel did NOT consume huge pages. Likely silent regression "
+                  "in map_view_large_pages.",
+                  LP_TEST_NUM_PAGES,
+                  (unsigned long long)meminfo_free_before,
+                  (unsigned long long)meminfo_free_during );
+        VirtualFree( addr, 0, MEM_RELEASE );
+        print_verdict( 0, fail_reason );
+        return 1;
+    }
+
+    /* Touch every page — write a unique byte at each page boundary,
+     * then read it back. Catches the case where the mapping returns
+     * a valid pointer but the underlying memory isn't actually accessible. */
+    print_section( "touch" );
+    test_ptr = (volatile char *)addr;
+    for (i = 0; i < LP_TEST_NUM_PAGES; i++)
+        test_ptr[i * page_size] = (char)('A' + i);
+    accessible = TRUE;
+    for (i = 0; i < LP_TEST_NUM_PAGES; i++)
+    {
+        if (test_ptr[i * page_size] != (char)('A' + i)) { accessible = FALSE; break; }
+    }
+    print_kv( "page touch+read", "%s (%d pages)", accessible ? "OK" : "MISMATCH", LP_TEST_NUM_PAGES );
+    if (!accessible)
+    {
+        snprintf( fail_reason, sizeof(fail_reason),
+                  "memory not accessible: page %llu read back wrong value",
+                  (unsigned long long)i );
+        VirtualFree( addr, 0, MEM_RELEASE );
+        print_verdict( 0, fail_reason );
+        return 1;
+    }
+
+    /* Free and verify HugePages_Free is restored. */
+    print_section( "free" );
+    if (!VirtualFree( addr, 0, MEM_RELEASE ))
+    {
+        snprintf( fail_reason, sizeof(fail_reason),
+                  "VirtualFree failed, GetLastError=%lu", (unsigned long)GetLastError() );
+        print_verdict( 0, fail_reason );
+        return 1;
+    }
+    print_kv( "VirtualFree",      "OK" );
+
+    meminfo_free_after = lp_read_meminfo( "HugePages_Free" );
+    print_kv( "HugePages_Free",   "%llu  (after free, was %llu)",
+              (unsigned long long)meminfo_free_after,
+              (unsigned long long)meminfo_free_before );
+
+    /* The post-free count may not return to EXACTLY the pre-alloc count
+     * (other Wine machinery may have allocated/freed pages in the interim),
+     * but it should be at least within LP_TEST_NUM_PAGES of where we started. */
+    if (meminfo_free_after + LP_TEST_NUM_PAGES < meminfo_free_before)
+    {
+        snprintf( fail_reason, sizeof(fail_reason),
+                  "HugePages_Free did not recover after VirtualFree "
+                  "(before=%llu, after_free=%llu) — possible huge-page leak",
+                  (unsigned long long)meminfo_free_before,
+                  (unsigned long long)meminfo_free_after );
+        print_verdict( 0, fail_reason );
+        return 1;
+    }
+
+    /* ─────── Negative test 1: VirtualAlloc with unaligned size ───────
+     *
+     * Validates the size-alignment check in allocate_virtual_memory
+     * (commit 0074 cmt 5/8 — the "size % lp_unit != 0" branch). */
+    print_section( "negative: unaligned size" );
+    SetLastError( 0 );
+    {
+        void *bad = VirtualAlloc( NULL, page_size + 1,
+                                  MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES,
+                                  PAGE_READWRITE );
+        DWORD bad_err = GetLastError();
+        print_kv( "VirtualAlloc(p+1)", "%p  (GetLastError=%lu)", bad, (unsigned long)bad_err );
+        if (bad)
+        {
+            VirtualFree( bad, 0, MEM_RELEASE );
+            print_verdict( 0, "VirtualAlloc with unaligned size succeeded — should have failed with ERROR_INVALID_PARAMETER" );
+            return 1;
+        }
+        if (bad_err != ERROR_INVALID_PARAMETER)
+        {
+            snprintf( fail_reason, sizeof(fail_reason),
+                      "VirtualAlloc with unaligned size failed with %lu, expected ERROR_INVALID_PARAMETER (87)",
+                      (unsigned long)bad_err );
+            print_verdict( 0, fail_reason );
+            return 1;
+        }
+        print_kv( "result",            "correctly rejected with ERROR_INVALID_PARAMETER" );
+    }
+
+    /* ─────── Positive test 2: CreateFileMapping(SEC_LARGE_PAGES) ─────
+     *
+     * Different code path — goes through wineserver create_mapping
+     * (commit 0074 cmt 1/8 + cmt 4/8 memfd MFD_HUGETLB) rather than
+     * the direct map_view_large_pages path tested above. Same
+     * /proc/meminfo cross-check pattern. */
+    print_section( "CreateFileMapping(SEC_LARGE_PAGES)" );
+    {
+        HANDLE hmap;
+        void *map_addr;
+        SIZE_T mf_free_before, mf_free_during, mf_free_after;
+
+        mf_free_before = lp_read_meminfo( "HugePages_Free" );
+        print_kv( "HugePages_Free",   "%llu  (before mapping)", (unsigned long long)mf_free_before );
+
+        SetLastError( 0 );
+        hmap = CreateFileMappingA( INVALID_HANDLE_VALUE, NULL,
+                                   PAGE_READWRITE | SEC_COMMIT | SEC_LARGE_PAGES,
+                                   0, alloc_size, NULL );
+        if (!hmap)
+        {
+            snprintf( fail_reason, sizeof(fail_reason),
+                      "CreateFileMapping(SEC_LARGE_PAGES) returned NULL, GetLastError=%lu",
+                      (unsigned long)GetLastError() );
+            print_verdict( 0, fail_reason );
+            return 1;
+        }
+        print_kv( "CreateFileMapping", "OK  (handle=%p)", hmap );
+
+        map_addr = MapViewOfFile( hmap, FILE_MAP_ALL_ACCESS, 0, 0, alloc_size );
+        if (!map_addr)
+        {
+            snprintf( fail_reason, sizeof(fail_reason),
+                      "MapViewOfFile failed, GetLastError=%lu", (unsigned long)GetLastError() );
+            CloseHandle( hmap );
+            print_verdict( 0, fail_reason );
+            return 1;
+        }
+        print_kv( "MapViewOfFile",     "%p", map_addr );
+
+        mf_free_during = lp_read_meminfo( "HugePages_Free" );
+        print_kv( "HugePages_Free",   "%llu  (after map, delta %lld)",
+                  (unsigned long long)mf_free_during,
+                  (long long)((SSIZE_T)mf_free_before - (SSIZE_T)mf_free_during) );
+        if (mf_free_during > mf_free_before ||
+            (mf_free_before - mf_free_during) < (SIZE_T)LP_TEST_NUM_PAGES)
+        {
+            snprintf( fail_reason, sizeof(fail_reason),
+                      "CreateFileMapping/MapViewOfFile did not consume huge pages "
+                      "(before=%llu, after=%llu) — silent regression in memfd MFD_HUGETLB path",
+                      (unsigned long long)mf_free_before,
+                      (unsigned long long)mf_free_during );
+            UnmapViewOfFile( map_addr );
+            CloseHandle( hmap );
+            print_verdict( 0, fail_reason );
+            return 1;
+        }
+
+        /* Touch the mapped view */
+        ((volatile char *)map_addr)[0] = 'X';
+        ((volatile char *)map_addr)[alloc_size - 1] = 'Y';
+        if (((volatile char *)map_addr)[0] != 'X' || ((volatile char *)map_addr)[alloc_size - 1] != 'Y')
+        {
+            UnmapViewOfFile( map_addr );
+            CloseHandle( hmap );
+            print_verdict( 0, "MapViewOfFile mapping not accessible" );
+            return 1;
+        }
+        print_kv( "view touch",       "OK" );
+
+        UnmapViewOfFile( map_addr );
+        CloseHandle( hmap );
+
+        mf_free_after = lp_read_meminfo( "HugePages_Free" );
+        print_kv( "HugePages_Free",   "%llu  (after unmap)", (unsigned long long)mf_free_after );
+        if (mf_free_after + LP_TEST_NUM_PAGES < mf_free_before)
+        {
+            snprintf( fail_reason, sizeof(fail_reason),
+                      "HugePages_Free did not recover after CloseHandle "
+                      "(before=%llu, after=%llu) — section close didn't release huge pages",
+                      (unsigned long long)mf_free_before,
+                      (unsigned long long)mf_free_after );
+            print_verdict( 0, fail_reason );
+            return 1;
+        }
+    }
+
+    /* ─────── Positive test 3: 1 GB huge page via NtAllocateVirtualMemoryEx ─────
+     *
+     * Validates the LARGE_PAGES_HUGE branch in commit 0074 cmt 5/8.
+     * Uses MEM_EXTENDED_PARAMETER_NONPAGED_HUGE to request 1 GiB pages.
+     *
+     * Skip conditions:
+     *  - 32-bit binary: a 32-bit process has ~2 GiB of user address
+     *    space total, of which substantial portions are already used
+     *    by the loader/ntdll/kernel32/heap/stack. Finding a contiguous
+     *    1 GiB-aligned chunk is essentially impossible in practice.
+     *    Not a bug in LARGE_PAGES_HUGE — a host-environment limit.
+     *  - No 1 GB hugepages reserved on the host (we read
+     *    /sys/kernel/mm/hugepages/hugepages-1048576kB/free_hugepages
+     *    directly because /proc/meminfo only reports the default size).
+     *  - NtAllocateVirtualMemoryEx not exported (older Wine).
+     */
+    print_section( "1 GB huge page (NtAllocateVirtualMemoryEx)" );
+    if (sizeof(void *) == 4)
+    {
+        print_kv( "skip",         "32-bit process — 1 GB allocation requires a contiguous" );
+        print_kv( "",             "1 GB-aligned chunk in a ~2 GB address space (impractical)" );
+        print_kv( "",             "Re-run on a 64-bit Wine build to exercise this path." );
+        goto skip_1gb_test;
+    }
+    {
+        PFN_NtAllocateVirtualMemoryEx p_NtAllocVMEx;
+        SIZE_T sys_1g_free_before, sys_1g_free_after;
+        SIZE_T huge_size = (SIZE_T)1 << 30;  /* 1 GiB */
+        MEM_EXTENDED_PARAMETER ext = { 0 };
+        void *huge_addr = NULL;
+        SIZE_T huge_size_io = huge_size;
+        HANDLE h;
+        char buf[64];
+        DWORD br = 0;
+
+        /* Check /sys/kernel/mm/hugepages/hugepages-1048576kB/free_hugepages.
+         * 1 GB = 1048576 kB. */
+        h = CreateFileA( "Z:\\sys\\kernel\\mm\\hugepages\\hugepages-1048576kB\\free_hugepages",
+                         GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL );
+        if (h == INVALID_HANDLE_VALUE)
+        {
+            print_kv( "skip",         "no 1 GB hugepages directory in /sys (kernel doesn't support them)" );
+            goto skip_1gb_test;
+        }
+        if (!ReadFile( h, buf, sizeof(buf) - 1, &br, NULL ))
+        {
+            CloseHandle( h );
+            print_kv( "skip",         "could not read 1 GB free_hugepages" );
+            goto skip_1gb_test;
+        }
+        CloseHandle( h );
+        buf[br] = '\0';
+        sys_1g_free_before = (SIZE_T)strtoul( buf, NULL, 10 );
+        print_kv( "1GB free (before)", "%llu", (unsigned long long)sys_1g_free_before );
+
+        if (sys_1g_free_before == 0)
+        {
+            print_kv( "skip",         "no free 1 GB hugepages (host has 0 reserved)" );
+            goto skip_1gb_test;
+        }
+
+        p_NtAllocVMEx = (PFN_NtAllocateVirtualMemoryEx)
+            GetProcAddress( hntdll, "NtAllocateVirtualMemoryEx" );
+        if (!p_NtAllocVMEx)
+        {
+            print_kv( "skip",         "NtAllocateVirtualMemoryEx not available" );
+            goto skip_1gb_test;
+        }
+
+        ext.Type = MemExtendedParameterAttributeFlags;
+        ext.ULong64 = MEM_EXTENDED_PARAMETER_NONPAGED_HUGE;
+
+        nt_status = p_NtAllocVMEx( GetCurrentProcess(), &huge_addr, &huge_size_io,
+                                    MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES,
+                                    PAGE_READWRITE, &ext, 1 );
+        print_kv( "NtAllocateVMEx", "%p  (NTSTATUS=0x%lx)",
+                  huge_addr, (unsigned long)nt_status );
+
+        if (nt_status != STATUS_SUCCESS || !huge_addr)
+        {
+            snprintf( fail_reason, sizeof(fail_reason),
+                      "NtAllocateVirtualMemoryEx(NONPAGED_HUGE, 1 GiB) failed: NTSTATUS=0x%lx",
+                      (unsigned long)nt_status );
+            print_verdict( 0, fail_reason );
+            return 1;
+        }
+
+        /* Cross-check the 1 GB free count decremented by 1. */
+        h = CreateFileA( "Z:\\sys\\kernel\\mm\\hugepages\\hugepages-1048576kB\\free_hugepages",
+                         GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL );
+        if (h != INVALID_HANDLE_VALUE)
+        {
+            br = 0;
+            ReadFile( h, buf, sizeof(buf) - 1, &br, NULL );
+            CloseHandle( h );
+            buf[br] = '\0';
+            sys_1g_free_after = (SIZE_T)strtoul( buf, NULL, 10 );
+            print_kv( "1GB free (during)", "%llu  (delta %lld)",
+                      (unsigned long long)sys_1g_free_after,
+                      (long long)((SSIZE_T)sys_1g_free_before - (SSIZE_T)sys_1g_free_after) );
+
+            if (sys_1g_free_after >= sys_1g_free_before)
+            {
+                /* huge_addr was allocated but the 1GB pool didn't shrink — wrong page size */
+                {
+                    SIZE_T zero = 0;
+                    NtFreeVirtualMemory( GetCurrentProcess(), &huge_addr, &zero, MEM_RELEASE );
+                }
+                snprintf( fail_reason, sizeof(fail_reason),
+                          "NtAllocateVMEx returned a pointer but 1GB free count "
+                          "did not decrement (before=%llu, after=%llu) — kernel "
+                          "did NOT consume a 1GB hugepage. Likely the LARGE_PAGES_HUGE "
+                          "branch in map_view_large_pages is using the wrong page size.",
+                          (unsigned long long)sys_1g_free_before,
+                          (unsigned long long)sys_1g_free_after );
+                print_verdict( 0, fail_reason );
+                return 1;
+            }
+        }
+
+        /* Touch first and last byte to verify accessibility */
+        ((volatile char *)huge_addr)[0] = 'H';
+        ((volatile char *)huge_addr)[huge_size - 1] = 'G';
+        if (((volatile char *)huge_addr)[0] != 'H' || ((volatile char *)huge_addr)[huge_size - 1] != 'G')
+        {
+            SIZE_T zero = 0;
+            NtFreeVirtualMemory( GetCurrentProcess(), &huge_addr, &zero, MEM_RELEASE );
+            print_verdict( 0, "1GB huge-page mapping not accessible" );
+            return 1;
+        }
+        print_kv( "touch first+last",  "OK" );
+
+        {
+            SIZE_T zero = 0;
+            NTSTATUS free_st = NtFreeVirtualMemory( GetCurrentProcess(), &huge_addr, &zero, MEM_RELEASE );
+            print_kv( "NtFreeVirtualMemory", "NTSTATUS=0x%lx", (unsigned long)free_st );
+            if (free_st != STATUS_SUCCESS)
+            {
+                snprintf( fail_reason, sizeof(fail_reason),
+                          "NtFreeVirtualMemory failed for 1 GB huge page: NTSTATUS=0x%lx",
+                          (unsigned long)free_st );
+                print_verdict( 0, fail_reason );
+                return 1;
+            }
+        }
+    }
+skip_1gb_test:
+
+    /* ─────── Negative test 4: CreateFileMapping without privilege ─────
+     *
+     * Validates the wineserver create_mapping privilege gate
+     * (commit 0074 cmt 1/8). Disable SeLockMemoryPrivilege, retry,
+     * expect ERROR_PRIVILEGE_NOT_HELD, then re-enable. */
+    print_section( "negative: CreateFileMapping without privilege" );
+    {
+        BOOLEAN prev;
+        HANDLE bad_map;
+        DWORD bad_err;
+
+        nt_status = p_RtlAdjustPrivilege( SE_LOCK_MEMORY_PRIVILEGE, FALSE, FALSE, &prev );
+        if (nt_status != STATUS_SUCCESS)
+        {
+            print_kv( "skip",         "RtlAdjustPrivilege(disable) failed, NTSTATUS=0x%lx",
+                      (unsigned long)nt_status );
+        }
+        else
+        {
+            print_kv( "SeLockMemory", "disabled (was: %s)", prev ? "enabled" : "disabled" );
+
+            SetLastError( 0 );
+            bad_map = CreateFileMappingA( INVALID_HANDLE_VALUE, NULL,
+                                          PAGE_READWRITE | SEC_COMMIT | SEC_LARGE_PAGES,
+                                          0, alloc_size, NULL );
+            bad_err = GetLastError();
+            print_kv( "CreateFileMapping", "%p  (GetLastError=%lu)", bad_map, (unsigned long)bad_err );
+
+            if (bad_map)
+            {
+                CloseHandle( bad_map );
+                /* Re-enable before failing so the test cleanup leaves the
+                 * token in a sane state. */
+                p_RtlAdjustPrivilege( SE_LOCK_MEMORY_PRIVILEGE, TRUE, FALSE, &prev );
+                print_verdict( 0, "CreateFileMapping(SEC_LARGE_PAGES) succeeded without SeLockMemoryPrivilege — wineserver create_mapping gate is broken" );
+                return 1;
+            }
+            if (bad_err != ERROR_PRIVILEGE_NOT_HELD)
+            {
+                snprintf( fail_reason, sizeof(fail_reason),
+                          "CreateFileMapping without privilege failed with %lu, expected ERROR_PRIVILEGE_NOT_HELD (1314)",
+                          (unsigned long)bad_err );
+                p_RtlAdjustPrivilege( SE_LOCK_MEMORY_PRIVILEGE, TRUE, FALSE, &prev );
+                print_verdict( 0, fail_reason );
+                return 1;
+            }
+            print_kv( "result",       "correctly rejected with ERROR_PRIVILEGE_NOT_HELD" );
+
+            /* Re-enable for any cleanup that follows. */
+            p_RtlAdjustPrivilege( SE_LOCK_MEMORY_PRIVILEGE, TRUE, FALSE, &prev );
+        }
+    }
+
+    /* Note on a known gap from the upstream 0074 patch:
+     *   On real Windows, BOTH VirtualAlloc(MEM_LARGE_PAGES) AND
+     *   CreateFileMapping(SEC_LARGE_PAGES) require SeLockMemoryPrivilege.
+     *   The 0074 patch only adds the privilege check to the wineserver
+     *   create_mapping handler (file mapping path), not to ntdll's
+     *   allocate_virtual_memory (VirtualAlloc path). So a privilege-
+     *   negative test for VirtualAlloc would NOT fail on Wine-NSPA after
+     *   0074 — the alloc would proceed regardless of the token's
+     *   SeLockMemoryPrivilege state. We don't test that case here
+     *   because it's a known divergence. If we extend
+     *   allocate_virtual_memory to enforce the privilege (matching
+     *   Windows), add the negative test for that path too. */
+
+    print_verdict( 1, NULL );
+    return 0;
+}
+
+/* ════════════════════════════════════════════════════════════════════════
  *   Command dispatch
  * ════════════════════════════════════════════════════════════════════════ */
 
@@ -1605,6 +2231,7 @@ static struct command commands[] = {
     { "fork-mutex",      "spawn N child processes (validate process.c opt-out, default 100)", cmd_fork_mutex    },
     { "child-quickexit", "internal helper — used by fork-mutex (prints a line, exits 42)",    cmd_child_quickexit },
     { "signal-recursion","guard-page fault stress (validate virtual_mutex + signal path)",    cmd_signal_recursion },
+    { "large-pages",     "VirtualAlloc(MEM_LARGE_PAGES) end-to-end + /proc/meminfo cross-check", cmd_large_pages },
     { "help",            "show this help",                                                  cmd_help          },
     { NULL, NULL, NULL }
 };

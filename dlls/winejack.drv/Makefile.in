@@ -1,0 +1,7 @@
+UNIXLIB    = winejack.so
+UNIX_CFLAGS  =
+UNIX_LIBS    = -ljack $(PTHREAD_LIBS)
+
+SOURCES = \
+	jack.c \
+	jackmidi.c

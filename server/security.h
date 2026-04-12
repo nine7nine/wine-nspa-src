@@ -23,6 +23,7 @@
 
 #include <sys/types.h>
 
+extern const struct luid SeLockMemoryPrivilege;
 extern const struct luid SeIncreaseQuotaPrivilege;
 extern const struct luid SeSecurityPrivilege;
 extern const struct luid SeTakeOwnershipPrivilege;

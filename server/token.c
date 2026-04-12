@@ -41,6 +41,10 @@
 
 #define MAX_SUBAUTH_COUNT 1
 
+/* NSPA: SeLockMemoryPrivilege LUID = 4 matches the real Windows value
+ * (Wine historically didn't track LUIDs 1-4). Required by Windows for
+ * VirtualAlloc(MEM_LARGE_PAGES) and CreateFileMapping(SEC_LARGE_PAGES). */
+const struct luid SeLockMemoryPrivilege           = {  4, 0 };
 const struct luid SeIncreaseQuotaPrivilege        = {  5, 0 };
 const struct luid SeTcbPrivilege                  = {  7, 0 };
 const struct luid SeSecurityPrivilege             = {  8, 0 };
@@ -771,6 +775,7 @@ struct token *token_create_admin( unsigned primary, int impersonation_level, int
         { SeManageVolumePrivilege, 0 },
         { SeImpersonatePrivilege, SE_PRIVILEGE_ENABLED },
         { SeCreateGlobalPrivilege, SE_PRIVILEGE_ENABLED },
+        { SeLockMemoryPrivilege, SE_PRIVILEGE_ENABLED },
     };
     /* note: we don't include non-builtin groups here for the user -
      * telling us these is the job of a client-side program */

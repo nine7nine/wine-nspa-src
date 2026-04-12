@@ -738,8 +738,13 @@ SIZE_T WINAPI DECLSPEC_HOTPATCH HeapCompact( HANDLE heap, DWORD flags )
  */
 HANDLE WINAPI DECLSPEC_HOTPATCH HeapCreate( DWORD flags, SIZE_T init_size, SIZE_T max_size )
 {
+    /* NSPA: see dlls/kernel32/heap.c::HeapCreate for rationale. Enable
+     * LFH by default except for executable heaps. */
+    ULONG hci = 2;  /* HEAP_LFH */
     HANDLE ret = RtlCreateHeap( flags, NULL, max_size, init_size, NULL, NULL );
     if (!ret) SetLastError( ERROR_NOT_ENOUGH_MEMORY );
+    else if (!(flags & HEAP_CREATE_ENABLE_EXECUTE))
+        HeapSetInformation( ret, HeapCompatibilityInformation, &hci, sizeof(hci) );
     return ret;
 }
 

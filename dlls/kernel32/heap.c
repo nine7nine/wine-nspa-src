@@ -57,9 +57,19 @@ HANDLE WINAPI HeapCreate(
                 SIZE_T maxSize      /* [in] Maximum heap size */
 ) {
     HANDLE ret;
+    /* NSPA: enable LFH (Low Fragmentation Heap) for new heaps by
+     * default, unless the caller requested an executable heap (in
+     * which case LFH isn't used). Wine already auto-promotes heaps
+     * to LFH later via heap_allocate_block_lfh's threshold path;
+     * setting the compat info at creation time means early
+     * allocations go through LFH too, rather than waiting for
+     * the promotion heuristic to trip. */
+    ULONG hci = 2;  /* HEAP_LFH per dlls/ntdll/heap.c */
 
     ret = RtlCreateHeap( flags, NULL, maxSize, initialSize, NULL, NULL );
     if (!ret) SetLastError( ERROR_NOT_ENOUGH_MEMORY );
+    else if (!(flags & HEAP_CREATE_ENABLE_EXECUTE))
+        HeapSetInformation( ret, HeapCompatibilityInformation, &hci, sizeof(hci) );
     return ret;
 }
 

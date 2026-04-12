@@ -271,12 +271,59 @@ void *anon_mmap_fixed( void *start, size_t size, int prot, int flags )
     return mmap( start, size, prot, MAP_PRIVATE | MAP_ANON | MAP_FIXED | flags, -1, 0 );
 }
 
+/* NSPA: large-pages mmap flags. MAP_HUGETLB asks the kernel for huge-page
+ * backing; MAP_LOCKED locks the pages in RAM (a Windows-MEM_LARGE_PAGES
+ * mapping is also locked, matching SeLockMemoryPrivilege semantics). On
+ * kernels without one or both, fall back to 0 — the caller's mmap will
+ * return ENOMEM and the alloc fails normally. */
+#if defined(MAP_HUGETLB) && defined(MAP_LOCKED)
+#define MMAP_LARGE_PAGES_FLAG (MAP_HUGETLB | MAP_LOCKED)
+#else
+#define MMAP_LARGE_PAGES_FLAG 0
+#endif
+
+/* Windows "huge page" extension (MEM_EXTENDED_PARAMETER_NONPAGED_HUGE) is
+ * exactly 1 GiB. Linux supports this via MAP_HUGE_30 (1<<30 bytes) when
+ * the kernel has 1 GB hugepages reserved. */
+#define NSPA_HUGE_PAGE_SIZE (1ull << 30)
+
+/* Compute the mmap flags for a given large-pages type. For LARGE_PAGES_LARGE,
+ * we encode the page size via MAP_HUGE_SHIFT — the value is the log2 of the
+ * page size in bytes, packed into the high bits of the mmap flags word.
+ * For LARGE_PAGES_HUGE we hardcode log2(1 GiB) = 30. */
+static int mmap_large_pages_flags( enum large_pages_type type )
+{
+    switch (type)
+    {
+#ifdef MAP_HUGE_SHIFT
+    case LARGE_PAGES_LARGE:
+    {
+        ULONG min = user_shared_data->LargePageMinimum;
+        unsigned int log2 = 0;
+        /* compute log2(min) — min is always a power of 2 if non-zero */
+        while (min > 1) { log2++; min >>= 1; }
+        if (!log2) return 0;  /* LargePageMinimum not set, fall back to no hint */
+        return MMAP_LARGE_PAGES_FLAG | (log2 << MAP_HUGE_SHIFT);
+    }
+    case LARGE_PAGES_HUGE:
+        return MMAP_LARGE_PAGES_FLAG | (30 << MAP_HUGE_SHIFT);
+#else
+    case LARGE_PAGES_LARGE:
+    case LARGE_PAGES_HUGE:
+        return MMAP_LARGE_PAGES_FLAG;
+#endif
+    case LARGE_PAGES_NONE:
+    default:
+        return 0;
+    }
+}
+
 /* allocate anonymous mmap() memory at any address */
-void *anon_mmap_alloc( size_t size, int prot )
+void *anon_mmap_alloc( size_t size, int prot, enum large_pages_type type )
 {
     assert( !(size & host_page_mask) );
 
-    return mmap( NULL, size, prot, MAP_PRIVATE | MAP_ANON, -1, 0 );
+    return mmap( NULL, size, prot, MAP_PRIVATE | MAP_ANON | mmap_large_pages_flags( type ), -1, 0 );
 }
 
 #ifdef USE_UFFD_WRITEWATCH
@@ -1266,7 +1313,7 @@ static BOOL alloc_pages_vprot( const void *addr, size_t size )
     for (i = idx >> pages_vprot_shift; i < (end + pages_vprot_mask) >> pages_vprot_shift; i++)
     {
         if (pages_vprot[i]) continue;
-        if ((ptr = anon_mmap_alloc( pages_vprot_mask + 1, PROT_READ | PROT_WRITE )) == MAP_FAILED)
+        if ((ptr = anon_mmap_alloc( pages_vprot_mask + 1, PROT_READ | PROT_WRITE, LARGE_PAGES_NONE )) == MAP_FAILED)
         {
             ERR( "anon mmap error %s for vprot table, size %08lx\n", strerror(errno), pages_vprot_mask + 1 );
             return FALSE;
@@ -1759,7 +1806,7 @@ static struct file_view *alloc_view(void)
     }
     if (view_block_start == view_block_end)
     {
-        void *ptr = anon_mmap_alloc( view_block_size, PROT_READ | PROT_WRITE );
+        void *ptr = anon_mmap_alloc( view_block_size, PROT_READ | PROT_WRITE, LARGE_PAGES_NONE );
         if (ptr == MAP_FAILED) return NULL;
         view_block_start = ptr;
         view_block_end = view_block_start + view_block_size / sizeof(*view_block_start);
@@ -2319,7 +2366,7 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
 
         for (;;)
         {
-            if ((ptr = anon_mmap_alloc( view_size, unix_prot )) == MAP_FAILED)
+            if ((ptr = anon_mmap_alloc( view_size, unix_prot, LARGE_PAGES_NONE )) == MAP_FAILED)
             {
                 status = (errno == ENOMEM) ? STATUS_NO_MEMORY : STATUS_INVALID_PARAMETER;
                 ERR( "anon mmap error %s, size %p, unix_prot %#x\n",
@@ -2337,6 +2384,84 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
 done:
     status = create_view( view_ret, ptr, size, vprot );
     if (status != STATUS_SUCCESS) unmap_area( ptr, size );
+    return status;
+}
+
+
+/***********************************************************************
+ *           map_view_large_pages
+ *
+ * NSPA: direct large-pages allocation path. Bypasses the
+ * find-suitable-area machinery in map_view because the kernel handles
+ * huge-page placement itself via MAP_HUGETLB | MAP_LOCKED. The address
+ * is chosen by the kernel; the caller's `base` parameter is honored
+ * only as an mmap hint (kernel may pick a different aligned region).
+ *
+ * `size` must already be a multiple of LargePageMinimum (LARGE) or
+ * 1 GiB (HUGE). The caller (allocate_virtual_memory) is responsible
+ * for that validation.
+ *
+ * Sets vprot |= SEC_LARGE_PAGES so the view records the mapping is
+ * large-page-backed (relevant for QueryWorkingSetEx LargePage flag
+ * reporting in commit 0074 cmt 7/8). MEM_LARGE_PAGES mappings are
+ * never executable on Windows — strip PROT_EXEC.
+ *
+ * Failure modes:
+ *   STATUS_NO_MEMORY      mmap returned ENOMEM (kernel out of huge
+ *                         pages, hugetlbfs not configured, or no
+ *                         contiguous region of the requested size)
+ *   STATUS_INVALID_PARAMETER  mmap returned EINVAL (e.g. unsupported
+ *                             size for the requested huge page level)
+ *   STATUS_ACCESS_DENIED  mlock returned EPERM (RLIMIT_MEMLOCK
+ *                         exceeded — Wine-NSPA's v1 RT setup
+ *                         normally has unlimited MEMLOCK)
+ *
+ * virtual_mutex must be held by the caller (matching the convention
+ * of map_view above).
+ */
+static NTSTATUS map_view_large_pages( struct file_view **view_ret, void *base, size_t size,
+                                      unsigned int vprot, enum large_pages_type type )
+{
+    int unix_prot = get_unix_prot( vprot );
+    int flags = MAP_PRIVATE | MAP_ANON | mmap_large_pages_flags( type );
+    void *ptr;
+    NTSTATUS status;
+
+    /* Windows MEM_LARGE_PAGES allocations are never executable. */
+    unix_prot &= ~PROT_EXEC;
+
+    ptr = mmap( base, size, unix_prot, flags, -1, 0 );
+    if (ptr == MAP_FAILED)
+    {
+        ERR( "large-pages mmap failed: %s, size %p, type %d\n",
+             strerror(errno), (void *)size, type );
+        if (errno == ENOMEM)  return STATUS_NO_MEMORY;
+        if (errno == EINVAL)  return STATUS_INVALID_PARAMETER;
+        return STATUS_NO_MEMORY;
+    }
+
+    /* MAP_LOCKED already locks the pages (when supported), but call
+     * mlock too as belt-and-suspenders, and to surface EPERM as a
+     * meaningful error rather than silently leaving pages unlocked. */
+    if (mlock( ptr, size ) == -1)
+    {
+        int saved = errno;
+        ERR( "mlock failed for large-pages mapping at %p size %p: %s\n",
+             ptr, (void *)size, strerror( saved ) );
+        munmap( ptr, size );
+        return (saved == EPERM) ? STATUS_ACCESS_DENIED : STATUS_NO_MEMORY;
+    }
+
+    /* Mark the view as large-pages-backed. The flag is read by
+     * QueryWorkingSetEx to set VirtualAttributes.LargePage. */
+    vprot |= SEC_LARGE_PAGES;
+
+    status = create_view( view_ret, ptr, size, vprot );
+    if (status != STATUS_SUCCESS)
+    {
+        munlock( ptr, size );
+        munmap( ptr, size );
+    }
     return status;
 }
 
@@ -3645,7 +3770,7 @@ static void *alloc_virtual_heap( SIZE_T size )
         mmap_remove_reserved_area( ret, size );
         return ret;
     }
-    return anon_mmap_alloc( size, PROT_READ | PROT_WRITE );
+    return anon_mmap_alloc( size, PROT_READ | PROT_WRITE, LARGE_PAGES_NONE );
 }
 
 /***********************************************************************
@@ -5111,10 +5236,40 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
     sigset_t sigset;
     SIZE_T size = *size_ptr;
     NTSTATUS status = STATUS_SUCCESS;
+    /* NSPA: large-pages allocation type — derived from MEM_LARGE_PAGES flag
+     * + the MEM_EXTENDED_PARAMETER_NONPAGED_HUGE attribute. NONE for the
+     * normal case (no large pages). */
+    enum large_pages_type lp_type = LARGE_PAGES_NONE;
+
+    if (type & MEM_LARGE_PAGES)
+    {
+        if (attributes & MEM_EXTENDED_PARAMETER_NONPAGED_HUGE)
+            lp_type = LARGE_PAGES_HUGE;
+        else
+            lp_type = LARGE_PAGES_LARGE;
+    }
 
     /* Round parameters to a page boundary */
 
     if (is_beyond_limit( 0, size, working_set_limit )) return STATUS_WORKING_SET_LIMIT_RANGE;
+
+    /* NSPA: validate large-pages requests up front. Per Windows semantics,
+     * MEM_LARGE_PAGES requires both MEM_RESERVE and MEM_COMMIT (no reserve-
+     * only large-page mappings), the size must be a multiple of the page
+     * size for the requested level, the host must have hugepages
+     * configured (LargePageMinimum != 0), and any explicit base must be
+     * aligned to the same boundary. */
+    if (lp_type != LARGE_PAGES_NONE)
+    {
+        SIZE_T lp_unit = (lp_type == LARGE_PAGES_HUGE)
+                            ? (SIZE_T)NSPA_HUGE_PAGE_SIZE
+                            : (SIZE_T)user_shared_data->LargePageMinimum;
+
+        if (lp_unit == 0) return STATUS_INVALID_PARAMETER;
+        if (!(type & MEM_COMMIT) || !(type & MEM_RESERVE)) return STATUS_INVALID_PARAMETER;
+        if (size == 0 || (size % lp_unit) != 0) return STATUS_INVALID_PARAMETER;
+        if (*ret && ((UINT_PTR)*ret % lp_unit) != 0) return STATUS_INVALID_PARAMETER;
+    }
 
     if (*ret)
     {
@@ -5122,7 +5277,10 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
             base = ROUND_ADDR( *ret, granularity_mask );
         else
             base = ROUND_ADDR( *ret, page_mask );
-        size = (((UINT_PTR)*ret + size + page_mask) & ~page_mask) - (UINT_PTR)base;
+        /* NSPA: don't round size for large-page allocations — caller already
+         * validated alignment and we want to preserve the exact size. */
+        if (lp_type == LARGE_PAGES_NONE)
+            size = (((UINT_PTR)*ret + size + page_mask) & ~page_mask) - (UINT_PTR)base;
 
         /* disallow low 64k, wrap-around and kernel space */
         if (((char *)base < (char *)0x10000) ||
@@ -5137,7 +5295,9 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
     else
     {
         base = NULL;
-        size = ROUND_SIZE( 0, size, page_mask );
+        /* NSPA: don't round size for large-page allocations. */
+        if (lp_type == LARGE_PAGES_NONE)
+            size = ROUND_SIZE( 0, size, page_mask );
     }
 
     /* Compute the alloc type flags */
@@ -5167,6 +5327,12 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
 
             if (vprot & VPROT_WRITECOPY) status = STATUS_INVALID_PAGE_PROTECTION;
             else if (is_dos_memory) status = allocate_dos_memory( &view, vprot );
+            /* NSPA: large pages take a direct-mmap path that bypasses the
+             * find-suitable-area machinery. The kernel handles huge-page
+             * placement via MAP_HUGETLB; we just create the view from the
+             * resulting pointer. */
+            else if (lp_type != LARGE_PAGES_NONE)
+                status = map_view_large_pages( &view, base, size, vprot, lp_type );
             else status = map_view( &view, base, size, type, vprot, limit_low, limit_high,
                                     align ? align - 1 : granularity_mask );
 
@@ -5206,14 +5372,11 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
         set_arm64ec_range( base, size );
     }
 
-#ifdef MADV_HUGEPAGE
-    /* NSPA: hint the kernel to use transparent huge pages for allocations
-     * that explicitly requested MEM_LARGE_PAGES. This is advisory — the
-     * kernel will honor it where THP is available and the allocation is
-     * large/aligned enough, and silently ignore it otherwise. */
-    if (!status && base && (type & MEM_LARGE_PAGES))
-        madvise( base, size, MADV_HUGEPAGE );
-#endif
+    /* NSPA: the earlier 0011 partial port added MADV_HUGEPAGE as a hint
+     * here. That's now superseded by map_view_large_pages above, which
+     * uses MAP_HUGETLB to actually allocate from the kernel's reserved
+     * huge-page pool — much stronger than a THP hint. The MADV_HUGEPAGE
+     * block is removed (was: #ifdef MADV_HUGEPAGE / madvise / #endif). */
 
     if (!status) VIRTUAL_DEBUG_DUMP_VIEW( view );
 
@@ -5381,8 +5544,13 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
                                            ULONG protect, MEM_EXTENDED_PARAMETER *parameters,
                                            ULONG count )
 {
+    /* NSPA: MEM_LARGE_PAGES is accepted by NtAllocateVirtualMemoryEx too —
+     * the actual large-pages allocation happens in allocate_virtual_memory
+     * via map_view_large_pages. Same flag was added to NtAllocateVirtualMemory's
+     * type_mask earlier in the 0011 partial port. */
     static const ULONG type_mask = MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN | MEM_WRITE_WATCH
-                                   | MEM_RESET | MEM_RESERVE_PLACEHOLDER | MEM_REPLACE_PLACEHOLDER;
+                                   | MEM_RESET | MEM_RESERVE_PLACEHOLDER | MEM_REPLACE_PLACEHOLDER
+                                   | MEM_LARGE_PAGES;
     ULONG_PTR limit_low = 0;
     ULONG_PTR limit_high = 0;
     ULONG_PTR align = 0;

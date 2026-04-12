@@ -1274,7 +1274,7 @@ static BOOL add_fd_to_cache( HANDLE handle, int fd, enum server_fd_type type,
         else
         {
             void *ptr = anon_mmap_alloc( FD_CACHE_BLOCK_SIZE * sizeof(union fd_cache_entry),
-                                         PROT_READ | PROT_WRITE );
+                                         PROT_READ | PROT_WRITE, LARGE_PAGES_NONE );
             if (ptr == MAP_FAILED) return FALSE;
             fd_cache[entry] = ptr;
         }

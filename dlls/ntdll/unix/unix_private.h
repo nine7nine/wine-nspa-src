@@ -357,8 +357,22 @@ extern unsigned int alloc_object_attributes( const OBJECT_ATTRIBUTES *attr, stru
                                              data_size_t *ret_len );
 extern NTSTATUS system_time_precise( void *args );
 
+/* NSPA: large-pages allocation type for anon_mmap_alloc and map_view.
+ * NONE = ordinary pages (the legacy behavior). LARGE = MAP_HUGETLB at
+ * the smallest hugepage size (typically 2 MB on x86_64) — what Windows
+ * calls a "large page". HUGE = MAP_HUGETLB at 1 GB — what Windows calls
+ * a "huge page" (the MEM_EXTENDED_PARAMETER_NONPAGED_HUGE attribute).
+ * See dlls/ntdll/unix/virtual.c::mmap_large_pages_flags for the
+ * mapping to mmap flags. */
+enum large_pages_type
+{
+    LARGE_PAGES_NONE  = 0,
+    LARGE_PAGES_LARGE = 1,
+    LARGE_PAGES_HUGE  = 2,
+};
+
 extern void *anon_mmap_fixed( void *start, size_t size, int prot, int flags );
-extern void *anon_mmap_alloc( size_t size, int prot );
+extern void *anon_mmap_alloc( size_t size, int prot, enum large_pages_type type );
 extern void virtual_init(void);
 extern ULONG_PTR get_system_affinity_mask(void);
 extern void virtual_get_system_info( SYSTEM_BASIC_INFORMATION *info, BOOL wow64 );

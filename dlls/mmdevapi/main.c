@@ -120,7 +120,9 @@ fail:
 
 static BOOL WINAPI init_driver(INIT_ONCE *once, void *param, void **context)
 {
-    static WCHAR default_list[] = L"pulse,alsa,oss,coreaudio";
+    /* NSPA: prefer JACK for audio; skip PulseAudio to avoid latency overhead.
+     * ALSA is fallback when JACK is unavailable. */
+    static WCHAR default_list[] = L"jack,alsa,oss,coreaudio";
     DriverFuncs driver;
     HKEY key;
     WCHAR reg_list[256], *p, *next, *driver_list = default_list;
@@ -170,14 +172,16 @@ static BOOL WINAPI init_driver(INIT_ONCE *once, void *param, void **context)
     {
         WCHAR midi_drvname[64];
 
+        ERR("NSPA RT:Audio: selected driver %s\n", debugstr_w(drvs.module_name));
+
         midi_drvname[0] = 0;
         wine_unix_call( midi_get_driver, midi_drvname );
         if (midi_drvname[0])
         {
             if (load_driver( midi_drvname, &midi_driver ))
-                TRACE( "loaded %s as MIDI driver\n", debugstr_w(midi_driver.module_name) );
+                ERR("NSPA RT:Audio: MIDI driver %s\n", debugstr_w(midi_driver.module_name));
             else
-               TRACE( "failed to load MIDI driver %s\n", wine_dbgstr_w(midi_drvname) );
+               ERR("NSPA RT:Audio: failed to load MIDI driver %s\n", wine_dbgstr_w(midi_drvname));
         }
         else midi_driver = drvs;
 

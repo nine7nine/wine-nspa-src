@@ -65,6 +65,12 @@ static UINT32         jack_rate;         /* JACK sample rate */
 static ULONG_PTR      zero_bits;
 
 /* ════════════════════════════════════════════════════════════════════════
+ *   Format enum (needed by stream struct)
+ * ════════════════════════════════════════════════════════════════════════ */
+
+enum sample_format { FMT_F32, FMT_S32, FMT_S24, FMT_S16 };
+
+/* ════════════════════════════════════════════════════════════════════════
  *   Stream structure (per WASAPI stream)
  * ════════════════════════════════════════════════════════════════════════ */
 
@@ -103,6 +109,9 @@ struct jack_stream
     /* Volumes */
     float  *vols;
     int     nchannels;
+
+    /* Cached format for RT fast-path (set once at creation, no branches in inner loop) */
+    enum sample_format sfmt;
 
     /* Timing */
     LARGE_INTEGER last_period_time;
@@ -191,8 +200,6 @@ static WAVEFORMATEXTENSIBLE *clone_format(const WAVEFORMATEX *fmt)
  *   Format detection helper
  * ════════════════════════════════════════════════════════════════════════ */
 
-enum sample_format { FMT_F32, FMT_S32, FMT_S24, FMT_S16 };
-
 static enum sample_format get_sample_format(const WAVEFORMATEXTENSIBLE *fmt)
 {
     if (fmt->Format.wFormatTag == WAVE_FORMAT_IEEE_FLOAT)
@@ -216,75 +223,87 @@ static enum sample_format get_sample_format(const WAVEFORMATEXTENSIBLE *fmt)
  *   No allocation, no branching in inner loops, volume applied inline.
  * ════════════════════════════════════════════════════════════════════════ */
 
-/* Read one interleaved frame from local_buffer, write one sample to jack_buf */
-static inline float sample_to_float(const BYTE *src, enum sample_format sfmt, int ch, int nch)
-{
-    switch (sfmt)
-    {
-    case FMT_F32:
-        return ((const float *)src)[ch];
-    case FMT_S32:
-        return (float)((const INT32 *)src)[ch] / 2147483648.0f;
-    case FMT_S24:
-    {
-        const BYTE *p = src + ch * 3;
-        INT32 v = (INT32)((UINT32)p[0] | ((UINT32)p[1] << 8) | ((UINT32)p[2] << 16));
-        if (v & 0x800000) v |= 0xFF000000; /* sign extend */
-        return (float)v / 8388608.0f;
-    }
-    case FMT_S16:
-        return (float)((const INT16 *)src)[ch] / 32768.0f;
-    }
-    return 0.0f;
-}
-
-/* Write one sample from jack_buf into interleaved local_buffer */
-static inline void float_to_sample(BYTE *dst, enum sample_format sfmt, int ch, int nch, float v)
-{
-    switch (sfmt)
-    {
-    case FMT_F32:
-        ((float *)dst)[ch] = v;
-        break;
-    case FMT_S32:
-    {
-        INT64 i = (INT64)(v * 2147483648.0);
-        if (i > 2147483647) i = 2147483647;
-        if (i < -2147483648LL) i = -2147483648LL;
-        ((INT32 *)dst)[ch] = (INT32)i;
-        break;
-    }
-    case FMT_S24:
-    {
-        INT32 i = (INT32)(v * 8388608.0f);
-        BYTE *p = dst + ch * 3;
-        if (i > 8388607) i = 8388607;
-        if (i < -8388608) i = -8388608;
-        p[0] = (BYTE)(i & 0xFF);
-        p[1] = (BYTE)((i >> 8) & 0xFF);
-        p[2] = (BYTE)((i >> 16) & 0xFF);
-        break;
-    }
-    case FMT_S16:
-    {
-        INT32 i = (INT32)(v * 32768.0f);
-        if (i > 32767) i = 32767;
-        if (i < -32768) i = -32768;
-        ((INT16 *)dst)[ch] = (INT16)i;
-        break;
-    }
-    }
-}
-
 /* ════════════════════════════════════════════════════════════════════════
  *   JACK audio process callback (RT context — no blocking, no alloc)
+ *
+ *   Optimized for the hot path:
+ *   - Format switch is OUTSIDE the inner loop (one branch per chunk,
+ *     not per sample)
+ *   - Float32 fast path: unity volume skips the multiply entirely
+ *   - Volume scaling folded into the format conversion constant
+ *   - Port buffer pointers gathered once, not per-channel-per-chunk
  * ════════════════════════════════════════════════════════════════════════ */
+
+/* Render one contiguous chunk from local_buffer to JACK port buffers.
+ * Separate loops per format avoid branches in the inner loop. */
+static void render_chunk(struct jack_stream *s, UINT32 src_offs,
+                         float **jack_bufs, UINT32 dst_offs, UINT32 frames)
+{
+    const UINT32 block = s->fmt->Format.nBlockAlign;
+    const BYTE *base = s->local_buffer + src_offs * block;
+    UINT32 ch, j;
+
+    switch (s->sfmt)
+    {
+    case FMT_F32:
+        for (ch = 0; ch < (UINT32)s->nports; ch++)
+        {
+            float *out = jack_bufs[ch] + dst_offs;
+            float vol = s->vols[ch];
+            const float *src = (const float *)base;
+            if (vol == 1.0f)
+                for (j = 0; j < frames; j++)
+                    out[j] = src[j * s->nchannels + ch];
+            else
+                for (j = 0; j < frames; j++)
+                    out[j] = src[j * s->nchannels + ch] * vol;
+        }
+        break;
+
+    case FMT_S16:
+        for (ch = 0; ch < (UINT32)s->nports; ch++)
+        {
+            float *out = jack_bufs[ch] + dst_offs;
+            float vol = s->vols[ch];
+            const INT16 *src = (const INT16 *)base;
+            for (j = 0; j < frames; j++)
+                out[j] = (float)src[j * s->nchannels + ch] * (vol / 32768.0f);
+        }
+        break;
+
+    case FMT_S32:
+        for (ch = 0; ch < (UINT32)s->nports; ch++)
+        {
+            float *out = jack_bufs[ch] + dst_offs;
+            float vol = s->vols[ch];
+            const INT32 *src = (const INT32 *)base;
+            for (j = 0; j < frames; j++)
+                out[j] = (float)src[j * s->nchannels + ch] * (vol / 2147483648.0f);
+        }
+        break;
+
+    case FMT_S24:
+        for (ch = 0; ch < (UINT32)s->nports; ch++)
+        {
+            float *out = jack_bufs[ch] + dst_offs;
+            float vol = s->vols[ch] / 8388608.0f;
+            for (j = 0; j < frames; j++)
+            {
+                const BYTE *p = base + (j * s->nchannels + ch) * 3;
+                INT32 v = (INT32)((UINT32)p[0] | ((UINT32)p[1] << 8) | ((UINT32)p[2] << 16));
+                if (v & 0x800000) v |= 0xFF000000;
+                out[j] = (float)v * vol;
+            }
+        }
+        break;
+    }
+}
 
 static void jack_process_render(struct jack_stream *s, jack_nframes_t nframes)
 {
-    UINT32 avail, ch;
+    UINT32 avail;
     int i;
-    enum sample_format sfmt;
+    float *jack_bufs[64]; /* max channels */
 
     if (pi_mutex_trylock(&s->lock) != 0)
     {
@@ -293,44 +312,28 @@ static void jack_process_render(struct jack_stream *s, jack_nframes_t nframes)
         return;
     }
 
-    sfmt = get_sample_format(s->fmt);
+    /* Gather port buffer pointers once */
+    for (i = 0; i < s->nports; i++)
+        jack_bufs[i] = (float *)jack_port_get_buffer(s->ports[i], nframes);
+
     avail = s->held_frames;
     if (avail > nframes) avail = nframes;
 
     if (avail > 0)
     {
-        UINT32 block = s->fmt->Format.nBlockAlign;
         UINT32 offs = s->lcl_offs_frames;
         UINT32 chunk1 = s->bufsize_frames - offs;
-        UINT32 to_copy = avail;
 
-        if (chunk1 > to_copy) chunk1 = to_copy;
+        if (chunk1 > avail) chunk1 = avail;
 
-        for (ch = 0; ch < (UINT32)s->nports; ch++)
-        {
-            float *jack_buf = (float *)jack_port_get_buffer(s->ports[ch], nframes);
-            float vol = s->vols[ch];
-            UINT32 j;
-            const BYTE *src;
+        render_chunk(s, offs, jack_bufs, 0, chunk1);
+        if (avail > chunk1)
+            render_chunk(s, 0, jack_bufs, chunk1, avail - chunk1);
 
-            /* First chunk (before wraparound) */
-            src = s->local_buffer + offs * block;
-            for (j = 0; j < chunk1; j++)
-                jack_buf[j] = sample_to_float(src + j * block, sfmt, ch, s->nchannels) * vol;
-
-            /* Second chunk (after wraparound) */
-            if (to_copy > chunk1)
-            {
-                UINT32 chunk2 = to_copy - chunk1;
-                src = s->local_buffer;
-                for (j = 0; j < chunk2; j++)
-                    jack_buf[chunk1 + j] = sample_to_float(src + j * block, sfmt, ch, s->nchannels) * vol;
-            }
-
-            /* Silence remainder */
-            for (j = to_copy; j < nframes; j++)
-                jack_buf[j] = 0.0f;
-        }
+        /* Silence any remainder */
+        if (avail < nframes)
+            for (i = 0; i < s->nports; i++)
+                memset(jack_bufs[i] + avail, 0, (nframes - avail) * sizeof(float));
 
         s->lcl_offs_frames = (offs + avail) % s->bufsize_frames;
         s->held_frames -= avail;
@@ -338,51 +341,104 @@ static void jack_process_render(struct jack_stream *s, jack_nframes_t nframes)
     else
     {
         for (i = 0; i < s->nports; i++)
-            memset(jack_port_get_buffer(s->ports[i], nframes), 0, nframes * sizeof(float));
+            memset(jack_bufs[i], 0, nframes * sizeof(float));
     }
 
     pi_mutex_unlock(&s->lock);
 }
 
+/* Capture one contiguous chunk from JACK port buffers to local_buffer. */
+static void capture_chunk(struct jack_stream *s, const float **jack_bufs,
+                          UINT32 src_offs, UINT32 dst_offs, UINT32 frames)
+{
+    const UINT32 block = s->fmt->Format.nBlockAlign;
+    BYTE *base = s->local_buffer + dst_offs * block;
+    UINT32 ch, j;
+
+    switch (s->sfmt)
+    {
+    case FMT_F32:
+        for (ch = 0; ch < (UINT32)s->nports; ch++)
+        {
+            const float *in = jack_bufs[ch] + src_offs;
+            float *dst = (float *)base;
+            for (j = 0; j < frames; j++)
+                dst[j * s->nchannels + ch] = in[j];
+        }
+        break;
+
+    case FMT_S16:
+        for (ch = 0; ch < (UINT32)s->nports; ch++)
+        {
+            const float *in = jack_bufs[ch] + src_offs;
+            INT16 *dst = (INT16 *)base;
+            for (j = 0; j < frames; j++)
+            {
+                INT32 v = (INT32)(in[j] * 32768.0f);
+                if (v > 32767) v = 32767; else if (v < -32768) v = -32768;
+                dst[j * s->nchannels + ch] = (INT16)v;
+            }
+        }
+        break;
+
+    case FMT_S32:
+        for (ch = 0; ch < (UINT32)s->nports; ch++)
+        {
+            const float *in = jack_bufs[ch] + src_offs;
+            INT32 *dst = (INT32 *)base;
+            for (j = 0; j < frames; j++)
+            {
+                INT64 v = (INT64)(in[j] * 2147483648.0);
+                if (v > 2147483647) v = 2147483647;
+                else if (v < -2147483648LL) v = -2147483648LL;
+                dst[j * s->nchannels + ch] = (INT32)v;
+            }
+        }
+        break;
+
+    case FMT_S24:
+        for (ch = 0; ch < (UINT32)s->nports; ch++)
+        {
+            const float *in = jack_bufs[ch] + src_offs;
+            for (j = 0; j < frames; j++)
+            {
+                INT32 v = (INT32)(in[j] * 8388608.0f);
+                BYTE *p = base + (j * s->nchannels + ch) * 3;
+                if (v > 8388607) v = 8388607; else if (v < -8388608) v = -8388608;
+                p[0] = (BYTE)(v & 0xFF);
+                p[1] = (BYTE)((v >> 8) & 0xFF);
+                p[2] = (BYTE)((v >> 16) & 0xFF);
+            }
+        }
+        break;
+    }
+}
+
 static void jack_process_capture(struct jack_stream *s, jack_nframes_t nframes)
 {
-    UINT32 space, ch;
-    enum sample_format sfmt;
+    UINT32 space;
+    int i;
+    const float *jack_bufs[64];
 
     if (pi_mutex_trylock(&s->lock) != 0)
         return;
 
-    sfmt = get_sample_format(s->fmt);
+    for (i = 0; i < s->nports; i++)
+        jack_bufs[i] = (const float *)jack_port_get_buffer(s->ports[i], nframes);
+
     space = s->bufsize_frames - s->held_frames;
     if (space > nframes) space = nframes;
 
     if (space > 0)
     {
-        UINT32 block = s->fmt->Format.nBlockAlign;
         UINT32 offs = s->wri_offs_frames;
         UINT32 chunk1 = s->bufsize_frames - offs;
-        UINT32 to_copy = space;
 
-        if (chunk1 > to_copy) chunk1 = to_copy;
+        if (chunk1 > space) chunk1 = space;
 
-        for (ch = 0; ch < (UINT32)s->nports; ch++)
-        {
-            const float *jack_buf = (const float *)jack_port_get_buffer(s->ports[ch], nframes);
-            UINT32 j;
-            BYTE *dst;
-
-            dst = s->local_buffer + offs * block;
-            for (j = 0; j < chunk1; j++)
-                float_to_sample(dst + j * block, sfmt, ch, s->nchannels, jack_buf[j]);
-
-            if (to_copy > chunk1)
-            {
-                UINT32 chunk2 = to_copy - chunk1;
-                dst = s->local_buffer;
-                for (j = 0; j < chunk2; j++)
-                    float_to_sample(dst + j * block, sfmt, ch, s->nchannels, jack_buf[chunk1 + j]);
-            }
-        }
+        capture_chunk(s, jack_bufs, 0, offs, chunk1);
+        if (space > chunk1)
+            capture_chunk(s, jack_bufs, chunk1, 0, space - chunk1);
 
         s->wri_offs_frames = (offs + space) % s->bufsize_frames;
         s->held_frames += space;
@@ -905,6 +961,7 @@ static NTSTATUS jack_create_stream(void *args)
     if (!fmtex) { free(stream); params->result = E_OUTOFMEMORY; return STATUS_SUCCESS; }
     stream->fmt = fmtex;
     stream->nchannels = params->fmt->nChannels;
+    stream->sfmt = get_sample_format(fmtex);
 
     /* Find target channel count from endpoint */
     count_physical_ports(params->flow, eps, &num_eps, ARRAY_SIZE(eps));

@@ -26,6 +26,9 @@
 #include <pthread.h>
 #include <math.h>
 #include <sys/mman.h>
+#ifdef __SSE2__
+#include <emmintrin.h>
+#endif
 #include <jack/jack.h>
 
 #include "ntstatus.h"
@@ -253,8 +256,143 @@ static enum sample_format get_sample_format(const WAVEFORMATEXTENSIBLE *fmt)
  *   - Port buffer pointers gathered once, not per-channel-per-chunk
  * ════════════════════════════════════════════════════════════════════════ */
 
+/* ── SSE2 fast paths for mono/stereo deinterleave + format conversion ──
+ *
+ * Mono (nchannels==1): data is sequential — perfect for SIMD.
+ * Stereo (nchannels==2): load pairs, deinterleave with shuffles.
+ * >2 channels: strided access kills vectorization, stay scalar.
+ *
+ * Volume is pre-scaled in set_volumes() — render_chunk multiplies only. */
+
+#ifdef __SSE2__
+/* F32 mono: 4 samples per iteration, sequential load → multiply → store */
+static void render_f32_mono_sse(float *out, const float *src, float vol, UINT32 frames)
+{
+    UINT32 j = 0;
+    __m128 vv = _mm_set1_ps(vol);
+    for (; j + 4 <= frames; j += 4)
+        _mm_storeu_ps(out + j, _mm_mul_ps(_mm_loadu_ps(src + j), vv));
+    for (; j < frames; j++)
+        out[j] = src[j] * vol;
+}
+
+/* F32 stereo: load 4 interleaved pairs (8 floats), deinterleave, multiply */
+static void render_f32_stereo_sse(float *out_l, float *out_r,
+                                   const float *src, float vol_l, float vol_r, UINT32 frames)
+{
+    UINT32 j = 0;
+    __m128 vl = _mm_set1_ps(vol_l);
+    __m128 vr = _mm_set1_ps(vol_r);
+    for (; j + 4 <= frames; j += 4)
+    {
+        /* Load 8 interleaved floats: L0 R0 L1 R1 | L2 R2 L3 R3 */
+        __m128 a = _mm_loadu_ps(src + j * 2);      /* L0 R0 L1 R1 */
+        __m128 b = _mm_loadu_ps(src + j * 2 + 4);  /* L2 R2 L3 R3 */
+        /* Deinterleave */
+        __m128 l = _mm_shuffle_ps(a, b, _MM_SHUFFLE(2, 0, 2, 0)); /* L0 L1 L2 L3 */
+        __m128 r = _mm_shuffle_ps(a, b, _MM_SHUFFLE(3, 1, 3, 1)); /* R0 R1 R2 R3 */
+        _mm_storeu_ps(out_l + j, _mm_mul_ps(l, vl));
+        _mm_storeu_ps(out_r + j, _mm_mul_ps(r, vr));
+    }
+    for (; j < frames; j++)
+    {
+        out_l[j] = src[j * 2] * vol_l;
+        out_r[j] = src[j * 2 + 1] * vol_r;
+    }
+}
+
+/* S16 mono: load 4 INT16, sign-extend to INT32, convert to float, multiply */
+static void render_s16_mono_sse(float *out, const INT16 *src, float vol, UINT32 frames)
+{
+    UINT32 j = 0;
+    __m128 vv = _mm_set1_ps(vol);
+    for (; j + 4 <= frames; j += 4)
+    {
+        __m128i lo = _mm_loadl_epi64((const __m128i *)(src + j));
+        __m128i i32 = _mm_srai_epi32(_mm_unpacklo_epi16(lo, lo), 16);
+        _mm_storeu_ps(out + j, _mm_mul_ps(_mm_cvtepi32_ps(i32), vv));
+    }
+    for (; j < frames; j++)
+        out[j] = (float)src[j] * vol;
+}
+
+/* S32 mono: load 4 INT32, convert to float, multiply */
+static void render_s32_mono_sse(float *out, const INT32 *src, float vol, UINT32 frames)
+{
+    UINT32 j = 0;
+    __m128 vv = _mm_set1_ps(vol);
+    for (; j + 4 <= frames; j += 4)
+        _mm_storeu_ps(out + j, _mm_mul_ps(_mm_cvtepi32_ps(_mm_loadu_si128((const __m128i *)(src + j))), vv));
+    for (; j < frames; j++)
+        out[j] = (float)src[j] * vol;
+}
+
+/* F32 capture mono: multiply → store (reverse of render) */
+static void capture_f32_mono_sse(const float *in, float *dst, UINT32 frames)
+{
+    UINT32 j = 0;
+    for (; j + 4 <= frames; j += 4)
+        _mm_storeu_ps(dst + j, _mm_loadu_ps(in + j));
+    for (; j < frames; j++)
+        dst[j] = in[j];
+}
+
+/* F32 capture stereo: interleave two channels */
+static void capture_f32_stereo_sse(const float *in_l, const float *in_r,
+                                    float *dst, UINT32 frames)
+{
+    UINT32 j = 0;
+    for (; j + 4 <= frames; j += 4)
+    {
+        __m128 l = _mm_loadu_ps(in_l + j);  /* L0 L1 L2 L3 */
+        __m128 r = _mm_loadu_ps(in_r + j);  /* R0 R1 R2 R3 */
+        __m128 lo = _mm_unpacklo_ps(l, r);   /* L0 R0 L1 R1 */
+        __m128 hi = _mm_unpackhi_ps(l, r);   /* L2 R2 L3 R3 */
+        _mm_storeu_ps(dst + j * 2, lo);
+        _mm_storeu_ps(dst + j * 2 + 4, hi);
+    }
+    for (; j < frames; j++)
+    {
+        dst[j * 2] = in_l[j];
+        dst[j * 2 + 1] = in_r[j];
+    }
+}
+
+/* S16 capture mono: float → INT32 → saturate → pack to INT16 */
+static void capture_s16_mono_sse(const float *in, INT16 *dst, UINT32 frames)
+{
+    UINT32 j = 0;
+    __m128 scale = _mm_set1_ps(32768.0f);
+    for (; j + 4 <= frames; j += 4)
+    {
+        __m128i i32 = _mm_cvtps_epi32(_mm_mul_ps(_mm_loadu_ps(in + j), scale));
+        __m128i i16 = _mm_packs_epi32(i32, i32); /* saturating pack */
+        _mm_storel_epi64((__m128i *)(dst + j), i16);
+    }
+    for (; j < frames; j++)
+    {
+        INT32 v = (INT32)(in[j] * 32768.0f);
+        if (v > 32767) v = 32767; else if (v < -32768) v = -32768;
+        dst[j] = (INT16)v;
+    }
+}
+
+/* S32 capture mono: float → INT32 (with clamping via double precision) */
+static void capture_s32_mono_sse(const float *in, INT32 *dst, UINT32 frames)
+{
+    UINT32 j;
+    for (j = 0; j < frames; j++)
+    {
+        INT64 v = (INT64)(in[j] * 2147483648.0);
+        if (v > 2147483647) v = 2147483647;
+        else if (v < -2147483648LL) v = -2147483648LL;
+        dst[j] = (INT32)v;
+    }
+}
+#endif /* __SSE2__ */
+
 /* Render one contiguous chunk from local_buffer to JACK port buffers.
- * Separate loops per format avoid branches in the inner loop. */
+ * Mono/stereo use SSE2 fast paths; >2 channels use scalar loops. */
 static void render_chunk(struct jack_stream *s, UINT32 src_offs,
                          float **jack_bufs, UINT32 dst_offs, UINT32 frames)
 {
@@ -262,12 +400,39 @@ static void render_chunk(struct jack_stream *s, UINT32 src_offs,
     const BYTE *base = s->local_buffer + src_offs * block;
     UINT32 ch, j;
 
-    /* Volume is pre-scaled in set_volumes() — no division here.
-     * For F32: vols[ch] = raw_vol (1.0 at unity)
-     * For S16: vols[ch] = raw_vol / 32768
-     * For S32: vols[ch] = raw_vol / 2147483648
-     * For S24: vols[ch] = raw_vol / 8388608
-     * Unity-volume fast path: skip multiply entirely (all formats). */
+#ifdef __SSE2__
+    /* SSE2 fast paths for mono and stereo (sequential / pair access patterns) */
+    if (s->nchannels == 1)
+    {
+        float *out = jack_bufs[0] + dst_offs;
+        float vol = s->vols[0];
+        switch (s->sfmt)
+        {
+        case FMT_F32:
+            if (vol == 1.0f)
+                memcpy(out, (const float *)base, frames * sizeof(float));
+            else
+                render_f32_mono_sse(out, (const float *)base, vol, frames);
+            return;
+        case FMT_S16:
+            render_s16_mono_sse(out, (const INT16 *)base, vol, frames);
+            return;
+        case FMT_S32:
+            render_s32_mono_sse(out, (const INT32 *)base, vol, frames);
+            return;
+        default: break; /* S24 falls through to scalar */
+        }
+    }
+    else if (s->nchannels == 2 && s->nports >= 2 && s->sfmt == FMT_F32)
+    {
+        render_f32_stereo_sse(jack_bufs[0] + dst_offs, jack_bufs[1] + dst_offs,
+                               (const float *)base, s->vols[0], s->vols[1], frames);
+        return;
+    }
+#endif
+
+    /* Scalar fallback: handles all channel counts and formats.
+     * Volume is pre-scaled in set_volumes() — no division here. */
     switch (s->sfmt)
     {
     case FMT_F32:
@@ -286,40 +451,26 @@ static void render_chunk(struct jack_stream *s, UINT32 src_offs,
         break;
 
     case FMT_S16:
-    {
-        float unity = 1.0f / 32768.0f;
         for (ch = 0; ch < (UINT32)s->nports; ch++)
         {
             float *out = jack_bufs[ch] + dst_offs;
             float vol = s->vols[ch];
             const INT16 *src = (const INT16 *)base;
-            if (vol == unity)
-                for (j = 0; j < frames; j++)
-                    out[j] = (float)src[j * s->nchannels + ch] * unity;
-            else
-                for (j = 0; j < frames; j++)
-                    out[j] = (float)src[j * s->nchannels + ch] * vol;
+            for (j = 0; j < frames; j++)
+                out[j] = (float)src[j * s->nchannels + ch] * vol;
         }
         break;
-    }
 
     case FMT_S32:
-    {
-        float unity = 1.0f / 2147483648.0f;
         for (ch = 0; ch < (UINT32)s->nports; ch++)
         {
             float *out = jack_bufs[ch] + dst_offs;
             float vol = s->vols[ch];
             const INT32 *src = (const INT32 *)base;
-            if (vol == unity)
-                for (j = 0; j < frames; j++)
-                    out[j] = (float)src[j * s->nchannels + ch] * unity;
-            else
-                for (j = 0; j < frames; j++)
-                    out[j] = (float)src[j * s->nchannels + ch] * vol;
+            for (j = 0; j < frames; j++)
+                out[j] = (float)src[j * s->nchannels + ch] * vol;
         }
         break;
-    }
 
     case FMT_S24:
         for (ch = 0; ch < (UINT32)s->nports; ch++)
@@ -388,13 +539,40 @@ static void jack_process_render(struct jack_stream *s, jack_nframes_t nframes)
     }
 }
 
-/* Capture one contiguous chunk from JACK port buffers to local_buffer. */
+/* Capture one contiguous chunk from JACK port buffers to local_buffer.
+ * Mono/stereo use SSE2 fast paths; >2 channels use scalar loops. */
 static void capture_chunk(struct jack_stream *s, const float **jack_bufs,
                           UINT32 src_offs, UINT32 dst_offs, UINT32 frames)
 {
     const UINT32 block = s->fmt->Format.nBlockAlign;
     BYTE *base = s->local_buffer + dst_offs * block;
     UINT32 ch, j;
+
+#ifdef __SSE2__
+    if (s->nchannels == 1)
+    {
+        const float *in = jack_bufs[0] + src_offs;
+        switch (s->sfmt)
+        {
+        case FMT_F32:
+            capture_f32_mono_sse(in, (float *)base, frames);
+            return;
+        case FMT_S16:
+            capture_s16_mono_sse(in, (INT16 *)base, frames);
+            return;
+        case FMT_S32:
+            capture_s32_mono_sse(in, (INT32 *)base, frames);
+            return;
+        default: break;
+        }
+    }
+    else if (s->nchannels == 2 && s->nports >= 2 && s->sfmt == FMT_F32)
+    {
+        capture_f32_stereo_sse(jack_bufs[0] + src_offs, jack_bufs[1] + src_offs,
+                                (float *)base, frames);
+        return;
+    }
+#endif
 
     switch (s->sfmt)
     {

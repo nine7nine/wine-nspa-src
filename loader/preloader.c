@@ -333,6 +333,26 @@ static inline int wld_prctl( int code, long arg )
     return SYSCALL_RET(ret);
 }
 
+static inline int wld_munmap( void *addr, size_t len )
+{
+    int ret;
+    __asm__ __volatile__( "pushl %%ebx; movl %2,%%ebx; int $0x80; popl %%ebx"
+                          : "=a" (ret) : "0" (91 /* SYS_munmap */), "r" (addr), "c" (len) );
+    return SYSCALL_RET(ret);
+}
+
+static inline void *wld_mremap( void *old_addr, size_t old_len, size_t new_len,
+                                int flags, void *new_addr )
+{
+    long ret;
+    __asm__ __volatile__( "pushl %%ebx; movl %2,%%ebx; pushl %%ebp; movl %6,%%ebp; int $0x80; popl %%ebp; popl %%ebx"
+                          : "=a" (ret)
+                          : "0" (163 /* SYS_mremap */), "r" (old_addr), "c" (old_len),
+                            "d" (new_len), "S" (flags), "g" (new_addr)
+                          : "memory" );
+    return (void *)SYSCALL_RET(ret);
+}
+
 #elif defined(__x86_64__)
 
 void *thread_data[256];
@@ -409,6 +429,12 @@ SYSCALL_FUNC( wld_mprotect, 10 /* SYS_mprotect */ );
 
 int wld_prctl( int code, long arg );
 SYSCALL_FUNC( wld_prctl, 157 /* SYS_prctl */ );
+
+int wld_munmap( void *addr, size_t len );
+SYSCALL_FUNC( wld_munmap, 11 /* SYS_munmap */ );
+
+void *wld_mremap( void *old_addr, size_t old_len, size_t new_len, int flags, void *new_addr );
+SYSCALL_FUNC( wld_mremap, 25 /* SYS_mremap */ );
 
 uid_t wld_getuid(void);
 SYSCALL_NOERR( wld_getuid, 102 /* SYS_getuid */ );
@@ -516,6 +542,12 @@ SYSCALL_FUNC( wld_mprotect, 226 /* SYS_mprotect */ );
 
 int wld_prctl( int code, long arg );
 SYSCALL_FUNC( wld_prctl, 167 /* SYS_prctl */ );
+
+int wld_munmap( void *addr, size_t len );
+SYSCALL_FUNC( wld_munmap, 215 /* SYS_munmap */ );
+
+void *wld_mremap( void *old_addr, size_t old_len, size_t new_len, int flags, void *new_addr );
+SYSCALL_FUNC( wld_mremap, 216 /* SYS_mremap */ );
 
 uid_t wld_getuid(void);
 SYSCALL_NOERR( wld_getuid, 174 /* SYS_getuid */ );
@@ -1369,6 +1401,83 @@ static int is_in_preload_range( const struct wld_auxv *av, int type )
     return 0;
 }
 
+#ifndef MREMAP_MAYMOVE
+#define MREMAP_MAYMOVE 1
+#endif
+#ifndef MREMAP_FIXED
+#define MREMAP_FIXED 2
+#endif
+
+/*
+ *  try_relocate_vdso
+ *
+ *  When the vDSO conflicts with a reserved address range, try to relocate it
+ *  via mremap instead of deleting the AT_SYSINFO* auxv entries. Preserving
+ *  the vDSO keeps the kernel's fast-path for clock_gettime/gettimeofday —
+ *  significant for RT audio latency (avoids ~200-400ns syscall overhead per
+ *  timing call).
+ *
+ *  Returns the new vDSO base address on success, or NULL on failure.
+ *  On failure, the caller should fall back to the original deletion behavior.
+ */
+static void *try_relocate_vdso( struct wld_auxv *av )
+{
+    unsigned long vdso_base = 0;
+    unsigned long vdso_size;
+    void *probe, *new_addr;
+
+    /* Find AT_SYSINFO_EHDR — this is the vDSO base address */
+    while (av->a_type != AT_NULL)
+    {
+        if (av->a_type == AT_SYSINFO_EHDR) { vdso_base = av->a_un.a_val; break; }
+        av++;
+    }
+    if (!vdso_base) return NULL;
+
+    /* Determine vDSO size from its ELF header. The vDSO is a proper ELF
+     * shared object; we walk its program headers to find the total mapping
+     * extent. We round up to include the vvar page(s) that precede the vDSO
+     * (the kernel maps vvar immediately before vdso). */
+    {
+        const ElfW(Ehdr) *ehdr = (const ElfW(Ehdr) *)vdso_base;
+        const ElfW(Phdr) *phdr;
+        unsigned long max_end = 0;
+        int i;
+
+        if (ehdr->e_ident[0] != 0x7f || ehdr->e_ident[1] != 'E' ||
+            ehdr->e_ident[2] != 'L' || ehdr->e_ident[3] != 'F')
+            return NULL;
+
+        phdr = (const ElfW(Phdr) *)((const char *)ehdr + ehdr->e_phoff);
+        for (i = 0; i < ehdr->e_phnum; i++)
+        {
+            if (phdr[i].p_type == PT_LOAD)
+            {
+                unsigned long seg_end = phdr[i].p_vaddr + phdr[i].p_memsz;
+                if (seg_end > max_end) max_end = seg_end;
+            }
+        }
+        if (!max_end) return NULL;
+        vdso_size = (max_end + page_mask) & ~page_mask;
+    }
+
+    /* Find a free address to move the vDSO to. Probe with an anonymous
+     * mapping, then unmap the probe — the kernel picks a non-conflicting
+     * address for us. */
+    probe = wld_mmap( NULL, vdso_size, PROT_NONE,
+                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0 );
+    if (probe == (void *)-1) return NULL;
+    wld_munmap( probe, vdso_size );
+
+    /* mremap the vDSO to the probed address. MREMAP_FIXED moves it
+     * atomically (like MAP_FIXED for mmap). */
+    new_addr = wld_mremap( (void *)vdso_base, vdso_size, vdso_size,
+                           MREMAP_MAYMOVE | MREMAP_FIXED, probe );
+    if (new_addr == (void *)-1) return NULL;
+
+    return new_addr;
+}
+
 /* set the process name if supported */
 static void set_process_name( int argc, char *argv[] )
 {
@@ -1402,7 +1511,7 @@ void* wld_start( void **stack )
     long i, *pargc;
     char **argv, **p;
     char *interp, *reserve = NULL;
-    struct wld_auxv new_av[8], delete_av[3], *av;
+    struct wld_auxv new_av[12], delete_av[3], *av;
     struct wld_link_map main_binary_map, ld_so_map;
     struct wine_preload_info **wine_main_preload_info;
 
@@ -1485,17 +1594,45 @@ void* wld_start( void **stack )
     SET_NEW_AV( 4, AT_BASE, ld_so_map.l_addr );
     SET_NEW_AV( 5, AT_FLAGS, get_auxiliary( av, AT_FLAGS, 0 ) );
     SET_NEW_AV( 6, AT_ENTRY, main_binary_map.l_entry );
-    SET_NEW_AV( 7, AT_NULL, 0 );
-#undef SET_NEW_AV
-
-    i = 0;
-    /* delete sysinfo values if addresses conflict */
-    if (is_in_preload_range( av, AT_SYSINFO ) || is_in_preload_range( av, AT_SYSINFO_EHDR ))
     {
-        delete_av[i++].a_type = AT_SYSINFO;
-        delete_av[i++].a_type = AT_SYSINFO_EHDR;
+        int nav = 7;
+
+        i = 0;
+        /* try to relocate vDSO if it conflicts with a reserved range;
+         * only delete the auxv entries as a last resort */
+        if (is_in_preload_range( av, AT_SYSINFO ) || is_in_preload_range( av, AT_SYSINFO_EHDR ))
+        {
+            void *new_vdso = try_relocate_vdso( av );
+            if (new_vdso)
+            {
+                /* relocation succeeded — update the auxv entries to point at
+                 * the new location instead of deleting them */
+                SET_NEW_AV( nav, AT_SYSINFO_EHDR, (unsigned long)new_vdso );
+                nav++;
+                /* AT_SYSINFO (the fast syscall entry point) is at a fixed
+                 * offset inside the vDSO. The kernel will resolve it from
+                 * the new AT_SYSINFO_EHDR when ld.so processes the auxv, so
+                 * we delete the old AT_SYSINFO to avoid stale pointers. */
+                delete_av[i++].a_type = AT_SYSINFO;
+#ifdef DUMP_AUX_INFO
+                wld_printf( "preloader: vDSO relocated to %p\n", new_vdso );
+#endif
+            }
+            else
+            {
+                /* relocation failed — fall back to deleting both entries */
+                delete_av[i++].a_type = AT_SYSINFO;
+                delete_av[i++].a_type = AT_SYSINFO_EHDR;
+#ifdef DUMP_AUX_INFO
+                wld_printf( "preloader: vDSO relocation failed, removing from auxv\n" );
+#endif
+            }
+        }
+        delete_av[i].a_type = AT_NULL;
+
+        SET_NEW_AV( nav, AT_NULL, 0 );
     }
-    delete_av[i].a_type = AT_NULL;
+#undef SET_NEW_AV
 
     /* get rid of first argument */
     set_process_name( *pargc, argv );

@@ -78,6 +78,13 @@ static ULONG execute_flags = MEM_EXECUTE_OPTION_DISABLE;
 static UINT process_error_mode;
 ULONG process_cookie = 0xdeadbeef;
 
+/* Per-process working set limits (stored by NtSetInformationProcess
+ * ProcessQuotaLimits, returned by NtQueryInformationProcess).
+ * No locking — same pattern as process_error_mode. */
+static SIZE_T ws_min_size = 204800;     /* default: 50 × 4 KB pages */
+static SIZE_T ws_max_size = 1413120;    /* default: 345 × 4 KB pages */
+static DWORD  ws_flags = QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE;
+
 static char **build_argv( const UNICODE_STRING *cmdline, int reserved )
 {
     char **argv, *arg, *src, *dst;
@@ -1557,33 +1564,32 @@ NTSTATUS WINAPI NtQueryInformationProcess( HANDLE handle, PROCESSINFOCLASS class
         break;
 
     case ProcessQuotaLimits:
+    {
+        QUOTA_LIMITS_EX qlimits;
+
+        if (size != sizeof(QUOTA_LIMITS) && size != sizeof(QUOTA_LIMITS_EX))
         {
-            QUOTA_LIMITS qlimits;
-
-            FIXME( "ProcessQuotaLimits (%p,%p,0x%08x,%p) stub\n", handle, info, size, ret_len );
-
-            len = sizeof(QUOTA_LIMITS);
-            if (size == len)
-            {
-                if (!handle) ret = STATUS_INVALID_HANDLE;
-                else
-                {
-                    /* FIXME: SetProcessWorkingSetSize can also set the quota values.
-                                Quota Limits should be stored inside the process. */
-                    qlimits.PagedPoolLimit = (SIZE_T)-1;
-                    qlimits.NonPagedPoolLimit = (SIZE_T)-1;
-                    /* Default minimum working set size is 204800 bytes (50 Pages) */
-                    qlimits.MinimumWorkingSetSize = 204800;
-                    /* Default maximum working set size is 1413120 bytes (345 Pages) */
-                    qlimits.MaximumWorkingSetSize = 1413120;
-                    qlimits.PagefileLimit = (SIZE_T)-1;
-                    qlimits.TimeLimit.QuadPart = -1;
-                    memcpy(info, &qlimits, len);
-                }
-            }
-            else ret = STATUS_INFO_LENGTH_MISMATCH;
+            ret = STATUS_INFO_LENGTH_MISMATCH;
             break;
         }
+        if (!handle) { ret = STATUS_INVALID_HANDLE; break; }
+
+        memset( &qlimits, 0, sizeof(qlimits) );
+        qlimits.PagedPoolLimit         = (SIZE_T)-1;
+        qlimits.NonPagedPoolLimit      = (SIZE_T)-1;
+        qlimits.MinimumWorkingSetSize  = ws_min_size;
+        qlimits.MaximumWorkingSetSize  = ws_max_size;
+        qlimits.PagefileLimit          = (SIZE_T)-1;
+        qlimits.TimeLimit.QuadPart     = -1;
+        if (size == sizeof(QUOTA_LIMITS_EX))
+        {
+            qlimits.WorkingSetLimit = (SIZE_T)-1;
+            qlimits.Flags = ws_flags;
+        }
+        len = (size == sizeof(QUOTA_LIMITS)) ? sizeof(QUOTA_LIMITS) : sizeof(QUOTA_LIMITS_EX);
+        memcpy( info, &qlimits, len );
+        break;
+    }
 
     default:
         FIXME("(%p,info_class=%d,%p,0x%08x,%p) Unknown information class\n",
@@ -1875,6 +1881,44 @@ NTSTATUS WINAPI NtSetInformationProcess( HANDLE handle, PROCESSINFOCLASS class, 
         }
         SERVER_END_REQ;
         break;
+
+    case ProcessQuotaLimits:
+    {
+        /* Store the caller's working set limits. No mlockall / setrlimit —
+         * Wine has no working set trimmer, so these are bookkeeping values
+         * that NtQueryInformationProcess(ProcessQuotaLimits) returns. */
+        if (size == sizeof(QUOTA_LIMITS))
+        {
+            const QUOTA_LIMITS *ql = info;
+            if (ql->MinimumWorkingSetSize == (SIZE_T)-1 && ql->MaximumWorkingSetSize == (SIZE_T)-1)
+            {
+                /* Soft flush request (SetProcessWorkingSetSize(-1,-1)).
+                 * Windows empties the working set; we have nothing to trim. */
+            }
+            else
+            {
+                ws_min_size = ql->MinimumWorkingSetSize;
+                ws_max_size = ql->MaximumWorkingSetSize;
+            }
+        }
+        else if (size == sizeof(QUOTA_LIMITS_EX))
+        {
+            const QUOTA_LIMITS_EX *ql = info;
+            if (ql->MinimumWorkingSetSize == (SIZE_T)-1 && ql->MaximumWorkingSetSize == (SIZE_T)-1)
+            {
+                /* Soft flush — no-op. */
+            }
+            else
+            {
+                ws_min_size = ql->MinimumWorkingSetSize;
+                ws_max_size = ql->MaximumWorkingSetSize;
+                ws_flags    = ql->Flags;
+            }
+        }
+        else
+            return STATUS_INFO_LENGTH_MISMATCH;
+        break;
+    }
 
     case ProcessPowerThrottlingState:
         FIXME( "ProcessPowerThrottlingState - stub\n" );

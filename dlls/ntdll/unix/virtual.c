@@ -5175,6 +5175,15 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
         set_arm64ec_range( base, size );
     }
 
+#ifdef MADV_HUGEPAGE
+    /* NSPA: hint the kernel to use transparent huge pages for allocations
+     * that explicitly requested MEM_LARGE_PAGES. This is advisory — the
+     * kernel will honor it where THP is available and the allocation is
+     * large/aligned enough, and silently ignore it otherwise. */
+    if (!status && base && (type & MEM_LARGE_PAGES))
+        madvise( base, size, MADV_HUGEPAGE );
+#endif
+
     if (!status) VIRTUAL_DEBUG_DUMP_VIEW( view );
 
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
@@ -5198,7 +5207,11 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
 NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR zero_bits,
                                          SIZE_T *size_ptr, ULONG type, ULONG protect )
 {
-    static const ULONG type_mask = MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN | MEM_WRITE_WATCH | MEM_RESET;
+    /* NSPA: MEM_LARGE_PAGES is accepted — we hint the kernel to upgrade
+     * the allocation to transparent huge pages via madvise() below. This
+     * is a no-op on kernels/configurations that don't have THP, so
+     * accepting the flag is safe even when huge pages aren't available. */
+    static const ULONG type_mask = MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN | MEM_WRITE_WATCH | MEM_RESET | MEM_LARGE_PAGES;
     ULONG_PTR limit;
 
     TRACE("%p %p %08lx %x %08x\n", process, *ret, *size_ptr, type, protect );

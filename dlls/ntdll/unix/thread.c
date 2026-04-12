@@ -2659,8 +2659,14 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
     case ThreadPerformanceCount:
     case ThreadSetTlsArrayAddress:
     default:
-        FIXME( "info class %d not supported yet\n", class );
-        return STATUS_NOT_IMPLEMENTED;
+        {
+            /* NSPA: FIXME-once — silence log spam in games that poll
+             * unsupported info classes. Each class fires once per process. */
+            static int once[MaxThreadInfoClass];
+            if (class >= 0 && class < MaxThreadInfoClass && !once[class]++)
+                FIXME( "info class %d not supported yet\n", class );
+            return STATUS_NOT_IMPLEMENTED;
+        }
     }
 }
 
@@ -2955,8 +2961,13 @@ NTSTATUS WINAPI NtSetInformationThread( HANDLE handle, THREADINFOCLASS class,
     case ThreadSetTlsArrayAddress:
     case ThreadIsIoPending:
     default:
-        FIXME( "info class %d not supported yet\n", class );
-        return STATUS_NOT_IMPLEMENTED;
+        {
+            /* NSPA: FIXME-once — silence log spam for unsupported info classes. */
+            static int once[MaxThreadInfoClass];
+            if (class >= 0 && class < MaxThreadInfoClass && !once[class]++)
+                FIXME( "info class %d not supported yet\n", class );
+            return STATUS_NOT_IMPLEMENTED;
+        }
     }
 }
 

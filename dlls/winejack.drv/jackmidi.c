@@ -54,11 +54,14 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(midi);
 
-#define JACK_MIDI_CLIENT_NAME  "wine-midi"
 #define MAX_MIDI_PORTS         64
 #define OUT_RB_SIZE            (64 * 1024)
 #define IN_RB_SIZE             (64 * 1024)
 #define RB_HDR_SIZE            3
+
+/* Shared JACK client from jack.c */
+extern jack_client_t *jack_get_client(void);
+extern BOOL jack_ensure_activated(void);
 
 struct midi_dest
 {
@@ -72,7 +75,6 @@ struct midi_src
     UINT startTime; MIDIINCAPSW caps; jack_port_t *port; char target[128];
 };
 
-static jack_client_t *jack_client;
 static jack_ringbuffer_t *out_rb, *in_rb;
 static int wakeup_pipe[2] = { -1, -1 };
 
@@ -148,12 +150,11 @@ static void notify_post(struct notify_context *notify)
     pi_mutex_unlock(&notify_mutex);
 }
 
-/* ── JACK process callback (RT context) ── */
+/* ── MIDI process (called from unified RT callback in jack.c) ── */
 
-static int jack_process_cb(jack_nframes_t nframes, void *arg)
+int jack_midi_process(jack_nframes_t nframes)
 {
     unsigned int i;
-    (void)arg;
 
     for (i = 0; i < num_dests; i++)
         if (dests[i].port)
@@ -191,32 +192,22 @@ static int jack_process_cb(jack_nframes_t nframes, void *arg)
     return 0;
 }
 
-/* ── JACK client lifecycle ── */
+/* ── JACK client lifecycle (uses shared client from jack.c) ── */
 
-static BOOL jack_open_client(void)
+static BOOL jack_midi_ensure_client(void)
 {
-    jack_status_t status;
-    if (jack_client) return TRUE;
-    jack_client = jack_client_open(JACK_MIDI_CLIENT_NAME, JackNoStartServer, &status);
-    if (!jack_client) { WARN("JACK unavailable (%d)\n", status); return FALSE; }
-    out_rb = jack_ringbuffer_create(OUT_RB_SIZE);
-    in_rb = jack_ringbuffer_create(IN_RB_SIZE);
-    jack_ringbuffer_mlock(out_rb); jack_ringbuffer_mlock(in_rb);
-    jack_set_process_callback(jack_client, jack_process_cb, NULL);
-    if (jack_activate(jack_client)) {
-        ERR("jack_activate failed\n");
-        jack_ringbuffer_free(out_rb); jack_ringbuffer_free(in_rb);
-        jack_client_close(jack_client); jack_client = NULL; out_rb = in_rb = NULL;
-        return FALSE;
+    if (!jack_ensure_activated()) return FALSE;
+    if (!out_rb)
+    {
+        out_rb = jack_ringbuffer_create(OUT_RB_SIZE);
+        in_rb = jack_ringbuffer_create(IN_RB_SIZE);
+        jack_ringbuffer_mlock(out_rb); jack_ringbuffer_mlock(in_rb);
     }
-    TRACE("JACK MIDI client '%s' active\n", jack_get_client_name(jack_client));
     return TRUE;
 }
 
-static void jack_close_client(void)
+static void jack_midi_cleanup_ringbufs(void)
 {
-    if (!jack_client) return;
-    jack_deactivate(jack_client); jack_client_close(jack_client); jack_client = NULL;
     if (out_rb) { jack_ringbuffer_free(out_rb); out_rb = NULL; }
     if (in_rb) { jack_ringbuffer_free(in_rb); in_rb = NULL; }
 }
@@ -232,15 +223,15 @@ static void make_caps_name(WCHAR *dst, size_t max, const char *name)
     dst[i] = 0;
 }
 
-static UINT jack_midi_init(void)
+UINT jack_midi_init_ex(void)
 {
     const char **ports; const char *us; int i;
 
-    if (!jack_open_client()) return 0;
-    us = jack_get_client_name(jack_client);
+    if (!jack_midi_ensure_client()) return 0;
+    us = jack_get_client_name(jack_get_client());
     num_dests = num_srcs = 0;
 
-    ports = jack_get_ports(jack_client, NULL, JACK_DEFAULT_MIDI_TYPE, JackPortIsInput);
+    ports = jack_get_ports(jack_get_client(), NULL, JACK_DEFAULT_MIDI_TYPE, JackPortIsInput);
     if (ports) {
         for (i = 0; ports[i] && num_dests < MAX_MIDI_PORTS; i++) {
             if (!strncmp(ports[i], us, strlen(us)) && ports[i][strlen(us)] == ':') continue;
@@ -258,7 +249,7 @@ static UINT jack_midi_init(void)
         jack_free(ports);
     }
 
-    ports = jack_get_ports(jack_client, NULL, JACK_DEFAULT_MIDI_TYPE, JackPortIsOutput);
+    ports = jack_get_ports(jack_get_client(), NULL, JACK_DEFAULT_MIDI_TYPE, JackPortIsOutput);
     if (ports) {
         for (i = 0; ports[i] && num_srcs < MAX_MIDI_PORTS; i++) {
             if (!strncmp(ports[i], us, strlen(us)) && ports[i][strlen(us)] == ':') continue;
@@ -274,7 +265,7 @@ static UINT jack_midi_init(void)
         jack_free(ports);
     }
 
-    if (!num_dests && !num_srcs) { TRACE("No JACK MIDI ports\n"); jack_close_client(); return 0; }
+    if (!num_dests && !num_srcs) { TRACE("No JACK MIDI ports\n"); jack_midi_cleanup_ringbufs(); return 0; }
     if (pipe(wakeup_pipe) == 0) fcntl(wakeup_pipe[1], F_SETFL, O_NONBLOCK);
     jack_midi_available = TRUE;
     TRACE("JACK MIDI: %u out, %u in\n", num_dests, num_srcs);
@@ -291,10 +282,10 @@ static UINT midi_out_open(WORD id, MIDIOPENDESC *desc, UINT flags, struct notify
     d->midiDesc = *desc; d->wFlags = HIWORD(flags & CALLBACK_TYPEMASK); d->runningStatus = 0;
     snprintf(pn, sizeof(pn), "midi_out_%u", id);
     seq_lock();
-    d->port = jack_port_register(jack_client, pn, JACK_DEFAULT_MIDI_TYPE, JackPortIsOutput, 0);
+    d->port = jack_port_register(jack_get_client(), pn, JACK_DEFAULT_MIDI_TYPE, JackPortIsOutput, 0);
     seq_unlock();
     if (!d->port) return MMSYSERR_ERROR;
-    if (jack_connect(jack_client, jack_port_name(d->port), d->target))
+    if (jack_connect(jack_get_client(), jack_port_name(d->port), d->target))
         WARN("auto-connect %s → %s failed\n", pn, d->target);
     d->bEnabled = TRUE;
     set_out_notify(n, d, id, MOM_OPEN, 0, 0);
@@ -306,7 +297,7 @@ static UINT midi_out_close(WORD id, struct notify_context *n)
     struct midi_dest *d;
     if (id >= num_dests) return MMSYSERR_BADDEVICEID;
     d = &dests[id]; if (!d->bEnabled) return MMSYSERR_ERROR;
-    seq_lock(); if (d->port) { jack_port_unregister(jack_client, d->port); d->port = NULL; } seq_unlock();
+    seq_lock(); if (d->port) { jack_port_unregister(jack_get_client(), d->port); d->port = NULL; } seq_unlock();
     d->bEnabled = FALSE; set_out_notify(n, d, id, MOM_CLOSE, 0, 0); d->midiDesc.hMidi = 0;
     return MMSYSERR_NOERROR;
 }
@@ -481,15 +472,15 @@ static UINT midi_in_open(WORD id, MIDIOPENDESC *desc, UINT flags, struct notify_
     s->lpQueueHdr = NULL; s->midiDesc = *desc; s->state = 0;
     snprintf(pn, sizeof(pn), "midi_in_%u", id);
     seq_lock();
-    s->port = jack_port_register(jack_client, pn, JACK_DEFAULT_MIDI_TYPE, JackPortIsInput, 0);
+    s->port = jack_port_register(jack_get_client(), pn, JACK_DEFAULT_MIDI_TYPE, JackPortIsInput, 0);
     seq_unlock();
     if (!s->port) return MMSYSERR_ERROR;
-    if (jack_connect(jack_client, s->target, jack_port_name(s->port)))
+    if (jack_connect(jack_get_client(), s->target, jack_port_name(s->port)))
         WARN("auto-connect %s → %s failed\n", s->target, pn);
     if (num_midi_in_started++ == 0) {
         in_notify_quit = 0;
         if (pthread_create(&in_notify_thread_id, NULL, in_notify_thread, NULL)) {
-            num_midi_in_started = 0; jack_port_unregister(jack_client, s->port); s->port = NULL;
+            num_midi_in_started = 0; jack_port_unregister(jack_get_client(), s->port); s->port = NULL;
             return MMSYSERR_ERROR;
         }
     }
@@ -503,7 +494,7 @@ static UINT midi_in_close(WORD id, struct notify_context *n)
     if (id >= num_srcs) return MMSYSERR_BADDEVICEID;
     s = &srcs[id]; if (!s->midiDesc.hMidi) return MMSYSERR_ERROR;
     if (s->lpQueueHdr) return MIDIERR_STILLPLAYING;
-    seq_lock(); if (s->port) { jack_port_unregister(jack_client, s->port); s->port = NULL; } seq_unlock();
+    seq_lock(); if (s->port) { jack_port_unregister(jack_get_client(), s->port); s->port = NULL; } seq_unlock();
     if (--num_midi_in_started == 0) {
         in_notify_quit = 1;
         if (wakeup_pipe[1] >= 0) { char x = 0; (void)write(wakeup_pipe[1], &x, 1); }
@@ -553,7 +544,7 @@ NTSTATUS jack_midi_out_message(void *args)
     struct midi_out_message_params *params = args;
     params->notify->send_notify = FALSE;
     switch (params->msg) {
-    case DRVM_INIT:      *params->err = jack_midi_init(); break;
+    case DRVM_INIT:      *params->err = jack_midi_init_ex(); break;
     case DRVM_EXIT:      *params->err = MMSYSERR_NOERROR; break;
     case MODM_OPEN:      *params->err = midi_out_open(params->dev_id, (MIDIOPENDESC *)params->param_1, params->param_2, params->notify); break;
     case MODM_CLOSE:     *params->err = midi_out_close(params->dev_id, params->notify); break;
@@ -579,7 +570,7 @@ NTSTATUS jack_midi_in_message(void *args)
     struct midi_in_message_params *params = args;
     params->notify->send_notify = FALSE;
     switch (params->msg) {
-    case DRVM_INIT:      *params->err = jack_midi_init(); break;
+    case DRVM_INIT:      *params->err = jack_midi_init_ex(); break;
     case DRVM_EXIT:      *params->err = MMSYSERR_NOERROR; break;
     case MIDM_OPEN:      *params->err = midi_in_open(params->dev_id, (MIDIOPENDESC *)params->param_1, params->param_2, params->notify); break;
     case MIDM_CLOSE:     *params->err = midi_in_close(params->dev_id, params->notify); break;
@@ -609,7 +600,7 @@ NTSTATUS jack_midi_release(void *args)
     }
     if (wakeup_pipe[0] >= 0) { close(wakeup_pipe[0]); wakeup_pipe[0] = -1; }
     if (wakeup_pipe[1] >= 0) { close(wakeup_pipe[1]); wakeup_pipe[1] = -1; }
-    jack_close_client(); jack_midi_available = FALSE;
+    jack_midi_cleanup_ringbufs(); jack_midi_available = FALSE;
     return STATUS_SUCCESS;
 }
 

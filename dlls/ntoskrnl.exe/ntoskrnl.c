@@ -3552,7 +3552,7 @@ MM_SYSTEMSIZE WINAPI MmQuerySystemSize(void)
  */
 void WINAPI KeInitializeDpc(KDPC *dpc, PKDEFERRED_ROUTINE deferred_routine, void *deferred_context)
 {
-    FIXME("dpc %p, deferred_routine %p, deferred_context %p semi-stub.\n",
+    TRACE("dpc %p, deferred_routine %p, deferred_context %p.\n",
             dpc, deferred_routine, deferred_context);
 
     dpc->DeferredRoutine = deferred_routine;

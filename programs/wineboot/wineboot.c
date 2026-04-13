@@ -374,8 +374,8 @@ static void create_user_shared_data(void)
             data->QpcBias = 0;
             data->QpcBypassEnabled = qpc_flags;
 
-            ERR( "NSPA RT:QPC: rdtsc bypass enabled (TSC freq=%I64u Hz, flags=%02x)\n",
-                 tsc_freq, qpc_flags );
+            fprintf( stderr, "wine: NSPA RT:QPC: rdtsc bypass enabled (TSC freq=%I64u Hz, flags=%02x)\n",
+                     tsc_freq, qpc_flags );
         }
         else
         {

@@ -192,6 +192,8 @@ ULONGLONG WINAPI KeQueryPerformanceCounter(LARGE_INTEGER *frequency)
 
     TRACE("(%p)\n", frequency);
 
-    NtQueryPerformanceCounter(&counter, frequency);
+    /* NSPA: Use Rtl path which has rdtsc bypass when available */
+    RtlQueryPerformanceFrequency(frequency);
+    RtlQueryPerformanceCounter(&counter);
     return counter.QuadPart;
 }

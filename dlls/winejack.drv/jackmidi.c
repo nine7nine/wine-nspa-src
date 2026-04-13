@@ -291,7 +291,34 @@ UINT jack_midi_init_ex(void)
         jack_free(ports);
     }
 
-    if (!num_dests && !num_srcs) { TRACE("No JACK MIDI ports\n"); jack_midi_cleanup_ringbufs(); return 0; }
+    /* If no external MIDI ports exist, create virtual through ports so
+     * Windows apps always see at least one MIDI device. MIDI data sent
+     * to the virtual output appears on the virtual input and vice versa,
+     * like ALSA's "Midi Through". Apps can also route to these ports
+     * via JACK's connection manager. */
+    if (!num_dests && !num_srcs)
+    {
+        TRACE("No external JACK MIDI ports, creating virtual through ports\n");
+        /* Create a virtual destination (output port) — apps send MIDI here */
+        memset(&dests[0], 0, sizeof(dests[0]));
+        { static const WCHAR n[] = {'W','i','n','e',' ','M','I','D','I',' ','O','u','t',0};
+          memcpy(dests[0].caps.szPname, n, sizeof(n)); }
+        dests[0].caps.wMid = 0x00FF;
+        dests[0].caps.wPid = 1;
+        dests[0].caps.vDriverVersion = 0x0100;
+        dests[0].caps.wTechnology = MOD_MIDIPORT;
+        dests[0].caps.wChannelMask = 0xFFFF;
+        num_dests = 1;
+
+        /* Create a virtual source (input port) — apps receive MIDI here */
+        memset(&srcs[0], 0, sizeof(srcs[0]));
+        { static const WCHAR n[] = {'W','i','n','e',' ','M','I','D','I',' ','I','n',0};
+          memcpy(srcs[0].caps.szPname, n, sizeof(n)); }
+        srcs[0].caps.wMid = 0x00FF;
+        srcs[0].caps.wPid = 1;
+        srcs[0].caps.vDriverVersion = 0x0100;
+        num_srcs = 1;
+    }
     if (pipe(wakeup_pipe) == 0) fcntl(wakeup_pipe[1], F_SETFL, O_NONBLOCK);
     jack_midi_available = TRUE;
     TRACE("JACK MIDI: %u out, %u in\n", num_dests, num_srcs);

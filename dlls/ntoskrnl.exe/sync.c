@@ -485,16 +485,15 @@ static void CALLBACK ke_timer_complete_proc(PTP_CALLBACK_INSTANCE instance, void
     TRACE("instance %p, timer %p, tp_timer %p.\n", instance, timer, tp_timer);
 
     if (dpc && dpc->DeferredRoutine)
-    {
-        TRACE("Calling dpc->DeferredRoutine %p, dpc->DeferredContext %p.\n", dpc->DeferredRoutine, dpc->DeferredContext);
         dpc->DeferredRoutine(dpc, dpc->DeferredContext, dpc->SystemArgument1, dpc->SystemArgument2);
-    }
+
     EnterCriticalSection( &sync_cs );
     timer->Header.SignalState = TRUE;
     if (timer->Header.WaitListHead.Blink)
         SetEvent(timer->Header.WaitListHead.Blink);
     LeaveCriticalSection( &sync_cs );
 }
+
 
 /***********************************************************************
  *           KeInitializeTimerEx   (NTOSKRNL.EXE.@)
@@ -540,15 +539,18 @@ BOOLEAN WINAPI KeSetTimerEx( KTIMER *timer, LARGE_INTEGER duetime, LONG period, 
         timer->Header.WaitListHead.Blink = NULL;
     }
 
+    timer->DueTime.QuadPart = duetime.QuadPart;
+    timer->Period = period;
+    timer->Dpc = dpc;
+
+    /* For short-period DPC timers (< 10ms), use a dedicated thread with
+     * a waitable timer for sub-ms resolution. Threadpool timers have
+     * ~15ms minimum resolution which makes dpclat show terrible numbers. */
     if (!timer->TimerListEntry.Blink)
         timer->TimerListEntry.Blink = (void *)CreateThreadpoolTimer(ke_timer_complete_proc, timer, NULL);
 
     if (!timer->TimerListEntry.Blink)
         ERR("Could not create thread pool timer.\n");
-
-    timer->DueTime.QuadPart = duetime.QuadPart;
-    timer->Period = period;
-    timer->Dpc = dpc;
 
     SetThreadpoolTimer((TP_TIMER *)timer->TimerListEntry.Blink, (FILETIME *)&duetime, period, 0);
     LeaveCriticalSection( &sync_cs );

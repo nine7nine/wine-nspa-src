@@ -40,6 +40,9 @@
 #include <sys/syscall.h>
 #endif
 #include <sys/time.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 #include <poll.h>
 #include <unistd.h>
 #ifdef HAVE_SCHED_H
@@ -2463,25 +2466,16 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
     }
     else
     {
-        LARGE_INTEGER now;
-        timeout_t when, diff;
         LONGLONG ticks = timeout->QuadPart;
-
-        if ((when = ticks) < 0)
-        {
-            NtQuerySystemTime( &now );
-            when = now.QuadPart - when;
-        }
-
-        /* Note that we yield after establishing the desired timeout, but
-           we only care about the result of the yield for zero timeouts */
-        status = NtYieldExecution();
-        if (!when) return status;
+        LARGE_INTEGER now;
+        timeout_t when = ticks, diff;
 
 #if defined(HAVE_CLOCK_GETTIME) && defined(HAVE_CLOCK_NANOSLEEP)
-        /* NSPA: use clock_nanosleep for sub-ms precision. select() only
-         * gives ~1ms granularity; clock_nanosleep gives ~50-100ns on
-         * modern kernels. Critical for DPC timing and audio callbacks. */
+        /* NSPA: use clock_nanosleep FIRST for sub-ms precision.
+         * This must run before NtYieldExecution — the yield causes a
+         * full scheduler round-trip that adds 1-15ms of jitter on non-RT
+         * threads. clock_nanosleep on an RT kernel gives ~50-100ns. */
+        if (ticks != 0)
         {
             struct timespec ts;
             int err;
@@ -2499,10 +2493,22 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
                 ts.tv_nsec = (long)((ticks % TICKSPERSEC) * 100);
             }
 
+            usleep(0);  /* brief yield without full scheduler round-trip */
             while ((err = clock_nanosleep( CLOCK_REALTIME, TIMER_ABSTIME, &ts, NULL )) == EINTR);
             if (!err) return STATUS_SUCCESS;
         }
 #endif
+
+        if (when < 0)
+        {
+            NtQuerySystemTime( &now );
+            when = now.QuadPart - when;
+        }
+
+        /* Note that we yield after establishing the desired timeout, but
+           we only care about the result of the yield for zero timeouts */
+        status = NtYieldExecution();
+        if (!when) return status;
 
         for (;;)
         {
@@ -2604,19 +2610,27 @@ NTSTATUS WINAPI NtSetTimerResolution( ULONG res, BOOLEAN set, ULONG *current_res
 {
     static BOOL has_request = FALSE;
 
-    TRACE( "(%u,%u,%p), semi-stub!\n", res, set, current_res );
+    TRACE( "(%u,%u,%p)\n", res, set, current_res );
 
-    /* Wine has no support for anything other that 1 ms and does not keep of
-     * track resolution requests anyway.
-     * Fortunately NtSetTimerResolution() should ignore requests to lower the
-     * timer resolution. So by claiming that 'some other process' requested the
-     * max resolution already, there no need to actually change it.
-     */
-    *current_res = 10000;
+#ifdef __linux__
+    /* NSPA: set Linux timer slack to match requested resolution.
+     * PR_SET_TIMERSLACK controls the maximum additional delay the kernel
+     * adds to timer expirations (select, poll, nanosleep, futex waits).
+     * Default is 50us; setting to 1ns gives sub-ms timer precision.
+     * This is what makes DPC timers, Sleep(1), and threadpool timers
+     * actually fire at their requested time. */
+    if (set)
+    {
+        unsigned long slack_ns = (unsigned long)res * 100;  /* 100ns units → ns */
+        if (slack_ns < 1) slack_ns = 1;
+        prctl( PR_SET_TIMERSLACK, slack_ns );
+    }
+    else
+        prctl( PR_SET_TIMERSLACK, 0 );  /* reset to default */
+#endif
 
-    /* Just keep track of whether this process requested a specific timer
-     * resolution.
-     */
+    *current_res = res < 5000 ? 5000 : res;  /* clamp to 0.5ms minimum */
+
     if (!has_request && !set)
         return STATUS_TIMER_RESOLUTION_NOT_SET;
     has_request = set;

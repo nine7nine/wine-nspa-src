@@ -391,12 +391,13 @@ LRESULT WINAPI DriverProc( DWORD_PTR id, HANDLE driver, UINT msg, LPARAM param1,
     case DRV_LOAD:
     {
         struct midi_init_params params;
-        UINT err = DRV_SUCCESS;
+        UINT err = MMSYSERR_NOERROR;
 
         params.err = &err;
         MIDI_CALL( midi_init, &params );
-        if (err == DRV_SUCCESS) notify_thread_handle = CreateThread( NULL, 0, notify_thread, NULL, 0, NULL );
-        return err;
+        if (err == MMSYSERR_NOERROR)
+            notify_thread_handle = CreateThread( NULL, 0, notify_thread, NULL, 0, NULL );
+        return (err == MMSYSERR_NOERROR) ? 1 : 0;
     }
     case DRV_FREE:
         MIDI_CALL( midi_release, NULL );

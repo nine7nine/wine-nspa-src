@@ -255,6 +255,22 @@ struct get_prop_value_params
     unsigned int *buffer_size;
 };
 
+/* NSPA: per-channel fast-path buffer info for direct ASIO→JACK path.
+ * Returned by get_fast_path_info when stream is in fast-path mode. */
+#define NSPA_FAST_PATH_MAX_CHANNELS 64
+struct fast_path_info_params
+{
+    stream_handle stream;
+    HRESULT result;
+    BOOL    available;                                 /* TRUE if fast path active */
+    UINT32  period_frames;                             /* frames per period/set */
+    int     nports;                                    /* number of channels */
+    volatile int    *write_buf_idx;                    /* pointer to buffer swap index */
+    volatile UINT32 *held_frames;                      /* pointer to held_frames counter */
+    float  *chan_bufs_a[NSPA_FAST_PATH_MAX_CHANNELS];  /* set A per-channel ptrs */
+    float  *chan_bufs_b[NSPA_FAST_PATH_MAX_CHANNELS];  /* set B per-channel ptrs */
+};
+
 struct midi_init_params
 {
     UINT *err;
@@ -350,5 +366,6 @@ enum unix_funcs
     midi_in_message,
     midi_notify_wait,
     aux_message,
+    get_fast_path_info,
     funcs_count
 };

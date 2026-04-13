@@ -310,8 +310,7 @@ static BOOL nspa_cs_pi_active(void)
 
     /* Publish our decision. If another thread already won the race, use
      * whatever value they set. */
-    if (!InterlockedCompareExchange( &nspa_cs_pi_state, new_state, 0 ) && new_state > 0)
-        ERR("NSPA RT:CS-PI: critical section priority inheritance enabled (FUTEX_LOCK_PI)\n");
+    InterlockedCompareExchange( &nspa_cs_pi_state, new_state, 0 );
     return nspa_cs_pi_state > 0;
 }
 

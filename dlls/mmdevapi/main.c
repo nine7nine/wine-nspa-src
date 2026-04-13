@@ -460,6 +460,28 @@ DWORD WINAPI modMessage( UINT id, UINT msg, DWORD_PTR user, DWORD_PTR param1, DW
     return err;
 }
 
+/* NSPA: expose per-channel fast-path buffer info for direct ASIO→JACK path.
+ * nspaASIO calls this after IAudioClient_Initialize to get per-channel
+ * buffer pointers, bypassing the interleave/deinterleave round-trip. */
+HRESULT WINAPI nspa_get_fast_path_info( IAudioClient *audio_client,
+                                         struct fast_path_info_params *info )
+{
+    struct audio_client *client;
+
+    InitOnceExecuteOnce( &init_once, init_driver, NULL, NULL );
+
+    if (!audio_client || !info)
+        return E_POINTER;
+
+    client = CONTAINING_RECORD( audio_client, struct audio_client, IAudioClient3_iface );
+    if (!client->stream)
+        return AUDCLNT_E_NOT_INITIALIZED;
+
+    info->stream = client->stream;
+    wine_unix_call( get_fast_path_info, info );
+    return info->result;
+}
+
 DWORD WINAPI auxMessage( UINT id, UINT msg, DWORD_PTR user, DWORD_PTR param1, DWORD_PTR param2 )
 {
     struct aux_message_params params;

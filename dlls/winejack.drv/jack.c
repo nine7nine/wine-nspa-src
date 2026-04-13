@@ -680,19 +680,9 @@ static int jack_audio_process_cb(jack_nframes_t nframes, void *arg)
             jack_process_capture(s, nframes);
     }
 
-    /* Signal event-driven streams from the RT callback.
-     * This gives the tightest possible wakeup timing — the app gets
-     * signaled exactly when JACK has consumed/produced a buffer,
-     * rather than relying on the timer thread's NtDelayExecution
-     * which has kernel scheduling jitter. The timer thread still
-     * runs (for apps that depend on periodic wakeups in push mode)
-     * but event-driven apps will see the RT-sourced signal first. */
-    for (i = 0; i < num_active_streams; i++)
-    {
-        struct jack_stream *s = active_streams[i];
-        if (s && s->started && s->event)
-            NtSetEvent(s->event, NULL);
-    }
+    /* Event signaling is handled by the timer_loop thread, not here.
+     * NtSetEvent is a syscall (wineserver or ntsync ioctl) — calling it
+     * from the JACK RT callback causes priority inversion and xruns. */
 
     /* MIDI ports (shared client — same RT callback) */
     if (jack_midi_available)

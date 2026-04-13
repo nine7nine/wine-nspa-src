@@ -2465,8 +2465,9 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
     {
         LARGE_INTEGER now;
         timeout_t when, diff;
+        LONGLONG ticks = timeout->QuadPart;
 
-        if ((when = timeout->QuadPart) < 0)
+        if ((when = ticks) < 0)
         {
             NtQuerySystemTime( &now );
             when = now.QuadPart - when;
@@ -2476,6 +2477,32 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
            we only care about the result of the yield for zero timeouts */
         status = NtYieldExecution();
         if (!when) return status;
+
+#if defined(HAVE_CLOCK_GETTIME) && defined(HAVE_CLOCK_NANOSLEEP)
+        /* NSPA: use clock_nanosleep for sub-ms precision. select() only
+         * gives ~1ms granularity; clock_nanosleep gives ~50-100ns on
+         * modern kernels. Critical for DPC timing and audio callbacks. */
+        {
+            struct timespec ts;
+            int err;
+
+            if (ticks < 0)
+            {
+                clock_gettime( CLOCK_REALTIME, &ts );
+                ts.tv_sec += (time_t)(-ticks / TICKSPERSEC);
+                ts.tv_nsec += (long)((-ticks % TICKSPERSEC) * 100);
+                if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
+            }
+            else
+            {
+                ts.tv_sec = (time_t)((ticks / TICKSPERSEC) - SECS_1601_TO_1970);
+                ts.tv_nsec = (long)((ticks % TICKSPERSEC) * 100);
+            }
+
+            while ((err = clock_nanosleep( CLOCK_REALTIME, TIMER_ABSTIME, &ts, NULL )) == EINTR);
+            if (!err) return STATUS_SUCCESS;
+        }
+#endif
 
         for (;;)
         {

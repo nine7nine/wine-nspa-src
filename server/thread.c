@@ -376,6 +376,8 @@ static void nspa_rt_init(void)
                  nspa_rt_map_prio( LOW_REALTIME_PRIORITY ) );
     }
 
+    fprintf( stderr, "wine: NSPA RT:CS-PI: critical section priority inheritance enabled (FUTEX_LOCK_PI)\n" );
+
     /* Soft NTSync dependency: warn if missing, but still apply RT. */
     if (access( "/dev/ntsync", F_OK ) != 0)
         fprintf( stderr, "wine: NSPA RT:NTSync: /dev/ntsync unavailable; wait paths will not be end-to-end RT\n" );

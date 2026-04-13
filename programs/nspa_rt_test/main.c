@@ -431,14 +431,17 @@ static DWORD WINAPI prio_p2_thread(void *arg)
     return 0;
 }
 
+/* Expected FIFO priorities under ceiling mapping:
+ *   fifo = NSPA_RT_PRIO - (31 - nt_band)
+ * With NSPA_RT_PRIO=80: TC(31)=80, NORMAL(24)=73, IDLE(16)=65 */
 static struct prio_p2_ctx prio_p2_cases[] = {
-    { "IDLE",    THREAD_PRIORITY_IDLE,          72 },
-    { "LOWEST",  THREAD_PRIORITY_LOWEST,        78 },
-    { "BELOW",   THREAD_PRIORITY_BELOW_NORMAL,  79 },
-    { "NORMAL",  THREAD_PRIORITY_NORMAL,        80 },
-    { "ABOVE",   THREAD_PRIORITY_ABOVE_NORMAL,  81 },
-    { "HIGHEST", THREAD_PRIORITY_HIGHEST,       82 },
-    { "TC",      THREAD_PRIORITY_TIME_CRITICAL, 87 },
+    { "IDLE",    THREAD_PRIORITY_IDLE,          65 },
+    { "LOWEST",  THREAD_PRIORITY_LOWEST,        71 },
+    { "BELOW",   THREAD_PRIORITY_BELOW_NORMAL,  72 },
+    { "NORMAL",  THREAD_PRIORITY_NORMAL,        73 },
+    { "ABOVE",   THREAD_PRIORITY_ABOVE_NORMAL,  74 },
+    { "HIGHEST", THREAD_PRIORITY_HIGHEST,       75 },
+    { "TC",      THREAD_PRIORITY_TIME_CRITICAL, 80 },
 };
 #define NUM_PRIO_P2 (sizeof(prio_p2_cases)/sizeof(prio_p2_cases[0]))
 
@@ -653,7 +656,7 @@ static DWORD WINAPI cs_waiter_thread(void *u)
     int iter;
     (void)u;
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-    printf("[CS-waiter]  win32_tid=%lu  SetThreadPriority(TIME_CRITICAL) -> SCHED_FIFO 87\n",
+    printf("[CS-waiter]  win32_tid=%lu  SetThreadPriority(TIME_CRITICAL) -> SCHED_FIFO (ceiling)\n",
            GetCurrentThreadId());
     fflush(stdout);
 
@@ -2615,7 +2618,7 @@ static DWORD WINAPI nts_pi_waiter_thread(void *u)
     (void)u;
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
     print_worker_start("waiter", GetCurrentThreadId(),
-                       "TIME_CRITICAL -> SCHED_FIFO 87");
+                       "TIME_CRITICAL -> SCHED_FIFO (ceiling)");
 
     for (iter = 0; iter < nts_pi_iters; iter++)
     {

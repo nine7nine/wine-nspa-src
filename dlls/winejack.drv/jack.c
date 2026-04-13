@@ -112,9 +112,21 @@ struct jack_stream
     UINT32  mmdev_period_frames;
     REFERENCE_TIME mmdev_period_rt;
 
-    /* Ring buffer — RT callback reads lcl_offs/held, app writes wri_offs/held.
-     * For lock-free RT access, the RT side reads these atomically without
-     * taking the lock (see jack_process_render/capture). */
+    /* ── Fast path (exclusive + float32 + JACK-native rate) ──
+     * Per-channel double buffers instead of interleaved ring buffer.
+     * RT reads set [1-write_buf_idx], app writes set [write_buf_idx].
+     * Buffer swap happens in RT callback after copying to JACK ports.
+     *
+     * chan_bufs[0] = set A (nports float* arrays, each period_frames long)
+     * chan_bufs[1] = set B
+     * chan_buf_mem = single allocation backing both sets */
+    BOOL    fast_path;
+    float  *chan_bufs[2][64];      /* per-channel pointers, 2 sets */
+    float  *chan_buf_mem;          /* backing allocation */
+    volatile int write_buf_idx;    /* app writes to this set (0 or 1) */
+
+    /* ── General path (shared mode, non-float32, rate mismatch) ──
+     * Interleaved ring buffer with head/tail tracking. */
     BYTE   *local_buffer;
     volatile UINT32  lcl_offs_frames;
     volatile UINT32  wri_offs_frames;
@@ -547,6 +559,56 @@ static void jack_process_render(struct jack_stream *s, jack_nframes_t nframes)
     }
 }
 
+/* ── Fast-path render: per-channel double buffer → JACK ports ──
+ *
+ * No deinterleave, no format conversion (data is already float32 per-channel).
+ * Unity volume = memcpy.  Non-unity = single multiply loop.
+ * After copying, swap the buffer index so the app gets the other set. */
+static void jack_process_render_fast(struct jack_stream *s, jack_nframes_t nframes)
+{
+    int read_idx = 1 - s->write_buf_idx;  /* RT reads the set app is NOT writing */
+    UINT32 avail = __atomic_load_n(&s->held_frames, __ATOMIC_ACQUIRE);
+    UINT32 frames = avail >= nframes ? nframes : avail;
+    int ch;
+
+    for (ch = 0; ch < s->nports; ch++)
+    {
+        float *dst = (float *)jack_port_get_buffer(s->ports[ch], nframes);
+        const float *src = s->chan_bufs[read_idx][ch];
+        float vol = s->vols[ch];
+
+        if (frames > 0)
+        {
+            if (vol == 1.0f)
+                memcpy(dst, src, frames * sizeof(float));
+            else
+            {
+                UINT32 j = 0;
+#ifdef __SSE2__
+                __m128 vv = _mm_set1_ps(vol);
+                for (; j + 4 <= frames; j += 4)
+                    _mm_storeu_ps(dst + j, _mm_mul_ps(_mm_loadu_ps(src + j), vv));
+#endif
+                for (; j < frames; j++)
+                    dst[j] = src[j] * vol;
+            }
+        }
+
+        /* Zero any remaining frames (underrun padding) */
+        if (frames < nframes)
+            memset(dst + frames, 0, (nframes - frames) * sizeof(float));
+    }
+
+    if (frames > 0)
+    {
+        /* Swap: the set we just read becomes the write set.
+         * The app will fill it next; we'll read the other set next period. */
+        __atomic_store_n(&s->write_buf_idx, read_idx, __ATOMIC_RELEASE);
+        __atomic_store_n(&s->held_frames, 0, __ATOMIC_RELEASE);
+        s->written_frames += frames;
+    }
+}
+
 /* Capture one contiguous chunk from JACK port buffers to local_buffer.
  * Mono/stereo use SSE2 fast paths; >2 channels use scalar loops. */
 static void capture_chunk(struct jack_stream *s, const float **jack_bufs,
@@ -686,7 +748,12 @@ static int jack_audio_process_cb(jack_nframes_t nframes, void *arg)
         if (!s || !s->started) continue;
 
         if (s->flow == eRender)
-            jack_process_render(s, nframes);
+        {
+            if (s->fast_path)
+                jack_process_render_fast(s, nframes);
+            else
+                jack_process_render(s, nframes);
+        }
         else
             jack_process_capture(s, nframes);
     }
@@ -1292,28 +1359,88 @@ static NTSTATUS jack_create_stream(void *args)
         }
     }
 
-    /* Allocate ring buffer */
-    size = stream->bufsize_frames * params->fmt->nBlockAlign;
-    if (NtAllocateVirtualMemory(GetCurrentProcess(), (void **)&stream->local_buffer,
-                                 zero_bits, &size, MEM_COMMIT, PAGE_READWRITE))
-    {
-        params->result = E_OUTOFMEMORY;
-        goto fail;
-    }
-    mlock(stream->local_buffer, size);  /* Pin audio buffer in RAM — prevent page faults in RT */
-    silence_buffer(&fmtex->Format, stream->local_buffer, stream->bufsize_frames);
+    /* ── Fast-path detection ──
+     * Exclusive + event-driven + float32 + JACK-native rate + render =
+     * per-channel double buffers instead of interleaved ring buffer. */
+    stream->fast_path = (params->flow == eRender &&
+                         params->share == AUDCLNT_SHAREMODE_EXCLUSIVE &&
+                         (params->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK) &&
+                         stream->sfmt == FMT_F32 &&
+                         params->fmt->nSamplesPerSec == jack_rate);
 
-    /* Pre-allocate tmp_buffer to max period size (avoids allocation in GetBuffer hot path) */
+    if (stream->fast_path)
     {
-        SIZE_T tmp_size = stream->bufsize_frames * params->fmt->nBlockAlign;
-        if (NtAllocateVirtualMemory(GetCurrentProcess(), (void **)&stream->tmp_buffer,
-                                     zero_bits, &tmp_size, MEM_COMMIT, PAGE_READWRITE))
+        /* Per-channel double buffers: 2 sets × nports channels × period frames.
+         * Single contiguous allocation for cache friendliness + easy cleanup. */
+        UINT32 period = stream->mmdev_period_frames;
+        SIZE_T chan_size = (SIZE_T)2 * stream->nports * period * sizeof(float);
+        float *mem;
+
+        stream->bufsize_frames = period;  /* fast path: exactly 1 period per set */
+
+        if (NtAllocateVirtualMemory(GetCurrentProcess(), (void **)&stream->chan_buf_mem,
+                                     zero_bits, &chan_size, MEM_COMMIT, PAGE_READWRITE))
         {
             params->result = E_OUTOFMEMORY;
             goto fail;
         }
-        mlock(stream->tmp_buffer, tmp_size);
-        stream->tmp_buffer_frames = stream->bufsize_frames;
+        mlock(stream->chan_buf_mem, chan_size);
+        memset(stream->chan_buf_mem, 0, chan_size);
+
+        /* Wire per-channel pointers into the contiguous block */
+        mem = stream->chan_buf_mem;
+        for (ch = 0; ch < stream->nports; ch++)
+        {
+            stream->chan_bufs[0][ch] = mem;  /* set A */
+            mem += period;
+        }
+        for (ch = 0; ch < stream->nports; ch++)
+        {
+            stream->chan_bufs[1][ch] = mem;  /* set B */
+            mem += period;
+        }
+        stream->write_buf_idx = 0;
+
+        /* Staging buffer for interleaved GetBuffer (general WASAPI compat).
+         * Phase D (nspaASIO direct) bypasses this entirely. */
+        size = period * params->fmt->nBlockAlign;
+        if (NtAllocateVirtualMemory(GetCurrentProcess(), (void **)&stream->tmp_buffer,
+                                     zero_bits, &size, MEM_COMMIT, PAGE_READWRITE))
+        {
+            params->result = E_OUTOFMEMORY;
+            goto fail;
+        }
+        mlock(stream->tmp_buffer, size);
+        stream->tmp_buffer_frames = period;
+
+        ERR("NSPA RT:JACK: fast-path stream (%u frames, %d ch, float32, JACK-synced)\n",
+            period, stream->nports);
+    }
+    else
+    {
+        /* General path: interleaved ring buffer */
+        size = stream->bufsize_frames * params->fmt->nBlockAlign;
+        if (NtAllocateVirtualMemory(GetCurrentProcess(), (void **)&stream->local_buffer,
+                                     zero_bits, &size, MEM_COMMIT, PAGE_READWRITE))
+        {
+            params->result = E_OUTOFMEMORY;
+            goto fail;
+        }
+        mlock(stream->local_buffer, size);
+        silence_buffer(&fmtex->Format, stream->local_buffer, stream->bufsize_frames);
+
+        /* Pre-allocate tmp_buffer for wraparound copies */
+        {
+            SIZE_T tmp_size = stream->bufsize_frames * params->fmt->nBlockAlign;
+            if (NtAllocateVirtualMemory(GetCurrentProcess(), (void **)&stream->tmp_buffer,
+                                         zero_bits, &tmp_size, MEM_COMMIT, PAGE_READWRITE))
+            {
+                params->result = E_OUTOFMEMORY;
+                goto fail;
+            }
+            mlock(stream->tmp_buffer, tmp_size);
+            stream->tmp_buffer_frames = stream->bufsize_frames;
+        }
     }
 
     /* Allocate volumes (raw + pre-scaled) */
@@ -1552,7 +1679,7 @@ static NTSTATUS jack_get_render_buffer(void *args)
 {
     struct get_render_buffer_params *params = args;
     struct jack_stream *stream = handle_get_stream(params->stream);
-    UINT32 write_pos, frames = params->frames;
+    UINT32 frames = params->frames;
 
     stream_lock(stream);
 
@@ -1562,23 +1689,37 @@ static NTSTATUS jack_get_render_buffer(void *args)
     if (!frames)
         return stream_unlock_result(stream, &params->result, S_OK);
 
-    if (stream->held_frames + frames > stream->bufsize_frames)
-        return stream_unlock_result(stream, &params->result, AUDCLNT_E_BUFFER_TOO_LARGE);
-
-    write_pos = stream->wri_offs_frames;
-    if (write_pos + frames > stream->bufsize_frames)
+    if (stream->fast_path)
     {
-        /* Wraparound — use pre-allocated temp buffer (no allocation in hot path) */
+        /* Fast path: return staging buffer (interleaved).  ReleaseBuffer
+         * will deinterleave into per-channel write-set buffers. */
+        if (frames > stream->bufsize_frames)
+            return stream_unlock_result(stream, &params->result, AUDCLNT_E_BUFFER_TOO_LARGE);
+
         *params->data = stream->tmp_buffer;
-        stream->getbuf_last = -(LONG)frames;
+        stream->getbuf_last = frames;
+        memset(stream->tmp_buffer, 0, frames * stream->fmt->Format.nBlockAlign);
     }
     else
     {
-        *params->data = stream->local_buffer + write_pos * stream->fmt->Format.nBlockAlign;
-        stream->getbuf_last = frames;
-    }
+        UINT32 write_pos = stream->wri_offs_frames;
 
-    silence_buffer(&stream->fmt->Format, *params->data, frames);
+        if (stream->held_frames + frames > stream->bufsize_frames)
+            return stream_unlock_result(stream, &params->result, AUDCLNT_E_BUFFER_TOO_LARGE);
+
+        if (write_pos + frames > stream->bufsize_frames)
+        {
+            *params->data = stream->tmp_buffer;
+            stream->getbuf_last = -(LONG)frames;
+        }
+        else
+        {
+            *params->data = stream->local_buffer + write_pos * stream->fmt->Format.nBlockAlign;
+            stream->getbuf_last = frames;
+        }
+
+        silence_buffer(&stream->fmt->Format, *params->data, frames);
+    }
 
     return stream_unlock_result(stream, &params->result, S_OK);
 }
@@ -1588,7 +1729,6 @@ static NTSTATUS jack_release_render_buffer(void *args)
     struct release_render_buffer_params *params = args;
     struct jack_stream *stream = handle_get_stream(params->stream);
     UINT32 written_frames = params->written_frames;
-    BYTE *buffer;
 
     stream_lock(stream);
 
@@ -1604,23 +1744,84 @@ static NTSTATUS jack_release_render_buffer(void *args)
     if (written_frames > (UINT32)(stream->getbuf_last >= 0 ? stream->getbuf_last : -stream->getbuf_last))
         return stream_unlock_result(stream, &params->result, AUDCLNT_E_INVALID_SIZE);
 
-    if (stream->getbuf_last >= 0)
-        buffer = stream->local_buffer + stream->wri_offs_frames * stream->fmt->Format.nBlockAlign;
+    if (stream->fast_path)
+    {
+        /* Fast path: deinterleave staging buffer → per-channel write-set.
+         * This runs on the app thread, not RT — can take its time. */
+        int wri = stream->write_buf_idx;
+        const float *src = (const float *)stream->tmp_buffer;
+        int ch, nch = stream->nchannels, nports = stream->nports;
+        UINT32 j;
+
+        if (params->flags & AUDCLNT_BUFFERFLAGS_SILENT)
+        {
+            for (ch = 0; ch < nports; ch++)
+                memset(stream->chan_bufs[wri][ch], 0, written_frames * sizeof(float));
+        }
+        else
+        {
+#ifdef __SSE2__
+            if (nch == 2 && nports >= 2)
+            {
+                /* SSE2 stereo deinterleave */
+                float *dst_l = stream->chan_bufs[wri][0];
+                float *dst_r = stream->chan_bufs[wri][1];
+                j = 0;
+                for (; j + 4 <= written_frames; j += 4)
+                {
+                    __m128 a = _mm_loadu_ps(src + j * 2);
+                    __m128 b = _mm_loadu_ps(src + j * 2 + 4);
+                    _mm_storeu_ps(dst_l + j, _mm_shuffle_ps(a, b, _MM_SHUFFLE(2,0,2,0)));
+                    _mm_storeu_ps(dst_r + j, _mm_shuffle_ps(a, b, _MM_SHUFFLE(3,1,3,1)));
+                }
+                for (; j < written_frames; j++)
+                {
+                    dst_l[j] = src[j * 2];
+                    dst_r[j] = src[j * 2 + 1];
+                }
+            }
+            else if (nch == 1 && nports >= 1)
+            {
+                memcpy(stream->chan_bufs[wri][0], src, written_frames * sizeof(float));
+            }
+            else
+#endif
+            {
+                for (ch = 0; ch < nports; ch++)
+                {
+                    float *dst = stream->chan_bufs[wri][ch];
+                    for (j = 0; j < written_frames; j++)
+                        dst[j] = src[j * nch + ch];
+                }
+            }
+        }
+
+        __atomic_store_n(&stream->held_frames, written_frames, __ATOMIC_RELEASE);
+        stream->written_frames += written_frames;
+    }
     else
-        buffer = stream->tmp_buffer;
+    {
+        /* General path: ring buffer */
+        BYTE *buffer;
 
-    if (params->flags & AUDCLNT_BUFFERFLAGS_SILENT)
-        silence_buffer(&stream->fmt->Format, buffer, written_frames);
+        if (stream->getbuf_last >= 0)
+            buffer = stream->local_buffer + stream->wri_offs_frames * stream->fmt->Format.nBlockAlign;
+        else
+            buffer = stream->tmp_buffer;
 
-    if (stream->getbuf_last < 0)
-        wrap_buffer(stream, buffer, written_frames);
+        if (params->flags & AUDCLNT_BUFFERFLAGS_SILENT)
+            silence_buffer(&stream->fmt->Format, buffer, written_frames);
 
-    stream->wri_offs_frames += written_frames;
-    stream->wri_offs_frames %= stream->bufsize_frames;
-    __sync_add_and_fetch(&stream->held_frames, written_frames);
-    stream->written_frames += written_frames;
+        if (stream->getbuf_last < 0)
+            wrap_buffer(stream, buffer, written_frames);
+
+        stream->wri_offs_frames += written_frames;
+        stream->wri_offs_frames %= stream->bufsize_frames;
+        __sync_add_and_fetch(&stream->held_frames, written_frames);
+        stream->written_frames += written_frames;
+    }
+
     stream->getbuf_last = 0;
-
     return stream_unlock_result(stream, &params->result, S_OK);
 }
 
@@ -1942,6 +2143,35 @@ static NTSTATUS jack_get_prop_value(void *args)
     return STATUS_SUCCESS;
 }
 
+static NTSTATUS jack_get_fast_path_info(void *args)
+{
+    struct fast_path_info_params *params = args;
+    struct jack_stream *stream = handle_get_stream(params->stream);
+    int ch;
+
+    if (!stream || !stream->fast_path)
+    {
+        params->available = FALSE;
+        params->result = S_OK;
+        return STATUS_SUCCESS;
+    }
+
+    params->available = TRUE;
+    params->period_frames = stream->bufsize_frames;
+    params->nports = stream->nports;
+    params->write_buf_idx = &stream->write_buf_idx;
+    params->held_frames = &stream->held_frames;
+
+    for (ch = 0; ch < stream->nports; ch++)
+    {
+        params->chan_bufs_a[ch] = stream->chan_bufs[0][ch];
+        params->chan_bufs_b[ch] = stream->chan_bufs[1][ch];
+    }
+
+    params->result = S_OK;
+    return STATUS_SUCCESS;
+}
+
 static NTSTATUS jack_midi_get_driver(void *args)
 {
     /* Return "jack" so mmdevapi loads winejack.drv as a separate MIDI driver
@@ -2010,6 +2240,7 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
     jack_midi_in_message,           /* midi_in_message */
     jack_midi_notify_wait,          /* midi_notify_wait */
     jack_not_implemented,           /* aux_message */
+    jack_get_fast_path_info,        /* get_fast_path_info */
 };
 
 C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == funcs_count);
@@ -2272,6 +2503,7 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
     jack_midi_in_message,
     jack_midi_notify_wait,
     jack_not_implemented,               /* aux_message */
+    jack_get_fast_path_info,            /* get_fast_path_info */
 };
 
 C_ASSERT(ARRAYSIZE(__wine_unix_call_wow64_funcs) == funcs_count);

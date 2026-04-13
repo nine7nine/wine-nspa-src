@@ -34,6 +34,37 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(asio);
 
+/* Import from mmdevapi.dll — per-channel fast-path buffer info */
+#define NSPA_FAST_PATH_MAX_CHANNELS 64
+typedef UINT64 stream_handle;
+struct fast_path_info_params
+{
+    stream_handle stream;
+    HRESULT result;
+    BOOL    available;
+    UINT32  period_frames;
+    int     nports;
+    volatile int    *write_buf_idx;
+    volatile UINT32 *held_frames;
+    float  *chan_bufs_a[NSPA_FAST_PATH_MAX_CHANNELS];
+    float  *chan_bufs_b[NSPA_FAST_PATH_MAX_CHANNELS];
+};
+
+typedef HRESULT (WINAPI *nspa_get_fast_path_info_fn)(IAudioClient *client,
+                                                     struct fast_path_info_params *info);
+
+static nspa_get_fast_path_info_fn get_fast_path_info_func(void)
+{
+    static nspa_get_fast_path_info_fn fn;
+    if (!fn)
+    {
+        HMODULE mod = GetModuleHandleW(L"mmdevapi");
+        if (mod)
+            fn = (nspa_get_fast_path_info_fn)GetProcAddress(mod, "nspa_get_fast_path_info");
+    }
+    return fn;
+}
+
 /* ════════════════════════════════════════════════════════════════════════
  *   CLSID — unique to nspaASIO
  * ════════════════════════════════════════════════════════════════════════ */
@@ -139,6 +170,17 @@ typedef struct nspaASIODriver {
     LARGE_INTEGER     system_time;
     LARGE_INTEGER     perf_freq;
     ASIOSampleRate    sample_rate;
+
+    /* NSPA fast path: direct per-channel write to winejack buffers.
+     * When available, play_thread skips interleave + GetBuffer/ReleaseBuffer
+     * and copies ASIO per-channel → winejack per-channel directly. */
+    BOOL              fast_path;
+    float            *fp_chan_a[64];  /* winejack set A per-channel ptrs */
+    float            *fp_chan_b[64];  /* winejack set B per-channel ptrs */
+    volatile int     *fp_write_idx;  /* winejack buffer swap index */
+    volatile UINT32  *fp_held;       /* winejack held_frames */
+    UINT32            fp_period;     /* winejack period frames */
+    int               fp_nports;     /* winejack port count */
 } nspaASIODriver;
 
 static nspaASIODriver *g_driver;
@@ -216,80 +258,112 @@ static unsigned __stdcall play_thread(void *arg)
         int src_idx = d->buf_index;  /* host just filled this one */
         BYTE **src_bufs = src_idx == 0 ? d->buf_a : d->buf_b;
 
-        /* Copy ASIO per-channel buffers → interleaved WASAPI buffer.
-         * Stereo F32 SSE2 fast path for the common JACK-backed case. */
-        hr = IAudioRenderClient_GetBuffer(d->render_client, d->buf_size, &wasapi_buf);
-        if (SUCCEEDED(hr))
+        if (d->fast_path)
         {
-            long i;
-            int ch, bps = d->bytes_per_sample, nch = d->wasapi_channels;
+            /* ── Direct per-channel path: ASIO → winejack, zero interleave ──
+             * Copy each ASIO output channel directly into winejack's per-channel
+             * write-set buffer. No GetBuffer, no interleave, no ReleaseBuffer. */
+            int wri = *d->fp_write_idx;
+            float **dst_set = (wri == 0) ? d->fp_chan_a : d->fp_chan_b;
+            int ch;
+            UINT32 frames = (UINT32)d->buf_size;
+            if (frames > d->fp_period) frames = d->fp_period;
+
+            for (ch = 0; ch < d->fp_nports && ch < d->out_map_count; ch++)
+            {
+                const float *src = (const float *)src_bufs[d->out_map[ch]];
+                float *dst = dst_set[ch];
+#ifdef __SSE2__
+                long j = 0;
+                for (; j + 4 <= (long)frames; j += 4)
+                    _mm_storeu_ps(dst + j, _mm_loadu_ps(src + j));
+                for (; j < (long)frames; j++)
+                    dst[j] = src[j];
+#else
+                memcpy(dst, src, frames * sizeof(float));
+#endif
+            }
+            /* Zero any unmapped channels */
+            for (; ch < d->fp_nports; ch++)
+                memset(dst_set[ch], 0, frames * sizeof(float));
+
+            /* Signal winejack that data is ready */
+            __atomic_store_n(d->fp_held, frames, __ATOMIC_RELEASE);
+        }
+        else
+        {
+            /* ── General WASAPI path: interleave → GetBuffer/ReleaseBuffer ── */
+            hr = IAudioRenderClient_GetBuffer(d->render_client, d->buf_size, &wasapi_buf);
+            if (SUCCEEDED(hr))
+            {
+                long i;
+                int ch, bps = d->bytes_per_sample, nch = d->wasapi_channels;
 
 #ifdef __SSE2__
-            if (bps == 4 && nch == 2 && d->out_map_count >= 2)
-            {
-                /* SSE2 stereo F32 interleave: 4 frames per iteration */
-                const float *src_l = (const float *)src_bufs[d->out_map[0]];
-                const float *src_r = (const float *)src_bufs[d->out_map[1]];
-                float *dst = (float *)wasapi_buf;
-                long j = 0;
-                for (; j + 4 <= d->buf_size; j += 4)
+                if (bps == 4 && nch == 2 && d->out_map_count >= 2)
                 {
-                    __m128 l = _mm_loadu_ps(src_l + j);
-                    __m128 r = _mm_loadu_ps(src_r + j);
-                    __m128 lo = _mm_unpacklo_ps(l, r);  /* L0 R0 L1 R1 */
-                    __m128 hi = _mm_unpackhi_ps(l, r);  /* L2 R2 L3 R3 */
-                    _mm_storeu_ps(dst + j * 2, lo);
-                    _mm_storeu_ps(dst + j * 2 + 4, hi);
-                }
-                for (; j < d->buf_size; j++)
-                {
-                    dst[j * 2] = src_l[j];
-                    dst[j * 2 + 1] = src_r[j];
-                }
-            }
-            else if (bps == 4 && nch == 1 && d->out_map_count >= 1)
-            {
-                /* SSE2 mono F32: straight copy, 4 samples per iteration */
-                const float *src_m = (const float *)src_bufs[d->out_map[0]];
-                float *dst = (float *)wasapi_buf;
-                long j = 0;
-                for (; j + 4 <= d->buf_size; j += 4)
-                    _mm_storeu_ps(dst + j, _mm_loadu_ps(src_m + j));
-                for (; j < d->buf_size; j++)
-                    dst[j] = src_m[j];
-            }
-            else
-#endif
-            if (bps == 4)  /* float32 or int32 — general channel count */
-            {
-                float *dst = (float *)wasapi_buf;
-                for (i = 0; i < d->buf_size; i++)
-                    for (ch = 0; ch < nch; ch++)
-                        dst[i * nch + ch] = (ch < d->out_map_count)
-                            ? ((float *)src_bufs[d->out_map[ch]])[i] : 0.0f;
-            }
-            else if (bps == 2)  /* int16 */
-            {
-                INT16 *dst = (INT16 *)wasapi_buf;
-                for (i = 0; i < d->buf_size; i++)
-                    for (ch = 0; ch < nch; ch++)
-                        dst[i * nch + ch] = (ch < d->out_map_count)
-                            ? ((INT16 *)src_bufs[d->out_map[ch]])[i] : 0;
-            }
-            else  /* int24 or other — fallback to byte copy */
-            {
-                BYTE *dst = wasapi_buf;
-                for (i = 0; i < d->buf_size; i++)
-                    for (ch = 0; ch < nch; ch++)
+                    const float *src_l = (const float *)src_bufs[d->out_map[0]];
+                    const float *src_r = (const float *)src_bufs[d->out_map[1]];
+                    float *dst = (float *)wasapi_buf;
+                    long j = 0;
+                    for (; j + 4 <= d->buf_size; j += 4)
                     {
-                        if (ch < d->out_map_count)
-                            memcpy(dst, src_bufs[d->out_map[ch]] + i * bps, bps);
-                        else
-                            memset(dst, 0, bps);
-                        dst += bps;
+                        __m128 l = _mm_loadu_ps(src_l + j);
+                        __m128 r = _mm_loadu_ps(src_r + j);
+                        __m128 lo = _mm_unpacklo_ps(l, r);
+                        __m128 hi = _mm_unpackhi_ps(l, r);
+                        _mm_storeu_ps(dst + j * 2, lo);
+                        _mm_storeu_ps(dst + j * 2 + 4, hi);
                     }
+                    for (; j < d->buf_size; j++)
+                    {
+                        dst[j * 2] = src_l[j];
+                        dst[j * 2 + 1] = src_r[j];
+                    }
+                }
+                else if (bps == 4 && nch == 1 && d->out_map_count >= 1)
+                {
+                    const float *src_m = (const float *)src_bufs[d->out_map[0]];
+                    float *dst = (float *)wasapi_buf;
+                    long j = 0;
+                    for (; j + 4 <= d->buf_size; j += 4)
+                        _mm_storeu_ps(dst + j, _mm_loadu_ps(src_m + j));
+                    for (; j < d->buf_size; j++)
+                        dst[j] = src_m[j];
+                }
+                else
+#endif
+                if (bps == 4)
+                {
+                    float *dst = (float *)wasapi_buf;
+                    for (i = 0; i < d->buf_size; i++)
+                        for (ch = 0; ch < nch; ch++)
+                            dst[i * nch + ch] = (ch < d->out_map_count)
+                                ? ((float *)src_bufs[d->out_map[ch]])[i] : 0.0f;
+                }
+                else if (bps == 2)
+                {
+                    INT16 *dst = (INT16 *)wasapi_buf;
+                    for (i = 0; i < d->buf_size; i++)
+                        for (ch = 0; ch < nch; ch++)
+                            dst[i * nch + ch] = (ch < d->out_map_count)
+                                ? ((INT16 *)src_bufs[d->out_map[ch]])[i] : 0;
+                }
+                else
+                {
+                    BYTE *dst = wasapi_buf;
+                    for (i = 0; i < d->buf_size; i++)
+                        for (ch = 0; ch < nch; ch++)
+                        {
+                            if (ch < d->out_map_count)
+                                memcpy(dst, src_bufs[d->out_map[ch]] + i * bps, bps);
+                            else
+                                memset(dst, 0, bps);
+                            dst += bps;
+                        }
+                }
+                IAudioRenderClient_ReleaseBuffer(d->render_client, d->buf_size, 0);
             }
-            IAudioRenderClient_ReleaseBuffer(d->render_client, d->buf_size, 0);
         }
 
         /* Toggle buffer index */
@@ -731,6 +805,30 @@ static ASIOError ASIOMETHODCALLTYPE asio_createBuffers(IASIO *iface, ASIOBufferI
     IAudioClient_GetBufferSize(d->audio_client, &d->wasapi_buf_frames);
     IAudioClient_SetEventHandle(d->audio_client, d->event);
     IAudioClient_GetService(d->audio_client, &IID_IAudioRenderClient, (void **)&d->render_client);
+
+    /* Probe for NSPA per-channel fast path (winejack direct) */
+    d->fast_path = FALSE;
+    {
+        struct fast_path_info_params fp;
+        nspa_get_fast_path_info_fn query = get_fast_path_info_func();
+        memset(&fp, 0, sizeof(fp));
+        if (query && SUCCEEDED(query(d->audio_client, &fp)) && fp.available)
+        {
+            int ch;
+            d->fast_path = TRUE;
+            d->fp_write_idx = fp.write_buf_idx;
+            d->fp_held = fp.held_frames;
+            d->fp_period = fp.period_frames;
+            d->fp_nports = fp.nports;
+            for (ch = 0; ch < fp.nports && ch < 64; ch++)
+            {
+                d->fp_chan_a[ch] = fp.chan_bufs_a[ch];
+                d->fp_chan_b[ch] = fp.chan_bufs_b[ch];
+            }
+            ERR("NSPA RT:ASIO: fast-path enabled (%u frames, %d ch, zero-interleave)\n",
+                d->fp_period, d->fp_nports);
+        }
+    }
 
     d->buf_index = 0;
     d->state = STATE_PREPARED;

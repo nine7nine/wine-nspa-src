@@ -963,6 +963,11 @@ NTSTATUS CDECL wine_ntoskrnl_main_loop( HANDLE stop_event )
     PsInitialSystemProcess = IoGetCurrentProcess();
     request_thread = GetCurrentThreadId();
 
+    /* NSPA: promote ntoskrnl main loop to TIME_CRITICAL — DPC callbacks and
+     * PnP manager run on this thread and need RT scheduling for low-latency
+     * device I/O (DPC Latency Checker, audio drivers, etc). */
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+
     pnp_manager_start();
 
     handles[0] = stop_event;
@@ -2803,7 +2808,23 @@ ULONG WINAPI KeQueryTimeIncrement(void)
  */
 KPRIORITY WINAPI KeSetPriorityThread( PKTHREAD Thread, KPRIORITY Priority )
 {
+    int win_prio;
     FIXME("(%p %ld)\n", Thread, Priority);
+
+    /* NSPA: map KPRIORITY to Win32 thread priority. Kernel priorities
+     * 16+ are realtime; map high values to TIME_CRITICAL. */
+    if (Priority >= LOW_REALTIME_PRIORITY)
+        win_prio = THREAD_PRIORITY_TIME_CRITICAL;
+    else if (Priority >= 13)
+        win_prio = THREAD_PRIORITY_HIGHEST;
+    else if (Priority >= 10)
+        win_prio = THREAD_PRIORITY_ABOVE_NORMAL;
+    else if (Priority >= 8)
+        win_prio = THREAD_PRIORITY_NORMAL;
+    else
+        win_prio = THREAD_PRIORITY_BELOW_NORMAL;
+
+    SetThreadPriority(GetCurrentThread(), win_prio);
     return Priority;
 }
 

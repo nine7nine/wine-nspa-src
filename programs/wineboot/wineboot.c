@@ -349,6 +349,42 @@ static void create_user_shared_data(void)
     data->SuiteMask                   = version.wSuiteMask;
     wcscpy( data->NtSystemRoot, L"C:\\windows" );
 
+    /* NSPA: Initialize QPC bypass — allow RtlQueryPerformanceCounter to
+     * read the TSC directly instead of going through NtQueryPerformanceCounter.
+     * ~10ns per call instead of ~200-1000ns. Critical for DPC latency and
+     * timing-sensitive applications (DAWs, dpclat, etc). */
+    {
+        UINT64 tsc_freq = read_tsc_frequency();
+        if (tsc_freq)
+        {
+            BYTE qpc_flags = SHARED_GLOBAL_FLAGS_QPC_BYPASS_ENABLED;
+            int regs[4];
+
+            /* Determine best serialization instruction */
+#if defined(__i386__) || defined(__x86_64__)
+            __cpuid( regs, 0x80000001 );
+            if (regs[3] & (1 << 27))
+                qpc_flags |= SHARED_GLOBAL_FLAGS_QPC_BYPASS_USE_RDTSCP;
+            else
+                qpc_flags |= SHARED_GLOBAL_FLAGS_QPC_BYPASS_USE_LFENCE;
+#endif
+
+            data->QpcFrequency = tsc_freq;
+            data->QpcShift = 0;
+            data->QpcBias = 0;
+            data->QpcBypassEnabled = qpc_flags;
+
+            ERR( "NSPA RT:QPC: rdtsc bypass enabled (TSC freq=%I64u Hz, flags=%02x)\n",
+                 tsc_freq, qpc_flags );
+        }
+        else
+        {
+            data->QpcFrequency = 10000000;  /* TICKSPERSEC */
+            data->QpcBypassEnabled = 0;
+            WARN( "NSPA RT:QPC: rdtsc bypass unavailable, falling back to syscall path\n" );
+        }
+    }
+
     UnmapViewOfFile( data );
 }
 

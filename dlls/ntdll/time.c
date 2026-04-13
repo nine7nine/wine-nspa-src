@@ -37,6 +37,9 @@
 #include "wine/exception.h"
 #include "wine/debug.h"
 #include "ntdll_misc.h"
+#if defined(__i386__) || defined(__x86_64__)
+#include <intrin.h>
+#endif
 
 WINE_DEFAULT_DEBUG_CHANNEL(ntdll);
 
@@ -378,9 +381,35 @@ LONGLONG WINAPI RtlGetSystemTimePrecise( void )
 
 /******************************************************************************
  *  RtlQueryPerformanceCounter   [NTDLL.@]
+ *
+ * NSPA: When QpcBypassEnabled is set in KUSER_SHARED_DATA, read the TSC
+ * directly via rdtsc/rdtscp — no syscall, ~10ns instead of ~200-1000ns.
+ * This is the same mechanism Windows uses on modern hardware.
  */
 BOOL WINAPI DECLSPEC_HOTPATCH RtlQueryPerformanceCounter( LARGE_INTEGER *counter )
 {
+#if defined(__i386__) || defined(__x86_64__)
+    if (user_shared_data->QpcBypassEnabled & SHARED_GLOBAL_FLAGS_QPC_BYPASS_ENABLED)
+    {
+        unsigned __int64 tsc;
+        unsigned int aux;
+
+        if (user_shared_data->QpcBypassEnabled & SHARED_GLOBAL_FLAGS_QPC_BYPASS_USE_RDTSCP)
+            tsc = __rdtscp(&aux);
+        else
+        {
+            if (user_shared_data->QpcBypassEnabled & SHARED_GLOBAL_FLAGS_QPC_BYPASS_USE_MFENCE)
+                __asm__ __volatile__ ( "mfence" : : : "memory" );
+            if (user_shared_data->QpcBypassEnabled & SHARED_GLOBAL_FLAGS_QPC_BYPASS_USE_LFENCE)
+                __asm__ __volatile__ ( "lfence" : : : "memory" );
+            tsc = __rdtsc();
+        }
+
+        counter->QuadPart = (tsc + user_shared_data->QpcBias) >> user_shared_data->QpcShift;
+        return TRUE;
+    }
+#endif
+
     NtQueryPerformanceCounter( counter, NULL );
     return TRUE;
 }
@@ -390,7 +419,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH RtlQueryPerformanceCounter( LARGE_INTEGER *counter
  */
 BOOL WINAPI DECLSPEC_HOTPATCH RtlQueryPerformanceFrequency( LARGE_INTEGER *frequency )
 {
-    frequency->QuadPart = TICKSPERSEC;
+    frequency->QuadPart = user_shared_data->QpcFrequency;
     return TRUE;
 }
 

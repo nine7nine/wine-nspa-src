@@ -26,6 +26,9 @@
 #include <pthread.h>
 #include <math.h>
 #include <sys/mman.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <poll.h>
 #ifdef __SSE2__
 #include <emmintrin.h>
 #endif
@@ -74,6 +77,11 @@ static pi_mutex_t     audio_client_lock = PI_MUTEX_INIT(0);
 static UINT32         jack_buf_frames;   /* JACK period in frames */
 static UINT32         jack_rate;         /* JACK sample rate */
 static ULONG_PTR      zero_bits;
+
+/* Wakeup pipe: RT callback writes → timer_loop reads.
+ * Synchronizes WASAPI event signaling to actual JACK period boundaries
+ * instead of using an independent NtDelayExecution timer with drift. */
+static int jack_wakeup_pipe[2] = { -1, -1 };
 
 /* ════════════════════════════════════════════════════════════════════════
  *   Format enum (needed by stream struct)
@@ -511,7 +519,7 @@ static void jack_process_render(struct jack_stream *s, jack_nframes_t nframes)
     for (i = 0; i < s->nports; i++)
         jack_bufs[i] = (float *)jack_port_get_buffer(s->ports[i], nframes);
 
-    avail = s->held_frames;
+    avail = __atomic_load_n(&s->held_frames, __ATOMIC_ACQUIRE);
     if (avail > nframes) avail = nframes;
 
     if (avail > 0)
@@ -621,9 +629,12 @@ static void capture_chunk(struct jack_stream *s, const float **jack_bufs,
             const float *in = jack_bufs[ch] + src_offs;
             for (j = 0; j < frames; j++)
             {
-                INT32 v = (INT32)(in[j] * 8388608.0f);
+                float vf = in[j] * 8388608.0f;
+                INT32 v;
                 BYTE *p = base + (j * s->nchannels + ch) * 3;
-                if (v > 8388607) v = 8388607; else if (v < -8388608) v = -8388608;
+                if (vf > 8388607.0f) vf = 8388607.0f;
+                else if (vf < -8388608.0f) vf = -8388608.0f;
+                v = (INT32)vf;
                 p[0] = (BYTE)(v & 0xFF);
                 p[1] = (BYTE)((v >> 8) & 0xFF);
                 p[2] = (BYTE)((v >> 16) & 0xFF);
@@ -644,7 +655,7 @@ static void jack_process_capture(struct jack_stream *s, jack_nframes_t nframes)
     for (i = 0; i < s->nports; i++)
         jack_bufs[i] = (const float *)jack_port_get_buffer(s->ports[i], nframes);
 
-    space = s->bufsize_frames - s->held_frames;
+    space = s->bufsize_frames - __atomic_load_n(&s->held_frames, __ATOMIC_ACQUIRE);
     if (space > nframes) space = nframes;
 
     if (space > 0)
@@ -680,9 +691,14 @@ static int jack_audio_process_cb(jack_nframes_t nframes, void *arg)
             jack_process_capture(s, nframes);
     }
 
-    /* Event signaling is handled by the timer_loop thread, not here.
-     * NtSetEvent is a syscall (wineserver or ntsync ioctl) — calling it
-     * from the JACK RT callback causes priority inversion and xruns. */
+    /* Wake the timer_loop thread so it can signal WASAPI events in sync
+     * with the actual JACK period boundary.  write() to a pipe with
+     * O_NONBLOCK is RT-safe on Linux — no allocation, no blocking. */
+    if (jack_wakeup_pipe[1] >= 0)
+    {
+        char x = 1;
+        (void)write(jack_wakeup_pipe[1], &x, 1);
+    }
 
     /* MIDI ports (shared client — same RT callback) */
     if (jack_midi_available)
@@ -742,6 +758,16 @@ static BOOL activate_audio_client(void)
     pi_mutex_lock(&audio_client_lock);
     if (audio_client_activated) { pi_mutex_unlock(&audio_client_lock); return TRUE; }
     if (!audio_client) { pi_mutex_unlock(&audio_client_lock); return FALSE; }
+
+    /* Create wakeup pipe for JACK→timer_loop synchronization */
+    if (jack_wakeup_pipe[0] < 0)
+    {
+        if (pipe(jack_wakeup_pipe) == 0)
+        {
+            fcntl(jack_wakeup_pipe[0], F_SETFL, O_NONBLOCK);
+            fcntl(jack_wakeup_pipe[1], F_SETFL, O_NONBLOCK);
+        }
+    }
 
     jack_set_process_callback(audio_client, jack_audio_process_cb, NULL);
     jack_set_buffer_size_callback(audio_client, jack_bufsize_changed_cb, NULL);
@@ -1462,39 +1488,42 @@ static NTSTATUS jack_timer_loop(void *args)
 {
     struct timer_loop_params *params = args;
     struct jack_stream *stream = handle_get_stream(params->stream);
-    LARGE_INTEGER delay, next;
-    int adjust;
-
-    stream_lock(stream);
-
-    delay.QuadPart = -stream->mmdev_period_rt;
-    NtQueryPerformanceCounter(&stream->last_period_time, NULL);
-    next.QuadPart = stream->last_period_time.QuadPart + stream->mmdev_period_rt;
+    int pipe_fd = jack_wakeup_pipe[0];
+    /* Timeout: 2x the WASAPI period in ms, as a safety net in case the
+     * RT callback can't write to the pipe (should never happen). */
+    int timeout_ms = (int)(stream->mmdev_period_rt / 10000) * 2;
+    if (timeout_ms < 10) timeout_ms = 10;
 
     while (!stream->please_quit)
     {
+        /* Block until the JACK RT callback signals a period boundary.
+         * This replaces NtDelayExecution — the wakeup is synchronized
+         * to the actual JACK callback, not an independent timer. */
+        if (pipe_fd >= 0)
+        {
+            struct pollfd pfd = { .fd = pipe_fd, .events = POLLIN };
+            poll(&pfd, 1, timeout_ms);
+            if (pfd.revents & POLLIN)
+            {
+                char buf[16];
+                (void)read(pipe_fd, buf, sizeof(buf)); /* drain */
+            }
+        }
+        else
+        {
+            /* Fallback if pipe wasn't created */
+            LARGE_INTEGER delay;
+            delay.QuadPart = -stream->mmdev_period_rt;
+            NtDelayExecution(FALSE, &delay);
+        }
+
+        NtQueryPerformanceCounter(&stream->last_period_time, NULL);
+
         /* Signal event for event-driven clients */
         if (stream->event)
             NtSetEvent(stream->event, NULL);
-
-        stream_unlock(stream);
-
-        NtDelayExecution(FALSE, &delay);
-
-        stream_lock(stream);
-        NtQueryPerformanceCounter(&stream->last_period_time, NULL);
-
-        /* Adaptive jitter correction (same as ALSA driver) */
-        adjust = next.QuadPart - stream->last_period_time.QuadPart;
-        if (adjust > stream->mmdev_period_rt / 2)
-            adjust = stream->mmdev_period_rt / 2;
-        else if (adjust < -stream->mmdev_period_rt / 2)
-            adjust = -stream->mmdev_period_rt / 2;
-        delay.QuadPart = -(stream->mmdev_period_rt + adjust);
-        next.QuadPart += stream->mmdev_period_rt;
     }
 
-    stream_unlock(stream);
     return STATUS_SUCCESS;
 }
 

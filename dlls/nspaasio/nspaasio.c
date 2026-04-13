@@ -201,17 +201,13 @@ static unsigned __stdcall play_thread(void *arg)
     events[0] = d->stop_event;
     events[1] = d->event;
 
-    /* Pre-fill first buffer with silence and start */
-    hr = IAudioRenderClient_GetBuffer(d->render_client, d->wasapi_buf_frames, &wasapi_buf);
-    if (SUCCEEDED(hr))
-        IAudioRenderClient_ReleaseBuffer(d->render_client, d->wasapi_buf_frames, AUDCLNT_BUFFERFLAGS_SILENT);
-
     IAudioClient_Start(d->audio_client);
 
     QueryPerformanceCounter(&d->system_time);
     d->sample_position = 0;
 
-    /* Initial callback so host fills buffer 0 */
+    /* First callback: host fills buffer 0, then we submit it immediately.
+     * No silence pre-fill — saves one full period of output latency. */
     if (d->callbacks->bufferSwitch)
         d->callbacks->bufferSwitch(d->buf_index, ASIOTrue);
 

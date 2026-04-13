@@ -12,14 +12,15 @@
 # this script just orchestrates runs, captures output, and summarizes.
 #
 # Environment overrides (all optional):
-#   WINE_BUILD     Wine build directory (default: ../build from script dir)
-#   TEST_EXE       Path to nspa_rt_test.exe relative to WINE_BUILD
+#   WINE           Wine binary (default: /usr/bin/wine)
+#   WINEPREFIX     Wine prefix (default: /home/ninez/Winebox/winebox-master)
+#   TEST_EXE       Path to nspa_rt_test.exe (default: nspa_rt_test.exe, found via PATH)
 #   LOG_DIR        Where to write per-run logs (default: /tmp/nspa_rt_test_logs)
 #   TIMEOUT_SECS   Per-test timeout in seconds (default: 120)
 #   RT_PRIO        NSPA_RT_PRIO for rt mode (default: 80)
 #   RT_POLICY      NSPA_RT_POLICY for rt mode (default: FF)
 #   INCLUDE_PRIORITY    Set to 1 to include the `priority` subcommand
-#                       (skipped by default because it sleeps 90 s for
+#                       (skipped by default because it sleeps 10 s for
 #                       external ps/chrt observation)
 #
 # Usage:
@@ -37,8 +38,10 @@ set -u
 # ─── configuration ───────────────────────────────────────────────────────
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-WINE_BUILD=${WINE_BUILD:-$(cd "$script_dir/../build" && pwd)}
-TEST_EXE=${TEST_EXE:-programs/nspa_rt_test/i386-windows/nspa_rt_test.exe}
+WINE=${WINE:-/usr/bin/wine}
+WINEPREFIX=${WINEPREFIX:-/home/ninez/Winebox/winebox-master}
+export WINEPREFIX
+TEST_EXE=${TEST_EXE:-nspa_rt_test.exe}
 LOG_DIR=${LOG_DIR:-/tmp/nspa_rt_test_logs}
 TIMEOUT_SECS=${TIMEOUT_SECS:-120}
 RT_PRIO=${RT_PRIO:-80}
@@ -47,13 +50,19 @@ INCLUDE_PRIORITY=${INCLUDE_PRIORITY:-0}
 
 # Test list. Each line is: "name arg1 arg2 ..." — args passed verbatim
 # to the subcommand. Add new tests here as they're implemented.
+# Format: "display_name subcmd [args...]"
+# display_name is used for log filenames and summary; subcmd is passed to wine.
 tests=(
-    "rapidmutex 4 500000"
-    "philosophers 50 4"
-    "fork-mutex 100"
-    "cs-contention"
-    "signal-recursion 4 500"
-    "large-pages"
+    "rapidmutex rapidmutex 4 500000"
+    "philosophers philosophers 50 4"
+    "fork-mutex fork-mutex 100"
+    "cs-contention cs-contention"
+    "signal-recursion signal-recursion 4 500"
+    "large-pages large-pages"
+    # ntsync scaling: subcmd chain_depth rapid_threads rapid_iters pi_iters prio_waiters
+    "ntsync-d4 ntsync 4 4 100000 8 5"
+    "ntsync-d8 ntsync 8 4 100000 3 10"
+    "ntsync-d12 ntsync 12 8 50000 3 16"
 )
 if [[ "$INCLUDE_PRIORITY" == "1" ]]; then
     tests+=("priority")
@@ -95,9 +104,11 @@ cleanup_stale() {
 results=()
 run_one() {
     local mode=$1
-    local name=$2
-    shift 2
+    local display_name=$2
+    local subcmd=$3
+    shift 3
     local args=("$@")
+    local name="$display_name"
 
     local log_file="$LOG_DIR/${mode}_${name}.log"
     local env_extra=()
@@ -111,8 +122,8 @@ run_one() {
     # to pass env vars without polluting the current shell's environment.
     # --kill-after=5 ensures we SIGKILL if SIGTERM isn't honored.
     timeout --kill-after=5 "$TIMEOUT_SECS" \
-        env WINEDEBUG=-all "${env_extra[@]}" \
-        ./wine "$TEST_EXE" "$name" "${args[@]}" \
+        env WINEDEBUG=-all WINEPREFIX="$WINEPREFIX" "${env_extra[@]}" \
+        "$WINE" "$TEST_EXE" "$subcmd" "${args[@]}" \
         > "$log_file" 2>&1
     local rc=$?
 
@@ -165,28 +176,37 @@ verdict_for() {
 
 banner "NSPA RT test harness runner"
 
-printf '  wine build  : %s\n' "$WINE_BUILD"
+printf '  wine        : %s\n' "$WINE"
+printf '  prefix      : %s\n' "$WINEPREFIX"
 printf '  test exe    : %s\n' "$TEST_EXE"
 printf '  log dir     : %s\n' "$LOG_DIR"
 printf '  timeout     : %s s / test\n' "$TIMEOUT_SECS"
 printf '  rt mode     : NSPA_RT_PRIO=%s NSPA_RT_POLICY=%s\n' "$RT_PRIO" "$RT_POLICY"
 printf '  tests       : %s\n' "${#tests[@]}"
 
-if [[ ! -d "$WINE_BUILD" ]]; then
-    printf '\nERROR: wine build dir not found: %s\n' "$WINE_BUILD" >&2
-    exit 2
-fi
-cd "$WINE_BUILD" || { printf 'ERROR: cannot cd to %s\n' "$WINE_BUILD" >&2; exit 2; }
-
-if [[ ! -x "./wine" ]]; then
-    printf '\nERROR: ./wine not found or not executable in %s\n' "$WINE_BUILD" >&2
+if [[ ! -x "$WINE" ]]; then
+    printf '\nERROR: wine not found or not executable: %s\n' "$WINE" >&2
     exit 2
 fi
 
+# Resolve TEST_EXE: PE binaries live in Wine's own search path
+# (/usr/lib/wine/{arch}-windows/), not in the Linux PATH. If the
+# given path doesn't exist as a regular file, search Wine's lib dirs.
 if [[ ! -f "$TEST_EXE" ]]; then
-    printf '\nERROR: test binary not found: %s/%s\n' "$WINE_BUILD" "$TEST_EXE" >&2
-    printf 'Build it with: make -j2 -C %s\n' "$WINE_BUILD" >&2
-    exit 2
+    found=""
+    for d in /usr/lib/wine/x86_64-windows /usr/lib/wine/i386-windows; do
+        if [[ -f "$d/$TEST_EXE" ]]; then
+            found="$d/$TEST_EXE"
+            break
+        fi
+    done
+    if [[ -n "$found" ]]; then
+        TEST_EXE="$found"
+    else
+        printf '\nERROR: test binary not found: %s\n' "$TEST_EXE" >&2
+        printf 'Ensure nspa_rt_test.exe is installed or provide TEST_EXE=/path/to/it\n' >&2
+        exit 2
+    fi
 fi
 
 mkdir -p "$LOG_DIR"
@@ -202,9 +222,10 @@ for mode in baseline rt; do
     for test_line in "${tests[@]}"; do
         # shellcheck disable=SC2206  # intentional word splitting for args
         parts=($test_line)
-        name="${parts[0]}"
-        args=("${parts[@]:1}")
-        run_one "$mode" "$name" "${args[@]}"
+        display_name="${parts[0]}"
+        subcmd="${parts[1]}"
+        args=("${parts[@]:2}")
+        run_one "$mode" "$display_name" "$subcmd" "${args[@]}"
     done
 done
 

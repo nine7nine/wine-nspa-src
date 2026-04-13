@@ -4568,8 +4568,16 @@ NTSTATUS WINAPI ExUuidCreate(UUID *uuid)
  */
 ULONG WINAPI ExSetTimerResolution(ULONG time, BOOLEAN set_resolution)
 {
-    FIXME("stub: %lu %d\n", time, set_resolution);
-    return KeQueryTimeIncrement();
+    ULONG actual = 0;
+    NTSTATUS status;
+
+    TRACE("(%lu, %d)\n", time, set_resolution);
+
+    /* Forward to NtSetTimerResolution which does the real work.
+     * time is in 100ns units (same as NtSetTimerResolution). */
+    status = NtSetTimerResolution(time, set_resolution, &actual);
+    if (status) actual = KeQueryTimeIncrement();
+    return actual;
 }
 
 /***********************************************************************

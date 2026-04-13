@@ -1925,8 +1925,17 @@ static NTSTATUS jack_get_prop_value(void *args)
 
 static NTSTATUS jack_midi_get_driver(void *args)
 {
+    /* Return "jack" so mmdevapi loads winejack.drv as a separate MIDI driver
+     * instance via __wine_load_unix_lib. This avoids a LoadLibraryW reentrancy
+     * issue where winmm's MMDRV_Install tries to LoadLibraryW("mmdevapi.dll")
+     * while mmdevapi is already initializing, which fails on JACK (the
+     * jack_client_open during test_connect holds the loader lock).
+     *
+     * Internally it's the same unix .so — the unified JACK client and MIDI
+     * state are shared via statics. Only the DriverFuncs handle differs. */
+    static const WCHAR jackW[] = {'j','a','c','k',0};
     WCHAR *name = args;
-    name[0] = 0; /* same driver for MIDI */
+    memcpy(name, jackW, sizeof(jackW));
     return STATUS_SUCCESS;
 }
 

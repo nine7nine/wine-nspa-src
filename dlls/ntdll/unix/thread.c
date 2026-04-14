@@ -1348,9 +1348,6 @@ static void contexts_from_server( CONTEXT *context, struct context_data server_c
  */
 static DECLSPEC_NORETURN void pthread_exit_wrapper( int status )
 {
-    /* NSPA: abandon any client-created mutexes owned by this thread */
-    abandon_client_mutexes( GetCurrentThreadId() );
-
     close( ntdll_get_thread_data()->alert_fd );
     close( ntdll_get_thread_data()->wait_fd[0] );
     close( ntdll_get_thread_data()->wait_fd[1] );

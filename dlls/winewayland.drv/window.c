@@ -667,6 +667,39 @@ LRESULT WAYLAND_DesktopWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     return NtUserMessageCall(hwnd, msg, wp, lp, 0, NtUserDefWindowProc, FALSE);
 }
 
+/***********************************************************************
+ *      WAYLAND_GetWindowStyleMasks
+ *
+ * Returns the window style bits whose non-client decorations are provided
+ * by the Wayland compositor (server-side decorations).  This allows win32u's
+ * get_visible_rect to compute the correct visible rect, preventing the
+ * decoration feedback loop for maximized windows.
+ */
+BOOL WAYLAND_GetWindowStyleMasks( HWND hwnd, UINT style, UINT ex_style, UINT *style_mask, UINT *ex_style_mask )
+{
+    struct wayland_win_data *data;
+
+    if (ex_style & WS_EX_TOOLWINDOW) return FALSE;
+
+    *style_mask = *ex_style_mask = 0;
+
+    if ((data = wayland_win_data_get( hwnd )))
+    {
+        BOOL managed = data->managed;
+        wayland_win_data_release( data );
+        if (!managed) return FALSE;
+    }
+
+    if ((style & WS_CAPTION) == WS_CAPTION)
+    {
+        *style_mask |= WS_CAPTION;
+        *style_mask |= WS_DLGFRAME | WS_THICKFRAME;
+        *ex_style_mask |= WS_EX_DLGMODALFRAME;
+    }
+
+    return TRUE;
+}
+
 /*****************************************************************
  *		WAYLAND_SetLayeredWindowAttributes
  */

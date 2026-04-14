@@ -22,6 +22,7 @@
 #define __WINE_SERVER_FILE_H
 
 #include <pthread.h>  /* NSPA v1.5: for global_lock */
+#include <rtpi.h>     /* NSPA: PI-aware mutex for global_lock */
 #include <sys/types.h>
 
 #include "object.h"
@@ -137,7 +138,7 @@ extern void remove_process_locks( struct process *process );
  * the main poll loop and per-client shm dispatcher pthreads. Released only
  * around the kernel poll/epoll syscall. poll_generation guards against
  * fd-reuse races when the poll set changes out of band. */
-extern pthread_mutex_t global_lock;
+extern pi_mutex_t global_lock;
 extern unsigned long poll_generation;
 extern void force_exit_poll(void);
 #ifdef __linux__

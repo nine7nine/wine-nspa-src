@@ -271,6 +271,68 @@ struct fast_path_info_params
     float  *chan_bufs_b[NSPA_FAST_PATH_MAX_CHANNELS];  /* set B per-channel ptrs */
 };
 
+/* NSPA Phase F: ASIO callback registration for zero-latency path.
+ *
+ * nspaASIO registers its per-channel buffers and a futex with winejack.
+ * The JACK process callback does:
+ *   1. Copy JACK capture → ASIO input bufs
+ *   2. futex_wake(signal_futex, CAPTURE_READY)
+ *   3. futex_wait(signal_futex, OUTPUT_READY, timeout)
+ *   4. Copy ASIO output bufs → JACK port bufs
+ *
+ * play_thread (Wine/FIFO) does:
+ *   1. futex_wait(signal_futex, CAPTURE_READY)
+ *   2. bufferSwitch() — host fills output
+ *   3. futex_wake(signal_futex, OUTPUT_READY)
+ *
+ * Result: output written in bufferSwitch appears in the SAME JACK period.
+ */
+struct register_asio_params
+{
+    HRESULT result;
+
+    /* Output buffers: per-channel double-buffered (ASIO writes, JACK reads) */
+    float  *out_bufs_a[NSPA_FAST_PATH_MAX_CHANNELS];
+    float  *out_bufs_b[NSPA_FAST_PATH_MAX_CHANNELS];
+    int     out_count;
+
+    /* Input buffers: per-channel double-buffered (JACK writes, ASIO reads) */
+    float  *in_bufs_a[NSPA_FAST_PATH_MAX_CHANNELS];
+    float  *in_bufs_b[NSPA_FAST_PATH_MAX_CHANNELS];
+    int     in_count;
+
+    UINT32  buf_size;       /* frames per buffer */
+
+    /* Returned by driver: futex address for synchronization */
+    volatile int *signal_futex;  /* shared futex variable */
+    int     *buf_index;          /* current double-buffer index (driver writes) */
+    long long *sample_pos;       /* monotonic sample counter (driver writes) */
+    UINT32  period_frames;       /* actual JACK period (returned) */
+    UINT32  sample_rate;         /* JACK sample rate (returned) */
+};
+
+struct unregister_asio_params
+{
+    HRESULT result;
+};
+
+/* Called by play_thread each period: blocks until JACK RT callback
+ * signals CAPTURE_READY, then returns the current buffer index. */
+struct asio_wait_callback_params
+{
+    HRESULT result;
+    int     buf_index;       /* returned: which buffer set to use */
+    long long sample_pos;    /* returned: current sample position */
+    BOOL    timed_out;       /* TRUE if JACK didn't signal in time */
+};
+
+/* Called by play_thread after bufferSwitch returns: signals JACK RT
+ * callback that output data is ready for same-period copy. */
+struct asio_signal_complete_params
+{
+    HRESULT result;
+};
+
 struct midi_init_params
 {
     UINT *err;
@@ -367,5 +429,9 @@ enum unix_funcs
     midi_notify_wait,
     aux_message,
     get_fast_path_info,
+    register_asio,
+    unregister_asio,
+    asio_wait_callback,
+    asio_signal_complete,
     funcs_count
 };

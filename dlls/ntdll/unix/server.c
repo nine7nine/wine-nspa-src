@@ -2228,14 +2228,6 @@ NTSTATUS WINAPI NtClose( HANDLE handle )
     if (HandleToLong( handle ) >= ~5 && HandleToLong( handle ) <= ~0)
         return STATUS_SUCCESS;
 
-    /* NSPA: client-created sync objects bypass the server entirely */
-    if (is_client_handle( handle ))
-    {
-        nspa_rt_map_remove( handle );
-        close_client_inproc_sync( handle );
-        return STATUS_SUCCESS;
-    }
-
     /* NSPA RT v1.2: evict any map entry for this handle. Harmless for
      * non-thread handles (the lookup just won't find it). Must run before
      * the server call so a recycled handle value can't briefly point at a

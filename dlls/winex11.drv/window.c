@@ -489,7 +489,6 @@ static unsigned long get_mwm_decorations_for_style( DWORD style, DWORD ex_style 
     unsigned long ret = 0;
 
     if (ex_style & WS_EX_TOOLWINDOW) return 0;
-    if (ex_style & WS_EX_LAYERED) return 0;
 
     if ((style & WS_CAPTION) == WS_CAPTION)
     {
@@ -507,7 +506,11 @@ static unsigned long get_mwm_decorations_for_style( DWORD style, DWORD ex_style 
  */
 static unsigned long get_mwm_decorations( struct x11drv_win_data *data, DWORD style, DWORD ex_style )
 {
-    if (EqualRect( &data->rects.window, &data->rects.visible )) return 0;
+    /* NSPA: Don't gate MWM decorations on window == visible.  The visible
+     * rect may not yet reflect the decoration offset (bootstrap / visual
+     * change), causing the WM to never see decoration hints.  The style
+     * check in get_mwm_decorations_for_style is sufficient. */
+    if (!data->managed) return 0;
     return get_mwm_decorations_for_style( style, ex_style );
 }
 

@@ -2466,7 +2466,12 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
     alsa_midi_out_message,
     alsa_midi_in_message,
     alsa_midi_notify_wait,
-    alsa_not_implemented,
+    alsa_not_implemented,           /* aux_message */
+    alsa_not_implemented,           /* get_fast_path_info */
+    alsa_not_implemented,           /* register_asio */
+    alsa_not_implemented,           /* unregister_asio */
+    alsa_not_implemented,           /* asio_wait_callback */
+    alsa_not_implemented,           /* asio_signal_complete */
 };
 
 C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == funcs_count);
@@ -2923,7 +2928,12 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
     alsa_wow64_midi_out_message,
     alsa_wow64_midi_in_message,
     alsa_wow64_midi_notify_wait,
-    alsa_not_implemented,
+    alsa_not_implemented,           /* aux_message */
+    alsa_not_implemented,           /* get_fast_path_info */
+    alsa_not_implemented,           /* register_asio */
+    alsa_not_implemented,           /* unregister_asio */
+    alsa_not_implemented,           /* asio_wait_callback */
+    alsa_not_implemented,           /* asio_signal_complete */
 };
 
 C_ASSERT(ARRAYSIZE(__wine_unix_call_wow64_funcs) == funcs_count);

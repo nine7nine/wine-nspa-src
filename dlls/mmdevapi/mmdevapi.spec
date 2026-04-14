@@ -28,3 +28,7 @@
 @ stdcall -private midMessage(long long long long long)
 @ stdcall -private modMessage(long long long long long)
 @ stdcall nspa_get_fast_path_info(ptr ptr)
+@ stdcall nspa_register_asio(ptr)
+@ stdcall nspa_unregister_asio(ptr)
+@ stdcall nspa_asio_wait_callback(ptr)
+@ stdcall nspa_asio_signal_complete(ptr)

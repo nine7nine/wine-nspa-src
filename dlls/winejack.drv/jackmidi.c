@@ -57,11 +57,15 @@ WINE_DEFAULT_DEBUG_CHANNEL(midi);
 #define MAX_MIDI_PORTS         64
 #define OUT_RB_SIZE            (64 * 1024)
 #define IN_RB_SIZE             (64 * 1024)
-#define RB_HDR_SIZE            3
+#define OUT_RB_HDR_SIZE        3   /* dev_id(1) + len(2) */
+#define IN_RB_HDR_SIZE         7   /* dev_id(1) + len(2) + frame_offset(4) */
 
 /* Shared JACK client from jack.c */
 extern jack_client_t *jack_get_client(void);
 extern BOOL jack_ensure_activated(void);
+
+/* JACK sample rate — needed for sub-period timestamp resolution */
+extern UINT32 jack_rate;
 
 struct midi_dest
 {
@@ -73,6 +77,7 @@ struct midi_src
 {
     int state; MIDIOPENDESC midiDesc; WORD wFlags; MIDIHDR *lpQueueHdr;
     UINT startTime; MIDIINCAPSW caps; jack_port_t *port; char target[128];
+    volatile UINT32 dropped_events;  /* incremented in RT callback on rb overflow */
 };
 
 static jack_ringbuffer_t *out_rb, *in_rb;
@@ -170,19 +175,24 @@ int jack_midi_process(jack_nframes_t nframes)
             dest_bufs[i] = NULL;
     }
 
-    /* Drain output ringbuffer → JACK MIDI port buffers */
-    while (jack_ringbuffer_read_space(out_rb) >= RB_HDR_SIZE)
+    /* Drain output ringbuffer → JACK MIDI port buffers.
+     * Each message has a timestamp (frame offset within the output period)
+     * stored in the header so events are spread across the period. */
+    while (jack_ringbuffer_read_space(out_rb) >= OUT_RB_HDR_SIZE)
     {
-        unsigned char hdr[RB_HDR_SIZE], data[4096];
+        unsigned char hdr[OUT_RB_HDR_SIZE], data[4096];
         uint8_t dev_id; uint16_t len;
-        if (jack_ringbuffer_peek(out_rb, (char *)hdr, RB_HDR_SIZE) < RB_HDR_SIZE) break;
+        if (jack_ringbuffer_peek(out_rb, (char *)hdr, OUT_RB_HDR_SIZE) < OUT_RB_HDR_SIZE) break;
         dev_id = hdr[0]; len = hdr[1] | ((uint16_t)hdr[2] << 8);
         if (len > sizeof(data)) len = sizeof(data);
-        if (jack_ringbuffer_read_space(out_rb) < (size_t)(RB_HDR_SIZE + len)) break;
-        jack_ringbuffer_read_advance(out_rb, RB_HDR_SIZE);
+        if (jack_ringbuffer_read_space(out_rb) < (size_t)(OUT_RB_HDR_SIZE + len)) break;
+        jack_ringbuffer_read_advance(out_rb, OUT_RB_HDR_SIZE);
         jack_ringbuffer_read(out_rb, (char *)data, len);
         if (dev_id < num_dests && dest_bufs[dev_id])
             jack_midi_event_write(dest_bufs[dev_id], 0, data, len);
+            /* Frame offset 0: WinMM output has no sub-period timing info,
+             * so all messages fire at the start of the period.  Spreading
+             * them artificially would add latency without improving accuracy. */
     }
 
     /* Read JACK MIDI input → input ringbuffer.
@@ -196,15 +206,25 @@ int jack_midi_process(jack_nframes_t nframes)
         count = jack_midi_get_event_count(buf);
         for (j = 0; j < count; j++)
         {
-            jack_midi_event_t ev; unsigned char in_hdr[RB_HDR_SIZE];
+            jack_midi_event_t ev; unsigned char in_hdr[IN_RB_HDR_SIZE];
+            uint32_t frame_off;
             if (jack_midi_event_get(&ev, buf, j) != 0 || ev.size == 0 || ev.size > 4096) continue;
-            in_hdr[0] = (unsigned char)i; in_hdr[1] = ev.size & 0xFF; in_hdr[2] = (ev.size >> 8) & 0xFF;
-            if (jack_ringbuffer_write_space(in_rb) >= (size_t)(RB_HDR_SIZE + ev.size))
+            frame_off = (uint32_t)ev.time;  /* frame offset within this period */
+            in_hdr[0] = (unsigned char)i;
+            in_hdr[1] = ev.size & 0xFF;
+            in_hdr[2] = (ev.size >> 8) & 0xFF;
+            in_hdr[3] = frame_off & 0xFF;
+            in_hdr[4] = (frame_off >> 8) & 0xFF;
+            in_hdr[5] = (frame_off >> 16) & 0xFF;
+            in_hdr[6] = (frame_off >> 24) & 0xFF;
+            if (jack_ringbuffer_write_space(in_rb) >= (size_t)(IN_RB_HDR_SIZE + ev.size))
             {
-                jack_ringbuffer_write(in_rb, (char *)in_hdr, RB_HDR_SIZE);
+                jack_ringbuffer_write(in_rb, (char *)in_hdr, IN_RB_HDR_SIZE);
                 jack_ringbuffer_write(in_rb, (char *)ev.buffer, ev.size);
                 had_input = 1;
             }
+            else
+                __atomic_add_fetch(&srcs[i].dropped_events, 1, __ATOMIC_RELAXED);
         }
     }
 
@@ -359,7 +379,7 @@ static UINT midi_out_data(WORD id, UINT data)
 {
     BYTE evt = LOBYTE(LOWORD(data)), d1, d2;
     struct midi_dest *dest;
-    unsigned char buf[3], hdr[RB_HDR_SIZE];
+    unsigned char buf[3], hdr[OUT_RB_HDR_SIZE];
     int len;
 
     if (id >= num_dests) return MMSYSERR_BADDEVICEID;
@@ -384,16 +404,19 @@ static UINT midi_out_data(WORD id, UINT data)
     }
 
     hdr[0] = (unsigned char)id; hdr[1] = len; hdr[2] = 0;
-    if (jack_ringbuffer_write_space(out_rb) >= (size_t)(RB_HDR_SIZE + len)) {
-        jack_ringbuffer_write(out_rb, (char *)hdr, RB_HDR_SIZE);
+    if (jack_ringbuffer_write_space(out_rb) >= (size_t)(OUT_RB_HDR_SIZE + len)) {
+        jack_ringbuffer_write(out_rb, (char *)hdr, OUT_RB_HDR_SIZE);
         jack_ringbuffer_write(out_rb, (char *)buf, len);
+    } else {
+        WARN("MIDI output ringbuffer full, dropping short message\n");
+        return MIDIERR_NOTREADY;
     }
     return MMSYSERR_NOERROR;
 }
 
 static UINT midi_out_long_data(WORD id, MIDIHDR *mh, UINT sz, struct notify_context *n)
 {
-    struct midi_dest *dest; unsigned char rb_h[RB_HDR_SIZE];
+    struct midi_dest *dest; unsigned char rb_h[OUT_RB_HDR_SIZE];
     BYTE *data, *nd = NULL; UINT len; int la = 0;
     if (id >= num_dests) return MMSYSERR_BADDEVICEID;
     dest = &dests[id];
@@ -416,9 +439,14 @@ static UINT midi_out_long_data(WORD id, MIDIHDR *mh, UINT sz, struct notify_cont
     }
     len = mh->dwBufferLength + la;
     rb_h[0] = (unsigned char)id; rb_h[1] = len & 0xFF; rb_h[2] = (len >> 8) & 0xFF;
-    if (jack_ringbuffer_write_space(out_rb) >= (size_t)(RB_HDR_SIZE + len)) {
-        jack_ringbuffer_write(out_rb, (char *)rb_h, RB_HDR_SIZE);
+    if (jack_ringbuffer_write_space(out_rb) >= (size_t)(OUT_RB_HDR_SIZE + len)) {
+        jack_ringbuffer_write(out_rb, (char *)rb_h, OUT_RB_HDR_SIZE);
         jack_ringbuffer_write(out_rb, (char *)data, len);
+    } else {
+        WARN("MIDI output ringbuffer full, dropping SysEx (%u bytes)\n", len);
+        free(nd);
+        mh->dwFlags &= ~MHDR_INQUEUE;
+        return MIDIERR_NOTREADY;
     }
     free(nd);
     dest->runningStatus = 0;
@@ -444,14 +472,21 @@ static UINT midi_out_unprepare(WORD id, MIDIHDR *h, UINT sz)
 
 static UINT midi_out_reset(WORD id)
 {
-    struct midi_dest *d; unsigned char msg[3], h[RB_HDR_SIZE]; int ch;
+    struct midi_dest *d; unsigned char msg[3], h[OUT_RB_HDR_SIZE]; int ch;
     if (id >= num_dests) return MMSYSERR_BADDEVICEID;
     d = &dests[id]; if (!d->bEnabled || !d->port) return MMSYSERR_NOTENABLED;
     for (ch = 0; ch < 16; ch++) {
-        msg[0] = 0xB0|ch; msg[1] = 123; msg[2] = 0;
+        /* CC 120: All Sound Off — hard kill, stops all audio immediately */
+        msg[0] = 0xB0|ch; msg[1] = 120; msg[2] = 0;
         h[0] = (unsigned char)id; h[1] = 3; h[2] = 0;
-        if (jack_ringbuffer_write_space(out_rb) >= RB_HDR_SIZE + 3) {
-            jack_ringbuffer_write(out_rb, (char *)h, RB_HDR_SIZE);
+        if (jack_ringbuffer_write_space(out_rb) >= OUT_RB_HDR_SIZE + 3) {
+            jack_ringbuffer_write(out_rb, (char *)h, OUT_RB_HDR_SIZE);
+            jack_ringbuffer_write(out_rb, (char *)msg, 3);
+        }
+        /* CC 123: All Notes Off — releases held notes */
+        msg[1] = 123;
+        if (jack_ringbuffer_write_space(out_rb) >= OUT_RB_HDR_SIZE + 3) {
+            jack_ringbuffer_write(out_rb, (char *)h, OUT_RB_HDR_SIZE);
             jack_ringbuffer_write(out_rb, (char *)msg, 3);
         }
     }
@@ -460,11 +495,17 @@ static UINT midi_out_reset(WORD id)
 
 /* ── Input ── */
 
-static void handle_midi_input(struct midi_src *src, const unsigned char *data, uint16_t len)
+static void handle_midi_input(struct midi_src *src, const unsigned char *data, uint16_t len,
+                              uint32_t frame_off)
 {
     UINT ct; struct notify_context notify;
     if (src->state != 1) return;
+    /* Sub-period timestamp: base time + frame offset within the JACK period.
+     * This gives sub-ms resolution instead of quantizing all events in one
+     * period to the same timestamp. */
     ct = get_time_msec() - src->startTime;
+    if (jack_rate > 0)
+        ct += (UINT)((uint64_t)frame_off * 1000 / jack_rate);
 
     if (len > 0 && data[0] == 0xF0) {
         UINT pos = 0, cl;
@@ -499,16 +540,33 @@ static void *in_notify_thread(void *arg)
     while (!in_notify_quit) {
         if (poll(&pfd, 1, 10) <= 0) continue;  /* 10ms max latency for MIDI input */
         { char dr[64]; (void)read(wakeup_pipe[0], dr, sizeof(dr)); }
-        while (jack_ringbuffer_read_space(in_rb) >= RB_HDR_SIZE) {
-            unsigned char hdr[RB_HDR_SIZE], data[4096];
-            uint8_t dev; uint16_t len;
-            if (jack_ringbuffer_peek(in_rb, (char *)hdr, RB_HDR_SIZE) < RB_HDR_SIZE) break;
+        while (jack_ringbuffer_read_space(in_rb) >= IN_RB_HDR_SIZE) {
+            unsigned char hdr[IN_RB_HDR_SIZE], data[4096];
+            uint8_t dev; uint16_t len; uint32_t frame_off;
+            if (jack_ringbuffer_peek(in_rb, (char *)hdr, IN_RB_HDR_SIZE) < IN_RB_HDR_SIZE) break;
             dev = hdr[0]; len = hdr[1] | ((uint16_t)hdr[2] << 8);
+            frame_off = (uint32_t)hdr[3] | ((uint32_t)hdr[4] << 8) |
+                        ((uint32_t)hdr[5] << 16) | ((uint32_t)hdr[6] << 24);
             if (len > sizeof(data)) len = sizeof(data);
-            if (jack_ringbuffer_read_space(in_rb) < (size_t)(RB_HDR_SIZE + len)) break;
-            jack_ringbuffer_read_advance(in_rb, RB_HDR_SIZE);
+            if (jack_ringbuffer_read_space(in_rb) < (size_t)(IN_RB_HDR_SIZE + len)) break;
+            jack_ringbuffer_read_advance(in_rb, IN_RB_HDR_SIZE);
             jack_ringbuffer_read(in_rb, (char *)data, len);
-            if (dev < num_srcs) handle_midi_input(&srcs[dev], data, len);
+            if (dev < num_srcs) handle_midi_input(&srcs[dev], data, len, frame_off);
+        }
+        /* Check for dropped events (RT callback couldn't write to ringbuffer) */
+        {
+            unsigned int si;
+            for (si = 0; si < num_srcs; si++)
+            {
+                UINT32 dropped = __atomic_exchange_n(&srcs[si].dropped_events, 0, __ATOMIC_RELAXED);
+                if (dropped > 0 && srcs[si].state == 1)
+                {
+                    struct notify_context notify;
+                    UINT ct = get_time_msec() - srcs[si].startTime;
+                    set_in_notify(&notify, &srcs[si], si, MIM_ERROR, 0, ct);
+                    notify_post(&notify);
+                }
+            }
         }
     }
     return NULL;
@@ -598,7 +656,23 @@ NTSTATUS jack_midi_out_message(void *args)
     params->notify->send_notify = FALSE;
     switch (params->msg) {
     case DRVM_INIT:      *params->err = jack_midi_init_ex(); break;
-    case DRVM_EXIT:      *params->err = MMSYSERR_NOERROR; break;
+    case DRVM_EXIT:
+    {
+        /* Close any open output ports to prevent JACK port leaks */
+        unsigned int di;
+        for (di = 0; di < num_dests; di++) {
+            if (dests[di].bEnabled && dests[di].port) {
+                seq_lock();
+                jack_port_unregister(jack_get_client(), dests[di].port);
+                dests[di].port = NULL;
+                seq_unlock();
+                dests[di].bEnabled = FALSE;
+                dests[di].midiDesc.hMidi = 0;
+            }
+        }
+        *params->err = MMSYSERR_NOERROR;
+        break;
+    }
     case MODM_OPEN:      *params->err = midi_out_open(params->dev_id, (MIDIOPENDESC *)params->param_1, params->param_2, params->notify); break;
     case MODM_CLOSE:     *params->err = midi_out_close(params->dev_id, params->notify); break;
     case MODM_DATA:      *params->err = midi_out_data(params->dev_id, params->param_1); break;
@@ -624,7 +698,29 @@ NTSTATUS jack_midi_in_message(void *args)
     params->notify->send_notify = FALSE;
     switch (params->msg) {
     case DRVM_INIT:      *params->err = jack_midi_init_ex(); break;
-    case DRVM_EXIT:      *params->err = MMSYSERR_NOERROR; break;
+    case DRVM_EXIT:
+    {
+        /* Close any open input ports to prevent JACK port leaks */
+        unsigned int si;
+        for (si = 0; si < num_srcs; si++) {
+            if (srcs[si].midiDesc.hMidi && srcs[si].port) {
+                seq_lock();
+                jack_port_unregister(jack_get_client(), srcs[si].port);
+                srcs[si].port = NULL;
+                seq_unlock();
+                srcs[si].midiDesc.hMidi = 0;
+                srcs[si].state = 0;
+            }
+        }
+        if (num_midi_in_started > 0) {
+            in_notify_quit = 1;
+            if (wakeup_pipe[1] >= 0) { char x = 0; (void)write(wakeup_pipe[1], &x, 1); }
+            pthread_join(in_notify_thread_id, NULL);
+            num_midi_in_started = 0;
+        }
+        *params->err = MMSYSERR_NOERROR;
+        break;
+    }
     case MIDM_OPEN:      *params->err = midi_in_open(params->dev_id, (MIDIOPENDESC *)params->param_1, params->param_2, params->notify); break;
     case MIDM_CLOSE:     *params->err = midi_in_close(params->dev_id, params->notify); break;
     case MIDM_ADDBUFFER: *params->err = midi_in_add_buffer(params->dev_id, (MIDIHDR *)params->param_1, params->param_2); break;

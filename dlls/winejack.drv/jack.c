@@ -78,7 +78,7 @@ extern int jack_midi_process(jack_nframes_t nframes);
 static jack_client_t *audio_client;
 static pi_mutex_t     audio_client_lock = PI_MUTEX_INIT(0);
 static UINT32         jack_buf_frames;   /* JACK period in frames */
-static UINT32         jack_rate;         /* JACK sample rate */
+UINT32                jack_rate;         /* JACK sample rate (non-static: jackmidi.c reads it) */
 static ULONG_PTR      zero_bits;
 
 /* Wakeup pipe: RT callback writes → timer_loop reads.

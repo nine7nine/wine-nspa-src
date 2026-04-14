@@ -32,6 +32,9 @@
 #ifdef __SSE2__
 #include <emmintrin.h>
 #endif
+#include <sys/syscall.h>
+#include <linux/futex.h>
+#include <errno.h>
 #include <jack/jack.h>
 
 #include "ntstatus.h"
@@ -167,6 +170,63 @@ struct jack_stream
 };
 
 static struct jack_stream *active_streams[MAX_AUDIO_STREAMS];
+
+/* ════════════════════════════════════════════════════════════════════════
+ *   Phase F: ASIO direct callback registration
+ *
+ *   When registered, the JACK process callback does a synchronous
+ *   round-trip with the play_thread via futex:
+ *     RT:  capture → signal CAPTURE_READY → wait OUTPUT_READY → copy output
+ *     PE:  wait CAPTURE_READY → bufferSwitch → signal OUTPUT_READY
+ *
+ *   Output written by the host in bufferSwitch is copied to JACK ports
+ *   in the SAME period = one JACK period of output latency (theoretical min).
+ * ════════════════════════════════════════════════════════════════════════ */
+
+#define ASIO_FUTEX_IDLE          0
+#define ASIO_FUTEX_CAPTURE_READY 1
+#define ASIO_FUTEX_OUTPUT_READY  2
+#define ASIO_FUTEX_QUIT          3
+
+static inline int futex_wait(volatile int *addr, int val, const struct timespec *timeout)
+{
+    return syscall(SYS_futex, addr, FUTEX_WAIT, val, timeout, NULL, 0);
+}
+
+static inline int futex_wake(volatile int *addr, int count)
+{
+    return syscall(SYS_futex, addr, FUTEX_WAKE, count, NULL, NULL, 0);
+}
+
+struct asio_registration
+{
+    /* Output: host fills in bufferSwitch, JACK RT copies to port bufs */
+    float  *out_bufs[2][64];
+    int     out_count;
+
+    /* Input: JACK RT fills from capture ports, host reads in bufferSwitch */
+    float  *in_bufs[2][64];
+    int     in_count;
+
+    UINT32  buf_size;       /* ASIO buffer size in frames */
+
+    /* JACK ports dedicated to ASIO (separate from WASAPI stream ports) */
+    jack_port_t *out_ports[64];
+    jack_port_t *in_ports[64];
+    int          out_port_count;
+    int          in_port_count;
+
+    /* Futex for RT ↔ play_thread synchronization */
+    volatile int signal_futex;
+
+    /* State (driver writes, PE reads via returned pointers) */
+    int       buf_index;
+    long long sample_pos;
+
+    BOOL active;
+};
+
+static struct asio_registration *asio_reg;
 
 /* Forward declaration — defined near set_volumes */
 static void recalc_vols_for_format(struct jack_stream *stream);
@@ -741,7 +801,86 @@ static int jack_audio_process_cb(jack_nframes_t nframes, void *arg)
     int i;
     (void)arg;
 
-    /* Audio streams */
+    /* ── Phase F: ASIO synchronous callback path ──
+     *
+     * When an ASIO driver is registered, the RT callback does a synchronous
+     * round-trip with the play_thread via futex.  Data written by the host
+     * in bufferSwitch is output in the SAME JACK period.
+     *
+     * This runs BEFORE normal WASAPI streams so that if a DAW uses both
+     * ASIO and WASAPI simultaneously, both get serviced in the same period. */
+    if (asio_reg && asio_reg->active)
+    {
+        struct asio_registration *reg = asio_reg;
+        int cur_idx = reg->buf_index;
+        int ch, expected;
+        UINT32 frames = nframes < (UINT32)reg->buf_size ? nframes : (UINT32)reg->buf_size;
+
+        /* 1. Copy JACK capture ports → ASIO input buffers */
+        for (ch = 0; ch < reg->in_port_count; ch++)
+        {
+            const float *src = (const float *)jack_port_get_buffer(reg->in_ports[ch], nframes);
+            float *dst = reg->in_bufs[cur_idx][ch];
+            if (src && dst)
+                memcpy(dst, src, frames * sizeof(float));
+        }
+
+        /* 2. CAS: IDLE → CAPTURE_READY, wake play_thread */
+        expected = ASIO_FUTEX_IDLE;
+        if (__atomic_compare_exchange_n(&reg->signal_futex, &expected,
+                                         ASIO_FUTEX_CAPTURE_READY, 0,
+                                         __ATOMIC_RELEASE, __ATOMIC_RELAXED))
+            futex_wake((volatile int *)&reg->signal_futex, 1);
+
+        /* 3. Wait for OUTPUT_READY (timeout = 2× period) */
+        {
+            struct timespec ts;
+            UINT64 period_ns = (UINT64)nframes * 1000000000ULL / jack_rate;
+            ts.tv_sec = 0;
+            ts.tv_nsec = (long)(period_ns * 2);
+            if (ts.tv_nsec >= 1000000000L) { ts.tv_sec = 1; ts.tv_nsec -= 1000000000L; }
+
+            for (;;)
+            {
+                int val = __atomic_load_n(&reg->signal_futex, __ATOMIC_ACQUIRE);
+                if (val == ASIO_FUTEX_OUTPUT_READY || val == ASIO_FUTEX_QUIT)
+                    break;
+                if (futex_wait((volatile int *)&reg->signal_futex, val, &ts) == -1 && errno == ETIMEDOUT)
+                    break;
+            }
+        }
+
+        /* 4. Copy ASIO output → JACK render ports (same period!) */
+        if (__atomic_load_n(&reg->signal_futex, __ATOMIC_ACQUIRE) == ASIO_FUTEX_OUTPUT_READY)
+        {
+            /* Host wrote to out_bufs[cur_idx] during bufferSwitch */
+            for (ch = 0; ch < reg->out_port_count; ch++)
+            {
+                float *dst = (float *)jack_port_get_buffer(reg->out_ports[ch], nframes);
+                const float *src = reg->out_bufs[cur_idx][ch];
+                if (dst && src)
+                    memcpy(dst, src, frames * sizeof(float));
+                else if (dst)
+                    memset(dst, 0, nframes * sizeof(float));
+            }
+        }
+        else
+        {
+            /* Timeout or quit: output silence */
+            for (ch = 0; ch < reg->out_port_count; ch++)
+            {
+                float *dst = (float *)jack_port_get_buffer(reg->out_ports[ch], nframes);
+                if (dst) memset(dst, 0, nframes * sizeof(float));
+            }
+        }
+
+        /* 5. Update position, flip buffer index, reset futex */
+        reg->sample_pos += frames;
+        reg->buf_index = 1 - cur_idx;
+        __atomic_store_n(&reg->signal_futex, ASIO_FUTEX_IDLE, __ATOMIC_RELEASE);
+    }
+
+    /* ── Normal WASAPI streams ── */
     for (i = 0; i < num_active_streams; i++)
     {
         struct jack_stream *s = active_streams[i];
@@ -2172,6 +2311,244 @@ static NTSTATUS jack_get_fast_path_info(void *args)
     return STATUS_SUCCESS;
 }
 
+/* ════════════════════════════════════════════════════════════════════════
+ *   Phase F: ASIO registration — register / unregister / wait / signal
+ * ════════════════════════════════════════════════════════════════════════ */
+
+static NTSTATUS jack_register_asio(void *args)
+{
+    struct register_asio_params *params = args;
+    struct asio_registration *reg;
+    int ch;
+    char port_name[64];
+
+    if (asio_reg)
+    {
+        ERR("ASIO already registered\n");
+        params->result = E_FAIL;
+        return STATUS_SUCCESS;
+    }
+
+    if (!ensure_audio_client() || !activate_audio_client())
+    {
+        params->result = AUDCLNT_E_ENDPOINT_CREATE_FAILED;
+        return STATUS_SUCCESS;
+    }
+
+    reg = calloc(1, sizeof(*reg));
+    if (!reg) { params->result = E_OUTOFMEMORY; return STATUS_SUCCESS; }
+
+    reg->out_count = params->out_count;
+    reg->in_count = params->in_count;
+    reg->buf_size = params->buf_size;
+    reg->signal_futex = ASIO_FUTEX_IDLE;
+    reg->buf_index = 0;
+    reg->sample_pos = 0;
+
+    /* Copy buffer pointers from nspaASIO */
+    for (ch = 0; ch < params->out_count && ch < 64; ch++)
+    {
+        reg->out_bufs[0][ch] = params->out_bufs_a[ch];
+        reg->out_bufs[1][ch] = params->out_bufs_b[ch];
+    }
+    for (ch = 0; ch < params->in_count && ch < 64; ch++)
+    {
+        reg->in_bufs[0][ch] = params->in_bufs_a[ch];
+        reg->in_bufs[1][ch] = params->in_bufs_b[ch];
+    }
+
+    /* Register JACK output ports (render: our output → physical input) */
+    reg->out_port_count = params->out_count < 64 ? params->out_count : 64;
+    for (ch = 0; ch < reg->out_port_count; ch++)
+    {
+        snprintf(port_name, sizeof(port_name), "asio_out_%d", ch);
+        reg->out_ports[ch] = jack_port_register(audio_client, port_name,
+                                                  JACK_DEFAULT_AUDIO_TYPE,
+                                                  JackPortIsOutput, 0);
+        if (!reg->out_ports[ch])
+        {
+            ERR("Failed to register ASIO output port %d\n", ch);
+            while (--ch >= 0)
+                jack_port_unregister(audio_client, reg->out_ports[ch]);
+            free(reg);
+            params->result = AUDCLNT_E_ENDPOINT_CREATE_FAILED;
+            return STATUS_SUCCESS;
+        }
+    }
+
+    /* Register JACK input ports (capture: physical output → our input) */
+    reg->in_port_count = params->in_count < 64 ? params->in_count : 64;
+    for (ch = 0; ch < reg->in_port_count; ch++)
+    {
+        snprintf(port_name, sizeof(port_name), "asio_in_%d", ch);
+        reg->in_ports[ch] = jack_port_register(audio_client, port_name,
+                                                 JACK_DEFAULT_AUDIO_TYPE,
+                                                 JackPortIsInput, 0);
+        if (!reg->in_ports[ch])
+        {
+            ERR("Failed to register ASIO input port %d\n", ch);
+            while (--ch >= 0)
+                jack_port_unregister(audio_client, reg->in_ports[ch]);
+            for (ch = 0; ch < reg->out_port_count; ch++)
+                jack_port_unregister(audio_client, reg->out_ports[ch]);
+            free(reg);
+            params->result = AUDCLNT_E_ENDPOINT_CREATE_FAILED;
+            return STATUS_SUCCESS;
+        }
+    }
+
+    /* Connect to physical ports */
+    {
+        const char **phys;
+        unsigned long flags;
+
+        /* Output: our ports → physical inputs (speakers) */
+        flags = JackPortIsPhysical | JackPortIsInput;
+        phys = jack_get_ports(audio_client, NULL, JACK_DEFAULT_AUDIO_TYPE, flags);
+        if (phys)
+        {
+            for (ch = 0; ch < reg->out_port_count && phys[ch]; ch++)
+            {
+                int err = jack_connect(audio_client, jack_port_name(reg->out_ports[ch]), phys[ch]);
+                if (err && err != EEXIST)
+                    WARN("ASIO output port %d connect failed: %d\n", ch, err);
+            }
+            jack_free(phys);
+        }
+
+        /* Input: physical outputs (mics) → our ports */
+        flags = JackPortIsPhysical | JackPortIsOutput;
+        phys = jack_get_ports(audio_client, NULL, JACK_DEFAULT_AUDIO_TYPE, flags);
+        if (phys)
+        {
+            for (ch = 0; ch < reg->in_port_count && phys[ch]; ch++)
+            {
+                int err = jack_connect(audio_client, phys[ch], jack_port_name(reg->in_ports[ch]));
+                if (err && err != EEXIST)
+                    WARN("ASIO input port %d connect failed: %d\n", ch, err);
+            }
+            jack_free(phys);
+        }
+    }
+
+    reg->active = TRUE;
+    __atomic_store_n(&asio_reg, reg, __ATOMIC_RELEASE);
+
+    /* Return pointers + info to caller */
+    params->signal_futex = &reg->signal_futex;
+    params->buf_index = &reg->buf_index;
+    params->sample_pos = &reg->sample_pos;
+    params->period_frames = jack_buf_frames;
+    params->sample_rate = jack_rate;
+    params->result = S_OK;
+
+    ERR("NSPA RT:ASIO: Phase F registered (%u frames, %d out, %d in, futex @ %p)\n",
+        reg->buf_size, reg->out_port_count, reg->in_port_count,
+        (void *)&reg->signal_futex);
+
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS jack_unregister_asio(void *args)
+{
+    struct unregister_asio_params *params = args;
+    struct asio_registration *reg = asio_reg;
+    int ch;
+
+    if (!reg) { params->result = S_OK; return STATUS_SUCCESS; }
+
+    /* Signal quit to unblock any waiting RT callback */
+    reg->active = FALSE;
+    __atomic_store_n(&reg->signal_futex, ASIO_FUTEX_QUIT, __ATOMIC_RELEASE);
+    futex_wake((volatile int *)&reg->signal_futex, 1);
+
+    /* Clear global before tearing down (RT callback checks asio_reg first) */
+    __atomic_store_n(&asio_reg, (struct asio_registration *)NULL, __ATOMIC_RELEASE);
+
+    /* Unregister JACK ports */
+    for (ch = 0; ch < reg->out_port_count; ch++)
+        if (reg->out_ports[ch])
+            jack_port_unregister(audio_client, reg->out_ports[ch]);
+    for (ch = 0; ch < reg->in_port_count; ch++)
+        if (reg->in_ports[ch])
+            jack_port_unregister(audio_client, reg->in_ports[ch]);
+
+    free(reg);
+
+    ERR("NSPA RT:ASIO: Phase F unregistered\n");
+    params->result = S_OK;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS jack_asio_wait_callback(void *args)
+{
+    struct asio_wait_callback_params *params = args;
+    struct asio_registration *reg = asio_reg;
+    struct timespec ts;
+    UINT64 period_ns;
+
+    if (!reg || !reg->active)
+    {
+        params->timed_out = TRUE;
+        params->result = S_OK;
+        return STATUS_SUCCESS;
+    }
+
+    /* Wait for CAPTURE_READY with timeout = 4× period (generous for scheduling) */
+    period_ns = (UINT64)jack_buf_frames * 1000000000ULL / jack_rate;
+    ts.tv_sec = 0;
+    ts.tv_nsec = (long)(period_ns * 4);
+    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec = ts.tv_nsec / 1000000000L; ts.tv_nsec %= 1000000000L; }
+
+    for (;;)
+    {
+        int val = __atomic_load_n(&reg->signal_futex, __ATOMIC_ACQUIRE);
+        if (val == ASIO_FUTEX_CAPTURE_READY)
+        {
+            params->buf_index = reg->buf_index;
+            params->sample_pos = reg->sample_pos;
+            params->timed_out = FALSE;
+            params->result = S_OK;
+            return STATUS_SUCCESS;
+        }
+        if (val == ASIO_FUTEX_QUIT)
+        {
+            params->timed_out = TRUE;
+            params->result = S_OK;
+            return STATUS_SUCCESS;
+        }
+        if (futex_wait((volatile int *)&reg->signal_futex, val, &ts) == -1 && errno == ETIMEDOUT)
+        {
+            params->timed_out = TRUE;
+            params->result = S_OK;
+            return STATUS_SUCCESS;
+        }
+    }
+}
+
+static NTSTATUS jack_asio_signal_complete(void *args)
+{
+    struct asio_signal_complete_params *params = args;
+    struct asio_registration *reg = asio_reg;
+    int expected;
+
+    if (!reg || !reg->active)
+    {
+        params->result = S_OK;
+        return STATUS_SUCCESS;
+    }
+
+    /* CAS: CAPTURE_READY → OUTPUT_READY */
+    expected = ASIO_FUTEX_CAPTURE_READY;
+    __atomic_compare_exchange_n(&reg->signal_futex, &expected,
+                                 ASIO_FUTEX_OUTPUT_READY, 0,
+                                 __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+    futex_wake((volatile int *)&reg->signal_futex, 1);
+
+    params->result = S_OK;
+    return STATUS_SUCCESS;
+}
+
 static NTSTATUS jack_midi_get_driver(void *args)
 {
     /* Return "jack" so mmdevapi loads winejack.drv as a separate MIDI driver
@@ -2241,6 +2618,10 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
     jack_midi_notify_wait,          /* midi_notify_wait */
     jack_not_implemented,           /* aux_message */
     jack_get_fast_path_info,        /* get_fast_path_info */
+    jack_register_asio,             /* register_asio */
+    jack_unregister_asio,           /* unregister_asio */
+    jack_asio_wait_callback,        /* asio_wait_callback */
+    jack_asio_signal_complete,      /* asio_signal_complete */
 };
 
 C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == funcs_count);
@@ -2504,6 +2885,10 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
     jack_midi_notify_wait,
     jack_not_implemented,               /* aux_message */
     jack_get_fast_path_info,            /* get_fast_path_info */
+    jack_register_asio,                 /* register_asio */
+    jack_unregister_asio,               /* unregister_asio */
+    jack_asio_wait_callback,            /* asio_wait_callback */
+    jack_asio_signal_complete,          /* asio_signal_complete */
 };
 
 C_ASSERT(ARRAYSIZE(__wine_unix_call_wow64_funcs) == funcs_count);

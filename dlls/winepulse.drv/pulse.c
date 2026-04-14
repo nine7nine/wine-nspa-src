@@ -2550,6 +2550,11 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
     pulse_not_implemented,
     pulse_not_implemented,
     pulse_not_implemented,
+    pulse_not_implemented,           /* get_fast_path_info */
+    pulse_not_implemented,           /* register_asio */
+    pulse_not_implemented,           /* unregister_asio */
+    pulse_not_implemented,           /* asio_wait_callback */
+    pulse_not_implemented,           /* asio_signal_complete */
 };
 
 C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == funcs_count);
@@ -3047,6 +3052,11 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
     pulse_not_implemented,
     pulse_not_implemented,
     pulse_not_implemented,
+    pulse_not_implemented,           /* get_fast_path_info */
+    pulse_not_implemented,           /* register_asio */
+    pulse_not_implemented,           /* unregister_asio */
+    pulse_not_implemented,           /* asio_wait_callback */
+    pulse_not_implemented,           /* asio_signal_complete */
 };
 
 C_ASSERT(ARRAYSIZE(__wine_unix_call_wow64_funcs) == funcs_count);

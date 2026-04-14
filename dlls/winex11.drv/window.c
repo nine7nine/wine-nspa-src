@@ -506,10 +506,6 @@ static unsigned long get_mwm_decorations_for_style( DWORD style, DWORD ex_style 
  */
 static unsigned long get_mwm_decorations( struct x11drv_win_data *data, DWORD style, DWORD ex_style )
 {
-    /* NSPA: Don't gate MWM decorations on window == visible.  The visible
-     * rect may not yet reflect the decoration offset (bootstrap / visual
-     * change), causing the WM to never see decoration hints.  The style
-     * check in get_mwm_decorations_for_style is sufficient. */
     if (!data->managed) return 0;
     return get_mwm_decorations_for_style( style, ex_style );
 }
@@ -1559,6 +1555,43 @@ UINT get_window_net_wm_state( Display *display, Window window )
 }
 
 
+BOOL read_net_frame_extents( Display *display, Window window, long *extents )
+{
+    Atom type;
+    int format;
+    unsigned long count, remaining;
+    unsigned char *prop = NULL;
+
+    if (XGetWindowProperty( display, window, x11drv_atom(_NET_FRAME_EXTENTS),
+                            0, 4, False, XA_CARDINAL, &type, &format,
+                            &count, &remaining, &prop ) != Success || !prop)
+        return FALSE;
+
+    if (type == XA_CARDINAL && format == 32 && count == 4)
+    {
+        long *data = (long *)prop;
+        extents[0] = data[0];
+        extents[1] = data[1];
+        extents[2] = data[2];
+        extents[3] = data[3];
+        XFree( prop );
+        return TRUE;
+    }
+
+    XFree( prop );
+    return FALSE;
+}
+
+void window_net_frame_extents_notify( struct x11drv_win_data *data, const long *extents, BOOL valid )
+{
+    data->has_frame_extents = valid;
+    if (valid)
+        memcpy( data->frame_extents, extents, sizeof(data->frame_extents) );
+    else
+        memset( data->frame_extents, 0, sizeof(data->frame_extents) );
+}
+
+
 /***********************************************************************
  *     set_xembed_flags
  */
@@ -1737,6 +1770,21 @@ static UINT window_update_client_state( struct x11drv_win_data *data )
     return 0;
 }
 
+static RECT window_rect_from_visible_state( const struct x11drv_win_data *data, RECT visible_rect )
+{
+    RECT window_rect = window_rect_from_visible( &data->rects, visible_rect );
+
+    if (data->managed && data->has_frame_extents)
+    {
+        window_rect.left   = visible_rect.left - data->frame_extents[0];
+        window_rect.top    = visible_rect.top - data->frame_extents[2];
+        window_rect.right  = visible_rect.right + data->frame_extents[1];
+        window_rect.bottom = visible_rect.bottom + data->frame_extents[3];
+    }
+
+    return window_rect;
+}
+
 static UINT window_update_client_config( struct x11drv_win_data *data )
 {
     static const UINT fullscreen_mask = (1 << NET_WM_STATE_MAXIMIZED) | (1 << NET_WM_STATE_FULLSCREEN);
@@ -1768,7 +1816,7 @@ static UINT window_update_client_config( struct x11drv_win_data *data )
     }
 
     flags = SWP_NOACTIVATE | SWP_NOZORDER;
-    rect = new_rect = window_rect_from_visible( &data->rects, data->current_state.rect );
+    rect = new_rect = window_rect_from_visible_state( data, data->current_state.rect );
     if (new_rect.left == old_rect.left && new_rect.top == old_rect.top) flags |= SWP_NOMOVE;
     else OffsetRect( &rect, old_rect.left - new_rect.left, old_rect.top - new_rect.top );
     if (rect.right == old_rect.right && rect.bottom == old_rect.bottom) flags |= SWP_NOSIZE;
@@ -1812,7 +1860,7 @@ BOOL X11DRV_GetWindowStateUpdates( HWND hwnd, UINT *state_cmd, UINT *swp_flags, 
     {
         *state_cmd = window_update_client_state( data );
         *swp_flags = window_update_client_config( data );
-        *rect = window_rect_from_visible( &data->rects, data->current_state.rect );
+        *rect = window_rect_from_visible_state( data, data->current_state.rect );
         release_win_data( data );
     }
 
@@ -3234,6 +3282,28 @@ BOOL X11DRV_GetWindowStyleMasks( HWND hwnd, UINT style, UINT ex_style, UINT *sty
         *ex_style_mask |= WS_EX_DLGMODALFRAME;
     }
 
+    return TRUE;
+}
+
+/***********************************************************************
+ *      GetFrameExtents   (X11DRV.@)
+ */
+BOOL X11DRV_GetFrameExtents( HWND hwnd, RECT *frame_rect )
+{
+    struct x11drv_win_data *data;
+
+    if (!(data = get_win_data( hwnd ))) return FALSE;
+    if (!data->managed || !data->has_frame_extents)
+    {
+        release_win_data( data );
+        return FALSE;
+    }
+
+    frame_rect->left   = -data->frame_extents[0];
+    frame_rect->top    = -data->frame_extents[2];
+    frame_rect->right  =  data->frame_extents[1];
+    frame_rect->bottom =  data->frame_extents[3];
+    release_win_data( data );
     return TRUE;
 }
 

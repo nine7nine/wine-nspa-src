@@ -711,6 +711,7 @@ static const struct user_driver_funcs x11drv_funcs =
     .pWindowMessage = X11DRV_WindowMessage,
     .pWindowPosChanging = X11DRV_WindowPosChanging,
     .pGetWindowStyleMasks = X11DRV_GetWindowStyleMasks,
+    .pGetFrameExtents = X11DRV_GetFrameExtents,
     .pGetWindowStateUpdates = X11DRV_GetWindowStateUpdates,
     .pCreateWindowSurface = X11DRV_CreateWindowSurface,
     .pMoveWindowBits = X11DRV_MoveWindowBits,

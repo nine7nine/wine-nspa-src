@@ -55,6 +55,9 @@ static void *client_objects[MAX_USER_HANDLES];
 
 static volatile unsigned int startup_info_flags;
 static unsigned int startup_show_window;
+static DWORD reentrant_wpchanged_thread;
+static HWND reentrant_wpchanged_hwnd;
+static UINT reentrant_wpchanged_depth;
 
 static unsigned int set_startup_info_flags( unsigned int mask, unsigned int flags )
 {
@@ -2077,12 +2080,12 @@ static RECT get_visible_rect( HWND hwnd, BOOL shaped, UINT style, UINT ex_style,
     if (get_present_rect( hwnd, &rect, get_thread_dpi() )) return rect;
     if (IsRectEmpty( &rects->window ) || shaped || !decorated_mode) return rects->window;
     if (!user_driver->pGetWindowStyleMasks( hwnd, style, ex_style, &style_mask, &ex_style_mask )) return rects->window;
-    /* NSPA: Move the window==client check AFTER GetWindowStyleMasks.  Apps that handle
-     * WM_NCCALCSIZE to set client == window (custom NC rendering, e.g. Ableton Live)
-     * still need decoration masking when the WM provides decorations.  Without this,
-     * visible == window, and the configure feedback loop causes 4px/frame growth. */
-    if (EqualRect( &rects->window, &rects->client ) && !style_mask && !ex_style_mask) return rects->window;
-    if (!NtUserAdjustWindowRect( &rect, style & style_mask, FALSE, ex_style & ex_style_mask, dpi )) return rects->window;
+    if (!user_driver->pGetFrameExtents( hwnd, &rect ))
+    {
+        if (EqualRect( &rects->window, &rects->client ) && !style_mask && !ex_style_mask) return rects->window;
+        if (!NtUserAdjustWindowRect( &rect, style & style_mask, FALSE, ex_style & ex_style_mask, dpi ))
+            return rects->window;
+    }
 
     visible_rect = rects->window;
     visible_rect.left   -= rect.left;
@@ -2241,6 +2244,30 @@ static BOOL is_fullscreen( const MONITORINFO *info, const RECT *rect )
 {
     return rect->left <= info->rcMonitor.left && rect->right >= info->rcMonitor.right &&
            rect->top <= info->rcMonitor.top && rect->bottom >= info->rcMonitor.bottom;
+}
+
+static void invalidate_exposed_client_area( HWND hwnd, const struct window_rects *new_rects, const RECT *valid_rect )
+{
+    HRGN client_rgn, valid_rgn;
+
+    if (EqualRect( valid_rect, &new_rects->client )) return;
+
+    client_rgn = NtGdiCreateRectRgn( 0, 0,
+                                     new_rects->client.right - new_rects->client.left,
+                                     new_rects->client.bottom - new_rects->client.top );
+    valid_rgn = NtGdiCreateRectRgn( valid_rect->left - new_rects->client.left,
+                                    valid_rect->top - new_rects->client.top,
+                                    valid_rect->right - new_rects->client.left,
+                                    valid_rect->bottom - new_rects->client.top );
+
+    if (client_rgn && valid_rgn)
+    {
+        if (NtGdiCombineRgn( client_rgn, client_rgn, valid_rgn, RGN_DIFF ) > NULLREGION)
+            NtUserRedrawWindow( hwnd, NULL, client_rgn, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN );
+    }
+
+    if (valid_rgn) NtGdiDeleteObjectApp( valid_rgn );
+    if (client_rgn) NtGdiDeleteObjectApp( client_rgn );
 }
 
 /***********************************************************************
@@ -2416,6 +2443,8 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
                 move_window_bits( hwnd, new_rects, valid_rects );
             }
         }
+
+        if (valid_rects) invalidate_exposed_client_area( hwnd, new_rects, &valid_rects[0] );
 
         if (need_icons && (icon = get_window_icon_info( hwnd, ICON_BIG, icon, &ii )))
         {
@@ -3701,14 +3730,16 @@ static UINT calc_ncsize( WINDOWPOS *winpos, const struct window_rects *old_rects
     if ((winpos->flags & (SWP_FRAMECHANGED | SWP_NOSIZE)) != SWP_NOSIZE)
     {
         NCCALCSIZE_PARAMS params;
+        NCCALCSIZE_PARAMS default_params;
         WINDOWPOS winposCopy;
-        UINT class_style;
+        UINT class_style, style, class_wvr_flags;
 
         params.rgrc[0] = new_rects->window;
         params.rgrc[1] = old_rects->window;
         params.rgrc[2] = old_rects->client;
         params.lppos = &winposCopy;
         winposCopy = *winpos;
+        default_params = params;
 
         if (winpos->flags & SWP_NOMOVE)
         {
@@ -3725,8 +3756,30 @@ static UINT calc_ncsize( WINDOWPOS *winpos, const struct window_rects *old_rects
         class_style = get_class_long( winpos->hwnd, GCL_STYLE, FALSE );
         if (class_style & CS_VREDRAW) wvr_flags |= WVR_VREDRAW;
         if (class_style & CS_HREDRAW) wvr_flags |= WVR_HREDRAW;
+        class_wvr_flags = wvr_flags;
 
         wvr_flags |= send_message( winpos->hwnd, WM_NCCALCSIZE, TRUE, (LPARAM)&params );
+
+        style = get_window_long( winpos->hwnd, GWL_STYLE );
+        /* Preserve the default non-client layout when a decorated menu window
+         * temporarily reports a client rect covering the whole window. */
+        if (!(style & WS_CHILD) &&
+            !(winpos->flags & SWP_FRAMECHANGED) &&
+            get_menu( winpos->hwnd ) &&
+            !EqualRect( &old_rects->client, &old_rects->window ) &&
+            EqualRect( &params.rgrc[0], &new_rects->window ))
+        {
+            UINT default_wvr_flags;
+
+            default_wvr_flags = class_wvr_flags |
+                                (UINT)default_window_proc( winpos->hwnd, WM_NCCALCSIZE, TRUE,
+                                                           (LPARAM)&default_params, FALSE );
+            if (!EqualRect( &default_params.rgrc[0], &new_rects->window ))
+            {
+                params = default_params;
+                wvr_flags = default_wvr_flags;
+            }
+        }
 
         new_rects->client = params.rgrc[0];
 
@@ -4069,6 +4122,17 @@ BOOL set_window_pos( WINDOWPOS *winpos, int parent_x, int parent_y )
     if (((winpos->flags & SWP_AGG_STATUSFLAGS) != SWP_AGG_NOPOSCHANGE)
             && !((orig_flags & SWP_AGG_NOCLIENTCHANGE) && (orig_flags & SWP_SHOWWINDOW)))
     {
+        static const UINT reentrant_resize_flags =
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
+        DWORD style = get_window_long( winpos->hwnd, GWL_STYLE );
+        DWORD tid = GetCurrentThreadId();
+        BOOL suppress_reentrant_wpch =
+            !(style & WS_CHILD) &&
+            reentrant_wpchanged_depth &&
+            reentrant_wpchanged_thread == tid &&
+            reentrant_wpchanged_hwnd == winpos->hwnd &&
+            (orig_flags & reentrant_resize_flags) == reentrant_resize_flags &&
+            !(orig_flags & (SWP_NOSIZE | SWP_SHOWWINDOW | SWP_HIDEWINDOW));
         /* WM_WINDOWPOSCHANGED is sent even if SWP_NOSENDCHANGING is set
            and always contains final window position.
          */
@@ -4076,7 +4140,22 @@ BOOL set_window_pos( WINDOWPOS *winpos, int parent_x, int parent_y )
         winpos->y  = new_rects.window.top;
         winpos->cx = new_rects.window.right - new_rects.window.left;
         winpos->cy = new_rects.window.bottom - new_rects.window.top;
-        send_message( winpos->hwnd, WM_WINDOWPOSCHANGED, 0, (LPARAM)winpos );
+        /* Avoid re-entering the same top-level window with a nested
+         * size-only WM_WINDOWPOSCHANGED update. */
+        if (!suppress_reentrant_wpch)
+        {
+            DWORD prev_thread = reentrant_wpchanged_thread;
+            HWND prev_hwnd = reentrant_wpchanged_hwnd;
+            UINT prev_depth = reentrant_wpchanged_depth;
+
+            reentrant_wpchanged_thread = tid;
+            reentrant_wpchanged_hwnd = winpos->hwnd;
+            reentrant_wpchanged_depth = prev_depth + 1;
+            send_message( winpos->hwnd, WM_WINDOWPOSCHANGED, 0, (LPARAM)winpos );
+            reentrant_wpchanged_thread = prev_thread;
+            reentrant_wpchanged_hwnd = prev_hwnd;
+            reentrant_wpchanged_depth = prev_depth;
+        }
     }
 
     if ((winpos->flags & (SWP_NOSIZE|SWP_NOMOVE|SWP_FRAMECHANGED)) != (SWP_NOSIZE|SWP_NOMOVE))

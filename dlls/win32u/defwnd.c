@@ -1876,13 +1876,21 @@ static void handle_nc_calc_size( HWND hwnd, WPARAM wparam, RECT *win_rect )
         win_rect->right  -= rect.right;
         win_rect->bottom -= rect.bottom;
 
-        if (((style & (WS_CHILD | WS_POPUP)) != WS_CHILD) && get_menu( hwnd ))
+        if ((style & (WS_CHILD | WS_POPUP)) != WS_CHILD)
         {
-            TRACE( "getting menu bar height with hwnd %p, width %d, at (%d, %d)\n",
-                   hwnd, win_rect->right - win_rect->left, -rect.left, -rect.top );
+            HMENU menu = get_menu( hwnd );
 
-            win_rect->top += get_menu_bar_height( hwnd, win_rect->right - win_rect->left,
-                                                  -rect.left, -rect.top );
+            if (menu)
+            {
+                UINT menu_height;
+
+                TRACE( "getting menu bar height with hwnd %p, width %d, at (%d, %d)\n",
+                       hwnd, win_rect->right - win_rect->left, -rect.left, -rect.top );
+
+                menu_height = get_menu_bar_height( hwnd, win_rect->right - win_rect->left,
+                                                   -rect.left, -rect.top );
+                win_rect->top += menu_height;
+            }
         }
 
         if (ex_style & WS_EX_CLIENTEDGE)

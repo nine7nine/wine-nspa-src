@@ -573,6 +573,27 @@ struct inproc_sync
 
 #define INPROC_SYNC_CACHE_BLOCK_SIZE  (65536 / sizeof(struct inproc_sync))
 #define INPROC_SYNC_CACHE_ENTRIES     128
+#define INPROC_SYNC_CACHE_TOTAL       (INPROC_SYNC_CACHE_BLOCK_SIZE * INPROC_SYNC_CACHE_ENTRIES)
+
+/*
+ * NSPA: Client-side handle allocation for anonymous sync objects.
+ *
+ * Server allocates handles from index 0 upward. We allocate from just below
+ * the cache ceiling downward. With 524,288 cacheable positions and typical
+ * server usage of <10K handles, collision is effectively impossible.
+ */
+#define CLIENT_HANDLE_BASE  (INPROC_SYNC_CACHE_TOTAL - 256)
+static LONG client_handle_next = CLIENT_HANDLE_BASE;
+
+/* NSPA: Track client-created mutexes for thread-death abandonment.
+ * Protected by fd_cache_mutex. */
+struct client_mutex_entry
+{
+    struct list entry;
+    int         fd;
+    HANDLE      handle;
+};
+static struct list client_mutex_list = LIST_INIT( client_mutex_list );
 
 static struct inproc_sync *inproc_sync_cache[INPROC_SYNC_CACHE_ENTRIES];
 static struct inproc_sync inproc_sync_cache_initial_block[INPROC_SYNC_CACHE_BLOCK_SIZE];
@@ -802,6 +823,261 @@ void close_inproc_sync( HANDLE handle )
     }
 }
 
+/*
+ * NSPA: Client-side sync object creation infrastructure.
+ *
+ * Anonymous sync objects bypass the wineserver entirely. The client calls
+ * the ntsync ioctl directly and populates the inproc_sync cache at a handle
+ * allocated from the client range (top-down, disjoint from server range).
+ */
+
+BOOL is_client_handle( HANDLE handle )
+{
+    unsigned int idx = (wine_server_obj_handle(handle) >> 2) - 1;
+    return idx >= CLIENT_HANDLE_BASE && idx < INPROC_SYNC_CACHE_TOTAL;
+}
+
+static inline BOOL is_anonymous_attr( const OBJECT_ATTRIBUTES *attr )
+{
+    if (!attr) return TRUE;
+    if (attr->Attributes & OBJ_INHERIT) return FALSE;
+    if (attr->RootDirectory) return FALSE;
+    if (!attr->ObjectName) return TRUE;
+    return attr->ObjectName->Length == 0;
+}
+
+static inline BOOL allow_client_sync_creation( enum inproc_sync_type type, const OBJECT_ATTRIBUTES *attr )
+{
+    /* Workaround: keep anonymous events on wineserver; semaphores/mutexes are
+     * stable, but client-created event handles still destabilize Ableton. */
+    if (type == INPROC_SYNC_EVENT) return FALSE;
+    return is_anonymous_attr( attr );
+}
+
+static HANDLE alloc_client_handle(void)
+{
+    LONG idx = InterlockedDecrement( &client_handle_next );
+
+    if (idx < 0)
+    {
+        InterlockedIncrement( &client_handle_next );
+        return NULL;
+    }
+
+    return wine_server_ptr_handle( (unsigned int)(idx + 1) << 2 );
+}
+
+static void free_client_handle( HANDLE handle )
+{
+    /* Handles are allocated top-down and not individually recycled. */
+    (void)handle;
+}
+
+/* Populate the inproc_sync cache directly for a client-created object.
+ * Caller closes fd on failure. */
+static NTSTATUS cache_client_inproc_sync( HANDLE handle, int fd,
+                                          enum inproc_sync_type type,
+                                          ACCESS_MASK access )
+{
+    unsigned int entry, idx = inproc_sync_handle_to_index( handle, &entry );
+    struct inproc_sync *cache;
+    int refcount;
+
+    if (entry >= INPROC_SYNC_CACHE_ENTRIES)
+    {
+        FIXME( "client handle %p maps beyond cache, not caching\n", handle );
+        return STATUS_NO_MEMORY;
+    }
+
+    if (!inproc_sync_cache[entry])
+    {
+        if (!entry)
+        {
+            InterlockedCompareExchangePointer( (void **)&inproc_sync_cache[0],
+                                               inproc_sync_cache_initial_block, NULL );
+        }
+        else
+        {
+            static const size_t size = INPROC_SYNC_CACHE_BLOCK_SIZE * sizeof(struct inproc_sync);
+            void *ptr = anon_mmap_alloc( size, PROT_READ | PROT_WRITE, LARGE_PAGES_NONE );
+            if (ptr == MAP_FAILED) return STATUS_NO_MEMORY;
+            if (InterlockedCompareExchangePointer( (void **)&inproc_sync_cache[entry],
+                                                   ptr, NULL ) != NULL)
+                munmap( ptr, size );
+        }
+    }
+
+    cache = &inproc_sync_cache[entry][idx];
+    cache->fd = fd;
+    cache->access = access;
+    cache->type = type;
+    cache->closed = 0;
+    refcount = InterlockedExchange( &cache->refcount, 1 );
+    assert( !refcount );
+
+    return STATUS_SUCCESS;
+}
+
+/* Caller must hold fd_cache_mutex. */
+void close_client_inproc_sync( HANDLE handle )
+{
+    struct inproc_sync *cache;
+    struct client_mutex_entry *mentry, *next;
+
+    if ((cache = get_cached_inproc_sync( handle )))
+    {
+        if (cache->type == INPROC_SYNC_MUTEX)
+        {
+            LIST_FOR_EACH_ENTRY_SAFE( mentry, next, &client_mutex_list, struct client_mutex_entry, entry )
+            {
+                if (mentry->handle == handle)
+                {
+                    list_remove( &mentry->entry );
+                    free( mentry );
+                    break;
+                }
+            }
+        }
+
+        cache->closed = 1;
+        release_inproc_sync( cache );
+        release_inproc_sync( cache );
+    }
+
+    free_client_handle( handle );
+}
+
+/* Mark all client-created mutexes owned by the dying thread as abandoned. */
+void abandon_client_mutexes( DWORD tid )
+{
+    struct client_mutex_entry *mentry;
+    __u32 owner = tid;
+    sigset_t sigset;
+
+    server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );
+    LIST_FOR_EACH_ENTRY( mentry, &client_mutex_list, struct client_mutex_entry, entry )
+        ioctl( mentry->fd, NTSYNC_IOC_MUTEX_KILL, &owner );
+    server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
+}
+
+#ifdef NTSYNC_IOC_EVENT_READ
+
+static NTSTATUS create_inproc_event_local( HANDLE *handle, ACCESS_MASK access,
+                                           EVENT_TYPE type, BOOLEAN state )
+{
+    struct ntsync_event_args args = {
+        .manual = (type == NotificationEvent),
+        .signaled = state,
+    };
+    HANDLE h;
+    int fd;
+    NTSTATUS ret;
+
+    h = alloc_client_handle();
+    if (!h) return STATUS_NOT_IMPLEMENTED;
+
+    fd = ioctl( inproc_device_fd, NTSYNC_IOC_CREATE_EVENT, &args );
+    if (fd < 0)
+    {
+        free_client_handle( h );
+        return errno_to_status( errno );
+    }
+
+    ret = cache_client_inproc_sync( h, fd, INPROC_SYNC_EVENT, access );
+    if (ret)
+    {
+        close( fd );
+        free_client_handle( h );
+        return ret;
+    }
+
+    *handle = h;
+    TRACE( "client event handle %p (fd %d)\n", h, fd );
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS create_inproc_semaphore_local( HANDLE *handle, ACCESS_MASK access,
+                                               LONG initial, LONG max )
+{
+    struct ntsync_sem_args args = {
+        .count = initial,
+        .max = max,
+    };
+    HANDLE h;
+    int fd;
+    NTSTATUS ret;
+
+    h = alloc_client_handle();
+    if (!h) return STATUS_NOT_IMPLEMENTED;
+
+    fd = ioctl( inproc_device_fd, NTSYNC_IOC_CREATE_SEM, &args );
+    if (fd < 0)
+    {
+        free_client_handle( h );
+        return errno_to_status( errno );
+    }
+
+    ret = cache_client_inproc_sync( h, fd, INPROC_SYNC_SEMAPHORE, access );
+    if (ret)
+    {
+        close( fd );
+        free_client_handle( h );
+        return ret;
+    }
+
+    *handle = h;
+    TRACE( "client semaphore handle %p (fd %d)\n", h, fd );
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS create_inproc_mutex_local( HANDLE *handle, ACCESS_MASK access,
+                                           BOOLEAN owned )
+{
+    struct ntsync_mutex_args args = {
+        .owner = owned ? GetCurrentThreadId() : 0,
+        .count = owned ? 1 : 0,
+    };
+    struct client_mutex_entry *mentry;
+    HANDLE h;
+    int fd;
+    NTSTATUS ret;
+    sigset_t sigset;
+
+    h = alloc_client_handle();
+    if (!h) return STATUS_NOT_IMPLEMENTED;
+
+    fd = ioctl( inproc_device_fd, NTSYNC_IOC_CREATE_MUTEX, &args );
+    if (fd < 0)
+    {
+        free_client_handle( h );
+        return errno_to_status( errno );
+    }
+
+    ret = cache_client_inproc_sync( h, fd, INPROC_SYNC_MUTEX, access );
+    if (ret)
+    {
+        close( fd );
+        free_client_handle( h );
+        return ret;
+    }
+
+    mentry = malloc( sizeof(*mentry) );
+    if (mentry)
+    {
+        mentry->fd = fd;
+        mentry->handle = h;
+        server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );
+        list_add_tail( &client_mutex_list, &mentry->entry );
+        server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
+    }
+
+    *handle = h;
+    TRACE( "client mutex handle %p (fd %d)\n", h, fd );
+    return STATUS_SUCCESS;
+}
+
+#endif /* NTSYNC_IOC_EVENT_READ */
+
 static NTSTATUS inproc_release_semaphore( HANDLE handle, ULONG count, ULONG *prev_count )
 {
     struct inproc_sync stack, *sync;
@@ -1003,6 +1279,15 @@ NTSTATUS WINAPI NtCreateSemaphore( HANDLE *handle, ACCESS_MASK access, const OBJ
 
     *handle = 0;
     if (max <= 0 || initial < 0 || initial > max) return STATUS_INVALID_PARAMETER;
+
+#ifdef NTSYNC_IOC_EVENT_READ
+    if (inproc_device_fd >= 0 && allow_client_sync_creation( INPROC_SYNC_SEMAPHORE, attr ))
+    {
+        ret = create_inproc_semaphore_local( handle, access, initial, max );
+        if (ret != STATUS_NOT_IMPLEMENTED) return ret;
+    }
+#endif
+
     if ((ret = alloc_object_attributes( attr, &objattr, &len ))) return ret;
 
     SERVER_START_REQ( create_semaphore )
@@ -1129,6 +1414,15 @@ NTSTATUS WINAPI NtCreateEvent( HANDLE *handle, ACCESS_MASK access, const OBJECT_
 
     *handle = 0;
     if (type != NotificationEvent && type != SynchronizationEvent) return STATUS_INVALID_PARAMETER;
+
+#ifdef NTSYNC_IOC_EVENT_READ
+    if (inproc_device_fd >= 0 && allow_client_sync_creation( INPROC_SYNC_EVENT, attr ))
+    {
+        ret = create_inproc_event_local( handle, access, type, state );
+        if (ret != STATUS_NOT_IMPLEMENTED) return ret;
+    }
+#endif
+
     if ((ret = alloc_object_attributes( attr, &objattr, &len ))) return ret;
 
     SERVER_START_REQ( create_event )
@@ -1319,6 +1613,15 @@ NTSTATUS WINAPI NtCreateMutant( HANDLE *handle, ACCESS_MASK access, const OBJECT
            attr ? debugstr_us(attr->ObjectName) : "(null)", owned );
 
     *handle = 0;
+
+#ifdef NTSYNC_IOC_EVENT_READ
+    if (inproc_device_fd >= 0 && allow_client_sync_creation( INPROC_SYNC_MUTEX, attr ))
+    {
+        ret = create_inproc_mutex_local( handle, access, owned );
+        if (ret != STATUS_NOT_IMPLEMENTED) return ret;
+    }
+#endif
+
     if ((ret = alloc_object_attributes( attr, &objattr, &len ))) return ret;
 
     SERVER_START_REQ( create_mutex )

@@ -784,10 +784,10 @@ static void *nspa_request_shm_thread( void *param )
     volatile struct request_shm *request_shm;
     unsigned long generation = 0;
 
-    pthread_mutex_lock( &global_lock );
+    pi_mutex_lock( &global_lock );
     request_shm_fd = thread->request_shm_fd;
     request_shm = thread->request_shm;
-    pthread_mutex_unlock( &global_lock );
+    pi_mutex_unlock( &global_lock );
 
     /* NSPA v2.4: publish our Linux TID to the shm so the client can boost
      * us via sched_setscheduler when it's blocked on a reply at a higher
@@ -812,7 +812,7 @@ static void *nspa_request_shm_thread( void *param )
             syscall( __NR_futex, &request_shm->futex, NSPA_FUTEX_WAIT, val, NULL, NULL, 0 );
         }
 
-        pthread_mutex_lock( &global_lock );
+        pi_mutex_lock( &global_lock );
         generation = poll_generation;
 
         val = request_shm->futex;
@@ -840,7 +840,7 @@ static void *nspa_request_shm_thread( void *param )
         if (val != 1 && val != -1)
             fatal_protocol_error( thread, "nspa shmem: unknown futex state %d (post)\n", val );
 
-        pthread_mutex_unlock( &global_lock );
+        pi_mutex_unlock( &global_lock );
         syscall( __NR_futex, &request_shm->futex, NSPA_FUTEX_WAKE, 1, NULL, NULL, 0 );
 
         if (poll_generation != generation)
@@ -848,12 +848,12 @@ static void *nspa_request_shm_thread( void *param )
     }
 
 done:
-    pthread_mutex_lock( &global_lock );
+    pi_mutex_lock( &global_lock );
 done_locked:
     if (request_shm_fd != -1) close( request_shm_fd );
     if (request_shm) munmap( (void *)request_shm, REQUEST_SHM_SIZE );
     release_object( thread );
-    pthread_mutex_unlock( &global_lock );
+    pi_mutex_unlock( &global_lock );
     if (poll_generation != generation)
         force_exit_poll();
     return NULL;

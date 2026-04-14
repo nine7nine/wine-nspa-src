@@ -528,8 +528,12 @@ static struct fd **freelist;                /* list of free entries in the array
  * poll loop holds this lock except around the actual poll/epoll syscall.
  * Per-thread shm dispatchers (in thread.c) acquire it to run request handlers.
  * poll_generation increments on every poll-set mutation so stale poll results
- * (e.g. fd reused after close) are skipped. */
-pthread_mutex_t global_lock = PTHREAD_MUTEX_INITIALIZER;
+ * (e.g. fd reused after close) are skipped.
+ *
+ * NSPA: PI-aware (FUTEX_LOCK_PI) so that when a high-priority dispatcher
+ * (boosted by v2.4 client PI) contends with a lower-priority holder, the
+ * holder is automatically boosted via the kernel's rt_mutex PI chain. */
+pi_mutex_t global_lock = PI_MUTEX_INIT(0);
 unsigned long   poll_generation;
 static int      poll_exit_pipe[2];
 static struct fd *poll_exit_fd;
@@ -615,7 +619,7 @@ static inline void main_loop_epoll(void)
 
     if (epoll_fd == -1) return;
 
-    pthread_mutex_lock( &global_lock );  /* NSPA v1.5 */
+    pi_mutex_lock( &global_lock );  /* NSPA v1.5 */
     while (active_users)
     {
         unsigned long generation;  /* NSPA v1.5 */
@@ -626,7 +630,7 @@ static inline void main_loop_epoll(void)
         if (epoll_fd == -1) break;  /* an error occurred with epoll */
 
         generation = poll_generation;
-        pthread_mutex_unlock( &global_lock );  /* NSPA v1.5: release around kernel wait */
+        pi_mutex_unlock( &global_lock );  /* NSPA v1.5: release around kernel wait */
 #ifdef HAVE_EPOLL_PWAIT2
         if (!failed_epoll_pwait2)
         {
@@ -637,7 +641,7 @@ static inline void main_loop_epoll(void)
         if (failed_epoll_pwait2)
 #endif
             ret = epoll_wait( epoll_fd, events, ARRAY_SIZE( events ), timeout );
-        pthread_mutex_lock( &global_lock );  /* NSPA v1.5: reacquire */
+        pi_mutex_lock( &global_lock );  /* NSPA v1.5: reacquire */
 
         set_current_time();
 
@@ -660,7 +664,7 @@ static inline void main_loop_epoll(void)
             if (pollfd[user].revents) fd_poll_event( poll_users[user], pollfd[user].revents );
         }
     }
-    pthread_mutex_unlock( &global_lock );  /* NSPA v1.5 */
+    pi_mutex_unlock( &global_lock );  /* NSPA v1.5 */
 }
 
 #elif defined(HAVE_KQUEUE)
@@ -732,7 +736,7 @@ static inline void main_loop_epoll(void)
 
     if (kqueue_fd == -1) return;
 
-    pthread_mutex_lock( &global_lock );  /* NSPA v1.5 */
+    pi_mutex_lock( &global_lock );  /* NSPA v1.5 */
     while (active_users)
     {
         unsigned long generation;  /* NSPA v1.5 */
@@ -743,9 +747,9 @@ static inline void main_loop_epoll(void)
         if (kqueue_fd == -1) break;  /* an error occurred with kqueue */
 
         generation = poll_generation;
-        pthread_mutex_unlock( &global_lock );  /* NSPA v1.5 */
+        pi_mutex_unlock( &global_lock );  /* NSPA v1.5 */
         ret = kevent( kqueue_fd, NULL, 0, events, ARRAY_SIZE( events ), timeout == -1 ? NULL : &ts );
-        pthread_mutex_lock( &global_lock );  /* NSPA v1.5 */
+        pi_mutex_lock( &global_lock );  /* NSPA v1.5 */
 
         set_current_time();
 
@@ -778,7 +782,7 @@ static inline void main_loop_epoll(void)
             pollfd[user].revents = 0;
         }
     }
-    pthread_mutex_unlock( &global_lock );  /* NSPA v1.5 */
+    pi_mutex_unlock( &global_lock );  /* NSPA v1.5 */
 }
 
 #elif defined(USE_EVENT_PORTS)
@@ -840,7 +844,7 @@ static inline void main_loop_epoll(void)
 
     if (port_fd == -1) return;
 
-    pthread_mutex_lock( &global_lock );  /* NSPA v1.5 */
+    pi_mutex_lock( &global_lock );  /* NSPA v1.5 */
     while (active_users)
     {
         unsigned long generation;  /* NSPA v1.5 */
@@ -852,9 +856,9 @@ static inline void main_loop_epoll(void)
         if (port_fd == -1) break;  /* an error occurred with event completion */
 
         generation = poll_generation;
-        pthread_mutex_unlock( &global_lock );  /* NSPA v1.5 */
+        pi_mutex_unlock( &global_lock );  /* NSPA v1.5 */
         ret = port_getn( port_fd, events, ARRAY_SIZE( events ), &nget, timeout == -1 ? NULL : &ts );
-        pthread_mutex_lock( &global_lock );  /* NSPA v1.5 */
+        pi_mutex_lock( &global_lock );  /* NSPA v1.5 */
 
 	if (ret == -1) break;  /* an error occurred with event completion */
 
@@ -882,7 +886,7 @@ static inline void main_loop_epoll(void)
             }
         }
     }
-    pthread_mutex_unlock( &global_lock );  /* NSPA v1.5 */
+    pi_mutex_unlock( &global_lock );  /* NSPA v1.5 */
 }
 
 #else /* HAVE_KQUEUE */
@@ -1083,7 +1087,7 @@ void main_loop(void)
     main_loop_epoll();
     /* fall through to normal poll loop */
 
-    pthread_mutex_lock( &global_lock );  /* NSPA v1.5 */
+    pi_mutex_lock( &global_lock );  /* NSPA v1.5 */
     while (active_users)
     {
         unsigned long generation;  /* NSPA v1.5 */
@@ -1093,9 +1097,9 @@ void main_loop(void)
         if (!active_users) break;  /* last user removed by a timeout */
 
         generation = poll_generation;
-        pthread_mutex_unlock( &global_lock );  /* NSPA v1.5 */
+        pi_mutex_unlock( &global_lock );  /* NSPA v1.5 */
         ret = poll( pollfd, nb_users, timeout );
-        pthread_mutex_lock( &global_lock );  /* NSPA v1.5 */
+        pi_mutex_lock( &global_lock );  /* NSPA v1.5 */
         set_current_time();
 
         if (ret > 0)
@@ -1112,7 +1116,7 @@ void main_loop(void)
             }
         }
     }
-    pthread_mutex_unlock( &global_lock );  /* NSPA v1.5 */
+    pi_mutex_unlock( &global_lock );  /* NSPA v1.5 */
 }
 
 

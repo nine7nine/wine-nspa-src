@@ -874,6 +874,11 @@ static BOOL nulldrv_GetWindowStyleMasks( HWND hwnd, UINT style, UINT ex_style, U
     return FALSE;
 }
 
+static BOOL nulldrv_GetFrameExtents( HWND hwnd, RECT *frame_rect )
+{
+    return FALSE;
+}
+
 static BOOL nulldrv_GetWindowStateUpdates( HWND hwnd, UINT *state_cmd, UINT *swp_flags, RECT *rect, HWND *foreground )
 {
     return FALSE;
@@ -1301,6 +1306,7 @@ static const struct user_driver_funcs lazy_load_driver =
     nulldrv_WindowMessage,
     nulldrv_WindowPosChanging,
     nulldrv_GetWindowStyleMasks,
+    nulldrv_GetFrameExtents,
     nulldrv_GetWindowStateUpdates,
     nulldrv_CreateWindowSurface,
     nulldrv_MoveWindowBits,

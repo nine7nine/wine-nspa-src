@@ -537,6 +537,7 @@ enum x11drv_atoms
     XATOM__NET_WM_WINDOW_TYPE_DIALOG,
     XATOM__NET_WM_WINDOW_TYPE_NORMAL,
     XATOM__NET_WM_WINDOW_TYPE_UTILITY,
+    XATOM__NET_FRAME_EXTENTS,
     XATOM__NET_WORKAREA,
     XATOM__GTK_WORKAREAS_D0,
     XATOM__XEMBED,
@@ -677,6 +678,8 @@ struct x11drv_win_data
     UINT        parent_invalid : 1; /* is the parent host window possibly invalid */
     UINT        reparenting : 1; /* window is being reparented, likely from a decoration change */
     UINT        is_resizable : 1; /* window is allowed to be resized by the window manager */
+    UINT        has_frame_extents : 1;
+    long        frame_extents[4];
     Window      embedder;       /* window id of embedder */
     Pixmap         icon_pixmap;
     Pixmap         icon_mask;
@@ -722,6 +725,9 @@ extern BOOL is_net_supported( Atom atom );
 extern Window init_clip_window(void);
 extern void window_set_user_time( struct x11drv_win_data *data, Time time, BOOL init );
 extern UINT get_window_net_wm_state( Display *display, Window window );
+extern BOOL read_net_frame_extents( Display *display, Window window, long *extents );
+extern void window_net_frame_extents_notify( struct x11drv_win_data *data, const long *extents, BOOL valid );
+extern BOOL X11DRV_GetFrameExtents( HWND hwnd, RECT *frame_rect );
 extern void make_window_embedded( struct x11drv_win_data *data );
 extern Window create_client_window( HWND hwnd, RECT client_rect, const XVisualInfo *visual, Colormap colormap );
 extern void detach_client_window( struct x11drv_win_data *data, Window client_window );

@@ -1316,6 +1316,19 @@ static void handle_wm_normal_hints_notify( HWND hwnd, XPropertyEvent *event )
     release_win_data( data );
 }
 
+static void handle_net_frame_extents_notify( HWND hwnd, XPropertyEvent *event )
+{
+    struct x11drv_win_data *data;
+    long extents[4] = {0};
+    BOOL valid = FALSE;
+
+    if (!(data = get_win_data( hwnd ))) return;
+    if (event->state == PropertyNewValue)
+        valid = read_net_frame_extents( event->display, event->window, extents );
+    window_net_frame_extents_notify( data, extents, valid );
+    release_win_data( data );
+}
+
 static void handle_net_supported_notify( XPropertyEvent *event )
 {
     struct x11drv_thread_data *data = x11drv_thread_data();
@@ -1353,6 +1366,7 @@ static BOOL X11DRV_PropertyNotify( HWND hwnd, XEvent *xev )
     if (event->atom == x11drv_atom(WM_HINTS)) handle_wm_hints_notify( hwnd, event );
     if (event->atom == x11drv_atom(_MOTIF_WM_HINTS)) handle_mwm_hints_notify( hwnd, event );
     if (event->atom == x11drv_atom(WM_NORMAL_HINTS)) handle_wm_normal_hints_notify( hwnd, event );
+    if (event->atom == x11drv_atom(_NET_FRAME_EXTENTS)) handle_net_frame_extents_notify( hwnd, event );
     if (event->atom == x11drv_atom(_NET_SUPPORTED)) handle_net_supported_notify( event );
     if (event->atom == x11drv_atom(_NET_ACTIVE_WINDOW)) handle_net_active_window( event );
 

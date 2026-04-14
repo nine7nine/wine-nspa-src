@@ -34,35 +34,68 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(asio);
 
-/* Import from mmdevapi.dll — per-channel fast-path buffer info */
+/* Import from mmdevapi.dll — Phase F ASIO registration */
 #define NSPA_FAST_PATH_MAX_CHANNELS 64
-typedef UINT64 stream_handle;
-struct fast_path_info_params
+
+struct register_asio_params
 {
-    stream_handle stream;
     HRESULT result;
-    BOOL    available;
+    float  *out_bufs_a[NSPA_FAST_PATH_MAX_CHANNELS];
+    float  *out_bufs_b[NSPA_FAST_PATH_MAX_CHANNELS];
+    int     out_count;
+    float  *in_bufs_a[NSPA_FAST_PATH_MAX_CHANNELS];
+    float  *in_bufs_b[NSPA_FAST_PATH_MAX_CHANNELS];
+    int     in_count;
+    UINT32  buf_size;
+    volatile int *signal_futex;
+    int     *buf_index;
+    long long *sample_pos;
     UINT32  period_frames;
-    int     nports;
-    volatile int    *write_buf_idx;
-    volatile UINT32 *held_frames;
-    float  *chan_bufs_a[NSPA_FAST_PATH_MAX_CHANNELS];
-    float  *chan_bufs_b[NSPA_FAST_PATH_MAX_CHANNELS];
+    UINT32  sample_rate;
 };
 
-typedef HRESULT (WINAPI *nspa_get_fast_path_info_fn)(IAudioClient *client,
-                                                     struct fast_path_info_params *info);
-
-static nspa_get_fast_path_info_fn get_fast_path_info_func(void)
+struct unregister_asio_params
 {
-    static nspa_get_fast_path_info_fn fn;
-    if (!fn)
-    {
-        HMODULE mod = GetModuleHandleW(L"mmdevapi");
-        if (mod)
-            fn = (nspa_get_fast_path_info_fn)GetProcAddress(mod, "nspa_get_fast_path_info");
-    }
-    return fn;
+    HRESULT result;
+};
+
+struct asio_wait_callback_params
+{
+    HRESULT result;
+    int     buf_index;
+    long long sample_pos;
+    BOOL    timed_out;
+};
+
+struct asio_signal_complete_params
+{
+    HRESULT result;
+};
+
+typedef HRESULT (WINAPI *nspa_register_asio_fn)(struct register_asio_params *params);
+typedef HRESULT (WINAPI *nspa_unregister_asio_fn)(struct unregister_asio_params *params);
+typedef HRESULT (WINAPI *nspa_asio_wait_callback_fn)(struct asio_wait_callback_params *params);
+typedef HRESULT (WINAPI *nspa_asio_signal_complete_fn)(struct asio_signal_complete_params *params);
+
+static nspa_register_asio_fn         pf_register;
+static nspa_unregister_asio_fn       pf_unregister;
+static nspa_asio_wait_callback_fn    pf_wait;
+static nspa_asio_signal_complete_fn  pf_signal;
+
+static BOOL load_phase_f_funcs(void)
+{
+    HMODULE mod;
+    if (pf_register) return TRUE;
+
+    mod = GetModuleHandleW(L"mmdevapi");
+    if (!mod) return FALSE;
+
+    pf_register   = (nspa_register_asio_fn)GetProcAddress(mod, "nspa_register_asio");
+    pf_unregister = (nspa_unregister_asio_fn)GetProcAddress(mod, "nspa_unregister_asio");
+    pf_wait       = (nspa_asio_wait_callback_fn)GetProcAddress(mod, "nspa_asio_wait_callback");
+    pf_signal     = (nspa_asio_signal_complete_fn)GetProcAddress(mod, "nspa_asio_signal_complete");
+
+    return pf_register && pf_unregister && pf_wait && pf_signal;
 }
 
 /* ════════════════════════════════════════════════════════════════════════
@@ -164,6 +197,7 @@ typedef struct nspaASIODriver {
     /* Playback thread */
     HANDLE            thread;
     HANDLE            stop_event;
+    volatile BOOL     please_quit;     /* Phase F: signal play thread to exit */
 
     /* Timing */
     long long         sample_position;
@@ -171,16 +205,14 @@ typedef struct nspaASIODriver {
     LARGE_INTEGER     perf_freq;
     ASIOSampleRate    sample_rate;
 
-    /* NSPA fast path: direct per-channel write to winejack buffers.
-     * When available, play_thread skips interleave + GetBuffer/ReleaseBuffer
-     * and copies ASIO per-channel → winejack per-channel directly. */
-    BOOL              fast_path;
-    float            *fp_chan_a[64];  /* winejack set A per-channel ptrs */
-    float            *fp_chan_b[64];  /* winejack set B per-channel ptrs */
-    volatile int     *fp_write_idx;  /* winejack buffer swap index */
-    volatile UINT32  *fp_held;       /* winejack held_frames */
-    UINT32            fp_period;     /* winejack period frames */
-    int               fp_nports;     /* winejack port count */
+    /* Phase F: ASIO registered directly with winejack JACK callback.
+     * When active, play_thread uses futex wait/signal instead of
+     * WaitForMultipleObjects + GetBuffer/ReleaseBuffer. */
+    BOOL              phase_f;           /* TRUE when registered with winejack */
+    volatile int     *pf_futex;          /* shared futex with JACK RT callback */
+    int              *pf_buf_index;      /* buffer index (driver writes) */
+    long long        *pf_sample_pos;     /* sample position (driver writes) */
+    UINT32            pf_period;         /* JACK period frames */
 } nspaASIODriver;
 
 static nspaASIODriver *g_driver;
@@ -226,7 +258,61 @@ static void get_nanotime(LARGE_INTEGER *freq, ASIOTimeStamp *ts)
  *   Playback thread — waits on WASAPI event, calls ASIO host callback
  * ════════════════════════════════════════════════════════════════════════ */
 
-static unsigned __stdcall play_thread(void *arg)
+/* ── Phase F play thread: futex-synchronized with JACK RT callback ──
+ *
+ * Each period:
+ *   1. Wait for CAPTURE_READY (JACK RT filled capture buffers)
+ *   2. Call bufferSwitch — host reads capture, writes output
+ *   3. Signal OUTPUT_READY (JACK RT copies output to JACK ports)
+ *
+ * Output written by the host appears in the SAME JACK period. */
+static unsigned __stdcall play_thread_phase_f(void *arg)
+{
+    nspaASIODriver *d = arg;
+    DWORD task_idx = 0;
+    HANDLE avrt;
+    struct asio_wait_callback_params wait_params;
+    struct asio_signal_complete_params signal_params;
+
+    avrt = AvSetMmThreadCharacteristicsW(L"Pro Audio", &task_idx);
+    if (avrt)
+        AvSetMmThreadPriority(avrt, AVRT_PRIORITY_CRITICAL);
+
+    QueryPerformanceCounter(&d->system_time);
+    d->sample_position = 0;
+
+    while (!d->please_quit)
+    {
+        /* Wait for JACK RT to signal capture ready */
+        memset(&wait_params, 0, sizeof(wait_params));
+        pf_wait(&wait_params);
+
+        if (wait_params.timed_out || d->please_quit)
+            continue;
+
+        /* Update timing from driver */
+        d->buf_index = wait_params.buf_index;
+        d->sample_position = wait_params.sample_pos;
+        QueryPerformanceCounter(&d->system_time);
+
+        /* Call host: it reads capture from in_bufs[buf_index],
+         * writes output to out_bufs[buf_index] */
+        if (d->callbacks->bufferSwitch)
+            d->callbacks->bufferSwitch(d->buf_index, ASIOTrue);
+
+        /* Signal JACK RT: output is ready for same-period copy */
+        memset(&signal_params, 0, sizeof(signal_params));
+        pf_signal(&signal_params);
+    }
+
+    if (avrt)
+        AvRevertMmThreadCharacteristics(avrt);
+
+    return 0;
+}
+
+/* ── WASAPI fallback play thread (Phase D fast-path or general path) ── */
+static unsigned __stdcall play_thread_wasapi(void *arg)
 {
     nspaASIODriver *d = arg;
     HANDLE events[2];
@@ -235,7 +321,6 @@ static unsigned __stdcall play_thread(void *arg)
     DWORD task_idx = 0;
     HANDLE avrt;
 
-    /* Boost to pro-audio priority */
     avrt = AvSetMmThreadCharacteristicsW(L"Pro Audio", &task_idx);
     if (avrt)
         AvSetMmThreadPriority(avrt, AVRT_PRIORITY_CRITICAL);
@@ -248,132 +333,90 @@ static unsigned __stdcall play_thread(void *arg)
     QueryPerformanceCounter(&d->system_time);
     d->sample_position = 0;
 
-    /* First callback: host fills buffer 0, then we submit it immediately.
-     * No silence pre-fill — saves one full period of output latency. */
     if (d->callbacks->bufferSwitch)
         d->callbacks->bufferSwitch(d->buf_index, ASIOTrue);
 
     while (WaitForMultipleObjects(2, events, FALSE, INFINITE) == WAIT_OBJECT_0 + 1)
     {
-        int src_idx = d->buf_index;  /* host just filled this one */
+        int src_idx = d->buf_index;
         BYTE **src_bufs = src_idx == 0 ? d->buf_a : d->buf_b;
 
-        if (d->fast_path)
+        hr = IAudioRenderClient_GetBuffer(d->render_client, d->buf_size, &wasapi_buf);
+        if (SUCCEEDED(hr))
         {
-            /* ── Direct per-channel path: ASIO → winejack, zero interleave ──
-             * Copy each ASIO output channel directly into winejack's per-channel
-             * write-set buffer. No GetBuffer, no interleave, no ReleaseBuffer. */
-            int wri = *d->fp_write_idx;
-            float **dst_set = (wri == 0) ? d->fp_chan_a : d->fp_chan_b;
-            int ch;
-            UINT32 frames = (UINT32)d->buf_size;
-            if (frames > d->fp_period) frames = d->fp_period;
+            long i;
+            int ch, bps = d->bytes_per_sample, nch = d->wasapi_channels;
 
-            for (ch = 0; ch < d->fp_nports && ch < d->out_map_count; ch++)
-            {
-                const float *src = (const float *)src_bufs[d->out_map[ch]];
-                float *dst = dst_set[ch];
 #ifdef __SSE2__
+            if (bps == 4 && nch == 2 && d->out_map_count >= 2)
+            {
+                const float *src_l = (const float *)src_bufs[d->out_map[0]];
+                const float *src_r = (const float *)src_bufs[d->out_map[1]];
+                float *dst = (float *)wasapi_buf;
                 long j = 0;
-                for (; j + 4 <= (long)frames; j += 4)
-                    _mm_storeu_ps(dst + j, _mm_loadu_ps(src + j));
-                for (; j < (long)frames; j++)
-                    dst[j] = src[j];
-#else
-                memcpy(dst, src, frames * sizeof(float));
-#endif
+                for (; j + 4 <= d->buf_size; j += 4)
+                {
+                    __m128 l = _mm_loadu_ps(src_l + j);
+                    __m128 r = _mm_loadu_ps(src_r + j);
+                    __m128 lo = _mm_unpacklo_ps(l, r);
+                    __m128 hi = _mm_unpackhi_ps(l, r);
+                    _mm_storeu_ps(dst + j * 2, lo);
+                    _mm_storeu_ps(dst + j * 2 + 4, hi);
+                }
+                for (; j < d->buf_size; j++)
+                {
+                    dst[j * 2] = src_l[j];
+                    dst[j * 2 + 1] = src_r[j];
+                }
             }
-            /* Zero any unmapped channels */
-            for (; ch < d->fp_nports; ch++)
-                memset(dst_set[ch], 0, frames * sizeof(float));
-
-            /* Signal winejack that data is ready */
-            __atomic_store_n(d->fp_held, frames, __ATOMIC_RELEASE);
-        }
-        else
-        {
-            /* ── General WASAPI path: interleave → GetBuffer/ReleaseBuffer ── */
-            hr = IAudioRenderClient_GetBuffer(d->render_client, d->buf_size, &wasapi_buf);
-            if (SUCCEEDED(hr))
+            else if (bps == 4 && nch == 1 && d->out_map_count >= 1)
             {
-                long i;
-                int ch, bps = d->bytes_per_sample, nch = d->wasapi_channels;
-
-#ifdef __SSE2__
-                if (bps == 4 && nch == 2 && d->out_map_count >= 2)
-                {
-                    const float *src_l = (const float *)src_bufs[d->out_map[0]];
-                    const float *src_r = (const float *)src_bufs[d->out_map[1]];
-                    float *dst = (float *)wasapi_buf;
-                    long j = 0;
-                    for (; j + 4 <= d->buf_size; j += 4)
-                    {
-                        __m128 l = _mm_loadu_ps(src_l + j);
-                        __m128 r = _mm_loadu_ps(src_r + j);
-                        __m128 lo = _mm_unpacklo_ps(l, r);
-                        __m128 hi = _mm_unpackhi_ps(l, r);
-                        _mm_storeu_ps(dst + j * 2, lo);
-                        _mm_storeu_ps(dst + j * 2 + 4, hi);
-                    }
-                    for (; j < d->buf_size; j++)
-                    {
-                        dst[j * 2] = src_l[j];
-                        dst[j * 2 + 1] = src_r[j];
-                    }
-                }
-                else if (bps == 4 && nch == 1 && d->out_map_count >= 1)
-                {
-                    const float *src_m = (const float *)src_bufs[d->out_map[0]];
-                    float *dst = (float *)wasapi_buf;
-                    long j = 0;
-                    for (; j + 4 <= d->buf_size; j += 4)
-                        _mm_storeu_ps(dst + j, _mm_loadu_ps(src_m + j));
-                    for (; j < d->buf_size; j++)
-                        dst[j] = src_m[j];
-                }
-                else
-#endif
-                if (bps == 4)
-                {
-                    float *dst = (float *)wasapi_buf;
-                    for (i = 0; i < d->buf_size; i++)
-                        for (ch = 0; ch < nch; ch++)
-                            dst[i * nch + ch] = (ch < d->out_map_count)
-                                ? ((float *)src_bufs[d->out_map[ch]])[i] : 0.0f;
-                }
-                else if (bps == 2)
-                {
-                    INT16 *dst = (INT16 *)wasapi_buf;
-                    for (i = 0; i < d->buf_size; i++)
-                        for (ch = 0; ch < nch; ch++)
-                            dst[i * nch + ch] = (ch < d->out_map_count)
-                                ? ((INT16 *)src_bufs[d->out_map[ch]])[i] : 0;
-                }
-                else
-                {
-                    BYTE *dst = wasapi_buf;
-                    for (i = 0; i < d->buf_size; i++)
-                        for (ch = 0; ch < nch; ch++)
-                        {
-                            if (ch < d->out_map_count)
-                                memcpy(dst, src_bufs[d->out_map[ch]] + i * bps, bps);
-                            else
-                                memset(dst, 0, bps);
-                            dst += bps;
-                        }
-                }
-                IAudioRenderClient_ReleaseBuffer(d->render_client, d->buf_size, 0);
+                const float *src_m = (const float *)src_bufs[d->out_map[0]];
+                float *dst = (float *)wasapi_buf;
+                long j = 0;
+                for (; j + 4 <= d->buf_size; j += 4)
+                    _mm_storeu_ps(dst + j, _mm_loadu_ps(src_m + j));
+                for (; j < d->buf_size; j++)
+                    dst[j] = src_m[j];
             }
+            else
+#endif
+            if (bps == 4)
+            {
+                float *dst = (float *)wasapi_buf;
+                for (i = 0; i < d->buf_size; i++)
+                    for (ch = 0; ch < nch; ch++)
+                        dst[i * nch + ch] = (ch < d->out_map_count)
+                            ? ((float *)src_bufs[d->out_map[ch]])[i] : 0.0f;
+            }
+            else if (bps == 2)
+            {
+                INT16 *dst = (INT16 *)wasapi_buf;
+                for (i = 0; i < d->buf_size; i++)
+                    for (ch = 0; ch < nch; ch++)
+                        dst[i * nch + ch] = (ch < d->out_map_count)
+                            ? ((INT16 *)src_bufs[d->out_map[ch]])[i] : 0;
+            }
+            else
+            {
+                BYTE *dst = wasapi_buf;
+                for (i = 0; i < d->buf_size; i++)
+                    for (ch = 0; ch < nch; ch++)
+                    {
+                        if (ch < d->out_map_count)
+                            memcpy(dst, src_bufs[d->out_map[ch]] + i * bps, bps);
+                        else
+                            memset(dst, 0, bps);
+                        dst += bps;
+                    }
+            }
+            IAudioRenderClient_ReleaseBuffer(d->render_client, d->buf_size, 0);
         }
 
-        /* Toggle buffer index */
         d->buf_index = 1 - d->buf_index;
-
-        /* Update timing */
         QueryPerformanceCounter(&d->system_time);
         d->sample_position += d->buf_size;
 
-        /* Call host to fill the next buffer */
         if (d->callbacks->bufferSwitch)
             d->callbacks->bufferSwitch(d->buf_index, ASIOTrue);
     }
@@ -556,17 +599,28 @@ static void ASIOMETHODCALLTYPE asio_getErrorMessage(IASIO *iface, char *string)
 static ASIOError ASIOMETHODCALLTYPE asio_start(IASIO *iface)
 {
     nspaASIODriver *d = (nspaASIODriver *)iface;
-    TRACE("start (iface=%p)\n", iface);
+    TRACE("start (iface=%p, phase_f=%d)\n", iface, d->phase_f);
 
     if (d->state != STATE_PREPARED)
         return ASE_InvalidMode;
 
-    d->stop_event = CreateEventW(NULL, FALSE, FALSE, NULL);
-    d->thread = (HANDLE)_beginthreadex(NULL, 0, play_thread, d, 0, NULL);
+    d->please_quit = FALSE;
+
+    if (d->phase_f)
+    {
+        /* Phase F: play_thread uses futex sync with JACK RT callback */
+        d->thread = (HANDLE)_beginthreadex(NULL, 0, play_thread_phase_f, d, 0, NULL);
+    }
+    else
+    {
+        /* WASAPI fallback: play_thread uses WaitForMultipleObjects on event */
+        d->stop_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+        d->thread = (HANDLE)_beginthreadex(NULL, 0, play_thread_wasapi, d, 0, NULL);
+    }
+
     if (!d->thread)
     {
-        CloseHandle(d->stop_event);
-        d->stop_event = NULL;
+        if (d->stop_event) { CloseHandle(d->stop_event); d->stop_event = NULL; }
         return ASE_HWMalfunction;
     }
 
@@ -577,28 +631,43 @@ static ASIOError ASIOMETHODCALLTYPE asio_start(IASIO *iface)
 static ASIOError ASIOMETHODCALLTYPE asio_stop(IASIO *iface)
 {
     nspaASIODriver *d = (nspaASIODriver *)iface;
-    TRACE("stop (iface=%p)\n", iface);
+    TRACE("stop (iface=%p, phase_f=%d)\n", iface, d->phase_f);
 
     if (d->state != STATE_RUNNING)
         return ASE_OK;
 
-    /* Stop the audio client first — this unblocks the event wait
-     * in the play thread so it can see the stop_event. */
-    if (d->audio_client)
-        IAudioClient_Stop(d->audio_client);
+    d->please_quit = TRUE;
 
-    SetEvent(d->stop_event);
-
-    if (WaitForSingleObject(d->thread, 1000) == WAIT_TIMEOUT)
+    if (d->phase_f)
     {
-        WARN("play thread did not exit in 1s, terminating\n");
-        TerminateThread(d->thread, 0);
+        /* Phase F: unregister from winejack (wakes the futex with QUIT) */
+        if (pf_unregister)
+        {
+            struct unregister_asio_params params = {0};
+            pf_unregister(&params);
+        }
+    }
+    else
+    {
+        /* WASAPI fallback: stop audio client, signal stop event */
+        if (d->audio_client)
+            IAudioClient_Stop(d->audio_client);
+        if (d->stop_event)
+            SetEvent(d->stop_event);
     }
 
-    CloseHandle(d->thread);
-    CloseHandle(d->stop_event);
-    d->thread = NULL;
-    d->stop_event = NULL;
+    if (d->thread)
+    {
+        if (WaitForSingleObject(d->thread, 1000) == WAIT_TIMEOUT)
+        {
+            WARN("play thread did not exit in 1s, terminating\n");
+            TerminateThread(d->thread, 0);
+        }
+        CloseHandle(d->thread);
+        d->thread = NULL;
+    }
+
+    if (d->stop_event) { CloseHandle(d->stop_event); d->stop_event = NULL; }
     d->state = STATE_PREPARED;
 
     return ASE_OK;
@@ -616,9 +685,18 @@ static ASIOError ASIOMETHODCALLTYPE asio_getChannels(IASIO *iface, long *numIn, 
 static ASIOError ASIOMETHODCALLTYPE asio_getLatencies(IASIO *iface, long *inLat, long *outLat)
 {
     nspaASIODriver *d = (nspaASIODriver *)iface;
-    /* Two buffers of latency (double-buffered) */
-    if (inLat) *inLat = d->buf_size * 2;
-    if (outLat) *outLat = d->buf_size * 2;
+    if (d->phase_f)
+    {
+        /* Phase F: same-period output = exactly one buffer of latency */
+        if (inLat) *inLat = d->buf_size;
+        if (outLat) *outLat = d->buf_size;
+    }
+    else
+    {
+        /* WASAPI fallback: two buffers of latency (double-buffered) */
+        if (inLat) *inLat = d->buf_size * 2;
+        if (outLat) *outLat = d->buf_size * 2;
+    }
     return ASE_OK;
 }
 
@@ -775,66 +853,88 @@ static ASIOError ASIOMETHODCALLTYPE asio_createBuffers(IASIO *iface, ASIOBufferI
     TRACE("createBuffers: %ld channels total, %d outputs mapped\n",
           numChannels, d->out_map_count);
 
-    /* Open WASAPI exclusive stream */
-    duration = (REFERENCE_TIME)(10000000.0 * bufferSize / d->sample_rate + 0.5);
-
-    hr = IAudioClient_Initialize(d->audio_client, AUDCLNT_SHAREMODE_EXCLUSIVE,
-                                  AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                                  duration, duration, &d->wfx.Format, NULL);
-    if (FAILED(hr))
+    /* ── Phase F: try direct ASIO registration with winejack ──
+     * This bypasses WASAPI entirely — winejack allocates its own JACK ports
+     * and the JACK RT callback does a synchronous round-trip with our
+     * play_thread via futex.  Same-period output = theoretical minimum latency. */
+    d->phase_f = FALSE;
+    if (load_phase_f_funcs() && d->sample_type == ASIOSTFloat32LSB)
     {
-        /* Fallback: try shared mode */
-        WARN("Exclusive mode failed (%08lx), trying shared\n", hr);
+        struct register_asio_params reg;
+        int ch, in_idx = 0;
 
-        /* Need a fresh audio client for retry */
-        IAudioClient_Release(d->audio_client);
-        d->audio_client = NULL;
-        IMMDevice_Activate(d->render_device, &IID_IAudioClient, CLSCTX_ALL, NULL, (void **)&d->audio_client);
+        memset(&reg, 0, sizeof(reg));
+        reg.buf_size = bufferSize;
+        reg.out_count = d->out_map_count;
 
-        hr = IAudioClient_Initialize(d->audio_client, AUDCLNT_SHAREMODE_SHARED,
-                                      AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                                      duration, 0, &d->wfx.Format, NULL);
-        if (FAILED(hr))
+        /* Wire output buffer pointers (float32 per-channel) */
+        for (ch = 0; ch < d->out_map_count && ch < 64; ch++)
         {
-            strcpy(d->error_msg, "WASAPI Initialize failed");
-            ERR("WASAPI Initialize failed: %08lx\n", hr);
-            return ASE_HWMalfunction;
+            reg.out_bufs_a[ch] = (float *)d->buf_a[d->out_map[ch]];
+            reg.out_bufs_b[ch] = (float *)d->buf_b[d->out_map[ch]];
+        }
+
+        /* Wire input buffer pointers */
+        for (i = 0; i < numChannels && in_idx < 64; i++)
+        {
+            if (infos[i].isInput)
+            {
+                reg.in_bufs_a[in_idx] = (float *)d->buf_a[i];
+                reg.in_bufs_b[in_idx] = (float *)d->buf_b[i];
+                in_idx++;
+            }
+        }
+        reg.in_count = in_idx;
+
+        if (SUCCEEDED(pf_register(&reg)))
+        {
+            d->phase_f = TRUE;
+            d->pf_futex = reg.signal_futex;
+            d->pf_buf_index = reg.buf_index;
+            d->pf_sample_pos = reg.sample_pos;
+            d->pf_period = reg.period_frames;
+
+            ERR("NSPA RT:ASIO: Phase F registered (%u frames, %d out, %d in, rate %u)\n",
+                reg.period_frames, reg.out_count, reg.in_count, reg.sample_rate);
         }
     }
 
-    IAudioClient_GetBufferSize(d->audio_client, &d->wasapi_buf_frames);
-    IAudioClient_SetEventHandle(d->audio_client, d->event);
-    IAudioClient_GetService(d->audio_client, &IID_IAudioRenderClient, (void **)&d->render_client);
-
-    /* Probe for NSPA per-channel fast path (winejack direct) */
-    d->fast_path = FALSE;
+    /* ── Fallback: WASAPI exclusive stream ── */
+    if (!d->phase_f)
     {
-        struct fast_path_info_params fp;
-        nspa_get_fast_path_info_fn query = get_fast_path_info_func();
-        memset(&fp, 0, sizeof(fp));
-        if (query && SUCCEEDED(query(d->audio_client, &fp)) && fp.available)
+        duration = (REFERENCE_TIME)(10000000.0 * bufferSize / d->sample_rate + 0.5);
+
+        hr = IAudioClient_Initialize(d->audio_client, AUDCLNT_SHAREMODE_EXCLUSIVE,
+                                      AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                                      duration, duration, &d->wfx.Format, NULL);
+        if (FAILED(hr))
         {
-            int ch;
-            d->fast_path = TRUE;
-            d->fp_write_idx = fp.write_buf_idx;
-            d->fp_held = fp.held_frames;
-            d->fp_period = fp.period_frames;
-            d->fp_nports = fp.nports;
-            for (ch = 0; ch < fp.nports && ch < 64; ch++)
+            WARN("Exclusive mode failed (%08lx), trying shared\n", hr);
+            IAudioClient_Release(d->audio_client);
+            d->audio_client = NULL;
+            IMMDevice_Activate(d->render_device, &IID_IAudioClient, CLSCTX_ALL, NULL, (void **)&d->audio_client);
+
+            hr = IAudioClient_Initialize(d->audio_client, AUDCLNT_SHAREMODE_SHARED,
+                                          AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                                          duration, 0, &d->wfx.Format, NULL);
+            if (FAILED(hr))
             {
-                d->fp_chan_a[ch] = fp.chan_bufs_a[ch];
-                d->fp_chan_b[ch] = fp.chan_bufs_b[ch];
+                strcpy(d->error_msg, "WASAPI Initialize failed");
+                ERR("WASAPI Initialize failed: %08lx\n", hr);
+                return ASE_HWMalfunction;
             }
-            ERR("NSPA RT:ASIO: fast-path enabled (%u frames, %d ch, zero-interleave)\n",
-                d->fp_period, d->fp_nports);
         }
+
+        IAudioClient_GetBufferSize(d->audio_client, &d->wasapi_buf_frames);
+        IAudioClient_SetEventHandle(d->audio_client, d->event);
+        IAudioClient_GetService(d->audio_client, &IID_IAudioRenderClient, (void **)&d->render_client);
     }
 
     d->buf_index = 0;
+    d->please_quit = FALSE;
     d->state = STATE_PREPARED;
 
-    TRACE("nspaASIO createBuffers: %ld frames, wasapi buf %u frames\n",
-          bufferSize, d->wasapi_buf_frames);
+    TRACE("nspaASIO createBuffers: %ld frames, phase_f=%d\n", bufferSize, d->phase_f);
 
     return ASE_OK;
 }
@@ -851,10 +951,17 @@ static ASIOError ASIOMETHODCALLTYPE asio_disposeBuffers(IASIO *iface)
     if (d->render_client) { IAudioRenderClient_Release(d->render_client); d->render_client = NULL; }
 
     /* Release the audio client so the next createBuffers gets a fresh one.
-     * IAudioClient cannot be re-initialized once initialized — must re-activate. */
+     * IAudioClient cannot be re-initialized once initialized — must re-activate.
+     * In Phase F mode, the audio_client was never Initialize'd for audio
+     * (winejack handles JACK ports directly), but still needs cleanup. */
     if (d->audio_client) { IAudioClient_Release(d->audio_client); d->audio_client = NULL; }
     if (d->render_device)
         IMMDevice_Activate(d->render_device, &IID_IAudioClient, CLSCTX_ALL, NULL, (void **)&d->audio_client);
+
+    d->phase_f = FALSE;
+    d->pf_futex = NULL;
+    d->pf_buf_index = NULL;
+    d->pf_sample_pos = NULL;
 
     if (d->buf_a)
     {
@@ -1037,7 +1144,7 @@ HRESULT WINAPI DllRegisterServer(void)
     if (r == ERROR_SUCCESS)
     {
         RegSetValueExA(key, "CLSID", 0, REG_SZ, (BYTE *)clsid_str, sizeof(clsid_str));
-        RegSetValueExA(key, "Description", 0, REG_SZ, (BYTE *)"nspaASIO - WASAPI/JACK bridge", 30);
+        RegSetValueExA(key, "Description", 0, REG_SZ, (BYTE *)"nspaASIO", 9);
         RegCloseKey(key);
     }
 

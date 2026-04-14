@@ -482,6 +482,39 @@ HRESULT WINAPI nspa_get_fast_path_info( IAudioClient *audio_client,
     return info->result;
 }
 
+/* NSPA Phase F: ASIO callback registration wrappers.
+ * nspaASIO calls these via GetProcAddress("mmdevapi", "nspa_register_asio"). */
+
+HRESULT WINAPI nspa_register_asio( struct register_asio_params *params )
+{
+    InitOnceExecuteOnce( &init_once, init_driver, NULL, NULL );
+    if (!params) return E_POINTER;
+    wine_unix_call( register_asio, params );
+    return params->result;
+}
+
+HRESULT WINAPI nspa_unregister_asio( struct unregister_asio_params *params )
+{
+    InitOnceExecuteOnce( &init_once, init_driver, NULL, NULL );
+    if (!params) return E_POINTER;
+    wine_unix_call( unregister_asio, params );
+    return params->result;
+}
+
+HRESULT WINAPI nspa_asio_wait_callback( struct asio_wait_callback_params *params )
+{
+    if (!params) return E_POINTER;
+    wine_unix_call( asio_wait_callback, params );
+    return params->result;
+}
+
+HRESULT WINAPI nspa_asio_signal_complete( struct asio_signal_complete_params *params )
+{
+    if (!params) return E_POINTER;
+    wine_unix_call( asio_signal_complete, params );
+    return params->result;
+}
+
 DWORD WINAPI auxMessage( UINT id, UINT msg, DWORD_PTR user, DWORD_PTR param1, DWORD_PTR param2 )
 {
     struct aux_message_params params;

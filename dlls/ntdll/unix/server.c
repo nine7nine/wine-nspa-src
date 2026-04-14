@@ -2233,6 +2233,14 @@ NTSTATUS WINAPI NtClose( HANDLE handle )
      * stale thread id. */
     nspa_rt_map_remove( handle );
 
+    if (is_client_handle( handle ))
+    {
+        server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );
+        close_client_inproc_sync( handle );
+        server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
+        return STATUS_SUCCESS;
+    }
+
     /* hold fd_cache_mutex to prevent the fd from being added again between the
      * call to remove_fd_from_cache and close_handle */
     server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );

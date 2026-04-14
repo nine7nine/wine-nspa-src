@@ -2075,8 +2075,13 @@ static RECT get_visible_rect( HWND hwnd, BOOL shaped, UINT style, UINT ex_style,
     RECT visible_rect, rect = {0};
 
     if (get_present_rect( hwnd, &rect, get_thread_dpi() )) return rect;
-    if (IsRectEmpty( &rects->window ) || EqualRect( &rects->window, &rects->client ) || shaped || !decorated_mode) return rects->window;
+    if (IsRectEmpty( &rects->window ) || shaped || !decorated_mode) return rects->window;
     if (!user_driver->pGetWindowStyleMasks( hwnd, style, ex_style, &style_mask, &ex_style_mask )) return rects->window;
+    /* NSPA: Move the window==client check AFTER GetWindowStyleMasks.  Apps that handle
+     * WM_NCCALCSIZE to set client == window (custom NC rendering, e.g. Ableton Live)
+     * still need decoration masking when the WM provides decorations.  Without this,
+     * visible == window, and the configure feedback loop causes 4px/frame growth. */
+    if (EqualRect( &rects->window, &rects->client ) && !style_mask && !ex_style_mask) return rects->window;
     if (!NtUserAdjustWindowRect( &rect, style & style_mask, FALSE, ex_style & ex_style_mask, dpi )) return rects->window;
 
     visible_rect = rects->window;

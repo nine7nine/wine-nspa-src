@@ -107,6 +107,28 @@ static int initial_cwd = -1;
 static pid_t server_pid;
 pi_mutex_t fd_cache_mutex = PI_MUTEX_INIT(0);
 
+#ifdef __linux__
+/* NSPA E2: per-process shared bitmap for client-poll fd monitoring.
+ * Client sets bit = "I'm monitoring this fd via io_uring."
+ * Server checks in sock_get_poll_events and skips epoll. */
+#define CLIENT_POLL_BITMAP_SIZE 8192
+static volatile unsigned char *client_poll_bitmap;
+
+void ntdll_client_poll_set( int unix_fd )
+{
+    if (!client_poll_bitmap || unix_fd < 0 || unix_fd >= CLIENT_POLL_BITMAP_SIZE * 8) return;
+    __atomic_or_fetch( (unsigned char *)&client_poll_bitmap[unix_fd >> 3],
+                       (unsigned char)(1u << (unix_fd & 7)), __ATOMIC_RELEASE );
+}
+
+void ntdll_client_poll_clear( int unix_fd )
+{
+    if (!client_poll_bitmap || unix_fd < 0 || unix_fd >= CLIENT_POLL_BITMAP_SIZE * 8) return;
+    __atomic_and_fetch( (unsigned char *)&client_poll_bitmap[unix_fd >> 3],
+                        (unsigned char)~(1u << (unix_fd & 7)), __ATOMIC_RELEASE );
+}
+#endif
+
 /* atomically exchange a 64-bit value */
 static inline LONG64 interlocked_xchg64( LONG64 *dest, LONG64 val )
 {
@@ -1927,6 +1949,8 @@ size_t server_init_process(void)
                     assert( handle == tid );
                     received_shm = TRUE;
                 }
+                /* NSPA E2: client_poll_bitmap is in the tail of request_shm.
+                 * Set up the pointer after mmap below. */
             }
         }
         SERVER_END_REQ;
@@ -1944,6 +1968,12 @@ size_t server_init_process(void)
                 close( shm_fd_local );
                 data->request_shm_fd = -1;
                 data->request_shm = NULL;
+            }
+            else if (!client_poll_bitmap)
+            {
+                /* NSPA E2: bitmap lives in the tail of the first thread's request_shm */
+                client_poll_bitmap = (volatile unsigned char *)data->request_shm
+                                     + NSPA_REQUEST_SHM_SIZE - CLIENT_POLL_BITMAP_SIZE;
             }
         }
     }

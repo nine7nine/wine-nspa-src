@@ -40,6 +40,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 
 #ifdef HAVE_LIBURING_H
@@ -74,6 +75,8 @@ enum uring_op_type
     URING_OP_FILE_WRITE,
     URING_OP_SOCKET_RECV,
     URING_OP_SOCKET_SEND,
+    URING_OP_SOCKET_POLL_RECV,  /* Phase 3: async poll for socket recv readiness */
+    URING_OP_SOCKET_POLL_SEND,  /* Phase 3: async poll for socket send readiness */
 };
 
 struct uring_async_op
@@ -85,10 +88,14 @@ struct uring_async_op
     void              *apc_user;    /* APC user context / IOCP cvalue */
     IO_STATUS_BLOCK   *io;          /* IO status block */
     unsigned int       options;     /* file options for set_sync_iosb */
-    int                dup_fd;      /* dup'd fd — we own this, always close */
+    int                dup_fd;      /* dup'd fd — we own this, always close (-1 = none) */
     ULONG              already;     /* bytes transferred before io_uring */
     ULONG              count;       /* total bytes requested */
     BOOL               avail_mode;  /* return on any data (pipes) */
+    /* Phase 3 socket poll fields */
+    void              *sock_async;  /* async_recv_ioctl* or async_send_ioctl* */
+    HANDLE             wait_handle; /* server async wait handle */
+    int                poll_unix_fd;/* unix fd for bitmap clear on completion */
     struct uring_async_op *next_free; /* freelist link (only valid when not in flight) */
 };
 
@@ -131,6 +138,7 @@ static void op_pool_free( struct uring_async_op *op )
 static __thread struct io_uring thread_ring;
 static __thread BOOL ring_initialized;
 static __thread BOOL ring_init_failed;
+static __thread int  ring_efd = -1;   /* eventfd for CQE notification (ntsync integration) */
 
 static BOOL ensure_ring(void)
 {
@@ -167,12 +175,27 @@ static BOOL ensure_ring(void)
     ring_initialized = TRUE;
     op_pool_init();
 
+    /* Create an eventfd for CQE notification.  When io_uring posts a CQE,
+     * the kernel writes to this eventfd.  The ntsync uring_fd extension
+     * watches it so that threads blocked in ntsync waits wake on I/O
+     * completion.  EFD_NONBLOCK avoids blocking reads in the drain path. */
+    ring_efd = eventfd( 0, EFD_NONBLOCK | EFD_CLOEXEC );
+    if (ring_efd >= 0)
+    {
+        if (io_uring_register_eventfd( &thread_ring, ring_efd ) < 0)
+        {
+            WARN( "io_uring_register_eventfd failed: %s\n", strerror( errno ) );
+            close( ring_efd );
+            ring_efd = -1;
+        }
+    }
+
     /* One-time banner on first ring init in the process */
     {
         static LONG once;
         if (!InterlockedExchange( &once, 1 ))
-            fprintf( stderr, "wine: NSPA RT:io_uring: ring active (sq=%u cq=%u flags=0x%x) — file I/O bypasses wineserver\n",
-                     params.sq_entries, params.cq_entries, params.flags );
+            fprintf( stderr, "wine: NSPA RT:io_uring: ring active (sq=%u cq=%u flags=0x%x efd=%d) — file I/O bypasses wineserver\n",
+                     params.sq_entries, params.cq_entries, params.flags, ring_efd );
     }
 
     TRACE( "io_uring ring initialized (sq=%u cq=%u flags=0x%x) for thread %04x\n",
@@ -191,8 +214,16 @@ void ntdll_io_uring_cleanup(void)
 
     ntdll_io_uring_process_completions();
     io_uring_queue_exit( &thread_ring );
+    if (ring_efd >= 0) { close( ring_efd ); ring_efd = -1; }
     ring_initialized = FALSE;
     TRACE( "io_uring ring cleaned up\n" );
+}
+
+/* Return the io_uring eventfd for this thread, or -1 if unavailable.
+ * Used by sync.c to pass to ntsync uring_fd for CQE wakeup. */
+int ntdll_io_uring_get_eventfd(void)
+{
+    return ring_efd;
 }
 
 
@@ -282,10 +313,36 @@ static int dup_fd_for_ring( int unix_fd )
     return fd;
 }
 
+/* Socket poll CQE handler — called when POLL_ADD fires.
+ * The CQE result contains poll revents (POLLIN/POLLOUT/etc).
+ * We call the socket I/O completion function in socket.c which
+ * does try_recv/try_send and set_async_direct_result. */
+extern void ntdll_complete_socket_poll( struct uring_async_op *op, int poll_revents );
+
+/* Field accessors for socket.c — avoids exposing uring_async_op struct */
+void *ntdll_uring_op_sock_async( struct uring_async_op *op ) { return op->sock_async; }
+HANDLE ntdll_uring_op_wait_handle( struct uring_async_op *op ) { return op->wait_handle; }
+unsigned int ntdll_uring_op_options( struct uring_async_op *op ) { return op->options; }
+IO_STATUS_BLOCK *ntdll_uring_op_io( struct uring_async_op *op ) { return op->io; }
+BOOL ntdll_uring_op_is_send( struct uring_async_op *op )
+{
+    return op->type == URING_OP_SOCKET_POLL_SEND;
+}
+int ntdll_uring_op_poll_unix_fd( struct uring_async_op *op ) { return op->poll_unix_fd; }
+
 static void complete_uring_op( struct uring_async_op *op, int result )
 {
     NTSTATUS status;
     ULONG_PTR information;
+
+    /* Socket poll completions are handled differently — the result is
+     * poll events, not bytes transferred. Delegate to socket.c. */
+    if (op->type == URING_OP_SOCKET_POLL_RECV || op->type == URING_OP_SOCKET_POLL_SEND)
+    {
+        ntdll_complete_socket_poll( op, result );
+        op_pool_free( op );
+        return;
+    }
 
     if (result >= 0)
     {
@@ -304,7 +361,7 @@ static void complete_uring_op( struct uring_async_op *op, int result )
     file_complete_async( op->handle, op->options, op->event, op->apc,
                          op->apc_user, op->io, status, information );
 
-    close( op->dup_fd );
+    if (op->dup_fd >= 0) close( op->dup_fd );
     op_pool_free( op );
 }
 
@@ -509,6 +566,64 @@ int ntdll_io_uring_submit_send( int unix_fd, int needs_close, struct msghdr *hdr
 
 
 /* -----------------------------------------------------------------------
+ * Phase 3: Async socket poll
+ *
+ * Submits an async POLL_ADD for socket readiness.  The CQE fires when
+ * the fd becomes readable/writable.  The completion handler calls
+ * try_recv/try_send and reports the result via set_async_direct_result.
+ *
+ * This replaces server-side epoll monitoring for socket I/O — the fd
+ * is removed from the wineserver's epoll set (because the async stays
+ * in ALERTED state, not WAITING) and monitored client-side via io_uring.
+ * ----------------------------------------------------------------------- */
+
+int ntdll_io_uring_submit_socket_poll( int unix_fd, short events,
+                                       HANDLE handle, HANDLE wait_handle,
+                                       HANDLE event, PIO_APC_ROUTINE apc,
+                                       void *apc_user, IO_STATUS_BLOCK *io,
+                                       unsigned int options, void *sock_async,
+                                       BOOL is_send )
+{
+    struct uring_async_op *op;
+    struct io_uring_sqe *sqe;
+
+    if (!ensure_ring()) return -ENOSYS;
+
+    op = op_pool_alloc();
+    if (!op) return -ENOMEM;
+
+    op->type        = is_send ? URING_OP_SOCKET_POLL_SEND : URING_OP_SOCKET_POLL_RECV;
+    op->handle      = handle;
+    op->event       = event;
+    op->apc         = apc;
+    op->apc_user    = apc_user;
+    op->io          = io;
+    op->options     = options;
+    op->dup_fd       = -1;  /* POLL_ADD — kernel pins the file, no dup needed */
+    op->sock_async   = sock_async;
+    op->wait_handle  = wait_handle;
+    op->poll_unix_fd = unix_fd;  /* for bitmap clear on completion */
+
+    sqe = io_uring_get_sqe( &thread_ring );
+    if (!sqe)
+    {
+        io_uring_submit( &thread_ring );
+        ntdll_io_uring_process_completions();
+        sqe = io_uring_get_sqe( &thread_ring );
+        if (!sqe) { op_pool_free( op ); return -ENOMEM; }
+    }
+
+    io_uring_prep_poll_add( sqe, unix_fd, (unsigned)events );
+    io_uring_sqe_set_data( sqe, op );
+    io_uring_submit( &thread_ring );
+
+    TRACE( "submitted async socket poll: handle=%p fd=%d events=%#x %s\n",
+           handle, unix_fd, events, is_send ? "send" : "recv" );
+    return 0;
+}
+
+
+/* -----------------------------------------------------------------------
  * Cooperative completion drain
  *
  * Called from wine_server_call() and server_wait() entry points so that
@@ -537,11 +652,13 @@ void ntdll_io_uring_process_completions(void)
                 /* Buffer in a write-watched page.  We cannot retry from
                  * io_uring — let the app re-issue the I/O (which will
                  * fall through to the server async path and use
-                 * virtual_locked_read with proper page fault handling). */
-                TRACE( "EFAULT for handle %p type=%d — caller should retry via server\n",
+                 * virtual_locked_read with proper page fault handling).
+                 * Socket poll ops need proper cleanup (release_fileio,
+                 * set_async_direct_result) — delegate to complete_uring_op
+                 * which handles all types correctly. */
+                TRACE( "EFAULT for handle %p type=%d — cleanup via complete_uring_op\n",
                        op->handle, op->type );
-                close( op->dup_fd );
-                op_pool_free( op );
+                complete_uring_op( op, result );
             }
             else
             {
@@ -566,6 +683,15 @@ BOOL ntdll_io_uring_enabled(void) { return FALSE; }
 void ntdll_io_uring_cleanup(void) { }
 int  ntdll_io_uring_poll( int fd, short events, int timeout_ms ) { return -ENOSYS; }
 void ntdll_io_uring_process_completions(void) { }
+int  ntdll_io_uring_get_eventfd(void) { return -1; }
+
+int ntdll_io_uring_submit_socket_poll( int unix_fd, short events,
+                                       HANDLE handle, HANDLE wait_handle,
+                                       HANDLE event, PIO_APC_ROUTINE apc,
+                                       void *apc_user, IO_STATUS_BLOCK *io,
+                                       unsigned int options, void *sock_async,
+                                       BOOL is_send )
+{ return -ENOSYS; }
 
 int ntdll_io_uring_submit_file_read( int unix_fd, int needs_close, void *buffer,
                                      ULONG already, ULONG count, HANDLE handle,

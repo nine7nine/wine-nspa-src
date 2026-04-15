@@ -1548,6 +1548,23 @@ static int sock_get_poll_events( struct fd *fd )
     if (!sock->type) /* not initialized yet */
         return -1;
 
+#ifdef __linux__
+    /* NSPA E2: if the client is monitoring this fd via io_uring,
+     * skip server-side epoll monitoring entirely.
+     * The bitmap is on the process that owns this socket.  We get the
+     * process from the thread that created the socket (current is only
+     * valid during request handling, not in the main epoll loop). */
+    {
+        struct process *process = sock->obj.handle_count && current ? current->process : NULL;
+        if (process && process->client_poll_bitmap)
+        {
+            int unix_fd = get_unix_fd( fd );
+            if (is_client_poll_fd( process, unix_fd ))
+                return -1;
+        }
+    }
+#endif
+
     LIST_FOR_EACH_ENTRY( req, &poll_list, struct poll_req, entry )
     {
         unsigned int i;

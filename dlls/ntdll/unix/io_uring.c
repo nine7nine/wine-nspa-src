@@ -64,6 +64,67 @@ WINE_DEFAULT_DEBUG_CHANNEL(io_uring);
 #define URING_INTERNAL_TAG ((void *)(uintptr_t)1)
 
 /* -----------------------------------------------------------------------
+ * Async op types and per-thread pool (forward declarations needed by
+ * ensure_ring → op_pool_init)
+ * ----------------------------------------------------------------------- */
+
+enum uring_op_type
+{
+    URING_OP_FILE_READ,
+    URING_OP_FILE_WRITE,
+    URING_OP_SOCKET_RECV,
+    URING_OP_SOCKET_SEND,
+};
+
+struct uring_async_op
+{
+    enum uring_op_type type;
+    HANDLE             handle;      /* NT file/socket handle */
+    HANDLE             event;       /* completion event (may be NULL) */
+    PIO_APC_ROUTINE    apc;         /* completion APC (may be NULL) */
+    void              *apc_user;    /* APC user context / IOCP cvalue */
+    IO_STATUS_BLOCK   *io;          /* IO status block */
+    unsigned int       options;     /* file options for set_sync_iosb */
+    int                dup_fd;      /* dup'd fd — we own this, always close */
+    ULONG              already;     /* bytes transferred before io_uring */
+    ULONG              count;       /* total bytes requested */
+    BOOL               avail_mode;  /* return on any data (pipes) */
+    struct uring_async_op *next_free; /* freelist link (only valid when not in flight) */
+};
+
+/* Pre-allocated per-thread op pool.  At most RING_SIZE SQEs can be in
+ * flight simultaneously, so a fixed array of that size is sufficient.
+ * Allocated once at ring init time — zero malloc in the submit path. */
+static __thread struct uring_async_op  op_pool[RING_SIZE];
+static __thread struct uring_async_op *op_free_head;
+
+static void op_pool_init(void)
+{
+    int i;
+    for (i = 0; i < RING_SIZE - 1; i++)
+        op_pool[i].next_free = &op_pool[i + 1];
+    op_pool[RING_SIZE - 1].next_free = NULL;
+    op_free_head = &op_pool[0];
+}
+
+static struct uring_async_op *op_pool_alloc(void)
+{
+    struct uring_async_op *op = op_free_head;
+    if (op)
+    {
+        op_free_head = op->next_free;
+        memset( op, 0, sizeof(*op) );
+    }
+    return op;
+}
+
+static void op_pool_free( struct uring_async_op *op )
+{
+    op->next_free = op_free_head;
+    op_free_head = op;
+}
+
+/* -----------------------------------------------------------------------
  * Per-thread ring management
  * ----------------------------------------------------------------------- */
 
@@ -98,6 +159,7 @@ static BOOL ensure_ring(void)
     }
 
     ring_initialized = TRUE;
+    op_pool_init();
     TRACE( "io_uring ring initialized (sq=%u cq=%u flags=0x%x) for thread %04x\n",
            params.sq_entries, params.cq_entries, params.flags, GetCurrentThreadId() );
     return TRUE;
@@ -195,29 +257,6 @@ int ntdll_io_uring_poll( int fd, short events, int timeout_ms )
  * server-side handle table does.
  * ----------------------------------------------------------------------- */
 
-enum uring_op_type
-{
-    URING_OP_FILE_READ,
-    URING_OP_FILE_WRITE,
-    URING_OP_SOCKET_RECV,
-    URING_OP_SOCKET_SEND,
-};
-
-struct uring_async_op
-{
-    enum uring_op_type type;
-    HANDLE             handle;      /* NT file/socket handle */
-    HANDLE             event;       /* completion event (may be NULL) */
-    PIO_APC_ROUTINE    apc;         /* completion APC (may be NULL) */
-    void              *apc_user;    /* APC user context / IOCP cvalue */
-    IO_STATUS_BLOCK   *io;          /* IO status block */
-    unsigned int       options;     /* file options for set_sync_iosb */
-    int                dup_fd;      /* dup'd fd — we own this, always close */
-    ULONG              already;     /* bytes transferred before io_uring */
-    ULONG              count;       /* total bytes requested */
-    BOOL               avail_mode;  /* return on any data (pipes) */
-};
-
 /* Dup the fd so it remains valid for the in-flight SQE.
  * The caller's fd and its needs_close semantics are unaffected. */
 static int dup_fd_for_ring( int unix_fd )
@@ -251,7 +290,7 @@ static void complete_uring_op( struct uring_async_op *op, int result )
                          op->apc_user, op->io, status, information );
 
     close( op->dup_fd );
-    free( op );
+    op_pool_free( op );
 }
 
 
@@ -271,7 +310,7 @@ int ntdll_io_uring_submit_file_read( int unix_fd, int needs_close, void *buffer,
     ring_fd = dup_fd_for_ring( unix_fd );
     if (ring_fd < 0) return -errno;
 
-    op = calloc( 1, sizeof(*op) );
+    op = op_pool_alloc();
     if (!op) { close( ring_fd ); return -ENOMEM; }
 
     op->type       = URING_OP_FILE_READ;
@@ -292,7 +331,7 @@ int ntdll_io_uring_submit_file_read( int unix_fd, int needs_close, void *buffer,
         io_uring_submit( &thread_ring );
         ntdll_io_uring_process_completions();
         sqe = io_uring_get_sqe( &thread_ring );
-        if (!sqe) { close( ring_fd ); free( op ); return -ENOMEM; }
+        if (!sqe) { close( ring_fd ); op_pool_free( op ); return -ENOMEM; }
     }
 
     io_uring_prep_read( sqe, ring_fd, (char *)buffer + already, count - already, 0 );
@@ -322,7 +361,7 @@ int ntdll_io_uring_submit_file_write( int unix_fd, int needs_close, const void *
     ring_fd = dup_fd_for_ring( unix_fd );
     if (ring_fd < 0) return -errno;
 
-    op = calloc( 1, sizeof(*op) );
+    op = op_pool_alloc();
     if (!op) { close( ring_fd ); return -ENOMEM; }
 
     op->type     = URING_OP_FILE_WRITE;
@@ -342,7 +381,7 @@ int ntdll_io_uring_submit_file_write( int unix_fd, int needs_close, const void *
         io_uring_submit( &thread_ring );
         ntdll_io_uring_process_completions();
         sqe = io_uring_get_sqe( &thread_ring );
-        if (!sqe) { close( ring_fd ); free( op ); return -ENOMEM; }
+        if (!sqe) { close( ring_fd ); op_pool_free( op ); return -ENOMEM; }
     }
 
     io_uring_prep_write( sqe, ring_fd, (const char *)buffer + already, count - already, 0 );
@@ -380,7 +419,7 @@ int ntdll_io_uring_submit_recv( int unix_fd, int needs_close, struct msghdr *hdr
     ring_fd = dup_fd_for_ring( unix_fd );
     if (ring_fd < 0) return -errno;
 
-    op = calloc( 1, sizeof(*op) );
+    op = op_pool_alloc();
     if (!op) { close( ring_fd ); return -ENOMEM; }
 
     op->type     = URING_OP_SOCKET_RECV;
@@ -398,7 +437,7 @@ int ntdll_io_uring_submit_recv( int unix_fd, int needs_close, struct msghdr *hdr
         io_uring_submit( &thread_ring );
         ntdll_io_uring_process_completions();
         sqe = io_uring_get_sqe( &thread_ring );
-        if (!sqe) { close( ring_fd ); free( op ); return -ENOMEM; }
+        if (!sqe) { close( ring_fd ); op_pool_free( op ); return -ENOMEM; }
     }
 
     io_uring_prep_recvmsg( sqe, ring_fd, hdr, flags );
@@ -424,7 +463,7 @@ int ntdll_io_uring_submit_send( int unix_fd, int needs_close, struct msghdr *hdr
     ring_fd = dup_fd_for_ring( unix_fd );
     if (ring_fd < 0) return -errno;
 
-    op = calloc( 1, sizeof(*op) );
+    op = op_pool_alloc();
     if (!op) { close( ring_fd ); return -ENOMEM; }
 
     op->type     = URING_OP_SOCKET_SEND;
@@ -442,7 +481,7 @@ int ntdll_io_uring_submit_send( int unix_fd, int needs_close, struct msghdr *hdr
         io_uring_submit( &thread_ring );
         ntdll_io_uring_process_completions();
         sqe = io_uring_get_sqe( &thread_ring );
-        if (!sqe) { close( ring_fd ); free( op ); return -ENOMEM; }
+        if (!sqe) { close( ring_fd ); op_pool_free( op ); return -ENOMEM; }
     }
 
     io_uring_prep_sendmsg( sqe, ring_fd, hdr, flags );
@@ -487,7 +526,7 @@ void ntdll_io_uring_process_completions(void)
                 TRACE( "EFAULT for handle %p type=%d — caller should retry via server\n",
                        op->handle, op->type );
                 close( op->dup_fd );
-                free( op );
+                op_pool_free( op );
             }
             else
             {

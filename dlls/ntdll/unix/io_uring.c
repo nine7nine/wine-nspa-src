@@ -140,6 +140,25 @@ static __thread BOOL ring_initialized;
 static __thread BOOL ring_init_failed;
 static __thread int  ring_efd = -1;   /* eventfd for CQE notification (ntsync integration) */
 
+/* Deferred completion queue — for completions that can't be delivered
+ * from inside the CQ drain (e.g. overlapped socket completions that
+ * call file_complete_async, which is unsafe from ntsync wait context).
+ * Processed by ntdll_io_uring_flush_deferred() after linux_wait_objs. */
+struct deferred_completion
+{
+    struct deferred_completion *next;
+    HANDLE  handle;
+    HANDLE  event;
+    PIO_APC_ROUTINE apc;
+    void   *apc_user;
+    IO_STATUS_BLOCK *io;
+    unsigned int options;
+    NTSTATUS status;
+    ULONG_PTR information;
+};
+static __thread struct deferred_completion *deferred_head;
+static __thread struct deferred_completion *deferred_free;
+
 static BOOL ensure_ring(void)
 {
     struct io_uring_params params;
@@ -224,6 +243,49 @@ void ntdll_io_uring_cleanup(void)
 int ntdll_io_uring_get_eventfd(void)
 {
     return ring_efd;
+}
+
+/* Queue a deferred completion — called from CQ drain when
+ * file_complete_async can't be called directly (ntsync context). */
+void ntdll_io_uring_defer_completion( HANDLE handle, unsigned int options,
+                                      HANDLE event, PIO_APC_ROUTINE apc,
+                                      void *apc_user, IO_STATUS_BLOCK *io,
+                                      NTSTATUS status, ULONG_PTR information )
+{
+    struct deferred_completion *dc = deferred_free;
+    if (dc)
+        deferred_free = dc->next;
+    else
+        dc = malloc( sizeof(*dc) );
+    if (!dc) return;
+
+    dc->handle = handle;
+    dc->event = event;
+    dc->apc = apc;
+    dc->apc_user = apc_user;
+    dc->io = io;
+    dc->options = options;
+    dc->status = status;
+    dc->information = information;
+    dc->next = deferred_head;
+    deferred_head = dc;
+}
+
+/* Flush deferred completions — called from inproc_wait AFTER
+ * linux_wait_objs returns, in a safe (non-ntsync) context. */
+void ntdll_io_uring_flush_deferred(void)
+{
+    struct deferred_completion *dc;
+
+    while ((dc = deferred_head))
+    {
+        deferred_head = dc->next;
+        file_complete_async( dc->handle, dc->options, dc->event,
+                             dc->apc, dc->apc_user, dc->io,
+                             dc->status, dc->information );
+        dc->next = deferred_free;
+        deferred_free = dc;
+    }
 }
 
 
@@ -688,6 +750,9 @@ void ntdll_io_uring_cleanup(void) { }
 int  ntdll_io_uring_poll( int fd, short events, int timeout_ms ) { return -ENOSYS; }
 void ntdll_io_uring_process_completions(void) { }
 int  ntdll_io_uring_get_eventfd(void) { return -1; }
+void ntdll_io_uring_defer_completion( HANDLE h, unsigned int o, HANDLE e,
+     PIO_APC_ROUTINE a, void *au, IO_STATUS_BLOCK *io, NTSTATUS s, ULONG_PTR i ) { }
+void ntdll_io_uring_flush_deferred(void) { }
 
 int ntdll_io_uring_submit_socket_poll( int unix_fd, short events,
                                        HANDLE handle, HANDLE wait_handle,

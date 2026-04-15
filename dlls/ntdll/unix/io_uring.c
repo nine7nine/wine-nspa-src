@@ -155,11 +155,26 @@ static BOOL ensure_ring(void)
     {
         WARN( "io_uring_queue_init failed: %s\n", strerror( -ret ) );
         ring_init_failed = TRUE;
+        {
+            static LONG once;
+            if (!InterlockedExchange( &once, 1 ))
+                fprintf( stderr, "wine: NSPA RT:io_uring: unavailable (%s) — file I/O uses server path\n",
+                         strerror( -ret ) );
+        }
         return FALSE;
     }
 
     ring_initialized = TRUE;
     op_pool_init();
+
+    /* One-time banner on first ring init in the process */
+    {
+        static LONG once;
+        if (!InterlockedExchange( &once, 1 ))
+            fprintf( stderr, "wine: NSPA RT:io_uring: ring active (sq=%u cq=%u flags=0x%x) — file I/O bypasses wineserver\n",
+                     params.sq_entries, params.cq_entries, params.flags );
+    }
+
     TRACE( "io_uring ring initialized (sq=%u cq=%u flags=0x%x) for thread %04x\n",
            params.sq_entries, params.cq_entries, params.flags, GetCurrentThreadId() );
     return TRUE;

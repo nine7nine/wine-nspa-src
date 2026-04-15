@@ -29,6 +29,9 @@
 #include <sys/socket.h>
 #include <poll.h>
 #include <sys/ioctl.h>
+#ifdef HAVE_LINUX_NTSYNC_H
+# include <linux/ntsync.h>
+#endif
 #include <unistd.h>
 #ifdef HAVE_IFADDRS_H
 # include <ifaddrs.h>
@@ -959,18 +962,19 @@ static NTSTATUS sock_recv( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, voi
      * Sync: CQE handler calls set_async_direct_result directly.
      * Overlapped: CQE handler defers file_complete_async via
      * ntdll_io_uring_defer_completion (flushed after linux_wait_objs). */
-    /* NSPA Phase 3 / E2: sync + overlapped. Overlapped completions are
-     * deferred and flushed in NtWaitForSingleObject after inproc_wait. */
-    if (status == STATUS_PENDING)
+    /* NSPA Phase 3 / E2: sync sockets only (wait_handle != 0).
+     * Overlapped bypass blocked: sock_get_poll_events can't check the
+     * bitmap from the main epoll loop (current == NULL), so the server
+     * still monitors → dual completion → double free. Needs per-fd or
+     * per-sock bitmap reference to fix. */
+    if (status == STATUS_PENDING && wait_handle)
     {
         ntdll_client_poll_set( fd );
         if (!ntdll_io_uring_submit_socket_poll( fd, POLLIN, handle, wait_handle,
                                                  event, apc, apc_user, io, options,
                                                  async, FALSE ))
         {
-            if (wait_handle)
-                return wait_async( wait_handle, options & FILE_SYNCHRONOUS_IO_ALERT );
-            return STATUS_PENDING;
+            return wait_async( wait_handle, options & FILE_SYNCHRONOUS_IO_ALERT );
         }
         ntdll_client_poll_clear( fd );
     }
@@ -1175,6 +1179,8 @@ extern HANDLE ntdll_uring_op_handle( struct uring_async_op *op );
 extern HANDLE ntdll_uring_op_event( struct uring_async_op *op );
 extern PIO_APC_ROUTINE ntdll_uring_op_apc( struct uring_async_op *op );
 extern void *ntdll_uring_op_apc_user( struct uring_async_op *op );
+extern int ntdll_uring_op_event_sync_fd( struct uring_async_op *op );
+extern int ntdll_uring_op_dup_fd( struct uring_async_op *op );
 
 /* Complete a socket poll — either via set_async_direct_result (synchronous,
  * wait_handle != 0) or file_complete_async (overlapped, wait_handle == 0).
@@ -1191,13 +1197,20 @@ static void complete_socket_poll_result( struct uring_async_op *op, HANDLE wait_
     }
     else
     {
-        /* Overlapped: this function is called from flush_deferred (safe
-         * context, outside ntsync). file_complete_async is safe here. */
-        file_complete_async( ntdll_uring_op_handle( op ), options,
-                             ntdll_uring_op_event( op ),
-                             ntdll_uring_op_apc( op ),
-                             ntdll_uring_op_apc_user( op ),
-                             io, status, information );
+        /* Overlapped: complete entirely with pre-resolved resources.
+         * No server calls, no get_inproc_sync, no NtSetEvent, no signal
+         * manipulation. Everything was resolved at submission time.
+         * CQ drain context only does: memory writes + raw ntsync ioctl. */
+        int event_fd = ntdll_uring_op_event_sync_fd( op );
+
+        io->Status = status;
+        io->Information = information;
+
+        if (event_fd >= 0)
+        {
+            __u32 prev;
+            ioctl( event_fd, NTSYNC_IOC_EVENT_SET, &prev );
+        }
     }
 }
 
@@ -1207,6 +1220,7 @@ void ntdll_complete_socket_poll( struct uring_async_op *op, int poll_revents )
     HANDLE wait_handle = ntdll_uring_op_wait_handle( op );
     BOOL is_send = ntdll_uring_op_is_send( op );
     int poll_fd = ntdll_uring_op_poll_unix_fd( op );
+    int dup_fd = ntdll_uring_op_dup_fd( op );  /* overlapped: pre-dup'd fd; sync: -1 */
 
     int fd, needs_close = FALSE;
     NTSTATUS status;
@@ -1228,20 +1242,31 @@ void ntdll_complete_socket_poll( struct uring_async_op *op, int poll_revents )
         {
             release_fileio( &((struct async_recv_ioctl *)sock_async)->io );
         }
+        if (dup_fd >= 0) close( dup_fd );
         return;
     }
 
-    /* The fd is ready. Fetch it from the server (may have changed). */
+    /* Get the fd for try_recv/try_send.
+     * Overlapped: use pre-dup'd fd (CQ drain can't call server_get_unix_fd).
+     * Sync: use server_get_unix_fd (safe in sync completion context). */
     if (is_send)
     {
         struct async_send_ioctl *async = sock_async;
         ULONG_PTR information;
 
-        needs_close = FALSE;
-        if ((fd = async->fd) == -1)
-            status = server_get_unix_fd( async->io.handle, 0, &fd, &needs_close, NULL, NULL );
-        else
+        if (dup_fd >= 0)
+        {
+            fd = dup_fd;
             status = STATUS_SUCCESS;
+        }
+        else
+        {
+            needs_close = FALSE;
+            if ((fd = async->fd) == -1)
+                status = server_get_unix_fd( async->io.handle, 0, &fd, &needs_close, NULL, NULL );
+            else
+                status = STATUS_SUCCESS;
+        }
 
         if (!status)
         {
@@ -1264,13 +1289,22 @@ void ntdll_complete_socket_poll( struct uring_async_op *op, int poll_revents )
             if (async->fd >= 0) close( async->fd );
             release_fileio( &async->io );
         }
+        if (dup_fd >= 0) close( dup_fd );
     }
     else
     {
         struct async_recv_ioctl *async = sock_async;
         ULONG_PTR information = 0;
 
-        status = server_get_unix_fd( async->io.handle, 0, &fd, &needs_close, NULL, NULL );
+        if (dup_fd >= 0)
+        {
+            fd = dup_fd;
+            status = STATUS_SUCCESS;
+        }
+        else
+        {
+            status = server_get_unix_fd( async->io.handle, 0, &fd, &needs_close, NULL, NULL );
+        }
 
         if (!status)
         {
@@ -1285,6 +1319,7 @@ void ntdll_complete_socket_poll( struct uring_async_op *op, int poll_revents )
 
         if (status != STATUS_PENDING)
             release_fileio( &async->io );
+        if (dup_fd >= 0) close( dup_fd );
         /* If STATUS_PENDING, same as send — server re-queues via epoll. */
     }
 }
@@ -1439,8 +1474,8 @@ static NTSTATUS sock_send( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, voi
         set_async_direct_result( &wait_handle, options, io, status, async->sent_len, FALSE );
     }
 
-    /* NSPA Phase 3 / E2: sync + overlapped. */
-    if (status == STATUS_PENDING && !async->sent_len)
+    /* NSPA Phase 3 / E2: sync sockets only. */
+    if (status == STATUS_PENDING && wait_handle && !async->sent_len)
     {
         ntdll_client_poll_set( fd );
         if (!ntdll_io_uring_submit_socket_poll( fd, POLLOUT, handle, wait_handle,

@@ -481,10 +481,6 @@ extern void ntdll_io_uring_process_completions(void);
 extern int  ntdll_io_uring_get_eventfd(void);
 extern void ntdll_client_poll_set( int unix_fd );
 extern void ntdll_client_poll_clear( int unix_fd );
-extern void ntdll_io_uring_defer_completion( HANDLE handle, unsigned int options,
-                                             HANDLE event, PIO_APC_ROUTINE apc,
-                                             void *apc_user, IO_STATUS_BLOCK *io,
-                                             NTSTATUS status, ULONG_PTR information );
 extern void ntdll_io_uring_flush_deferred(void);
 extern int  ntdll_io_uring_submit_socket_poll( int unix_fd, short events,
                                                HANDLE handle, HANDLE wait_handle,

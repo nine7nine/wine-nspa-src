@@ -147,14 +147,8 @@ static __thread int  ring_efd = -1;   /* eventfd for CQE notification (ntsync in
 struct deferred_completion
 {
     struct deferred_completion *next;
-    HANDLE  handle;
-    HANDLE  event;
-    PIO_APC_ROUTINE apc;
-    void   *apc_user;
-    IO_STATUS_BLOCK *io;
-    unsigned int options;
-    NTSTATUS status;
-    ULONG_PTR information;
+    struct uring_async_op op;  /* copy of the op at CQE time */
+    int poll_revents;
 };
 static __thread struct deferred_completion *deferred_head;
 static __thread struct deferred_completion *deferred_free;
@@ -245,12 +239,11 @@ int ntdll_io_uring_get_eventfd(void)
     return ring_efd;
 }
 
-/* Queue a deferred completion — called from CQ drain when
- * file_complete_async can't be called directly (ntsync context). */
-void ntdll_io_uring_defer_completion( HANDLE handle, unsigned int options,
-                                      HANDLE event, PIO_APC_ROUTINE apc,
-                                      void *apc_user, IO_STATUS_BLOCK *io,
-                                      NTSTATUS status, ULONG_PTR information )
+/* Queue a deferred socket poll completion — saves the entire op + revents.
+ * Called from complete_uring_op when the socket poll is overlapped
+ * (wait_handle == 0). The FULL completion (fd fetch, try_recv/try_send,
+ * file_complete_async, release_fileio) runs in flush_deferred. */
+void ntdll_io_uring_defer_socket_poll( struct uring_async_op *op, int poll_revents )
 {
     struct deferred_completion *dc = deferred_free;
     if (dc)
@@ -259,20 +252,17 @@ void ntdll_io_uring_defer_completion( HANDLE handle, unsigned int options,
         dc = malloc( sizeof(*dc) );
     if (!dc) return;
 
-    dc->handle = handle;
-    dc->event = event;
-    dc->apc = apc;
-    dc->apc_user = apc_user;
-    dc->io = io;
-    dc->options = options;
-    dc->status = status;
-    dc->information = information;
+    dc->op = *op;  /* shallow copy — all fields are values or pointers we own */
+    dc->poll_revents = poll_revents;
     dc->next = deferred_head;
     deferred_head = dc;
 }
 
-/* Flush deferred completions — called from inproc_wait AFTER
- * linux_wait_objs returns, in a safe (non-ntsync) context. */
+/* Flush deferred completions — called from NtWaitForSingleObject /
+ * NtWaitForMultipleObjects AFTER inproc_wait returns. Safe context:
+ * fully outside the ntsync ioctl stack. */
+extern void ntdll_complete_socket_poll( struct uring_async_op *op, int poll_revents );
+
 void ntdll_io_uring_flush_deferred(void)
 {
     struct deferred_completion *dc;
@@ -280,9 +270,7 @@ void ntdll_io_uring_flush_deferred(void)
     while ((dc = deferred_head))
     {
         deferred_head = dc->next;
-        file_complete_async( dc->handle, dc->options, dc->event,
-                             dc->apc, dc->apc_user, dc->io,
-                             dc->status, dc->information );
+        ntdll_complete_socket_poll( &dc->op, dc->poll_revents );
         dc->next = deferred_free;
         deferred_free = dc;
     }
@@ -376,9 +364,10 @@ static int dup_fd_for_ring( int unix_fd )
 }
 
 /* Socket poll CQE handler — called when POLL_ADD fires.
- * The CQE result contains poll revents (POLLIN/POLLOUT/etc).
- * We call the socket I/O completion function in socket.c which
- * does try_recv/try_send and set_async_direct_result. */
+ * For synchronous sockets (wait_handle != 0): completes inline.
+ * For overlapped (wait_handle == 0): defers EVERYTHING — the entire
+ * completion (fd fetch, try_recv/try_send, file_complete_async) runs
+ * later in ntdll_io_uring_flush_deferred, safely outside ntsync. */
 extern void ntdll_complete_socket_poll( struct uring_async_op *op, int poll_revents );
 
 /* Field accessors for socket.c — avoids exposing uring_async_op struct */
@@ -401,11 +390,20 @@ static void complete_uring_op( struct uring_async_op *op, int result )
     NTSTATUS status;
     ULONG_PTR information;
 
-    /* Socket poll completions are handled differently — the result is
-     * poll events, not bytes transferred. Delegate to socket.c. */
+    /* Socket poll completions: sync (wait_handle != 0) completes inline,
+     * overlapped (wait_handle == 0) defers everything to flush_deferred. */
     if (op->type == URING_OP_SOCKET_POLL_RECV || op->type == URING_OP_SOCKET_POLL_SEND)
     {
-        ntdll_complete_socket_poll( op, result );
+        if (op->wait_handle)
+        {
+            ntdll_complete_socket_poll( op, result );
+        }
+        else
+        {
+            /* Defer: copy op, free pool slot, process in flush_deferred
+             * which runs outside the ntsync ioctl stack. */
+            ntdll_io_uring_defer_socket_poll( op, result );
+        }
         op_pool_free( op );
         return;
     }
@@ -750,8 +748,6 @@ void ntdll_io_uring_cleanup(void) { }
 int  ntdll_io_uring_poll( int fd, short events, int timeout_ms ) { return -ENOSYS; }
 void ntdll_io_uring_process_completions(void) { }
 int  ntdll_io_uring_get_eventfd(void) { return -1; }
-void ntdll_io_uring_defer_completion( HANDLE h, unsigned int o, HANDLE e,
-     PIO_APC_ROUTINE a, void *au, IO_STATUS_BLOCK *io, NTSTATUS s, ULONG_PTR i ) { }
 void ntdll_io_uring_flush_deferred(void) { }
 
 int ntdll_io_uring_submit_socket_poll( int unix_fd, short events,

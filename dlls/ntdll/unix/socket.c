@@ -956,9 +956,11 @@ static NTSTATUS sock_recv( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, voi
 
     /* NSPA Phase 3 / E2: take over fd monitoring from server epoll.
      * The bitmap bit tells sock_get_poll_events to skip this fd.
-     * Currently sync sockets only (wait_handle != 0). Overlapped bypass
-     * needs further investigation (file_complete_async from CQ drain
-     * context causes nested exception on signal stack). */
+     * Sync: CQE handler calls set_async_direct_result directly.
+     * Overlapped: CQE handler defers file_complete_async via
+     * ntdll_io_uring_defer_completion (flushed after linux_wait_objs). */
+    /* NSPA Phase 3 / E2: sync sockets only. Overlapped needs deferred
+     * completion outside the ntsync ioctl stack (future work). */
     if (status == STATUS_PENDING && wait_handle)
     {
         ntdll_client_poll_set( fd );
@@ -1187,14 +1189,15 @@ static void complete_socket_poll_result( struct uring_async_op *op, HANDLE wait_
     }
     else
     {
-        /* Overlapped: complete client-side. Signals ov.hEvent, sets IOSB,
-         * queues APC, handles IOCP. Server async is a zombie — cleaned up
-         * when the socket handle is closed. */
-        file_complete_async( ntdll_uring_op_handle( op ), options,
-                             ntdll_uring_op_event( op ),
-                             ntdll_uring_op_apc( op ),
-                             ntdll_uring_op_apc_user( op ),
-                             io, status, information );
+        /* Overlapped: defer the completion — file_complete_async is unsafe
+         * from inside the ntsync CQ drain context (nested exception on
+         * signal stack). The deferred queue is flushed by
+         * ntdll_io_uring_flush_deferred() after linux_wait_objs returns. */
+        ntdll_io_uring_defer_completion( ntdll_uring_op_handle( op ), options,
+                                         ntdll_uring_op_event( op ),
+                                         ntdll_uring_op_apc( op ),
+                                         ntdll_uring_op_apc_user( op ),
+                                         io, status, information );
     }
 }
 
@@ -1436,7 +1439,7 @@ static NTSTATUS sock_send( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, voi
         set_async_direct_result( &wait_handle, options, io, status, async->sent_len, FALSE );
     }
 
-    /* NSPA Phase 3 / E2: sync sockets only (same limitation as recv). */
+    /* NSPA Phase 3 / E2: sync sockets only. */
     if (status == STATUS_PENDING && wait_handle && !async->sent_len)
     {
         ntdll_client_poll_set( fd );

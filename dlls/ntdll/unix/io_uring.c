@@ -329,6 +329,10 @@ BOOL ntdll_uring_op_is_send( struct uring_async_op *op )
     return op->type == URING_OP_SOCKET_POLL_SEND;
 }
 int ntdll_uring_op_poll_unix_fd( struct uring_async_op *op ) { return op->poll_unix_fd; }
+HANDLE ntdll_uring_op_handle( struct uring_async_op *op ) { return op->handle; }
+HANDLE ntdll_uring_op_event( struct uring_async_op *op ) { return op->event; }
+PIO_APC_ROUTINE ntdll_uring_op_apc( struct uring_async_op *op ) { return op->apc; }
+void *ntdll_uring_op_apc_user( struct uring_async_op *op ) { return op->apc_user; }
 
 static void complete_uring_op( struct uring_async_op *op, int result )
 {

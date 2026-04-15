@@ -316,6 +316,15 @@ static int nspa_rt_apply_tid( int tid, int nt_band )
         }
         return 0;
     }
+
+    /* NSPA v2.5: cache our own RT state so shmem PI boost can skip
+     * sched_getscheduler(0) + sched_getparam(0) on every request. */
+    if (tid == 0)
+    {
+        struct ntdll_thread_data *data = ntdll_get_thread_data();
+        data->nspa_rt_cached_policy = policy;
+        data->nspa_rt_cached_prio   = fifo;
+    }
     return 1;
 }
 
@@ -1348,6 +1357,7 @@ static DECLSPEC_NORETURN void pthread_exit_wrapper( int status )
 {
     struct thread_data *data = get_thread_data();
     abandon_client_mutexes( GetCurrentThreadId() );
+    ntdll_io_uring_cleanup();
     close( data->alert_fd );
     close( data->wait_fd[0] );
     close( data->wait_fd[1] );

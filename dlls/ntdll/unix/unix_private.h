@@ -167,6 +167,11 @@ struct teb_data
     DWORD                     nspa_unix_tid; /* NSPA v2.3: cached Linux kernel TID
                                               * for CS-PI fast path. 0 = uninitialized.
                                               * Populated on first NtNspaGetUnixTid call. */
+    int                       nspa_rt_cached_policy;  /* NSPA v2.5: cached sched policy
+                                                       * (SCHED_FIFO/RR/OTHER). Updated by
+                                                       * nspa_rt_apply_tid on self (tid==0). */
+    int                       nspa_rt_cached_prio;    /* NSPA v2.5: cached sched_priority.
+                                                       * 0 = not RT / uninitialized. */
 };
 
 C_ASSERT( sizeof(struct teb_data) <= sizeof(((TEB *)0)->GdiTebBatch) );
@@ -486,6 +491,29 @@ extern NTSTATUS wow64_wine_spawnvp( void *args );
 #endif
 
 extern void dbg_init(void);
+
+/* io_uring integration (io_uring.c) — all return -ENOSYS if unavailable */
+extern BOOL ntdll_io_uring_enabled(void);
+extern void ntdll_io_uring_cleanup(void);
+extern int  ntdll_io_uring_poll( int fd, short events, int timeout_ms );
+extern void ntdll_io_uring_process_completions(void);
+extern int  ntdll_io_uring_submit_file_read( int unix_fd, int needs_close, void *buffer,
+                                             ULONG already, ULONG count, HANDLE handle,
+                                             HANDLE event, PIO_APC_ROUTINE apc, void *apc_user,
+                                             IO_STATUS_BLOCK *io, unsigned int options,
+                                             BOOL avail_mode );
+extern int  ntdll_io_uring_submit_file_write( int unix_fd, int needs_close, const void *buffer,
+                                              ULONG already, ULONG count, HANDLE handle,
+                                              HANDLE event, PIO_APC_ROUTINE apc, void *apc_user,
+                                              IO_STATUS_BLOCK *io, unsigned int options );
+extern int  ntdll_io_uring_submit_recv( int unix_fd, int needs_close, struct msghdr *hdr,
+                                        int flags, HANDLE handle, HANDLE event,
+                                        PIO_APC_ROUTINE apc, void *apc_user,
+                                        IO_STATUS_BLOCK *io, unsigned int options );
+extern int  ntdll_io_uring_submit_send( int unix_fd, int needs_close, struct msghdr *hdr,
+                                        int flags, HANDLE handle, HANDLE event,
+                                        PIO_APC_ROUTINE apc, void *apc_user,
+                                        IO_STATUS_BLOCK *io, unsigned int options );
 
 extern void close_inproc_sync( HANDLE handle );
 extern BOOL is_client_handle( HANDLE handle );

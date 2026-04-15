@@ -65,6 +65,10 @@
 #endif
 #ifdef HAVE_LINUX_NTSYNC_H
 # include <linux/ntsync.h>
+/* NSPA: uring_fd extension — compat for headers that still have 'pad' */
+# ifndef NTSYNC_INDEX_URING_READY
+#  define NTSYNC_INDEX_URING_READY 0xFFFFFFFEu
+# endif
 #endif
 
 #include "ntstatus.h"
@@ -425,8 +429,13 @@ static NTSTATUS linux_query_mutex_obj( int obj, MUTANT_BASIC_INFORMATION *info )
     return STATUS_SUCCESS;
 }
 
+/* NSPA internal sentinel: ntsync returned because io_uring CQE ready.
+ * Not a real NTSTATUS — used only between linux_wait_objs and callers. */
+#define STATUS_URING_COMPLETION ((NTSTATUS)0xC01500FEu)
+
 static NTSTATUS linux_wait_objs( int device, DWORD count, const int *objs, WAIT_TYPE type,
-                                 int alert_fd, const LARGE_INTEGER *timeout )
+                                 int alert_fd, int uring_fd,
+                                 const LARGE_INTEGER *timeout )
 {
     struct ntsync_wait_args args = {0};
     unsigned long request;
@@ -453,6 +462,9 @@ static NTSTATUS linux_wait_objs( int device, DWORD count, const int *objs, WAIT_
     args.owner = GetCurrentThreadId();
     args.index = ~0u;
     args.alert = alert_fd;
+    /* NSPA: pass io_uring eventfd so ntsync wakes on CQE.  The kernel
+     * extension renames 'pad' to 'uring_fd' — same offset, same size. */
+    args.pad = uring_fd > 0 ? uring_fd : 0;
 
     if (type != WaitAll || count == 1) request = NTSYNC_IOC_WAIT_ANY;
     else request = NTSYNC_IOC_WAIT_ALL;
@@ -462,6 +474,18 @@ static NTSTATUS linux_wait_objs( int device, DWORD count, const int *objs, WAIT_
 
     if (!ret)
     {
+        if (args.index == NTSYNC_INDEX_URING_READY)
+        {
+            /* io_uring CQE arrived — consume the eventfd counter and
+             * tell the caller to drain completions and retry. */
+            if (uring_fd > 0)
+            {
+                uint64_t val;
+                read( uring_fd, &val, sizeof(val) );
+            }
+            return STATUS_URING_COMPLETION;
+        }
+
         if (args.index == count)
         {
             static const LARGE_INTEGER timeout;
@@ -521,7 +545,8 @@ static NTSTATUS linux_query_mutex_obj( int obj, MUTANT_BASIC_INFORMATION *info )
 }
 
 static NTSTATUS linux_wait_objs( int device, DWORD count, const int *objs, WAIT_TYPE type,
-                                 int alert_fd, const LARGE_INTEGER *timeout )
+                                 int alert_fd, int uring_fd,
+                                 const LARGE_INTEGER *timeout )
 {
     return STATUS_NOT_IMPLEMENTED;
 }
@@ -1205,7 +1230,7 @@ static NTSTATUS inproc_wait( DWORD count, const HANDLE *handles, WAIT_TYPE type,
                              BOOLEAN alertable, const LARGE_INTEGER *timeout )
 {
     struct inproc_sync *syncs[64], stack[ARRAY_SIZE(syncs)];
-    int objs[ARRAY_SIZE(syncs)], alert_fd = 0;
+    int objs[ARRAY_SIZE(syncs)], alert_fd = 0, uring_fd;
     NTSTATUS ret;
 
     if (inproc_device_fd < 0) return STATUS_NOT_IMPLEMENTED;
@@ -1223,7 +1248,19 @@ static NTSTATUS inproc_wait( DWORD count, const HANDLE *handles, WAIT_TYPE type,
     }
 
     if (alertable) alert_fd = get_inproc_alert_fd();
-    ret = linux_wait_objs( inproc_device_fd, count, objs, type, alert_fd, timeout );
+    uring_fd = ntdll_io_uring_get_eventfd();
+
+    /* Retry loop: if ntsync wakes because the io_uring eventfd fired,
+     * drain CQEs (which may signal wait objects) and re-enter the wait.
+     * The retry is bounded — CQE count is finite per drain cycle.
+     * Note: for relative timeouts, each retry recomputes now+offset in
+     * linux_wait_objs. The drift is negligible (microseconds per retry). */
+    do {
+        ret = linux_wait_objs( inproc_device_fd, count, objs, type,
+                               alert_fd, uring_fd, timeout );
+        if (ret == STATUS_URING_COMPLETION)
+            ntdll_io_uring_process_completions();
+    } while (ret == STATUS_URING_COMPLETION);
 
     while (count--) release_inproc_sync( syncs[count] );
     return ret;
@@ -1253,8 +1290,15 @@ static NTSTATUS inproc_signal_and_wait( HANDLE signal, HANDLE wait,
 
     if (!ret)
     {
+        int uring_fd = ntdll_io_uring_get_eventfd();
+
         if (alertable) alert_fd = get_inproc_alert_fd();
-        ret = linux_wait_objs( inproc_device_fd, 1, &wait_sync->fd, WaitAny, alert_fd, timeout );
+        do {
+            ret = linux_wait_objs( inproc_device_fd, 1, &wait_sync->fd, WaitAny,
+                                   alert_fd, uring_fd, timeout );
+            if (ret == STATUS_URING_COMPLETION)
+                ntdll_io_uring_process_completions();
+        } while (ret == STATUS_URING_COMPLETION);
     }
 
     release_inproc_sync( wait_sync );

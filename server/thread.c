@@ -2276,6 +2276,12 @@ DECL_HANDLER(init_first_thread)
      * inproc_device's token. */
     if ((reply->has_request_shm = current->request_shm_fd != -1))
         send_client_fd( current->process, current->request_shm_fd, reply->tid );
+
+    /* NSPA E2: use the tail of the first thread's request_shm as the
+     * client-poll bitmap.  No separate shmem or protocol field needed. */
+    if (current->request_shm && !current->process->client_poll_bitmap)
+        current->process->client_poll_bitmap =
+            (volatile unsigned char *)current->request_shm + REQUEST_SHM_SIZE - CLIENT_POLL_BITMAP_SIZE;
 #endif
 }
 

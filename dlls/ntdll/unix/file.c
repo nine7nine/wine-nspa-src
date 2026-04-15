@@ -6153,13 +6153,23 @@ NTSTATUS WINAPI NtReadFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, vo
                 status = STATUS_SUCCESS;
                 goto done;
             }
+            /* io_uring fast path: submit read directly, bypass server async registration.
+             * The dup'd fd ensures lifetime safety for the in-flight SQE. */
+            if (!ntdll_io_uring_submit_file_read( unix_handle, needs_close, buffer,
+                                                   total, length, handle, event, apc,
+                                                   apc_user, io, options, avail_mode ))
+            {
+                needs_close = 0;  /* io_uring.c closed it (or dup'd its own) */
+                status = STATUS_PENDING;
+                goto err;
+            }
+            /* io_uring unavailable — fall back to server async */
             status = register_async_file_read( handle, event, apc, apc_user, iosb_ptr,
                                                buffer, total, length, avail_mode );
             goto err;
         }
         else  /* synchronous read, wait for the fd to become ready */
         {
-            struct pollfd pfd;
             int ret, timeout;
 
             if (!timeout_init_done)
@@ -6170,10 +6180,17 @@ NTSTATUS WINAPI NtReadFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, vo
             }
             timeout = get_next_io_timeout( &timeouts, total );
 
-            pfd.fd = unix_handle;
-            pfd.events = POLLIN;
+            ret = ntdll_io_uring_poll( unix_handle, POLLIN, timeout ? timeout : 0 );
+            if (ret == -ENOSYS)
+            {
+                /* io_uring not available — fall back to poll() */
+                struct pollfd pfd;
+                pfd.fd = unix_handle;
+                pfd.events = POLLIN;
+                ret = poll( &pfd, 1, timeout );
+            }
 
-            if (!timeout || !(ret = poll( &pfd, 1, timeout )))
+            if (!timeout || !ret)
             {
                 if (total)  /* return with what we got so far */
                     status = STATUS_SUCCESS;
@@ -6181,9 +6198,9 @@ NTSTATUS WINAPI NtReadFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, vo
                     status = STATUS_TIMEOUT;
                 goto done;
             }
-            if (ret == -1 && errno != EINTR)
+            if (ret < 0 && ret != -EINTR && errno != EINTR)
             {
-                status = errno_to_status( errno );
+                status = errno_to_status( ret < 0 ? -ret : errno );
                 goto done;
             }
             /* will now restart the read */
@@ -6435,33 +6452,44 @@ NTSTATUS WINAPI NtWriteFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, v
 
         if (async_write)
         {
-            struct async_fileio_write *fileio;
-
-            fileio = (struct async_fileio_write *)alloc_fileio( sizeof(*fileio), async_write_proc, handle );
-            if (!fileio)
+            /* io_uring fast path: submit write directly, bypass server */
+            if (!ntdll_io_uring_submit_file_write( unix_handle, needs_close, buffer,
+                                                    total, length, handle, event, apc,
+                                                    apc_user, io, options ))
             {
-                status = STATUS_NO_MEMORY;
+                needs_close = 0;
+                status = STATUS_PENDING;
                 goto err;
             }
-            fileio->already = total;
-            fileio->count = length;
-            fileio->buffer = buffer;
-
-            SERVER_START_REQ( register_async )
+            /* io_uring unavailable — fall back to server async */
             {
-                req->type   = ASYNC_TYPE_WRITE;
-                req->count  = length;
-                req->async  = server_async( handle, &fileio->io, event, apc, apc_user, iosb_ptr );
-                status = wine_server_call( req );
-            }
-            SERVER_END_REQ;
+                struct async_fileio_write *fileio;
 
-            if (status != STATUS_PENDING) free( fileio );
-            goto err;
+                fileio = (struct async_fileio_write *)alloc_fileio( sizeof(*fileio), async_write_proc, handle );
+                if (!fileio)
+                {
+                    status = STATUS_NO_MEMORY;
+                    goto err;
+                }
+                fileio->already = total;
+                fileio->count = length;
+                fileio->buffer = buffer;
+
+                SERVER_START_REQ( register_async )
+                {
+                    req->type   = ASYNC_TYPE_WRITE;
+                    req->count  = length;
+                    req->async  = server_async( handle, &fileio->io, event, apc, apc_user, iosb_ptr );
+                    status = wine_server_call( req );
+                }
+                SERVER_END_REQ;
+
+                if (status != STATUS_PENDING) free( fileio );
+                goto err;
+            }
         }
         else  /* synchronous write, wait for the fd to become ready */
         {
-            struct pollfd pfd;
             int ret, timeout;
 
             if (!timeout_init_done)
@@ -6473,18 +6501,24 @@ NTSTATUS WINAPI NtWriteFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, v
             }
             timeout = get_next_io_timeout( &timeouts, total );
 
-            pfd.fd = unix_handle;
-            pfd.events = POLLOUT;
+            ret = ntdll_io_uring_poll( unix_handle, POLLOUT, timeout ? timeout : 0 );
+            if (ret == -ENOSYS)
+            {
+                struct pollfd pfd;
+                pfd.fd = unix_handle;
+                pfd.events = POLLOUT;
+                ret = poll( &pfd, 1, timeout );
+            }
 
-            if (!timeout || !(ret = poll( &pfd, 1, timeout )))
+            if (!timeout || !ret)
             {
                 /* return with what we got so far */
                 status = total ? STATUS_SUCCESS : STATUS_TIMEOUT;
                 goto done;
             }
-            if (ret == -1 && errno != EINTR)
+            if (ret < 0 && ret != -EINTR && errno != EINTR)
             {
-                status = errno_to_status( errno );
+                status = errno_to_status( ret < 0 ? -ret : errno );
                 goto done;
             }
             /* will now restart the write */

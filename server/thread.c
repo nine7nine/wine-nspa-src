@@ -378,9 +378,26 @@ static void nspa_rt_init(void)
 
     fprintf( stderr, "wine: NSPA RT:CS-PI: critical section priority inheritance enabled (FUTEX_LOCK_PI)\n" );
 
-    /* Soft NTSync dependency: warn if missing, but still apply RT. */
+    /* NTSync dependency: RT mode requires /dev/ntsync for correct wait
+     * paths.  Without it, ALL sync waits serialize through the wineserver
+     * global_lock, causing priority inversion and potential deadlocks
+     * under heavy threading (e.g. Ableton Live).
+     *
+     * Note: get_inproc_device_fd() caches the fd on first call — if ntsync
+     * is loaded AFTER the wineserver starts, it will never be used.
+     * Ensure ntsync is in /etc/modules-load.d/ for autoload at boot. */
     if (access( "/dev/ntsync", F_OK ) != 0)
-        fprintf( stderr, "wine: NSPA RT:NTSync: /dev/ntsync unavailable; wait paths will not be end-to-end RT\n" );
+    {
+        fprintf( stderr, "\n"
+                 "wine: *** NSPA RT:NTSync: CRITICAL — /dev/ntsync is NOT available ***\n"
+                 "wine: *** All sync waits will serialize through wineserver (deadlock risk!) ***\n"
+                 "wine: *** Fix: sudo modprobe ntsync && echo ntsync | sudo tee /etc/modules-load.d/ntsync.conf ***\n"
+                 "\n" );
+    }
+    else
+    {
+        fprintf( stderr, "wine: NSPA RT:NTSync: /dev/ntsync available — kernel-direct sync active\n" );
+    }
 
     /* NSPA RT v1.1: optionally promote wineserver itself to RT, at a priority
      * BELOW the audio callback band so audio callbacks always preempt the

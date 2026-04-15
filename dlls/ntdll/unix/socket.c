@@ -962,11 +962,11 @@ static NTSTATUS sock_recv( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, voi
      * Sync: CQE handler calls set_async_direct_result directly.
      * Overlapped: CQE handler defers file_complete_async via
      * ntdll_io_uring_defer_completion (flushed after linux_wait_objs). */
-    /* NSPA Phase 3 / E2: sync sockets only (wait_handle != 0).
-     * Overlapped bypass blocked: sock_get_poll_events can't check the
-     * bitmap from the main epoll loop (current == NULL), so the server
-     * still monitors → dual completion → double free. Needs per-fd or
-     * per-sock bitmap reference to fix. */
+    /* NSPA Phase 3 / E2: sync sockets only. Overlapped bypass blocked:
+     * the ALERTED→EAGAIN→PENDING path calls set_async_direct_result(PENDING)
+     * which re-queues the server async for epoll. Then io_uring poll also
+     * monitors → double completion race. Fix: intercept BEFORE
+     * set_async_direct_result, not after. Future work. */
     if (status == STATUS_PENDING && wait_handle)
     {
         ntdll_client_poll_set( fd );

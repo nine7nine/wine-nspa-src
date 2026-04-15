@@ -298,6 +298,9 @@ struct sock
     unsigned int        reset : 1;   /* did we get a TCP reset? */
     unsigned int        reuseaddr : 1; /* winsock SO_REUSEADDR option value */
     unsigned int        exclusiveaddruse : 1; /* winsock SO_EXCLUSIVEADDRUSE option value */
+#ifdef __linux__
+    volatile unsigned char *client_poll_bitmap; /* NSPA E2: per-process bitmap (from process) */
+#endif
 };
 
 static int is_tcp_socket( struct sock *sock )
@@ -1550,18 +1553,15 @@ static int sock_get_poll_events( struct fd *fd )
 
 #ifdef __linux__
     /* NSPA E2: if the client is monitoring this fd via io_uring,
-     * skip server-side epoll monitoring entirely.
-     * The bitmap is on the process that owns this socket.  We get the
-     * process from the thread that created the socket (current is only
-     * valid during request handling, not in the main epoll loop). */
+     * skip server-side epoll monitoring entirely.  The bitmap pointer
+     * is cached on the sock (set in recv_socket/send_socket handlers)
+     * so this works from the main epoll loop where current == NULL. */
+    if (sock->client_poll_bitmap)
     {
-        struct process *process = sock->obj.handle_count && current ? current->process : NULL;
-        if (process && process->client_poll_bitmap)
-        {
-            int unix_fd = get_unix_fd( fd );
-            if (is_client_poll_fd( process, unix_fd ))
-                return -1;
-        }
+        int unix_fd = get_unix_fd( fd );
+        if (unix_fd >= 0 && unix_fd < CLIENT_POLL_BITMAP_SIZE * 8 &&
+            (sock->client_poll_bitmap[unix_fd >> 3] >> (unix_fd & 7)) & 1)
+            return -1;
     }
 #endif
 
@@ -1837,6 +1837,9 @@ static struct sock *create_socket(void)
     sock->sndtimeo = 0;
     sock->icmp_fixup_data_len = 0;
     sock->bound_addr[0] = sock->bound_addr[1] = NULL;
+#ifdef __linux__
+    sock->client_poll_bitmap = NULL;
+#endif
     init_async_queue( &sock->read_q );
     init_async_queue( &sock->write_q );
     init_async_queue( &sock->ifchange_q );
@@ -4004,6 +4007,13 @@ DECL_HANDLER(recv_socket)
     if (!sock) return;
     fd = sock->fd;
 
+#ifdef __linux__
+    /* NSPA E2: cache the process bitmap on the sock so sock_get_poll_events
+     * can check it from the main epoll loop (where current == NULL). */
+    if (!sock->client_poll_bitmap && current->process->client_poll_bitmap)
+        sock->client_poll_bitmap = current->process->client_poll_bitmap;
+#endif
+
     if (!req->force_async && !sock->nonblocking && is_fd_overlapped( fd ))
         timeout = (timeout_t)sock->rcvtimeo * -10000;
 
@@ -4092,6 +4102,11 @@ DECL_HANDLER(send_socket)
 
     if (!sock) return;
     fd = sock->fd;
+
+#ifdef __linux__
+    if (!sock->client_poll_bitmap && current->process->client_poll_bitmap)
+        sock->client_poll_bitmap = current->process->client_poll_bitmap;
+#endif
 
     if (sock->type == WS_SOCK_DGRAM && !sock->bound)
     {

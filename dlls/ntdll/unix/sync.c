@@ -371,6 +371,7 @@ static NTSTATUS linux_set_event_obj( int obj, LONG *prev_state )
     return STATUS_SUCCESS;
 }
 
+
 static NTSTATUS linux_reset_event_obj( int obj, LONG *prev_state )
 {
     __u32 prev;
@@ -1224,6 +1225,36 @@ static int get_inproc_alert_fd(void)
     }
 
     return fd;
+}
+
+/* NSPA Phase 3: resolve an event handle to its ntsync fd.
+ * Returns the fd (caller must NOT close it) or -1 on failure.
+ * Must be called from a safe context (not CQ drain). */
+int ntdll_resolve_event_sync_fd( HANDLE event )
+{
+    struct inproc_sync stack, *sync = &stack;
+
+    if (inproc_device_fd < 0 || !event) return -1;
+    if (get_inproc_sync( event, INPROC_SYNC_EVENT, EVENT_MODIFY_STATE, &stack, &sync )) return -1;
+    {
+        int fd = sync->fd;
+        release_inproc_sync( sync );
+        return fd;
+    }
+}
+
+/* NSPA Phase 3: signal an event via direct ntsync ioctl.
+ * Safe from any context (CQ drain, ntsync wait, signal handler).
+ * Bypasses NtSetEvent and Wine syscall dispatch entirely.
+ * Used by overlapped socket CQE completion to signal ov.hEvent. */
+void ntdll_signal_event_direct( HANDLE event )
+{
+    struct inproc_sync stack, *sync = &stack;
+
+    if (inproc_device_fd < 0) return;
+    if (get_inproc_sync( event, INPROC_SYNC_EVENT, EVENT_MODIFY_STATE, &stack, &sync )) return;
+    linux_set_event_obj( sync->fd, NULL );
+    release_inproc_sync( sync );
 }
 
 static NTSTATUS inproc_wait( DWORD count, const HANDLE *handles, WAIT_TYPE type,

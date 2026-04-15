@@ -96,6 +96,7 @@ struct uring_async_op
     void              *sock_async;  /* async_recv_ioctl* or async_send_ioctl* */
     HANDLE             wait_handle; /* server async wait handle */
     int                poll_unix_fd;/* unix fd for bitmap clear on completion */
+    int                event_sync_fd;/* pre-resolved ntsync fd for ov.hEvent (-1 = none) */
     struct uring_async_op *next_free; /* freelist link (only valid when not in flight) */
 };
 
@@ -384,26 +385,20 @@ HANDLE ntdll_uring_op_handle( struct uring_async_op *op ) { return op->handle; }
 HANDLE ntdll_uring_op_event( struct uring_async_op *op ) { return op->event; }
 PIO_APC_ROUTINE ntdll_uring_op_apc( struct uring_async_op *op ) { return op->apc; }
 void *ntdll_uring_op_apc_user( struct uring_async_op *op ) { return op->apc_user; }
+int ntdll_uring_op_event_sync_fd( struct uring_async_op *op ) { return op->event_sync_fd; }
+int ntdll_uring_op_dup_fd( struct uring_async_op *op ) { return op->dup_fd; }
 
 static void complete_uring_op( struct uring_async_op *op, int result )
 {
     NTSTATUS status;
     ULONG_PTR information;
 
-    /* Socket poll completions: sync (wait_handle != 0) completes inline,
-     * overlapped (wait_handle == 0) defers everything to flush_deferred. */
+    /* Socket poll completions — both sync and overlapped complete inline.
+     * Overlapped uses ntdll_signal_event_direct (raw ntsync ioctl) instead
+     * of NtSetEvent to avoid ntsync reentrancy. */
     if (op->type == URING_OP_SOCKET_POLL_RECV || op->type == URING_OP_SOCKET_POLL_SEND)
     {
-        if (op->wait_handle)
-        {
-            ntdll_complete_socket_poll( op, result );
-        }
-        else
-        {
-            /* Defer: copy op, free pool slot, process in flush_deferred
-             * which runs outside the ntsync ioctl stack. */
-            ntdll_io_uring_defer_socket_poll( op, result );
-        }
+        ntdll_complete_socket_poll( op, result );
         op_pool_free( op );
         return;
     }
@@ -650,23 +645,36 @@ int ntdll_io_uring_submit_socket_poll( int unix_fd, short events,
 {
     struct uring_async_op *op;
     struct io_uring_sqe *sqe;
+    int recv_fd = -1;
 
     if (!ensure_ring()) return -ENOSYS;
 
-    op = op_pool_alloc();
-    if (!op) return -ENOMEM;
+    /* For overlapped sockets (wait_handle == 0), dup the fd now so the
+     * CQ drain can call try_recv/try_send without server_get_unix_fd
+     * (which is unsafe from CQ drain context — signal manipulation). */
+    if (!wait_handle)
+    {
+        recv_fd = dup( unix_fd );
+        if (recv_fd < 0) return -errno;
+    }
 
-    op->type        = is_send ? URING_OP_SOCKET_POLL_SEND : URING_OP_SOCKET_POLL_RECV;
-    op->handle      = handle;
-    op->event       = event;
-    op->apc         = apc;
-    op->apc_user    = apc_user;
-    op->io          = io;
-    op->options     = options;
-    op->dup_fd       = -1;  /* POLL_ADD — kernel pins the file, no dup needed */
-    op->sock_async   = sock_async;
-    op->wait_handle  = wait_handle;
-    op->poll_unix_fd = unix_fd;  /* for bitmap clear on completion */
+    op = op_pool_alloc();
+    if (!op) { if (recv_fd >= 0) close( recv_fd ); return -ENOMEM; }
+
+    op->type          = is_send ? URING_OP_SOCKET_POLL_SEND : URING_OP_SOCKET_POLL_RECV;
+    op->handle        = handle;
+    op->event         = event;
+    op->apc           = apc;
+    op->apc_user      = apc_user;
+    op->io            = io;
+    op->options       = options;
+    op->dup_fd        = recv_fd;  /* overlapped: dup'd fd for try_recv; sync: -1 */
+    op->sock_async    = sock_async;
+    op->wait_handle   = wait_handle;
+    op->poll_unix_fd  = unix_fd;
+    /* Pre-resolve event ntsync fd for overlapped — CQ drain can't call
+     * get_inproc_sync (server call, signal manipulation = crash). */
+    op->event_sync_fd = (!wait_handle && event) ? ntdll_resolve_event_sync_fd( event ) : -1;
 
     sqe = io_uring_get_sqe( &thread_ring );
     if (!sqe)

@@ -501,6 +501,8 @@ extern int  ntdll_io_uring_get_eventfd(void);
 extern void ntdll_client_poll_set( int unix_fd );
 extern void ntdll_client_poll_clear( int unix_fd );
 extern void ntdll_io_uring_flush_deferred(void);
+extern void ntdll_signal_event_direct( HANDLE event );
+extern int  ntdll_resolve_event_sync_fd( HANDLE event );
 extern int  ntdll_io_uring_submit_socket_poll( int unix_fd, short events,
                                                HANDLE handle, HANDLE wait_handle,
                                                HANDLE event, PIO_APC_ROUTINE apc,

@@ -1,0 +1,541 @@
+/*
+ * Wine-NSPA io_uring integration for ntdll
+ *
+ * Copyright 2026 Wine-NSPA
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ *
+ * Per-thread io_uring ring management for file and socket I/O.
+ * Reduces syscall overhead and bypasses wineserver for I/O operations.
+ *
+ * Design:
+ *   - Per-thread rings (SINGLE_ISSUER) — no cross-thread submission
+ *   - COOP_TASKRUN — completions processed in submitter context (RT safe)
+ *   - Every io_uring path has a fallback to existing behavior
+ *   - Cooperative completion drain at server_call / server_wait entry points
+ *   - fd references held for the lifetime of in-flight SQEs
+ */
+
+#if 0
+#pragma makedep unix
+#endif
+
+#include "config.h"
+
+#include <errno.h>
+#include <poll.h>
+#include <stdarg.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/socket.h>
+
+#ifdef HAVE_LIBURING_H
+#include <liburing.h>
+#endif
+
+#include "ntstatus.h"
+#define WIN32_NO_STATUS
+#include "windef.h"
+#include "winternl.h"
+#include "wine/debug.h"
+#include "unix_private.h"
+
+WINE_DEFAULT_DEBUG_CHANNEL(io_uring);
+
+
+#ifdef HAVE_LIBURING_H
+
+#define RING_SIZE 32
+
+/* Sentinel user_data value for internal operations (cancel, etc.) */
+#define URING_INTERNAL_TAG ((void *)(uintptr_t)1)
+
+/* -----------------------------------------------------------------------
+ * Per-thread ring management
+ * ----------------------------------------------------------------------- */
+
+static __thread struct io_uring thread_ring;
+static __thread BOOL ring_initialized;
+static __thread BOOL ring_init_failed;
+
+static BOOL ensure_ring(void)
+{
+    struct io_uring_params params;
+    int ret;
+
+    if (ring_initialized) return TRUE;
+    if (ring_init_failed)  return FALSE;
+
+    memset( &params, 0, sizeof(params) );
+    params.flags = IORING_SETUP_SINGLE_ISSUER
+                 | IORING_SETUP_COOP_TASKRUN;
+
+    ret = io_uring_queue_init_params( RING_SIZE, &thread_ring, &params );
+    if (ret < 0)
+    {
+        /* kernel too old for advanced flags — try plain init */
+        memset( &params, 0, sizeof(params) );
+        ret = io_uring_queue_init_params( RING_SIZE, &thread_ring, &params );
+    }
+    if (ret < 0)
+    {
+        WARN( "io_uring_queue_init failed: %s\n", strerror( -ret ) );
+        ring_init_failed = TRUE;
+        return FALSE;
+    }
+
+    ring_initialized = TRUE;
+    TRACE( "io_uring ring initialized (sq=%u cq=%u flags=0x%x) for thread %04x\n",
+           params.sq_entries, params.cq_entries, params.flags, GetCurrentThreadId() );
+    return TRUE;
+}
+
+BOOL ntdll_io_uring_enabled(void)
+{
+    return ensure_ring();
+}
+
+void ntdll_io_uring_cleanup(void)
+{
+    if (!ring_initialized) return;
+
+    ntdll_io_uring_process_completions();
+    io_uring_queue_exit( &thread_ring );
+    ring_initialized = FALSE;
+    TRACE( "io_uring ring cleaned up\n" );
+}
+
+
+/* -----------------------------------------------------------------------
+ * Phase 1: Blocking poll replacement
+ *
+ * Replaces poll(fd, events, timeout_ms) in synchronous I/O wait loops.
+ * Returns: positive revents on success, 0 on timeout, negative on error.
+ * ----------------------------------------------------------------------- */
+
+int ntdll_io_uring_poll( int fd, short events, int timeout_ms )
+{
+    struct io_uring_sqe *sqe;
+    struct io_uring_cqe *cqe;
+    struct __kernel_timespec ts;
+    int ret;
+
+    if (!ensure_ring()) return -ENOSYS;
+
+    /* drain any pending completions first */
+    ntdll_io_uring_process_completions();
+
+    sqe = io_uring_get_sqe( &thread_ring );
+    if (!sqe) return -ENOMEM;
+
+    io_uring_prep_poll_add( sqe, fd, (unsigned)events );
+    io_uring_sqe_set_data( sqe, NULL );
+
+    if (timeout_ms > 0)
+    {
+        ts.tv_sec  = timeout_ms / 1000;
+        ts.tv_nsec = (long)(timeout_ms % 1000) * 1000000;
+        ret = io_uring_submit_and_wait_timeout( &thread_ring, &cqe, 1, &ts, NULL );
+    }
+    else if (timeout_ms == 0)
+    {
+        io_uring_submit( &thread_ring );
+        ret = io_uring_peek_cqe( &thread_ring, &cqe );
+    }
+    else
+    {
+        io_uring_submit( &thread_ring );
+        ret = io_uring_wait_cqe( &thread_ring, &cqe );
+    }
+
+    if (ret == -ETIME || (ret == -EAGAIN && timeout_ms == 0))
+    {
+        /* timed out — cancel the pending poll, drain all CQEs */
+        struct io_uring_sqe *cancel_sqe = io_uring_get_sqe( &thread_ring );
+        if (cancel_sqe)
+        {
+            io_uring_prep_cancel64( cancel_sqe, 0, 0 );
+            io_uring_sqe_set_data( cancel_sqe, URING_INTERNAL_TAG );
+            io_uring_submit( &thread_ring );
+            /* wait for the cancel completion + the cancelled poll */
+            for (int i = 0; i < 2; i++)
+            {
+                if (io_uring_wait_cqe( &thread_ring, &cqe ) == 0)
+                    io_uring_cqe_seen( &thread_ring, cqe );
+            }
+        }
+        return 0;  /* timeout — matches poll() returning 0 */
+    }
+    if (ret < 0) return ret;
+
+    ret = cqe->res;
+    io_uring_cqe_seen( &thread_ring, cqe );
+    return (ret < 0) ? ret : ret;  /* revents mask or error */
+}
+
+
+/* -----------------------------------------------------------------------
+ * Phase 2 & 3: Async I/O — server bypass
+ *
+ * Track pending operations.  The unix_fd is dup'd to ensure it stays
+ * valid for the lifetime of the in-flight SQE, regardless of what the
+ * server-side handle table does.
+ * ----------------------------------------------------------------------- */
+
+enum uring_op_type
+{
+    URING_OP_FILE_READ,
+    URING_OP_FILE_WRITE,
+    URING_OP_SOCKET_RECV,
+    URING_OP_SOCKET_SEND,
+};
+
+struct uring_async_op
+{
+    enum uring_op_type type;
+    HANDLE             handle;      /* NT file/socket handle */
+    HANDLE             event;       /* completion event (may be NULL) */
+    PIO_APC_ROUTINE    apc;         /* completion APC (may be NULL) */
+    void              *apc_user;    /* APC user context / IOCP cvalue */
+    IO_STATUS_BLOCK   *io;          /* IO status block */
+    unsigned int       options;     /* file options for set_sync_iosb */
+    int                dup_fd;      /* dup'd fd — we own this, always close */
+    ULONG              already;     /* bytes transferred before io_uring */
+    ULONG              count;       /* total bytes requested */
+    BOOL               avail_mode;  /* return on any data (pipes) */
+};
+
+/* Dup the fd so it remains valid for the in-flight SQE.
+ * The caller's fd and its needs_close semantics are unaffected. */
+static int dup_fd_for_ring( int unix_fd )
+{
+    int fd = dup( unix_fd );
+    if (fd < 0)
+        WARN( "dup(%d) failed: %s\n", unix_fd, strerror( errno ) );
+    return fd;
+}
+
+static void complete_uring_op( struct uring_async_op *op, int result )
+{
+    NTSTATUS status;
+    ULONG_PTR information;
+
+    if (result >= 0)
+    {
+        information = op->already + result;
+        if (result == 0 && !op->already)
+            status = (op->type == URING_OP_FILE_READ) ? STATUS_PIPE_BROKEN : STATUS_SUCCESS;
+        else
+            status = STATUS_SUCCESS;
+    }
+    else
+    {
+        information = op->already;
+        status = errno_to_status( -result );
+    }
+
+    file_complete_async( op->handle, op->options, op->event, op->apc,
+                         op->apc_user, op->io, status, information );
+
+    close( op->dup_fd );
+    free( op );
+}
+
+
+int ntdll_io_uring_submit_file_read( int unix_fd, int needs_close, void *buffer,
+                                     ULONG already, ULONG count, HANDLE handle,
+                                     HANDLE event, PIO_APC_ROUTINE apc, void *apc_user,
+                                     IO_STATUS_BLOCK *io, unsigned int options,
+                                     BOOL avail_mode )
+{
+    struct uring_async_op *op;
+    struct io_uring_sqe *sqe;
+    int ring_fd;
+
+    if (!ensure_ring()) return -ENOSYS;
+
+    /* dup the fd so we own a stable reference for the in-flight SQE */
+    ring_fd = dup_fd_for_ring( unix_fd );
+    if (ring_fd < 0) return -errno;
+
+    op = calloc( 1, sizeof(*op) );
+    if (!op) { close( ring_fd ); return -ENOMEM; }
+
+    op->type       = URING_OP_FILE_READ;
+    op->handle     = handle;
+    op->event      = event;
+    op->apc        = apc;
+    op->apc_user   = apc_user;
+    op->io         = io;
+    op->options    = options;
+    op->dup_fd     = ring_fd;
+    op->already    = already;
+    op->count      = count;
+    op->avail_mode = avail_mode;
+
+    sqe = io_uring_get_sqe( &thread_ring );
+    if (!sqe)
+    {
+        io_uring_submit( &thread_ring );
+        ntdll_io_uring_process_completions();
+        sqe = io_uring_get_sqe( &thread_ring );
+        if (!sqe) { close( ring_fd ); free( op ); return -ENOMEM; }
+    }
+
+    io_uring_prep_read( sqe, ring_fd, (char *)buffer + already, count - already, 0 );
+    io_uring_sqe_set_data( sqe, op );
+    io_uring_submit( &thread_ring );
+
+    /* the caller's fd lifecycle is unchanged — close if needed */
+    if (needs_close) close( unix_fd );
+
+    TRACE( "submitted async read: handle=%p fd=%d(%d) buf=%p+%u len=%u\n",
+           handle, unix_fd, ring_fd, buffer, already, count - already );
+    return 0;
+}
+
+
+int ntdll_io_uring_submit_file_write( int unix_fd, int needs_close, const void *buffer,
+                                      ULONG already, ULONG count, HANDLE handle,
+                                      HANDLE event, PIO_APC_ROUTINE apc, void *apc_user,
+                                      IO_STATUS_BLOCK *io, unsigned int options )
+{
+    struct uring_async_op *op;
+    struct io_uring_sqe *sqe;
+    int ring_fd;
+
+    if (!ensure_ring()) return -ENOSYS;
+
+    ring_fd = dup_fd_for_ring( unix_fd );
+    if (ring_fd < 0) return -errno;
+
+    op = calloc( 1, sizeof(*op) );
+    if (!op) { close( ring_fd ); return -ENOMEM; }
+
+    op->type     = URING_OP_FILE_WRITE;
+    op->handle   = handle;
+    op->event    = event;
+    op->apc      = apc;
+    op->apc_user = apc_user;
+    op->io       = io;
+    op->options  = options;
+    op->dup_fd   = ring_fd;
+    op->already  = already;
+    op->count    = count;
+
+    sqe = io_uring_get_sqe( &thread_ring );
+    if (!sqe)
+    {
+        io_uring_submit( &thread_ring );
+        ntdll_io_uring_process_completions();
+        sqe = io_uring_get_sqe( &thread_ring );
+        if (!sqe) { close( ring_fd ); free( op ); return -ENOMEM; }
+    }
+
+    io_uring_prep_write( sqe, ring_fd, (const char *)buffer + already, count - already, 0 );
+    io_uring_sqe_set_data( sqe, op );
+    io_uring_submit( &thread_ring );
+
+    if (needs_close) close( unix_fd );
+
+    TRACE( "submitted async write: handle=%p fd=%d(%d) buf=%p+%u len=%u\n",
+           handle, unix_fd, ring_fd, buffer, already, count - already );
+    return 0;
+}
+
+
+/* -----------------------------------------------------------------------
+ * Phase 3: Socket I/O
+ *
+ * NOTE: The msghdr and its iov/control buffers must remain valid until
+ * the CQE is processed.  The caller is responsible for keeping them
+ * alive (typically on the stack of a function that blocks until
+ * completion, or heap-allocated for true async).
+ * ----------------------------------------------------------------------- */
+
+int ntdll_io_uring_submit_recv( int unix_fd, int needs_close, struct msghdr *hdr,
+                                int flags, HANDLE handle, HANDLE event,
+                                PIO_APC_ROUTINE apc, void *apc_user,
+                                IO_STATUS_BLOCK *io, unsigned int options )
+{
+    struct uring_async_op *op;
+    struct io_uring_sqe *sqe;
+    int ring_fd;
+
+    if (!ensure_ring()) return -ENOSYS;
+
+    ring_fd = dup_fd_for_ring( unix_fd );
+    if (ring_fd < 0) return -errno;
+
+    op = calloc( 1, sizeof(*op) );
+    if (!op) { close( ring_fd ); return -ENOMEM; }
+
+    op->type     = URING_OP_SOCKET_RECV;
+    op->handle   = handle;
+    op->event    = event;
+    op->apc      = apc;
+    op->apc_user = apc_user;
+    op->io       = io;
+    op->options  = options;
+    op->dup_fd   = ring_fd;
+
+    sqe = io_uring_get_sqe( &thread_ring );
+    if (!sqe)
+    {
+        io_uring_submit( &thread_ring );
+        ntdll_io_uring_process_completions();
+        sqe = io_uring_get_sqe( &thread_ring );
+        if (!sqe) { close( ring_fd ); free( op ); return -ENOMEM; }
+    }
+
+    io_uring_prep_recvmsg( sqe, ring_fd, hdr, flags );
+    io_uring_sqe_set_data( sqe, op );
+    io_uring_submit( &thread_ring );
+
+    if (needs_close) close( unix_fd );
+    return 0;
+}
+
+
+int ntdll_io_uring_submit_send( int unix_fd, int needs_close, struct msghdr *hdr,
+                                int flags, HANDLE handle, HANDLE event,
+                                PIO_APC_ROUTINE apc, void *apc_user,
+                                IO_STATUS_BLOCK *io, unsigned int options )
+{
+    struct uring_async_op *op;
+    struct io_uring_sqe *sqe;
+    int ring_fd;
+
+    if (!ensure_ring()) return -ENOSYS;
+
+    ring_fd = dup_fd_for_ring( unix_fd );
+    if (ring_fd < 0) return -errno;
+
+    op = calloc( 1, sizeof(*op) );
+    if (!op) { close( ring_fd ); return -ENOMEM; }
+
+    op->type     = URING_OP_SOCKET_SEND;
+    op->handle   = handle;
+    op->event    = event;
+    op->apc      = apc;
+    op->apc_user = apc_user;
+    op->io       = io;
+    op->options  = options;
+    op->dup_fd   = ring_fd;
+
+    sqe = io_uring_get_sqe( &thread_ring );
+    if (!sqe)
+    {
+        io_uring_submit( &thread_ring );
+        ntdll_io_uring_process_completions();
+        sqe = io_uring_get_sqe( &thread_ring );
+        if (!sqe) { close( ring_fd ); free( op ); return -ENOMEM; }
+    }
+
+    io_uring_prep_sendmsg( sqe, ring_fd, hdr, flags );
+    io_uring_sqe_set_data( sqe, op );
+    io_uring_submit( &thread_ring );
+
+    if (needs_close) close( unix_fd );
+    return 0;
+}
+
+
+/* -----------------------------------------------------------------------
+ * Cooperative completion drain
+ *
+ * Called from wine_server_call() and server_wait() entry points so that
+ * completions are processed in the calling thread's context (preserving
+ * RT priority).  Also called from ntdll_io_uring_poll() and before new
+ * SQE submissions when the ring is full.
+ * ----------------------------------------------------------------------- */
+
+void ntdll_io_uring_process_completions(void)
+{
+    struct io_uring_cqe *cqe;
+    unsigned int head, count = 0;
+
+    if (!ring_initialized) return;
+
+    io_uring_for_each_cqe( &thread_ring, head, cqe )
+    {
+        struct uring_async_op *op = io_uring_cqe_get_data( cqe );
+
+        if (op && op != URING_INTERNAL_TAG)
+        {
+            int result = cqe->res;
+
+            if (result == -EFAULT)
+            {
+                /* Buffer in a write-watched page.  We cannot retry from
+                 * io_uring — let the app re-issue the I/O (which will
+                 * fall through to the server async path and use
+                 * virtual_locked_read with proper page fault handling). */
+                TRACE( "EFAULT for handle %p type=%d — caller should retry via server\n",
+                       op->handle, op->type );
+                close( op->dup_fd );
+                free( op );
+            }
+            else
+            {
+                TRACE( "completing type=%d handle=%p result=%d\n",
+                       op->type, op->handle, result );
+                complete_uring_op( op, result );
+            }
+        }
+        count++;
+    }
+
+    if (count)
+        io_uring_cq_advance( &thread_ring, count );
+}
+
+
+#else /* !HAVE_LIBURING_H */
+
+/* Stubs — all return -ENOSYS so callers fall back to existing paths */
+
+BOOL ntdll_io_uring_enabled(void) { return FALSE; }
+void ntdll_io_uring_cleanup(void) { }
+int  ntdll_io_uring_poll( int fd, short events, int timeout_ms ) { return -ENOSYS; }
+void ntdll_io_uring_process_completions(void) { }
+
+int ntdll_io_uring_submit_file_read( int unix_fd, int needs_close, void *buffer,
+                                     ULONG already, ULONG count, HANDLE handle,
+                                     HANDLE event, PIO_APC_ROUTINE apc, void *apc_user,
+                                     IO_STATUS_BLOCK *io, unsigned int options,
+                                     BOOL avail_mode )
+{ return -ENOSYS; }
+
+int ntdll_io_uring_submit_file_write( int unix_fd, int needs_close, const void *buffer,
+                                      ULONG already, ULONG count, HANDLE handle,
+                                      HANDLE event, PIO_APC_ROUTINE apc, void *apc_user,
+                                      IO_STATUS_BLOCK *io, unsigned int options )
+{ return -ENOSYS; }
+
+int ntdll_io_uring_submit_recv( int unix_fd, int needs_close, struct msghdr *hdr,
+                                int flags, HANDLE handle, HANDLE event,
+                                PIO_APC_ROUTINE apc, void *apc_user,
+                                IO_STATUS_BLOCK *io, unsigned int options )
+{ return -ENOSYS; }
+
+int ntdll_io_uring_submit_send( int unix_fd, int needs_close, struct msghdr *hdr,
+                                int flags, HANDLE handle, HANDLE event,
+                                PIO_APC_ROUTINE apc, void *apc_user,
+                                IO_STATUS_BLOCK *io, unsigned int options )
+{ return -ENOSYS; }
+
+#endif /* HAVE_LIBURING_H */

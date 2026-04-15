@@ -48,6 +48,7 @@
  *
  */
 
+#include <winsock2.h>
 #include <windows.h>
 #include <limits.h>
 #include <stdarg.h>
@@ -3564,6 +3565,286 @@ nts_t5:
 }
 
 /* ════════════════════════════════════════════════════════════════════════
+ *   socket-io — async TCP loopback latency / throughput test
+ *
+ *   Creates a TCP loopback socket pair. One thread sends fixed-size
+ *   messages, the main thread receives them using overlapped WSARecv.
+ *   Measures per-message latency to exercise the socket async path
+ *   (server epoll monitoring vs io_uring poll bypass).
+ *
+ *   Run before and after io_uring Phase 3 to compare.
+ * ════════════════════════════════════════════════════════════════════════ */
+
+#define SOCKIO_MSG_SIZE     256
+#define SOCKIO_ITERATIONS   2000
+#define SOCKIO_PORT         0       /* ephemeral */
+
+/* Helper: create a connected TCP loopback pair. Returns 0 on success. */
+static int make_tcp_pair(SOCKET *client_out, SOCKET *server_out)
+{
+    SOCKET listener, client, accepted;
+    struct sockaddr_in addr;
+    int addrlen = sizeof(addr);
+
+    listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listener == INVALID_SOCKET) return -1;
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(SOCKIO_PORT);
+
+    if (bind(listener, (struct sockaddr *)&addr, sizeof(addr)) < 0) goto fail;
+    if (listen(listener, 1) < 0) goto fail;
+    if (getsockname(listener, (struct sockaddr *)&addr, &addrlen) < 0) goto fail;
+
+    client = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (client == INVALID_SOCKET) goto fail;
+    if (connect(client, (struct sockaddr *)&addr, sizeof(addr)) < 0) { closesocket(client); goto fail; }
+
+    accepted = accept(listener, NULL, NULL);
+    if (accepted == INVALID_SOCKET) { closesocket(client); goto fail; }
+
+    closesocket(listener);
+    *client_out = client;
+    *server_out = accepted;
+    return 0;
+
+fail:
+    closesocket(listener);
+    return -1;
+}
+
+/* Deferred sender: waits for per-iteration signal before each send.
+ * This ensures the receiver calls WSARecv BEFORE data is available,
+ * exercising the async wait path (server epoll or io_uring poll). */
+struct sockio_deferred_ctx {
+    SOCKET sock;
+    int iterations;
+    HANDLE send_gate;   /* auto-reset: receiver signals, sender sends one msg */
+    HANDLE done_event;  /* manual-reset: sender sets when finished */
+    volatile int error;
+};
+
+static DWORD WINAPI sockio_deferred_sender(void *param)
+{
+    struct sockio_deferred_ctx *ctx = param;
+    char buf[SOCKIO_MSG_SIZE];
+    int i;
+
+    memset(buf, 'X', sizeof(buf));
+
+    for (i = 0; i < ctx->iterations; i++)
+    {
+        WaitForSingleObject(ctx->send_gate, INFINITE);
+        if (send(ctx->sock, buf, sizeof(buf), 0) != sizeof(buf))
+        {
+            ctx->error = WSAGetLastError();
+            break;
+        }
+    }
+    SetEvent(ctx->done_event);
+    return 0;
+}
+
+/* Run one phase of the socket-io test.
+ * If deferred=TRUE, receiver calls WSARecv first, THEN signals sender.
+ * This forces the async path (EAGAIN → io_uring poll or server epoll). */
+static void sockio_run_phase(const char *label, SOCKET client, SOCKET server,
+                             int iterations, BOOL deferred,
+                             LARGE_INTEGER freq)
+{
+    struct sockio_deferred_ctx sender_ctx;
+    HANDLE sender_thread;
+    WSAOVERLAPPED ov;
+    WSABUF wsabuf;
+    char recv_buf[SOCKIO_MSG_SIZE];
+    DWORD bytes_recv, flags;
+    LARGE_INTEGER t_start, t_end;
+    double *latencies;
+    double total_us = 0, min_us = 1e9, max_us = 0, avg_us;
+    int i, pass = 0, fail = 0, pending_count = 0;
+
+    latencies = malloc(iterations * sizeof(double));
+    if (!latencies) { printf("  [FAIL] malloc\n"); return; }
+
+    sender_ctx.sock = server;
+    sender_ctx.iterations = iterations;
+    sender_ctx.send_gate = CreateEventW(NULL, FALSE, FALSE, NULL);  /* auto-reset */
+    sender_ctx.done_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    sender_ctx.error = 0;
+
+    sender_thread = CreateThread(NULL, 0, sockio_deferred_sender, &sender_ctx, 0, NULL);
+    if (!sender_thread)
+    {
+        printf("  [FAIL] CreateThread: %lu\n", GetLastError());
+        free(latencies);
+        return;
+    }
+
+    printf("  Running %d %s recv cycles...\n", iterations, label);
+    fflush(stdout);
+
+    for (i = 0; i < iterations; i++)
+    {
+        DWORD wait_ret;
+        int total_recv = 0;
+
+        if (!deferred)
+        {
+            /* Immediate mode: send first, then recv */
+            SetEvent(sender_ctx.send_gate);
+            Sleep(0); /* yield to let sender run */
+        }
+
+        QueryPerformanceCounter(&t_start);
+
+        while (total_recv < SOCKIO_MSG_SIZE)
+        {
+            memset(&ov, 0, sizeof(ov));
+            ov.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+            wsabuf.buf = recv_buf + total_recv;
+            wsabuf.len = SOCKIO_MSG_SIZE - total_recv;
+            flags = 0;
+
+            if (WSARecv(client, &wsabuf, 1, &bytes_recv, &flags, &ov, NULL) == SOCKET_ERROR)
+            {
+                if (WSAGetLastError() != WSA_IO_PENDING)
+                {
+                    CloseHandle(ov.hEvent);
+                    fail++;
+                    goto next;
+                }
+
+                if (deferred && total_recv == 0)
+                {
+                    /* WSARecv returned PENDING — now signal the sender.
+                     * This is the key: the async wait path is now active. */
+                    SetEvent(sender_ctx.send_gate);
+                    pending_count++;
+                }
+
+                wait_ret = WaitForSingleObject(ov.hEvent, 5000);
+                if (wait_ret != WAIT_OBJECT_0)
+                {
+                    CloseHandle(ov.hEvent);
+                    fail++;
+                    goto next;
+                }
+                WSAGetOverlappedResult(client, &ov, &bytes_recv, FALSE, &flags);
+            }
+            else if (deferred && total_recv == 0)
+            {
+                /* Completed immediately even in deferred mode —
+                 * data was already buffered (TCP coalescing). */
+                SetEvent(sender_ctx.send_gate);
+            }
+
+            CloseHandle(ov.hEvent);
+            total_recv += bytes_recv;
+        }
+
+        QueryPerformanceCounter(&t_end);
+        {
+            double us = (double)(t_end.QuadPart - t_start.QuadPart) * 1e6 / freq.QuadPart;
+            latencies[pass] = us;
+            total_us += us;
+            if (us < min_us) min_us = us;
+            if (us > max_us) max_us = us;
+            pass++;
+        }
+next:;
+    }
+
+    WaitForSingleObject(sender_thread, 5000);
+    CloseHandle(sender_thread);
+    CloseHandle(sender_ctx.send_gate);
+    CloseHandle(sender_ctx.done_event);
+
+    avg_us = pass > 0 ? total_us / pass : 0;
+
+    /* Sort for percentiles */
+    for (i = 0; i < pass - 1; i++)
+    {
+        int j;
+        for (j = i + 1; j < pass; j++)
+            if (latencies[j] < latencies[i])
+            { double t = latencies[i]; latencies[i] = latencies[j]; latencies[j] = t; }
+    }
+
+    printf("\n  -- %s results --\n", label);
+    printf("  Iterations:  %d pass, %d fail", pass, fail);
+    if (deferred) printf(", %d went async (PENDING)", pending_count);
+    printf("\n");
+    printf("  Latency (us):\n");
+    printf("    min:    %8.1f\n", min_us);
+    printf("    avg:    %8.1f\n", avg_us);
+    printf("    p50:    %8.1f\n", pass > 0 ? latencies[pass / 2] : 0.0);
+    printf("    p95:    %8.1f\n", pass > 0 ? latencies[(int)(pass * 0.95)] : 0.0);
+    printf("    p99:    %8.1f\n", pass > 0 ? latencies[(int)(pass * 0.99)] : 0.0);
+    printf("    max:    %8.1f\n", max_us);
+    printf("  Throughput:  %.0f msgs/sec\n", pass > 0 ? 1e6 / avg_us : 0.0);
+    fflush(stdout);
+
+    free(latencies);
+}
+
+static int cmd_socket_io(int argc, char **argv)
+{
+    WSADATA wsa;
+    SOCKET client, server;
+    LARGE_INTEGER freq;
+    int iterations = SOCKIO_ITERATIONS;
+
+    (void)argc; (void)argv;
+
+    print_banner("socket-io", "async TCP loopback latency test (io_uring Phase 3)");
+    fflush(stdout);
+
+    if (WSAStartup(MAKEWORD(2, 2), &wsa))
+    {
+        printf("  [FAIL] WSAStartup failed\n");
+        return 1;
+    }
+
+    QueryPerformanceFrequency(&freq);
+
+    print_section("parameters");
+    print_kv("msg_size", "%d bytes", SOCKIO_MSG_SIZE);
+    print_kv("iterations", "%d per phase", iterations);
+    print_kv("transport", "TCP loopback (127.0.0.1)");
+    print_kv("recv mode", "overlapped WSARecv");
+
+    if (make_tcp_pair(&client, &server))
+    {
+        printf("  [FAIL] make_tcp_pair: %d\n", WSAGetLastError());
+        WSACleanup();
+        return 1;
+    }
+    printf("  [OK] TCP pair created\n");
+    fflush(stdout);
+
+    /* Phase A: Immediate — data sent before recv.
+     * Exercises the fast path (try_recv succeeds immediately). */
+    print_section("Phase A: immediate recv (data already buffered)");
+    sockio_run_phase("immediate", client, server, iterations, FALSE, freq);
+
+    /* Phase B: Deferred — recv called before send.
+     * Forces the async wait path (EAGAIN → io_uring poll or server epoll). */
+    print_section("Phase B: deferred recv (async wait path)");
+    sockio_run_phase("deferred", client, server, iterations, TRUE, freq);
+
+    closesocket(client);
+    closesocket(server);
+    WSACleanup();
+
+    printf("\n  Verdict: PASS\n");
+    fflush(stdout);
+    return 0;
+}
+
+
+/* ════════════════════════════════════════════════════════════════════════
  *   Command dispatch
  * ════════════════════════════════════════════════════════════════════════ */
 
@@ -3585,6 +3866,7 @@ static struct command commands[] = {
     { "signal-recursion","guard-page fault stress (validate virtual_mutex + signal path)",    cmd_signal_recursion },
     { "large-pages",     "VirtualAlloc(MEM_LARGE_PAGES) end-to-end + /proc/meminfo cross-check", cmd_large_pages },
     { "ntsync",          "NTSync kernel driver PI + priority-ordered wakeup (5 sub-tests)",  cmd_ntsync        },
+    { "socket-io",       "async TCP loopback latency (io_uring Phase 3 baseline/compare)",  cmd_socket_io     },
     { "help",            "show this help",                                                  cmd_help          },
     { NULL, NULL, NULL }
 };

@@ -29,6 +29,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/mman.h>
 #include <sys/types.h>
 #include <sys/time.h>
 #include <sys/socket.h>
@@ -699,6 +700,9 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
     process->rawinput_mouse  = NULL;
     process->rawinput_kbd    = NULL;
     memset( &process->image_info, 0, sizeof(process->image_info) );
+#ifdef __linux__
+    process->client_poll_bitmap = NULL;
+#endif
     list_init( &process->rawinput_entry );
     list_init( &process->kernel_object );
     list_init( &process->thread_list );
@@ -800,6 +804,7 @@ static void process_destroy( struct object *obj )
     free( process->rawinput_devices );
     free( process->dir_cache );
     free( process->image );
+    /* NSPA E2: client_poll_bitmap is inside request_shm — no separate cleanup. */
 }
 
 /* dump a process on stdout for debugging purposes */

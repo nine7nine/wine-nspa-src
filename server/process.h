@@ -88,6 +88,9 @@ struct process
     struct list          rawinput_entry;  /* entry in the rawinput process list */
     struct list          kernel_object;   /* list of kernel object pointers */
     struct pe_image_info image_info;      /* main exe image info */
+#ifdef __linux__
+    volatile unsigned char *client_poll_bitmap; /* NSPA E2: per-fd bitmap in first thread's request_shm tail */
+#endif
 };
 
 /* process functions */

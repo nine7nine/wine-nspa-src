@@ -1790,6 +1790,40 @@ int create_request_shm( int *fd, struct request_shm **ptr )
     }
     return 1;
 }
+
+/* NSPA E2: create per-process bitmap for client-poll fd monitoring.
+ * One bit per unix fd. 8 KB = 65536 fds. Client sets bits for fds it
+ * monitors via io_uring; server checks in sock_get_poll_events to skip
+ * epoll monitoring for those fds. */
+#define CLIENT_POLL_BITMAP_SIZE 8192  /* 65536 bits = 65536 fds */
+
+int create_client_poll_bitmap( int *fd, volatile unsigned char **ptr )
+{
+    if ((*fd = create_temp_file( 0, CLIENT_POLL_BITMAP_SIZE )) == -1) return 0;
+
+    *ptr = mmap( NULL, CLIENT_POLL_BITMAP_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, *fd, 0 );
+    if (*ptr == MAP_FAILED)
+    {
+        close( *fd );
+        *fd = -1;
+        *ptr = NULL;
+        set_error( STATUS_NO_MEMORY );
+        return 0;
+    }
+    memset( (void *)*ptr, 0, CLIENT_POLL_BITMAP_SIZE );
+    return 1;
+}
+
+/* Check if a unix fd is client-poll monitored. */
+int is_client_poll_fd( struct process *process, int unix_fd )
+{
+    volatile unsigned char *bitmap;
+
+    if (unix_fd < 0 || unix_fd >= CLIENT_POLL_BITMAP_SIZE * 8) return 0;
+    bitmap = process->client_poll_bitmap;
+    if (!bitmap) return 0;
+    return (bitmap[unix_fd >> 3] >> (unix_fd & 7)) & 1;
+}
 #endif
 
 /* create a file mapping */

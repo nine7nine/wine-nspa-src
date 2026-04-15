@@ -143,6 +143,8 @@ extern unsigned long poll_generation;
 extern void force_exit_poll(void);
 #ifdef __linux__
 extern int create_request_shm( int *fd, struct request_shm **ptr );
+extern int is_client_poll_fd( struct process *process, int unix_fd );
+#define CLIENT_POLL_BITMAP_SIZE 8192
 #endif
 
 static inline struct fd *get_obj_fd( struct object *obj ) { return obj->ops->get_fd( obj ); }

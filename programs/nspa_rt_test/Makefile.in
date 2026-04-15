@@ -1,5 +1,6 @@
 MODULE    = nspa_rt_test.exe
 INSTALL_LIB = nspa_rt_test.exe
+IMPORTS   = ws2_32
 
 EXTRADLLFLAGS = -mconsole
 

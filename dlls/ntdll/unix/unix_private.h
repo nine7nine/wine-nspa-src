@@ -497,6 +497,15 @@ extern BOOL ntdll_io_uring_enabled(void);
 extern void ntdll_io_uring_cleanup(void);
 extern int  ntdll_io_uring_poll( int fd, short events, int timeout_ms );
 extern void ntdll_io_uring_process_completions(void);
+extern int  ntdll_io_uring_get_eventfd(void);
+extern void ntdll_client_poll_set( int unix_fd );
+extern void ntdll_client_poll_clear( int unix_fd );
+extern int  ntdll_io_uring_submit_socket_poll( int unix_fd, short events,
+                                               HANDLE handle, HANDLE wait_handle,
+                                               HANDLE event, PIO_APC_ROUTINE apc,
+                                               void *apc_user, IO_STATUS_BLOCK *io,
+                                               unsigned int options, void *sock_async,
+                                               BOOL is_send );
 extern int  ntdll_io_uring_submit_file_read( int unix_fd, int needs_close, void *buffer,
                                              ULONG already, ULONG count, HANDLE handle,
                                              HANDLE event, PIO_APC_ROUTINE apc, void *apc_user,

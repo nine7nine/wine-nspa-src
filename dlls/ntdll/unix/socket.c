@@ -27,6 +27,7 @@
 #include <errno.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <poll.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
 #ifdef HAVE_IFADDRS_H
@@ -953,6 +954,23 @@ static NTSTATUS sock_recv( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, voi
         set_async_direct_result( &wait_handle, options, io, status, information, FALSE );
     }
 
+    /* NSPA Phase 3 / E2: when the server will monitor via epoll (STATUS_PENDING)
+     * and we have a wait_handle (synchronous I/O), take over monitoring with
+     * io_uring poll.  The bitmap bit tells sock_get_poll_events to skip epoll.
+     * Overlapped sockets (wait_handle==0) use the normal server epoll path
+     * because set_async_direct_result requires a valid async handle. */
+    if (status == STATUS_PENDING && wait_handle)
+    {
+        ntdll_client_poll_set( fd );
+        if (!ntdll_io_uring_submit_socket_poll( fd, POLLIN, handle, wait_handle,
+                                                 event, apc, apc_user, io, options,
+                                                 async, FALSE ))
+        {
+            return wait_async( wait_handle, options & FILE_SYNCHRONOUS_IO_ALERT );
+        }
+        ntdll_client_poll_clear( fd );
+    }
+
     if (status != STATUS_PENDING)
         release_fileio( &async->io );
 
@@ -1126,6 +1144,124 @@ static NTSTATUS try_send( int fd, struct async_send_ioctl *async )
     return STATUS_SUCCESS;
 }
 
+
+/* -----------------------------------------------------------------------
+ * NSPA Phase 3: io_uring socket poll completion handler.
+ *
+ * Called from complete_uring_op (io_uring.c) when a POLL_ADD CQE fires
+ * for a socket.  The fd is now readable/writable.  We fetch the fd,
+ * call try_recv/try_send (which does the actual I/O + post-processing),
+ * and report the result to the server via set_async_direct_result.
+ *
+ * The uring_async_op struct is defined in io_uring.c — we access it
+ * via the opaque pointer fields stored at submission time.
+ * ----------------------------------------------------------------------- */
+
+struct uring_async_op;  /* forward declaration — defined in io_uring.c */
+
+/* These field accessors avoid pulling the full struct definition into socket.c.
+ * The struct layout is stable (pool-allocated in io_uring.c). */
+extern void *ntdll_uring_op_sock_async( struct uring_async_op *op );
+extern HANDLE ntdll_uring_op_wait_handle( struct uring_async_op *op );
+extern unsigned int ntdll_uring_op_options( struct uring_async_op *op );
+extern IO_STATUS_BLOCK *ntdll_uring_op_io( struct uring_async_op *op );
+extern BOOL ntdll_uring_op_is_send( struct uring_async_op *op );
+extern int ntdll_uring_op_poll_unix_fd( struct uring_async_op *op );
+
+void ntdll_complete_socket_poll( struct uring_async_op *op, int poll_revents )
+{
+    void *sock_async = ntdll_uring_op_sock_async( op );
+    HANDLE wait_handle = ntdll_uring_op_wait_handle( op );
+    unsigned int options = ntdll_uring_op_options( op );
+    IO_STATUS_BLOCK *io = ntdll_uring_op_io( op );
+    BOOL is_send = ntdll_uring_op_is_send( op );
+    int poll_fd = ntdll_uring_op_poll_unix_fd( op );
+
+    int fd, needs_close = FALSE;
+    NTSTATUS status;
+
+    /* NSPA E2: clear the client-poll bitmap bit now that we're handling it. */
+    ntdll_client_poll_clear( poll_fd );
+
+    if (poll_revents < 0)
+    {
+        /* poll failed (e.g. cancelled) — complete with error */
+        status = errno_to_status( -poll_revents );
+        set_async_direct_result( &wait_handle, options, io, status, 0, FALSE );
+        if (is_send)
+        {
+            struct async_send_ioctl *async = sock_async;
+            if (async->fd >= 0) close( async->fd );
+            release_fileio( &async->io );
+        }
+        else
+        {
+            release_fileio( &((struct async_recv_ioctl *)sock_async)->io );
+        }
+        return;
+    }
+
+    /* The fd is ready.  Fetch it from the server (may have changed). */
+    if (is_send)
+    {
+        struct async_send_ioctl *async = sock_async;
+        ULONG_PTR information;
+
+        needs_close = FALSE;
+        if ((fd = async->fd) == -1)
+            status = server_get_unix_fd( async->io.handle, 0, &fd, &needs_close, NULL, NULL );
+        else
+            status = STATUS_SUCCESS;
+
+        if (!status)
+        {
+            status = try_send( fd, async );
+            information = async->sent_len;
+            if (needs_close) close( fd );
+        }
+        else
+        {
+            information = 0;
+        }
+
+        if (status == STATUS_DEVICE_NOT_READY)
+            status = STATUS_PENDING;
+
+        set_async_direct_result( &wait_handle, options, io, status, information, FALSE );
+
+        if (status != STATUS_PENDING)
+        {
+            if (async->fd >= 0) close( async->fd );
+            release_fileio( &async->io );
+        }
+        /* If STATUS_PENDING, the server re-queues and will re-alert via epoll.
+         * The async_send_proc callback will handle it from there. */
+    }
+    else
+    {
+        struct async_recv_ioctl *async = sock_async;
+        ULONG_PTR information = 0;
+
+        status = server_get_unix_fd( async->io.handle, 0, &fd, &needs_close, NULL, NULL );
+
+        if (!status)
+        {
+            status = try_recv( fd, async, &information );
+            if (needs_close) close( fd );
+        }
+
+        if (status == STATUS_DEVICE_NOT_READY)
+            status = STATUS_PENDING;
+
+        set_async_direct_result( &wait_handle, options, io, status, information, FALSE );
+
+        if (status != STATUS_PENDING)
+            release_fileio( &async->io );
+        /* If STATUS_PENDING, same as send — server re-queues via epoll. */
+    }
+}
+
+
 static BOOL async_send_proc( void *user, ULONG_PTR *info, unsigned int *status )
 {
     struct async_send_ioctl *async = user;
@@ -1273,6 +1409,19 @@ static NTSTATUS sock_send( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, voi
         }
 
         set_async_direct_result( &wait_handle, options, io, status, async->sent_len, FALSE );
+    }
+
+    /* NSPA Phase 3 / E2: same as recv — synchronous send only. */
+    if (status == STATUS_PENDING && wait_handle && !async->sent_len)
+    {
+        ntdll_client_poll_set( fd );
+        if (!ntdll_io_uring_submit_socket_poll( fd, POLLOUT, handle, wait_handle,
+                                                 event, apc, apc_user, io, options,
+                                                 async, TRUE ))
+        {
+            return wait_async( wait_handle, options & FILE_SYNCHRONOUS_IO_ALERT );
+        }
+        ntdll_client_poll_clear( fd );
     }
 
     if (status != STATUS_PENDING)

@@ -316,57 +316,89 @@ struct nspa_shm_boost_state
     int prio;    /* original rt_priority */
 };
 
-/* Boost the wineserver dispatch thread to match our own RT priority
- * iff (a) we are SCHED_FIFO or SCHED_RR, (b) the server's TID has been
- * published to the shm, and (c) the server's current priority is below
- * ours. On failure (e.g. server is already at/above our priority, or
- * we're not RT), leaves saved->tid == 0 so nspa_shm_pi_unboost is a no-op. */
+/* Per-thread cache of the wineserver dispatch thread's base scheduling
+ * state (before any boost). Populated once on the first PI boost via
+ * sched_getscheduler/sched_getparam, then reused for all subsequent
+ * unboosts. This avoids querying the server's state on every request. */
+static __thread int nspa_srv_base_policy = -1;  /* -1 = not yet cached */
+static __thread int nspa_srv_base_prio;
+
+/* NSPA v2.5: simplified PI boost using cached RT state.
+ *
+ * Boost the wineserver dispatch thread to match our own RT priority.
+ *
+ * Our own state: uses per-thread cached policy+prio when available
+ * (populated by nspa_rt_apply_tid on self-promotion). Falls back to
+ * sched_getscheduler(0) + sched_getparam(0) on cache miss (e.g.
+ * cross-thread promotion or Tier 2), then populates the cache.
+ *
+ * Server's base state: queried once (first boost) and cached in TLS.
+ *
+ * Steady-state cost for RT threads: 1 boost + 1 unboost = 2 syscalls.
+ * Non-RT threads: 1 syscall (sched_getscheduler) then fast-out.
+ * Previous cost: 4 query + 1 boost + 1 unboost = 6 syscalls. */
 static void nspa_shm_pi_boost( volatile struct request_shm *shm,
                                 struct nspa_shm_boost_state *saved )
 {
-    struct sched_param my_param, srv_param;
-    int my_policy, srv_policy, srv_tid;
+    struct ntdll_thread_data *data = ntdll_get_thread_data();
+    struct sched_param param;
+    int my_policy, my_prio, srv_tid;
 
     saved->tid = 0;
 
-    /* Fast out: only bother if we're RT. SCHED_OTHER clients don't need
-     * the wineserver boosted; it's already running at SCHED_FIFO (v1.1). */
-    my_policy = sched_getscheduler( 0 );
-    if (my_policy != SCHED_FIFO && my_policy != SCHED_RR)
-        return;
-    if (sched_getparam( 0, &my_param ) < 0)
-        return;
-    if (my_param.sched_priority <= 0)
-        return;
+    /* Check our RT state. The cache (nspa_rt_cached_prio) is populated by
+     * nspa_rt_apply_tid(0, ...) for Tier 1 self-promotion. If the cache is
+     * empty (prio == 0), fall back to the syscall — covers cross-thread
+     * promotion and Tier 2 server-side scheduling. */
+    my_prio = data->nspa_rt_cached_prio;
+    my_policy = data->nspa_rt_cached_policy;
+
+    if (my_prio <= 0)
+    {
+        /* Cache miss — query the kernel and populate. */
+        my_policy = sched_getscheduler( 0 );
+        if (my_policy != SCHED_FIFO && my_policy != SCHED_RR)
+            return;
+        if (sched_getparam( 0, &param ) < 0 || param.sched_priority <= 0)
+            return;
+        my_prio = param.sched_priority;
+        /* Populate cache so subsequent requests skip the syscalls. */
+        data->nspa_rt_cached_policy = my_policy;
+        data->nspa_rt_cached_prio   = my_prio;
+    }
 
     /* Acquire pairs with the dispatch thread's release store. */
     srv_tid = __atomic_load_n( &shm->server_dispatch_tid, __ATOMIC_ACQUIRE );
     if (srv_tid <= 0)
         return;
 
-    srv_policy = sched_getscheduler( srv_tid );
-    if (srv_policy < 0)
-        return;
-    if (sched_getparam( srv_tid, &srv_param ) < 0)
-        return;
-
-    /* Skip the boost if the server is already at-or-above our priority in
-     * the same RT class. This matches the POSIX PI semantics: no lowering. */
-    if ((srv_policy == SCHED_FIFO || srv_policy == SCHED_RR) &&
-        srv_param.sched_priority >= my_param.sched_priority)
-        return;
-
-    /* Stash original state so we can restore it. */
-    saved->tid    = srv_tid;
-    saved->policy = srv_policy;
-    saved->prio   = srv_param.sched_priority;
-
-    /* Boost to MATCH our policy (FIFO or RR) and our priority. */
-    if (sched_setscheduler( srv_tid, my_policy, &my_param ) < 0)
+    /* Cache the server dispatch thread's base scheduling state on first
+     * boost. This is stable — the server sets it once at startup and never
+     * changes it (only we boost/unboost it transiently). */
+    if (nspa_srv_base_policy < 0)
     {
-        /* Most likely EPERM — not enough caps. Treat as "no boost done"
-         * so restore is a no-op. Wine should have RLIMIT_RTPRIO from
-         * v1 setup, so this shouldn't normally happen. */
+        struct sched_param srv_param;
+        nspa_srv_base_policy = sched_getscheduler( srv_tid );
+        if (nspa_srv_base_policy < 0)
+            nspa_srv_base_policy = SCHED_FIFO;
+        if (sched_getparam( srv_tid, &srv_param ) == 0)
+            nspa_srv_base_prio = srv_param.sched_priority;
+        else
+            nspa_srv_base_prio = 1;
+    }
+
+    /* Skip if server is already at or above our priority. */
+    if ((nspa_srv_base_policy == SCHED_FIFO || nspa_srv_base_policy == SCHED_RR) &&
+        nspa_srv_base_prio >= my_prio)
+        return;
+
+    saved->tid    = srv_tid;
+    saved->policy = nspa_srv_base_policy;
+    saved->prio   = nspa_srv_base_prio;
+
+    param.sched_priority = my_prio;
+    if (sched_setscheduler( srv_tid, my_policy, &param ) < 0)
+    {
         saved->tid = 0;
     }
 }
@@ -918,6 +950,9 @@ unsigned int server_select( const union select_op *select_op, data_size_t size, 
         struct context_data context[2];
     } reply_data;
 
+    /* drain any pending io_uring completions before blocking */
+    ntdll_io_uring_process_completions();
+
     memset( &result, 0, sizeof(result) );
 
     do
@@ -983,6 +1018,8 @@ unsigned int server_wait( const union select_op *select_op, data_size_t size, UI
     timeout_t abs_timeout = timeout ? timeout->QuadPart : TIMEOUT_INFINITE;
     unsigned int ret;
     struct user_apc apc;
+
+    ntdll_io_uring_process_completions();
 
     if (abs_timeout < 0)
     {

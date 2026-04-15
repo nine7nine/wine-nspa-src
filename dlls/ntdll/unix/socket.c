@@ -959,16 +959,18 @@ static NTSTATUS sock_recv( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, voi
      * Sync: CQE handler calls set_async_direct_result directly.
      * Overlapped: CQE handler defers file_complete_async via
      * ntdll_io_uring_defer_completion (flushed after linux_wait_objs). */
-    /* NSPA Phase 3 / E2: sync sockets only. Overlapped needs deferred
-     * completion outside the ntsync ioctl stack (future work). */
-    if (status == STATUS_PENDING && wait_handle)
+    /* NSPA Phase 3 / E2: sync + overlapped. Overlapped completions are
+     * deferred and flushed in NtWaitForSingleObject after inproc_wait. */
+    if (status == STATUS_PENDING)
     {
         ntdll_client_poll_set( fd );
         if (!ntdll_io_uring_submit_socket_poll( fd, POLLIN, handle, wait_handle,
                                                  event, apc, apc_user, io, options,
                                                  async, FALSE ))
         {
-            return wait_async( wait_handle, options & FILE_SYNCHRONOUS_IO_ALERT );
+            if (wait_handle)
+                return wait_async( wait_handle, options & FILE_SYNCHRONOUS_IO_ALERT );
+            return STATUS_PENDING;
         }
         ntdll_client_poll_clear( fd );
     }
@@ -1189,15 +1191,13 @@ static void complete_socket_poll_result( struct uring_async_op *op, HANDLE wait_
     }
     else
     {
-        /* Overlapped: defer the completion — file_complete_async is unsafe
-         * from inside the ntsync CQ drain context (nested exception on
-         * signal stack). The deferred queue is flushed by
-         * ntdll_io_uring_flush_deferred() after linux_wait_objs returns. */
-        ntdll_io_uring_defer_completion( ntdll_uring_op_handle( op ), options,
-                                         ntdll_uring_op_event( op ),
-                                         ntdll_uring_op_apc( op ),
-                                         ntdll_uring_op_apc_user( op ),
-                                         io, status, information );
+        /* Overlapped: this function is called from flush_deferred (safe
+         * context, outside ntsync). file_complete_async is safe here. */
+        file_complete_async( ntdll_uring_op_handle( op ), options,
+                             ntdll_uring_op_event( op ),
+                             ntdll_uring_op_apc( op ),
+                             ntdll_uring_op_apc_user( op ),
+                             io, status, information );
     }
 }
 
@@ -1439,15 +1439,17 @@ static NTSTATUS sock_send( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, voi
         set_async_direct_result( &wait_handle, options, io, status, async->sent_len, FALSE );
     }
 
-    /* NSPA Phase 3 / E2: sync sockets only. */
-    if (status == STATUS_PENDING && wait_handle && !async->sent_len)
+    /* NSPA Phase 3 / E2: sync + overlapped. */
+    if (status == STATUS_PENDING && !async->sent_len)
     {
         ntdll_client_poll_set( fd );
         if (!ntdll_io_uring_submit_socket_poll( fd, POLLOUT, handle, wait_handle,
                                                  event, apc, apc_user, io, options,
                                                  async, TRUE ))
         {
-            return wait_async( wait_handle, options & FILE_SYNCHRONOUS_IO_ALERT );
+            if (wait_handle)
+                return wait_async( wait_handle, options & FILE_SYNCHRONOUS_IO_ALERT );
+            return STATUS_PENDING;
         }
         ntdll_client_poll_clear( fd );
     }

@@ -1259,12 +1259,7 @@ static NTSTATUS inproc_wait( DWORD count, const HANDLE *handles, WAIT_TYPE type,
         ret = linux_wait_objs( inproc_device_fd, count, objs, type,
                                alert_fd, uring_fd, timeout );
         if (ret == STATUS_URING_COMPLETION)
-        {
             ntdll_io_uring_process_completions();
-            /* Flush deferred completions (overlapped socket I/O) in a
-             * safe context — outside the ntsync ioctl. */
-            ntdll_io_uring_flush_deferred();
-        }
     } while (ret == STATUS_URING_COMPLETION);
 
     while (count--) release_inproc_sync( syncs[count] );
@@ -2710,6 +2705,7 @@ NTSTATUS WINAPI NtWaitForMultipleObjects( DWORD count, const HANDLE *handles, WA
 
     if ((ret = inproc_wait( count, handles, type, alertable, timeout )) != STATUS_NOT_IMPLEMENTED)
     {
+        ntdll_io_uring_flush_deferred();
         TRACE( "-> %#x\n", ret );
         return ret;
     }
@@ -2736,6 +2732,9 @@ NTSTATUS WINAPI NtWaitForSingleObject( HANDLE handle, BOOLEAN alertable, const L
 
     if ((ret = inproc_wait( 1, &handle, WaitAny, alertable, timeout )) != STATUS_NOT_IMPLEMENTED)
     {
+        /* NSPA Phase 3: flush deferred socket completions AFTER inproc_wait
+         * returns — safe context, fully outside the ntsync ioctl stack. */
+        ntdll_io_uring_flush_deferred();
         TRACE( "-> %#x\n", ret );
         return ret;
     }

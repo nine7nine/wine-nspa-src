@@ -1259,7 +1259,12 @@ static NTSTATUS inproc_wait( DWORD count, const HANDLE *handles, WAIT_TYPE type,
         ret = linux_wait_objs( inproc_device_fd, count, objs, type,
                                alert_fd, uring_fd, timeout );
         if (ret == STATUS_URING_COMPLETION)
+        {
             ntdll_io_uring_process_completions();
+            /* Flush deferred completions (overlapped socket I/O) in a
+             * safe context — outside the ntsync ioctl. */
+            ntdll_io_uring_flush_deferred();
+        }
     } while (ret == STATUS_URING_COMPLETION);
 
     while (count--) release_inproc_sync( syncs[count] );
@@ -1297,7 +1302,10 @@ static NTSTATUS inproc_signal_and_wait( HANDLE signal, HANDLE wait,
             ret = linux_wait_objs( inproc_device_fd, 1, &wait_sync->fd, WaitAny,
                                    alert_fd, uring_fd, timeout );
             if (ret == STATUS_URING_COMPLETION)
+            {
                 ntdll_io_uring_process_completions();
+                ntdll_io_uring_flush_deferred();
+            }
         } while (ret == STATUS_URING_COMPLETION);
     }
 

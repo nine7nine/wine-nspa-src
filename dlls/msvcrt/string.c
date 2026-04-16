@@ -34,6 +34,10 @@
 #include "wine/asm.h"
 #include "wine/debug.h"
 
+#if defined(__i386__) || (defined(__x86_64__) && !defined(__arm64ec__))
+#include <immintrin.h>
+#endif
+
 WINE_DEFAULT_DEBUG_CHANNEL(msvcrt);
 
 struct MSVCRT__LDOUBLE
@@ -2788,377 +2792,426 @@ int __cdecl memcmp(const void *ptr1, const void *ptr2, size_t n)
 
 #if defined(__i386__) || (defined(__x86_64__) && !defined(__arm64ec__))
 
-#ifdef __i386__
+#define likely(x) __builtin_expect(!!(x), 1)
+#define unlikely(x) __builtin_expect(!!(x), 0)
 
-#define DEST_REG "%edi"
-#define SRC_REG "%esi"
-#define LEN_REG "%ecx"
-#define TMP_REG "%edx"
+/*
+ * Small-copy fast path: handles n <= 32 using overlapping load/store pairs.
+ * No vector registers touched — pure scalar. Handles n == 0 (falls through).
+ */
+static FORCEINLINE void memmove_c_unaligned_32(char *d, const char *s, size_t n)
+{
+    typedef uint64_t DECLSPEC_ALIGN(1) unaligned_ui64;
+    typedef uint32_t DECLSPEC_ALIGN(1) unaligned_ui32;
+    typedef uint16_t DECLSPEC_ALIGN(1) unaligned_ui16;
+    uint64_t tmp0, tmp1, tmp2, tmpn;
 
-#define MEMMOVE_INIT \
-    "pushl " SRC_REG "\n\t" \
-    __ASM_CFI(".cfi_adjust_cfa_offset 4\n\t") \
-    "pushl " DEST_REG "\n\t" \
-    __ASM_CFI(".cfi_adjust_cfa_offset 4\n\t") \
-    "movl 12(%esp), " DEST_REG "\n\t" \
-    "movl 16(%esp), " SRC_REG "\n\t" \
-    "movl 20(%esp), " LEN_REG "\n\t"
+    if (unlikely(n >= 24))
+    {
+        tmp0 = *(unaligned_ui64 *)s;
+        tmp1 = *(unaligned_ui64 *)(s + 8);
+        tmp2 = *(unaligned_ui64 *)(s + 16);
+        tmpn = *(unaligned_ui64 *)(s + n - 8);
+        *(unaligned_ui64 *)d = tmp0;
+        *(unaligned_ui64 *)(d + 8) = tmp1;
+        *(unaligned_ui64 *)(d + 16) = tmp2;
+        *(unaligned_ui64 *)(d + n - 8) = tmpn;
+    }
+    else if (unlikely(n >= 16))
+    {
+        tmp0 = *(unaligned_ui64 *)s;
+        tmp1 = *(unaligned_ui64 *)(s + 8);
+        tmpn = *(unaligned_ui64 *)(s + n - 8);
+        *(unaligned_ui64 *)d = tmp0;
+        *(unaligned_ui64 *)(d + 8) = tmp1;
+        *(unaligned_ui64 *)(d + n - 8) = tmpn;
+    }
+    else if (unlikely(n >= 8))
+    {
+        tmp0 = *(unaligned_ui64 *)s;
+        tmpn = *(unaligned_ui64 *)(s + n - 8);
+        *(unaligned_ui64 *)d = tmp0;
+        *(unaligned_ui64 *)(d + n - 8) = tmpn;
+    }
+    else if (unlikely(n >= 4))
+    {
+        tmp0 = *(unaligned_ui32 *)s;
+        tmpn = *(unaligned_ui32 *)(s + n - 4);
+        *(unaligned_ui32 *)d = (uint32_t)tmp0;
+        *(unaligned_ui32 *)(d + n - 4) = (uint32_t)tmpn;
+    }
+    else if (unlikely(n >= 2))
+    {
+        tmp0 = *(unaligned_ui16 *)s;
+        tmpn = *(unaligned_ui16 *)(s + n - 2);
+        *(unaligned_ui16 *)d = (uint16_t)tmp0;
+        *(unaligned_ui16 *)(d + n - 2) = (uint16_t)tmpn;
+    }
+    else if (likely(n >= 1))
+    {
+        *(uint8_t *)d = *(uint8_t *)s;
+    }
+}
 
-#define MEMMOVE_CLEANUP \
-    "movl 12(%esp), %eax\n\t" \
-    "popl " DEST_REG "\n\t" \
-    __ASM_CFI(".cfi_adjust_cfa_offset -4\n\t") \
-    "popl " SRC_REG "\n\t" \
-    __ASM_CFI(".cfi_adjust_cfa_offset -4\n\t")
+/*
+ * Scalar (non-SIMD) memmove for systems without SSE2.
+ * Copies 48 bytes/iter forward, 48 bytes/iter backward.
+ */
+static void *__cdecl memmove_c(char *d, const char *s, size_t n)
+{
+    typedef uint64_t DECLSPEC_ALIGN(1) unaligned_ui64;
 
+    if (likely(n <= 32))
+    {
+        memmove_c_unaligned_32(d, s, n);
+    }
+    else if (d <= s)
+    {
+        uint64_t tmp0, tmp1, tmp2;
+        size_t k = 0;
+        while (unlikely(n >= 48))
+        {
+            tmp0 = *(unaligned_ui64 *)(s +  0);
+            tmp1 = *(unaligned_ui64 *)(s +  8);
+            tmp2 = *(unaligned_ui64 *)(s + 16);
+            *(unaligned_ui64 *)(d +  0) = tmp0;
+            *(unaligned_ui64 *)(d +  8) = tmp1;
+            *(unaligned_ui64 *)(d + 16) = tmp2;
+            tmp0 = *(unaligned_ui64 *)(s + 24);
+            tmp1 = *(unaligned_ui64 *)(s + 32);
+            tmp2 = *(unaligned_ui64 *)(s + 40);
+            *(unaligned_ui64 *)(d + 24) = tmp0;
+            *(unaligned_ui64 *)(d + 32) = tmp1;
+            *(unaligned_ui64 *)(d + 40) = tmp2;
+            d += 48; s += 48; n -= 48; k += 48;
+        }
+        while (unlikely(n >= 24))
+        {
+            tmp0 = *(unaligned_ui64 *)(s +  0);
+            tmp1 = *(unaligned_ui64 *)(s +  8);
+            tmp2 = *(unaligned_ui64 *)(s + 16);
+            *(unaligned_ui64 *)(d +  0) = tmp0;
+            *(unaligned_ui64 *)(d +  8) = tmp1;
+            *(unaligned_ui64 *)(d + 16) = tmp2;
+            d += 24; s += 24; n -= 24; k += 24;
+        }
+        memmove_c_unaligned_32(d, s, n);
+        return d - k;
+    }
+    else
+    {
+        uint64_t tmp0, tmp1, tmp2;
+        size_t k = n;
+        while (unlikely(k >= 48))
+        {
+            tmp0 = *(unaligned_ui64 *)(s + k -  8);
+            tmp1 = *(unaligned_ui64 *)(s + k - 16);
+            tmp2 = *(unaligned_ui64 *)(s + k - 24);
+            *(unaligned_ui64 *)(d + k -  8) = tmp0;
+            *(unaligned_ui64 *)(d + k - 16) = tmp1;
+            *(unaligned_ui64 *)(d + k - 24) = tmp2;
+            tmp0 = *(unaligned_ui64 *)(s + k - 32);
+            tmp1 = *(unaligned_ui64 *)(s + k - 40);
+            tmp2 = *(unaligned_ui64 *)(s + k - 48);
+            *(unaligned_ui64 *)(d + k - 32) = tmp0;
+            *(unaligned_ui64 *)(d + k - 40) = tmp1;
+            *(unaligned_ui64 *)(d + k - 48) = tmp2;
+            k -= 48;
+        }
+        while (unlikely(k >= 24))
+        {
+            tmp0 = *(unaligned_ui64 *)(s + k -  8);
+            tmp1 = *(unaligned_ui64 *)(s + k - 16);
+            tmp2 = *(unaligned_ui64 *)(s + k - 24);
+            *(unaligned_ui64 *)(d + k -  8) = tmp0;
+            *(unaligned_ui64 *)(d + k - 16) = tmp1;
+            *(unaligned_ui64 *)(d + k - 24) = tmp2;
+            k -= 24;
+        }
+        memmove_c_unaligned_32(d, s, k);
+    }
+    return d;
+}
+
+/*
+ * Macro templates for generating SSE2 and AVX memmove variants.
+ *
+ * MEMMOVEV_UNALIGNED_DECLARE: handles n <= 6*size using overlapping
+ * unaligned load/store pairs (no alignment loop needed).
+ *
+ * MEMMOVEV_DECLARE: full memmove with destination-aligned bulk loop.
+ * Forward: align dest, copy 12*size/iter, then 6*size cleanup.
+ * Backward: align dest end, copy 12*size/iter backward, then cleanup.
+ */
+#define MEMMOVEV_UNALIGNED_DECLARE(name, type, size, loadu, storeu) \
+static FORCEINLINE void memmove_ ## name ## _unaligned(char *d, const char *s, size_t n) \
+{ \
+    type tmp0, tmp1, tmp2, tmp3, tmp4, tmp5; \
+    if (unlikely(n > 4 * size)) \
+    { \
+        tmp0 = loadu((type *)(s + 0 * size)); \
+        tmp1 = loadu((type *)(s + 1 * size)); \
+        tmp2 = loadu((type *)(s + 2 * size)); \
+        tmp3 = loadu((type *)(s + n - 3 * size)); \
+        tmp4 = loadu((type *)(s + n - 2 * size)); \
+        tmp5 = loadu((type *)(s + n - 1 * size)); \
+        storeu((type *)(d + 0 * size), tmp0); \
+        storeu((type *)(d + 1 * size), tmp1); \
+        storeu((type *)(d + 2 * size), tmp2); \
+        storeu((type *)(d + n - 3 * size), tmp3); \
+        storeu((type *)(d + n - 2 * size), tmp4); \
+        storeu((type *)(d + n - 1 * size), tmp5); \
+    } \
+    else if (unlikely(n > size * 2)) \
+    { \
+        tmp0 = loadu((type *)(s + 0 * size)); \
+        tmp1 = loadu((type *)(s + 1 * size)); \
+        tmp2 = loadu((type *)(s + n - 2 * size)); \
+        tmp3 = loadu((type *)(s + n - 1 * size)); \
+        storeu((type *)(d + 0 * size), tmp0); \
+        storeu((type *)(d + 1 * size), tmp1); \
+        storeu((type *)(d + n - 2 * size), tmp2); \
+        storeu((type *)(d + n - 1 * size), tmp3); \
+    } \
+    else if (unlikely(n > size)) \
+    { \
+        tmp0 = loadu((type *)(s + 0 * size)); \
+        tmp1 = loadu((type *)(s + n - 1 * size)); \
+        storeu((type *)(d + 0 * size), tmp0); \
+        storeu((type *)(d + n - 1 * size), tmp1); \
+    } \
+    else memmove_c_unaligned_32(d, s, n); \
+}
+
+#define MEMMOVEV_DECLARE(name, type, size, loadu, storeu, store, cleanup) \
+static void *__cdecl memmove_ ## name(char *d, const char *s, size_t n) \
+{ \
+    if (likely(n <= 6 * size)) \
+    { \
+        memmove_ ## name ## _unaligned(d, s, n); \
+        cleanup; \
+        return d; \
+    } \
+    if (d <= s) \
+    { \
+        type tmp0, tmp1, tmp2, tmp3, tmp4, tmp5; \
+        size_t k = (size - ((uintptr_t)d & (size - 1))); \
+        tmp0 = loadu((type *)s); \
+        tmp1 = loadu((type *)(s + k + 0 * size)); \
+        tmp2 = loadu((type *)(s + k + 1 * size)); \
+        tmp3 = loadu((type *)(s + k + 2 * size)); \
+        tmp4 = loadu((type *)(s + k + 3 * size)); \
+        tmp5 = loadu((type *)(s + k + 4 * size)); \
+        storeu((type *)d, tmp0); \
+        store((type *)(d + k + 0 * size), tmp1); \
+        store((type *)(d + k + 1 * size), tmp2); \
+        store((type *)(d + k + 2 * size), tmp3); \
+        store((type *)(d + k + 3 * size), tmp4); \
+        store((type *)(d + k + 4 * size), tmp5); \
+        k += 5 * size; d += k; s += k; n -= k; \
+        while (unlikely(n >= 12 * size)) \
+        { \
+            tmp0 = loadu((type *)(s + 0 * size)); \
+            tmp1 = loadu((type *)(s + 1 * size)); \
+            tmp2 = loadu((type *)(s + 2 * size)); \
+            tmp3 = loadu((type *)(s + 3 * size)); \
+            tmp4 = loadu((type *)(s + 4 * size)); \
+            tmp5 = loadu((type *)(s + 5 * size)); \
+            store((type *)(d + 0 * size), tmp0); \
+            store((type *)(d + 1 * size), tmp1); \
+            store((type *)(d + 2 * size), tmp2); \
+            store((type *)(d + 3 * size), tmp3); \
+            store((type *)(d + 4 * size), tmp4); \
+            store((type *)(d + 5 * size), tmp5); \
+            tmp0 = loadu((type *)(s +  6 * size)); \
+            tmp1 = loadu((type *)(s +  7 * size)); \
+            tmp2 = loadu((type *)(s +  8 * size)); \
+            tmp3 = loadu((type *)(s +  9 * size)); \
+            tmp4 = loadu((type *)(s + 10 * size)); \
+            tmp5 = loadu((type *)(s + 11 * size)); \
+            store((type *)(d +  6 * size), tmp0); \
+            store((type *)(d +  7 * size), tmp1); \
+            store((type *)(d +  8 * size), tmp2); \
+            store((type *)(d +  9 * size), tmp3); \
+            store((type *)(d + 10 * size), tmp4); \
+            store((type *)(d + 11 * size), tmp5); \
+            d += 12 * size; s += 12 * size; n -= 12 * size; k += 12 * size; \
+        } \
+        while (unlikely(n >= 6 * size)) \
+        { \
+            tmp0 = loadu((type *)(s + 0 * size)); \
+            tmp1 = loadu((type *)(s + 1 * size)); \
+            tmp2 = loadu((type *)(s + 2 * size)); \
+            tmp3 = loadu((type *)(s + 3 * size)); \
+            tmp4 = loadu((type *)(s + 4 * size)); \
+            tmp5 = loadu((type *)(s + 5 * size)); \
+            store((type *)(d + 0 * size), tmp0); \
+            store((type *)(d + 1 * size), tmp1); \
+            store((type *)(d + 2 * size), tmp2); \
+            store((type *)(d + 3 * size), tmp3); \
+            store((type *)(d + 4 * size), tmp4); \
+            store((type *)(d + 5 * size), tmp5); \
+            d += 6 * size; s += 6 * size; n -= 6 * size; k += 6 * size; \
+        } \
+        memmove_ ## name ## _unaligned(d, s, n); \
+        cleanup; \
+        return d - k; \
+    } \
+    else \
+    { \
+        type tmp0, tmp1, tmp2, tmp3, tmp4, tmp5; \
+        size_t k = n - ((uintptr_t)(d + n) & (size - 1)); \
+        tmp0 = loadu((type *)(s + n - 1 * size)); \
+        tmp1 = loadu((type *)(s + k - 1 * size)); \
+        tmp2 = loadu((type *)(s + k - 2 * size)); \
+        tmp3 = loadu((type *)(s + k - 3 * size)); \
+        tmp4 = loadu((type *)(s + k - 4 * size)); \
+        tmp5 = loadu((type *)(s + k - 5 * size)); \
+        storeu((type *)(d + n - 1 * size), tmp0); \
+        store((type *)(d + k - 1 * size), tmp1); \
+        store((type *)(d + k - 2 * size), tmp2); \
+        store((type *)(d + k - 3 * size), tmp3); \
+        store((type *)(d + k - 4 * size), tmp4); \
+        store((type *)(d + k - 5 * size), tmp5); \
+        k -= 5 * size; \
+        while (unlikely(k >= 12 * size)) \
+        { \
+            tmp0 = loadu((type *)(s + k - 1 * size)); \
+            tmp1 = loadu((type *)(s + k - 2 * size)); \
+            tmp2 = loadu((type *)(s + k - 3 * size)); \
+            tmp3 = loadu((type *)(s + k - 4 * size)); \
+            tmp4 = loadu((type *)(s + k - 5 * size)); \
+            tmp5 = loadu((type *)(s + k - 6 * size)); \
+            store((type *)(d + k - 1 * size), tmp0); \
+            store((type *)(d + k - 2 * size), tmp1); \
+            store((type *)(d + k - 3 * size), tmp2); \
+            store((type *)(d + k - 4 * size), tmp3); \
+            store((type *)(d + k - 5 * size), tmp4); \
+            store((type *)(d + k - 6 * size), tmp5); \
+            tmp0 = loadu((type *)(s + k -  7 * size)); \
+            tmp1 = loadu((type *)(s + k -  8 * size)); \
+            tmp2 = loadu((type *)(s + k -  9 * size)); \
+            tmp3 = loadu((type *)(s + k - 10 * size)); \
+            tmp4 = loadu((type *)(s + k - 11 * size)); \
+            tmp5 = loadu((type *)(s + k - 12 * size)); \
+            store((type *)(d + k -  7 * size), tmp0); \
+            store((type *)(d + k -  8 * size), tmp1); \
+            store((type *)(d + k -  9 * size), tmp2); \
+            store((type *)(d + k - 10 * size), tmp3); \
+            store((type *)(d + k - 11 * size), tmp4); \
+            store((type *)(d + k - 12 * size), tmp5); \
+            k -= 12 * size; \
+        } \
+        while (unlikely(k >= 6 * size)) \
+        { \
+            tmp0 = loadu((type *)(s + k - 1 * size)); \
+            tmp1 = loadu((type *)(s + k - 2 * size)); \
+            tmp2 = loadu((type *)(s + k - 3 * size)); \
+            tmp3 = loadu((type *)(s + k - 4 * size)); \
+            tmp4 = loadu((type *)(s + k - 5 * size)); \
+            tmp5 = loadu((type *)(s + k - 6 * size)); \
+            store((type *)(d + k - 1 * size), tmp0); \
+            store((type *)(d + k - 2 * size), tmp1); \
+            store((type *)(d + k - 3 * size), tmp2); \
+            store((type *)(d + k - 4 * size), tmp3); \
+            store((type *)(d + k - 5 * size), tmp4); \
+            store((type *)(d + k - 6 * size), tmp5); \
+            k -= 6 * size; \
+        } \
+        memmove_ ## name ## _unaligned(d, s, k); \
+        cleanup; \
+    } \
+    return d; \
+}
+
+/* --- SSE2 variant (128-bit, 16 bytes/vector) --- */
+
+#ifndef __SSE2__
+#ifdef __clang__
+#pragma clang attribute push (__attribute__((target("sse2"))), apply_to=function)
 #else
-
-#define DEST_REG "%rdi"
-#define SRC_REG "%rsi"
-#define LEN_REG "%r8"
-#define TMP_REG "%r9"
-
-#define MEMMOVE_INIT \
-    "pushq " SRC_REG "\n\t" \
-    __ASM_SEH(".seh_pushreg " SRC_REG "\n\t") \
-    __ASM_CFI(".cfi_adjust_cfa_offset 8\n\t") \
-    "pushq " DEST_REG "\n\t" \
-    __ASM_SEH(".seh_pushreg " DEST_REG "\n\t") \
-    __ASM_SEH(".seh_endprologue\n\t") \
-    __ASM_CFI(".cfi_adjust_cfa_offset 8\n\t") \
-    "movq %rcx, " DEST_REG "\n\t" \
-    "movq %rdx, " SRC_REG "\n\t"
-
-#define MEMMOVE_CLEANUP \
-    "movq %rcx, %rax\n\t" \
-    "popq " DEST_REG "\n\t" \
-    __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t") \
-    "popq " SRC_REG "\n\t" \
-    __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
+#pragma GCC push_options
+#pragma GCC target("sse2")
+#endif
+#define WINE_DISABLE_SSE2
 #endif
 
-void * __cdecl sse2_memmove(void *dst, const void *src, size_t n);
-__ASM_GLOBAL_FUNC( sse2_memmove,
-        MEMMOVE_INIT
-        "mov " DEST_REG ", " TMP_REG "\n\t" /* check copying direction */
-        "sub " SRC_REG ", " TMP_REG "\n\t"
-        "cmp " LEN_REG ", " TMP_REG "\n\t"
-        "jb copy_bwd\n\t"
-        /* copy forwards */
-        "cmp $4, " LEN_REG "\n\t" /* 4-bytes align */
-        "jb copy_fwd3\n\t"
-        "mov " DEST_REG ", " TMP_REG "\n\t"
-        "shr $1, " TMP_REG "\n\t"
-        "jnc 1f\n\t"
-        "movsb\n\t"
-        "dec " LEN_REG "\n\t"
-        "inc " TMP_REG "\n\t"
-        "1:\n\t"
-        "shr $1, " TMP_REG "\n\t"
-        "jnc 1f\n\t"
-        "movsw\n\t"
-        "sub $2, " LEN_REG "\n\t"
-        "inc " TMP_REG "\n\t"
-        "1:\n\t" /* 16-bytes align */
-        "cmp $16, " LEN_REG "\n\t"
-        "jb copy_fwd15\n\t"
-        "shr $1, " TMP_REG "\n\t"
-        "jnc 1f\n\t"
-        "movsl\n\t"
-        "sub $4, " LEN_REG "\n\t"
-        "inc " TMP_REG "\n\t"
-        "1:\n\t"
-        "shr $1, " TMP_REG "\n\t"
-        "jnc 1f\n\t"
-        "movsl\n\t"
-        "movsl\n\t"
-        "sub $8, " LEN_REG "\n\t"
-        "1:\n\t"
-        "cmp $64, " LEN_REG "\n\t"
-        "jb copy_fwd63\n\t"
-        "1:\n\t" /* copy 64-bytes blocks in loop, dest 16-bytes aligned */
-        "movdqu 0x00(" SRC_REG "), %xmm0\n\t"
-        "movdqu 0x10(" SRC_REG "), %xmm1\n\t"
-        "movdqu 0x20(" SRC_REG "), %xmm2\n\t"
-        "movdqu 0x30(" SRC_REG "), %xmm3\n\t"
-        "movdqa %xmm0, 0x00(" DEST_REG ")\n\t"
-        "movdqa %xmm1, 0x10(" DEST_REG ")\n\t"
-        "movdqa %xmm2, 0x20(" DEST_REG ")\n\t"
-        "movdqa %xmm3, 0x30(" DEST_REG ")\n\t"
-        "add $64, " SRC_REG "\n\t"
-        "add $64, " DEST_REG "\n\t"
-        "sub $64, " LEN_REG "\n\t"
-        "cmp $64, " LEN_REG "\n\t"
-        "jae 1b\n\t"
-        "copy_fwd63:\n\t" /* copy last 63 bytes, dest 16-bytes aligned */
-        "mov " LEN_REG ", " TMP_REG "\n\t"
-        "and $15, " LEN_REG "\n\t"
-        "shr $5, " TMP_REG "\n\t"
-        "jnc 1f\n\t"
-        "movdqu 0(" SRC_REG "), %xmm0\n\t"
-        "movdqa %xmm0, 0(" DEST_REG ")\n\t"
-        "add $16, " SRC_REG "\n\t"
-        "add $16, " DEST_REG "\n\t"
-        "1:\n\t"
-        "shr $1, " TMP_REG "\n\t"
-        "jnc copy_fwd15\n\t"
-        "movdqu 0x00(" SRC_REG "), %xmm0\n\t"
-        "movdqu 0x10(" SRC_REG "), %xmm1\n\t"
-        "movdqa %xmm0, 0x00(" DEST_REG ")\n\t"
-        "movdqa %xmm1, 0x10(" DEST_REG ")\n\t"
-        "add $32, " SRC_REG "\n\t"
-        "add $32, " DEST_REG "\n\t"
-        "copy_fwd15:\n\t" /* copy last 15 bytes, dest 4-bytes aligned */
-        "mov " LEN_REG ", " TMP_REG "\n\t"
-        "and $3, " LEN_REG "\n\t"
-        "shr $3, " TMP_REG "\n\t"
-        "jnc 1f\n\t"
-        "movsl\n\t"
-        "1:\n\t"
-        "shr $1, " TMP_REG "\n\t"
-        "jnc copy_fwd3\n\t"
-        "movsl\n\t"
-        "movsl\n\t"
-        "copy_fwd3:\n\t" /* copy last 3 bytes */
-        "shr $1, " LEN_REG "\n\t"
-        "jnc 1f\n\t"
-        "movsb\n\t"
-        "1:\n\t"
-        "shr $1, " LEN_REG "\n\t"
-        "jnc 1f\n\t"
-        "movsw\n\t"
-        "1:\n\t"
-        MEMMOVE_CLEANUP
-        "ret\n\t"
-        "copy_bwd:\n\t"
-        "lea (" DEST_REG ", " LEN_REG "), " DEST_REG "\n\t"
-        "lea (" SRC_REG ", " LEN_REG "), " SRC_REG "\n\t"
-        "cmp $4, " LEN_REG "\n\t" /* 4-bytes align */
-        "jb copy_bwd3\n\t"
-        "mov " DEST_REG ", " TMP_REG "\n\t"
-        "shr $1, " TMP_REG "\n\t"
-        "jnc 1f\n\t"
-        "dec " SRC_REG "\n\t"
-        "dec " DEST_REG "\n\t"
-        "movb (" SRC_REG "), %al\n\t"
-        "movb %al, (" DEST_REG ")\n\t"
-        "dec " LEN_REG "\n\t"
-        "1:\n\t"
-        "shr $1, " TMP_REG "\n\t"
-        "jnc 1f\n\t"
-        "sub $2, " SRC_REG "\n\t"
-        "sub $2, " DEST_REG "\n\t"
-        "movw (" SRC_REG "), %ax\n\t"
-        "movw %ax, (" DEST_REG ")\n\t"
-        "sub $2, " LEN_REG "\n\t"
-        "1:\n\t" /* 16-bytes align */
-        "cmp $16, " LEN_REG "\n\t"
-        "jb copy_bwd15\n\t"
-        "shr $1, " TMP_REG "\n\t"
-        "jnc 1f\n\t"
-        "sub $4, " SRC_REG "\n\t"
-        "sub $4, " DEST_REG "\n\t"
-        "movl (" SRC_REG "), %eax\n\t"
-        "movl %eax, (" DEST_REG ")\n\t"
-        "sub $4, " LEN_REG "\n\t"
-        "1:\n\t"
-        "shr $1, " TMP_REG "\n\t"
-        "jnc 1f\n\t"
-        "sub $8, " SRC_REG "\n\t"
-        "sub $8, " DEST_REG "\n\t"
-        "movl 4(" SRC_REG "), %eax\n\t"
-        "movl %eax, 4(" DEST_REG ")\n\t"
-        "movl (" SRC_REG "), %eax\n\t"
-        "movl %eax, (" DEST_REG ")\n\t"
-        "sub $8, " LEN_REG "\n\t"
-        "1:\n\t"
-        "cmp $64, " LEN_REG "\n\t"
-        "jb copy_bwd63\n\t"
-        "1:\n\t" /* copy 64-bytes blocks in loop, dest 16-bytes aligned */
-        "sub $64, " SRC_REG "\n\t"
-        "sub $64, " DEST_REG "\n\t"
-        "movdqu 0x00(" SRC_REG "), %xmm0\n\t"
-        "movdqu 0x10(" SRC_REG "), %xmm1\n\t"
-        "movdqu 0x20(" SRC_REG "), %xmm2\n\t"
-        "movdqu 0x30(" SRC_REG "), %xmm3\n\t"
-        "movdqa %xmm0, 0x00(" DEST_REG ")\n\t"
-        "movdqa %xmm1, 0x10(" DEST_REG ")\n\t"
-        "movdqa %xmm2, 0x20(" DEST_REG ")\n\t"
-        "movdqa %xmm3, 0x30(" DEST_REG ")\n\t"
-        "sub $64, " LEN_REG "\n\t"
-        "cmp $64, " LEN_REG "\n\t"
-        "jae 1b\n\t"
-        "copy_bwd63:\n\t" /* copy last 63 bytes, dest 16-bytes aligned */
-        "mov " LEN_REG ", " TMP_REG "\n\t"
-        "and $15, " LEN_REG "\n\t"
-        "shr $5, " TMP_REG "\n\t"
-        "jnc 1f\n\t"
-        "sub $16, " SRC_REG "\n\t"
-        "sub $16, " DEST_REG "\n\t"
-        "movdqu (" SRC_REG "), %xmm0\n\t"
-        "movdqa %xmm0, (" DEST_REG ")\n\t"
-        "1:\n\t"
-        "shr $1, " TMP_REG "\n\t"
-        "jnc copy_bwd15\n\t"
-        "sub $32, " SRC_REG "\n\t"
-        "sub $32, " DEST_REG "\n\t"
-        "movdqu 0x00(" SRC_REG "), %xmm0\n\t"
-        "movdqu 0x10(" SRC_REG "), %xmm1\n\t"
-        "movdqa %xmm0, 0x00(" DEST_REG ")\n\t"
-        "movdqa %xmm1, 0x10(" DEST_REG ")\n\t"
-        "copy_bwd15:\n\t" /* copy last 15 bytes, dest 4-bytes aligned */
-        "mov " LEN_REG ", " TMP_REG "\n\t"
-        "and $3, " LEN_REG "\n\t"
-        "shr $3, " TMP_REG "\n\t"
-        "jnc 1f\n\t"
-        "sub $4, " SRC_REG "\n\t"
-        "sub $4, " DEST_REG "\n\t"
-        "movl (" SRC_REG "), %eax\n\t"
-        "movl %eax, (" DEST_REG ")\n\t"
-        "1:\n\t"
-        "shr $1, " TMP_REG "\n\t"
-        "jnc copy_bwd3\n\t"
-        "sub $8, " SRC_REG "\n\t"
-        "sub $8, " DEST_REG "\n\t"
-        "movl 4(" SRC_REG "), %eax\n\t"
-        "movl %eax, 4(" DEST_REG ")\n\t"
-        "movl (" SRC_REG "), %eax\n\t"
-        "movl %eax, (" DEST_REG ")\n\t"
-        "copy_bwd3:\n\t" /* copy last 3 bytes */
-        "shr $1, " LEN_REG "\n\t"
-        "jnc 1f\n\t"
-        "dec " SRC_REG "\n\t"
-        "dec " DEST_REG "\n\t"
-        "movb (" SRC_REG "), %al\n\t"
-        "movb %al, (" DEST_REG ")\n\t"
-        "1:\n\t"
-        "shr $1, " LEN_REG "\n\t"
-        "jnc 1f\n\t"
-        "movw -2(" SRC_REG "), %ax\n\t"
-        "movw %ax, -2(" DEST_REG ")\n\t"
-        "1:\n\t"
-        MEMMOVE_CLEANUP
-        "ret" )
+#define SSE2_CLEANUP ((void)0)
+MEMMOVEV_UNALIGNED_DECLARE(sse2, __m128i, 16, _mm_loadu_si128, _mm_storeu_si128)
+MEMMOVEV_DECLARE(sse2, __m128i, 16, _mm_loadu_si128, _mm_storeu_si128, _mm_store_si128, SSE2_CLEANUP)
+#undef SSE2_CLEANUP
 
+#ifdef WINE_DISABLE_SSE2
+#undef WINE_DISABLE_SSE2
+#ifdef __clang__
+#pragma clang attribute pop
+#else
+#pragma GCC pop_options
 #endif
+#endif
+
+/* --- AVX variant (256-bit, 32 bytes/vector) --- */
+
+#ifndef __AVX__
+#ifdef __clang__
+#pragma clang attribute push (__attribute__((target("avx"))), apply_to=function)
+#else
+#pragma GCC push_options
+#pragma GCC target("avx")
+#endif
+#define WINE_DISABLE_AVX
+#endif
+
+#define AVX_CLEANUP _mm256_zeroupper()
+MEMMOVEV_UNALIGNED_DECLARE(avx, __m256i, 32, _mm256_loadu_si256, _mm256_storeu_si256)
+MEMMOVEV_DECLARE(avx, __m256i, 32, _mm256_loadu_si256, _mm256_storeu_si256, _mm256_store_si256, AVX_CLEANUP)
+#undef AVX_CLEANUP
+
+#ifdef WINE_DISABLE_AVX
+#undef WINE_DISABLE_AVX
+#ifdef __clang__
+#pragma clang attribute pop
+#else
+#pragma GCC pop_options
+#endif
+#endif
+
+#undef MEMMOVEV_DECLARE
+#undef MEMMOVEV_UNALIGNED_DECLARE
+#undef likely
+#undef unlikely
+
+#endif /* __i386__ || __x86_64__ */
 
 /*********************************************************************
  *                  memmove (MSVCRT.@)
  */
-#ifdef WORDS_BIGENDIAN
-# define MERGE(w1, sh1, w2, sh2) ((w1 << sh1) | (w2 >> sh2))
-#else
-# define MERGE(w1, sh1, w2, sh2) ((w1 >> sh1) | (w2 << sh2))
-#endif
-void * __cdecl memmove(void *dst, const void *src, size_t n)
+void *__cdecl memmove(void *dst, const void *src, size_t n)
 {
-#if defined(__x86_64__) && !defined(__arm64ec__)
-    return sse2_memmove(dst, src, n);
+#if defined(__i386__) || (defined(__x86_64__) && !defined(__arm64ec__))
+    if (__builtin_expect(n <= 32, 1)) { memmove_c_unaligned_32(dst, src, n); return dst; }
+    if (__builtin_expect(avx_supported, 1)) return memmove_avx(dst, src, n);
+    if (__builtin_expect(sse2_supported, 1)) return memmove_sse2(dst, src, n);
+    return memmove_c(dst, src, n);
 #else
     unsigned char *d = dst;
     const unsigned char *s = src;
-    int sh1;
-
-#ifdef __i386__
-    if (sse2_supported)
-        return sse2_memmove(dst, src, n);
-#endif
-
     if (!n) return dst;
-
-    if ((size_t)dst - (size_t)src >= n)
-    {
-        for (; (size_t)d % sizeof(size_t) && n; n--) *d++ = *s++;
-
-        sh1 = 8 * ((size_t)s % sizeof(size_t));
-        if (!sh1)
-        {
-            while (n >= sizeof(size_t))
-            {
-                *(size_t*)d = *(size_t*)s;
-                s += sizeof(size_t);
-                d += sizeof(size_t);
-                n -= sizeof(size_t);
-            }
-        }
-        else if (n >= 2 * sizeof(size_t))
-        {
-            int sh2 = 8 * sizeof(size_t) - sh1;
-            size_t x, y;
-
-            s -= sh1 / 8;
-            x = *(size_t*)s;
-            do
-            {
-                s += sizeof(size_t);
-                y = *(size_t*)s;
-                *(size_t*)d = MERGE(x, sh1, y, sh2);
-                d += sizeof(size_t);
-
-                s += sizeof(size_t);
-                x = *(size_t*)s;
-                *(size_t*)d = MERGE(y, sh1, x, sh2);
-                d += sizeof(size_t);
-
-                n -= 2 * sizeof(size_t);
-            } while (n >= 2 * sizeof(size_t));
-            s += sh1 / 8;
-        }
+    if (d <= s)
         while (n--) *d++ = *s++;
-        return dst;
-    }
     else
     {
-        d += n;
-        s += n;
-
-        for (; (size_t)d % sizeof(size_t) && n; n--) *--d = *--s;
-
-        sh1 = 8 * ((size_t)s % sizeof(size_t));
-        if (!sh1)
-        {
-            while (n >= sizeof(size_t))
-            {
-                s -= sizeof(size_t);
-                d -= sizeof(size_t);
-                *(size_t*)d = *(size_t*)s;
-                n -= sizeof(size_t);
-            }
-        }
-        else if (n >= 2 * sizeof(size_t))
-        {
-            int sh2 = 8 * sizeof(size_t) - sh1;
-            size_t x, y;
-
-            s -= sh1 / 8;
-            x = *(size_t*)s;
-            do
-            {
-                s -= sizeof(size_t);
-                y = *(size_t*)s;
-                d -= sizeof(size_t);
-                *(size_t*)d = MERGE(y, sh1, x, sh2);
-
-                s -= sizeof(size_t);
-                x = *(size_t*)s;
-                d -= sizeof(size_t);
-                *(size_t*)d = MERGE(x, sh1, y, sh2);
-
-                n -= 2 * sizeof(size_t);
-            } while (n >= 2 * sizeof(size_t));
-            s += sh1 / 8;
-        }
+        d += n; s += n;
         while (n--) *--d = *--s;
     }
     return dst;
 #endif
 }
-#undef MERGE
 
 /*********************************************************************
  *                  memcpy   (MSVCRT.@)
  */
-void * __cdecl memcpy(void *dst, const void *src, size_t n)
+void *__cdecl memcpy(void *dst, const void *src, size_t n)
 {
     return memmove(dst, src, n);
 }

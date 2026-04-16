@@ -66,11 +66,13 @@ typedef int (CDECL *MSVCRT_matherr_func)(struct _exception *);
 static MSVCRT_matherr_func MSVCRT_default_matherr_func = NULL;
 
 BOOL sse2_supported;
+BOOL avx_supported;
 static BOOL sse2_enabled;
 
 void msvcrt_init_math( void *module )
 {
     sse2_supported = IsProcessorFeaturePresent( PF_XMMI64_INSTRUCTIONS_AVAILABLE );
+    avx_supported = IsProcessorFeaturePresent( PF_AVX_INSTRUCTIONS_AVAILABLE );
 #if _MSVCR_VER <=71
     sse2_enabled = FALSE;
 #else

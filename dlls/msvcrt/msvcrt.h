@@ -68,6 +68,7 @@ typedef struct _iobuf
 #undef wcsncpy
 
 extern BOOL sse2_supported;
+extern BOOL avx_supported;
 
 #define DBL80_MAX_10_EXP 4932
 #define DBL80_MIN_10_EXP -4951

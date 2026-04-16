@@ -3845,6 +3845,142 @@ static int cmd_socket_io(int argc, char **argv)
 
 
 /* ════════════════════════════════════════════════════════════════════════
+ *   SRW contention benchmark
+ *
+ *   N threads acquire/release a shared SRWLOCK in a tight loop.
+ *   Measures acquire latency (p50, p99, max) and ops/sec.
+ *   Used to validate the SRW spin phase improvement.
+ *
+ *   Usage: nspa_rt_test.exe srw-bench [threads] [iterations]
+ *          Default: 4 threads, 500000 iterations per thread.
+ * ════════════════════════════════════════════════════════════════════════ */
+
+static SRWLOCK srw_bench_lock = SRWLOCK_INIT;
+static volatile LONG srw_bench_ready = 0;
+static volatile LONG srw_bench_go = 0;
+
+struct srw_bench_result {
+    LONGLONG min_ns, max_ns, sum_ns;
+    LONGLONG p50_ns, p99_ns;
+    DWORD count;
+};
+
+static DWORD WINAPI srw_bench_thread(LPVOID arg)
+{
+    struct srw_bench_result *res = (struct srw_bench_result *)arg;
+    LARGE_INTEGER freq, t0, t1;
+    LONGLONG *samples;
+    DWORD iters = res->count;
+    DWORD i;
+
+    QueryPerformanceFrequency(&freq);
+    samples = (LONGLONG *)malloc(iters * sizeof(LONGLONG));
+    if (!samples) { printf("  [FAIL] malloc failed\n"); return 1; }
+
+    /* Signal ready and wait for go */
+    InterlockedIncrement(&srw_bench_ready);
+    while (!srw_bench_go) YieldProcessor();
+
+    for (i = 0; i < iters; i++)
+    {
+        QueryPerformanceCounter(&t0);
+        AcquireSRWLockExclusive(&srw_bench_lock);
+        /* Simulate tiny critical section — just a volatile write */
+        *(volatile LONG *)&srw_bench_lock;
+        ReleaseSRWLockExclusive(&srw_bench_lock);
+        QueryPerformanceCounter(&t1);
+        samples[i] = (t1.QuadPart - t0.QuadPart) * 1000000000LL / freq.QuadPart;
+    }
+
+    /* Sort for percentiles */
+    {
+        DWORD j;
+        for (i = 1; i < iters; i++)
+        {
+            LONGLONG key = samples[i];
+            j = i;
+            while (j > 0 && samples[j-1] > key) { samples[j] = samples[j-1]; j--; }
+            samples[j] = key;
+        }
+    }
+
+    res->min_ns = samples[0];
+    res->max_ns = samples[iters - 1];
+    res->p50_ns = samples[iters / 2];
+    res->p99_ns = samples[(DWORD)(iters * 0.99)];
+    res->sum_ns = 0;
+    for (i = 0; i < iters; i++) res->sum_ns += samples[i];
+
+    free(samples);
+    return 0;
+}
+
+static int cmd_srw_bench(int argc, char **argv)
+{
+    DWORD num_threads = 4, iters = 500000;
+    struct srw_bench_result *results;
+    HANDLE *threads;
+    LARGE_INTEGER freq;
+    LONGLONG total_ops = 0, total_ns = 0;
+    DWORD i;
+
+    if (argc > 1) num_threads = atoi(argv[1]);
+    if (argc > 2) iters = atoi(argv[2]);
+    if (num_threads < 1) num_threads = 1;
+    if (num_threads > 64) num_threads = 64;
+    if (iters < 100) iters = 100;
+
+    QueryPerformanceFrequency(&freq);
+
+    printf("SRW contention benchmark: %lu threads, %lu iterations each\n", num_threads, iters);
+
+    results = (struct srw_bench_result *)calloc(num_threads, sizeof(*results));
+    threads = (HANDLE *)calloc(num_threads, sizeof(HANDLE));
+    if (!results || !threads) { printf("  [FAIL] alloc\n"); return 1; }
+
+    /* Initialize and create threads */
+    srw_bench_ready = 0;
+    srw_bench_go = 0;
+    for (i = 0; i < num_threads; i++)
+    {
+        results[i].count = iters;
+        threads[i] = CreateThread(NULL, 0, srw_bench_thread, &results[i], 0, NULL);
+    }
+
+    /* Wait for all threads ready */
+    while ((DWORD)srw_bench_ready < num_threads) Sleep(0);
+
+    /* Go! */
+    InterlockedExchange(&srw_bench_go, 1);
+
+    WaitForMultipleObjects(num_threads, threads, TRUE, INFINITE);
+
+    /* Aggregate results */
+    printf("\n  Thread     avg(ns)   p50(ns)   p99(ns)   max(ns)    ops/sec\n");
+    for (i = 0; i < num_threads; i++)
+    {
+        struct srw_bench_result *r = &results[i];
+        LONGLONG avg = r->sum_ns / iters;
+        LONGLONG ops_sec = (r->sum_ns > 0) ? (LONGLONG)iters * 1000000000LL / r->sum_ns : 0;
+        printf("  T%-3lu    %8lld  %8lld  %8lld  %8lld  %10lld\n",
+               i, avg, r->p50_ns, r->p99_ns, r->max_ns, ops_sec);
+        total_ops += iters;
+        total_ns += r->sum_ns;
+        CloseHandle(threads[i]);
+    }
+
+    {
+        LONGLONG overall_avg = total_ns / total_ops;
+        printf("\n  Overall: %lld ops, avg %lld ns/op\n", total_ops, overall_avg);
+    }
+
+    free(results);
+    free(threads);
+    printf("  [PASS]\n");
+    return 0;
+}
+
+/* ════════════════════════════════════════════════════════════════════════
  *   Command dispatch
  * ════════════════════════════════════════════════════════════════════════ */
 
@@ -3867,6 +4003,7 @@ static struct command commands[] = {
     { "large-pages",     "VirtualAlloc(MEM_LARGE_PAGES) end-to-end + /proc/meminfo cross-check", cmd_large_pages },
     { "ntsync",          "NTSync kernel driver PI + priority-ordered wakeup (5 sub-tests)",  cmd_ntsync        },
     { "socket-io",       "async TCP loopback latency (io_uring Phase 3 baseline/compare)",  cmd_socket_io     },
+    { "srw-bench",       "SRW lock contention benchmark (acquire latency + ops/sec)",      cmd_srw_bench     },
     { "help",            "show this help",                                                  cmd_help          },
     { NULL, NULL, NULL }
 };

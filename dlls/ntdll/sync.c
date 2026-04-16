@@ -869,6 +869,29 @@ struct srw_lock
 };
 C_ASSERT( sizeof(struct srw_lock) == 4 );
 
+/* NSPA: SRW lock spin phase.
+ *
+ * Windows SRW locks spin ~1024 iterations before parking via
+ * NtWaitForAlertByThreadId. Wine currently does zero spinning —
+ * every contended acquire is a syscall. This adds a bounded spin
+ * phase matching Windows behavior.
+ *
+ * Spin count: 256 for normal threads. Windows uses ~1024 but our
+ * futex indirection (RtlWaitOnAddress → alert → futex) is lighter
+ * than Windows' kernel transition, so fewer spins suffice to catch
+ * short critical sections.
+ *
+ * RT threads (NSPA_RT_PRIO active) skip spinning entirely. An RT
+ * thread spinning at SCHED_FIFO priority starves the lock holder
+ * (who may be at normal priority), making the lock slower to release.
+ * Better to fall through to the futex wait immediately so the
+ * scheduler can handle priority properly.
+ *
+ * Disabled on single-CPU systems (spinning is pointless — the holder
+ * can't make progress while we're spinning on the same core).
+ */
+#define SRW_SPIN_COUNT 256
+
 /***********************************************************************
  *              RtlInitializeSRWLock (NTDLL.@)
  *
@@ -923,6 +946,26 @@ void WINAPI RtlAcquireSRWLockExclusive( RTL_SRWLOCK *lock )
         } while (InterlockedCompareExchange( u.l, new.l, old.l ) != old.l);
 
         if (!wait) return;
+
+        /* Spin before parking — avoids syscall for short-held locks.
+         * Skip for RT threads (spinning at SCHED_FIFO starves the holder)
+         * and single-CPU systems (holder can't progress while we spin). */
+        if (NtCurrentTeb()->Peb->NumberOfProcessors > 1 && !nspa_cs_pi_active())
+        {
+            unsigned int i;
+
+            for (i = 0; i < SRW_SPIN_COUNT; i++)
+            {
+                /* Re-read owners field; if it became 0, retry the CAS loop. */
+                if (!*(volatile short *)&u.s->owners)
+                    break;
+                YieldProcessor();
+            }
+            /* If owners is now 0, go back to the CAS loop instead of parking. */
+            if (!*(volatile short *)&u.s->owners)
+                continue;
+        }
+
         RtlWaitOnAddress( &u.s->owners, &new.s.owners, sizeof(short), NULL );
     }
 }
@@ -962,6 +1005,26 @@ void WINAPI RtlAcquireSRWLockShared( RTL_SRWLOCK *lock )
         } while (InterlockedCompareExchange( u.l, new.l, old.l ) != old.l);
 
         if (!wait) return;
+
+        /* Spin before parking — avoids syscall for short-held locks.
+         * Skip for RT threads (spinning at SCHED_FIFO starves the holder)
+         * and single-CPU systems (holder can't progress while we spin). */
+        if (NtCurrentTeb()->Peb->NumberOfProcessors > 1 && !nspa_cs_pi_active())
+        {
+            unsigned int i;
+
+            for (i = 0; i < SRW_SPIN_COUNT; i++)
+            {
+                /* Re-read exclusive_waiters; if it became 0, retry the CAS loop. */
+                if (!*(volatile short *)&u.s->exclusive_waiters)
+                    break;
+                YieldProcessor();
+            }
+            /* If exclusive_waiters is now 0, go back to the CAS loop. */
+            if (!*(volatile short *)&u.s->exclusive_waiters)
+                continue;
+        }
+
         RtlWaitOnAddress( u.s, &new.s, sizeof(struct srw_lock), NULL );
     }
 }

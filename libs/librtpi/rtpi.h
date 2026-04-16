@@ -73,6 +73,18 @@
 #ifndef FUTEX_WAKE_PRIVATE
 #define FUTEX_WAKE_PRIVATE       (FUTEX_WAKE       | FUTEX_PRIVATE_FLAG)
 #endif
+#ifndef FUTEX_WAIT_REQUEUE_PI
+#define FUTEX_WAIT_REQUEUE_PI    11
+#endif
+#ifndef FUTEX_CMP_REQUEUE_PI
+#define FUTEX_CMP_REQUEUE_PI     12
+#endif
+#ifndef FUTEX_WAIT_REQUEUE_PI_PRIVATE
+#define FUTEX_WAIT_REQUEUE_PI_PRIVATE  (FUTEX_WAIT_REQUEUE_PI | FUTEX_PRIVATE_FLAG)
+#endif
+#ifndef FUTEX_CMP_REQUEUE_PI_PRIVATE
+#define FUTEX_CMP_REQUEUE_PI_PRIVATE   (FUTEX_CMP_REQUEUE_PI | FUTEX_PRIVATE_FLAG)
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -99,14 +111,19 @@ typedef union pi_mutex {
     uint8_t pad[64];
 } pi_mutex_t __attribute__((aligned(64)));
 
+/* Condvar states — upstream librtpi compatibility. */
+#define RTPI_COND_STATE_READY  0
+
 typedef union pi_cond {
     struct {
         uint32_t cond;       /* sequence counter, incremented on each
-                              * signal/broadcast. Waiters read this,
-                              * then wait on it via FUTEX_WAIT. */
+                              * signal/broadcast. Waiters FUTEX_WAIT_REQUEUE_PI
+                              * on this, then the kernel requeues them onto the
+                              * PI mutex's futex on signal. */
         uint32_t flags;
-        uint32_t wake_id;    /* reserved for future use */
-        uint32_t state;      /* reserved for future use */
+        uint32_t wake_id;    /* tracks signal generation to detect missed wakes
+                              * on EAGAIN (value changed between unlock & wait) */
+        uint32_t state;      /* RTPI_COND_STATE_READY (for EAGAIN retry logic) */
     };
     uint8_t pad[128];
 } pi_cond_t __attribute__((aligned(64)));
@@ -273,13 +290,35 @@ static inline void pi_mutex_free(pi_mutex_t *mutex)
 }
 
 /* ================================================================== *
- *   pi_cond_t — sequence-counter condvar (standard futex pattern)
+ *   pi_cond_t — FUTEX_WAIT_REQUEUE_PI condvar
+ *
+ *   Uses FUTEX_WAIT_REQUEUE_PI / FUTEX_CMP_REQUEUE_PI so that waiters
+ *   are atomically requeued from the condvar futex onto the PI mutex's
+ *   futex on signal. This closes the priority inversion window that
+ *   existed with plain FUTEX_WAIT (where a woken thread had to manually
+ *   relock the mutex, creating a gap where no PI boost was in effect).
+ *
+ *   Wait path:
+ *     1. Increment sequence counter + record wake_id
+ *     2. Unlock PI mutex
+ *     3. FUTEX_WAIT_REQUEUE_PI on condvar (kernel atomically waits,
+ *        then requeues us onto the mutex PI chain on wake)
+ *     4. On success: we already own the mutex. Done.
+ *     5. On error (EAGAIN = value changed): manually relock, retry.
+ *
+ *   Signal path:
+ *     1. Increment sequence counter + set wake_id
+ *     2. FUTEX_CMP_REQUEUE_PI: wakes 1 waiter, requeues the rest
+ *        directly onto the mutex PI chain (no thundering herd)
+ *
+ *   Based on upstream librtpi (pi_cond.c), adapted for header-only.
  * ================================================================== */
 
 static inline int pi_cond_init(pi_cond_t *cond, uint32_t flags)
 {
     memset(cond, 0, sizeof(*cond));
     cond->flags = flags;
+    cond->state = RTPI_COND_STATE_READY;
     return 0;
 }
 
@@ -289,79 +328,107 @@ static inline int pi_cond_destroy(pi_cond_t *cond)
     return 0;
 }
 
-static inline int pi_cond_wait(pi_cond_t *cond, pi_mutex_t *mutex)
-{
-    uint32_t seq;
-    int ret;
-    int wait_op = (cond->flags & RTPI_COND_PSHARED) ? FUTEX_WAIT : FUTEX_WAIT_PRIVATE;
-
-    seq = __atomic_load_n(&cond->cond, __ATOMIC_ACQUIRE);
-
-    /* Release mutex, wait, reacquire. Standard condvar dance. */
-    pi_mutex_unlock(mutex);
-    do {
-        ret = syscall(SYS_futex, &cond->cond, wait_op, seq, NULL, NULL, 0);
-    } while (ret == -1 && errno == EINTR);
-
-    {
-        int lret = pi_mutex_lock(mutex);
-        if (lret) return lret;
-    }
-    if (ret == 0 || errno == EAGAIN) return 0;
-    return errno;
-}
-
 static inline int pi_cond_timedwait(pi_cond_t *cond, pi_mutex_t *mutex,
                                      const struct timespec *abstime)
 {
-    uint32_t seq;
-    int ret;
-    int wait_op = (cond->flags & RTPI_COND_PSHARED) ? FUTEX_WAIT : FUTEX_WAIT_PRIVATE;
-    struct timespec now, rel;
-    clockid_t clock_id = (cond->flags & RTPI_COND_CLOCK_REALTIME) ? CLOCK_REALTIME : CLOCK_MONOTONIC;
+    int ret, err;
+    uint32_t wake_id, futex_id;
+    int wait_op = (cond->flags & RTPI_COND_PSHARED)
+                  ? FUTEX_WAIT_REQUEUE_PI : FUTEX_WAIT_REQUEUE_PI_PRIVATE;
 
-    seq = __atomic_load_n(&cond->cond, __ATOMIC_ACQUIRE);
+    if (cond->flags & RTPI_COND_CLOCK_REALTIME)
+        wait_op |= FUTEX_CLOCK_REALTIME;
 
-    /* Convert abstime to relative (FUTEX_WAIT expects relative). */
-    clock_gettime(clock_id, &now);
-    rel.tv_sec  = abstime->tv_sec  - now.tv_sec;
-    rel.tv_nsec = abstime->tv_nsec - now.tv_nsec;
-    if (rel.tv_nsec < 0) { rel.tv_nsec += 1000000000L; rel.tv_sec -= 1; }
-    if (rel.tv_sec < 0)
-        return ETIMEDOUT;
+    cond->cond++;
+    wake_id = cond->wake_id;
 
-    pi_mutex_unlock(mutex);
-    do {
-        ret = syscall(SYS_futex, &cond->cond, wait_op, seq, &rel, NULL, 0);
-    } while (ret == -1 && errno == EINTR);
+again:
+    futex_id = cond->cond;
+    ret = pi_mutex_unlock(mutex);
+    if (ret) return ret;
 
+    /* FUTEX_WAIT_REQUEUE_PI: sleep on condvar, kernel requeues us onto
+     * the PI mutex's futex on signal. If successful, we own the mutex. */
+    ret = syscall(SYS_futex, &cond->cond, wait_op, futex_id,
+                  abstime, &mutex->futex, 0);
+    err = errno;
+
+    /* Success: kernel requeued us and we now own the mutex. */
+    if (ret == 0)
+        return 0;
+
+    /* Error path: must manually reacquire the mutex. */
     {
         int lret = pi_mutex_lock(mutex);
         if (lret) return lret;
     }
-    if (ret == 0 || errno == EAGAIN) return 0;
-    if (errno == ETIMEDOUT) return ETIMEDOUT;
-    return errno;
+
+    /* EAGAIN = condvar value changed between unlock & wait.
+     * Check if we raced with a signal. */
+    if (err == EAGAIN && cond->state == RTPI_COND_STATE_READY)
+    {
+        /* If wake_id changed, a signal happened after us — we may have
+         * missed the wake. Stay awake (don't retry). */
+        if (cond->wake_id != wake_id)
+            return 0;
+
+        /* Same wake_id — genuine race. Reload and retry. */
+        cond->cond++;
+        goto again;
+    }
+
+    if (err == ETIMEDOUT) return ETIMEDOUT;
+    return err;
+}
+
+static inline int pi_cond_wait(pi_cond_t *cond, pi_mutex_t *mutex)
+{
+    return pi_cond_timedwait(cond, mutex, NULL);
 }
 
 static inline int pi_cond_signal(pi_cond_t *cond, pi_mutex_t *mutex)
 {
-    int wake_op = (cond->flags & RTPI_COND_PSHARED) ? FUTEX_WAKE : FUTEX_WAKE_PRIVATE;
-    (void)mutex;  /* reserved; may be used by future FUTEX_CMP_REQUEUE_PI upgrade */
+    int ret;
+    uint32_t id;
+    int requeue_op = (cond->flags & RTPI_COND_PSHARED)
+                     ? FUTEX_CMP_REQUEUE_PI : FUTEX_CMP_REQUEUE_PI_PRIVATE;
 
-    __atomic_fetch_add(&cond->cond, 1, __ATOMIC_RELEASE);
-    syscall(SYS_futex, &cond->cond, wake_op, 1, NULL, NULL, 0);
-    return 0;
+again:
+    cond->cond++;
+    id = cond->cond;
+    cond->wake_id = id;
+
+    /* FUTEX_CMP_REQUEUE_PI: wake 1, requeue 0 (signal wakes exactly one). */
+    ret = syscall(SYS_futex, &cond->cond, requeue_op, 1,
+                  (void *)(long)0, &mutex->futex, id);
+    if (ret >= 0)
+        return 0;
+    if (errno == EAGAIN)
+        goto again;
+    return errno;
 }
 
 static inline int pi_cond_broadcast(pi_cond_t *cond, pi_mutex_t *mutex)
 {
-    int wake_op = (cond->flags & RTPI_COND_PSHARED) ? FUTEX_WAKE : FUTEX_WAKE_PRIVATE;
-    (void)mutex;
+    int ret;
+    uint32_t id;
+    int requeue_op = (cond->flags & RTPI_COND_PSHARED)
+                     ? FUTEX_CMP_REQUEUE_PI : FUTEX_CMP_REQUEUE_PI_PRIVATE;
 
-    __atomic_fetch_add(&cond->cond, 1, __ATOMIC_RELEASE);
-    syscall(SYS_futex, &cond->cond, wake_op, INT_MAX, NULL, NULL, 0);
-    return 0;
+again:
+    cond->cond++;
+    id = cond->cond;
+    cond->wake_id = id;
+
+    /* FUTEX_CMP_REQUEUE_PI: wake 1, requeue INT_MAX (all others move
+     * directly onto the PI mutex's wait queue — no thundering herd). */
+    ret = syscall(SYS_futex, &cond->cond, requeue_op, 1,
+                  (void *)(long)INT_MAX, &mutex->futex, id);
+    if (ret >= 0)
+        return 0;
+    if (errno == EAGAIN)
+        goto again;
+    return errno;
 }
 
 static inline pi_cond_t *pi_cond_alloc(void)

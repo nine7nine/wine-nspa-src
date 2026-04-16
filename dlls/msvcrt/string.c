@@ -36,7 +36,207 @@
 
 #if defined(__i386__) || (defined(__x86_64__) && !defined(__arm64ec__))
 #include <immintrin.h>
+
+#ifndef __SSE2__
+#ifdef __clang__
+#pragma clang attribute push (__attribute__((target("sse2"))), apply_to=function)
+#else
+#pragma GCC push_options
+#pragma GCC target("sse2")
 #endif
+#define WINE_SIMD_DISABLE_SSE2
+#endif
+
+extern BOOL sse2_supported;
+
+/* ---- SIMD memchr: scan for byte in buffer ---- */
+
+static void *memchr_sse2(const unsigned char *p, unsigned char c, size_t n)
+{
+    __m128i needle = _mm_set1_epi8(c);
+    int mask;
+
+    /* unaligned head: up to 15 bytes to reach 16-byte alignment */
+    if (n >= 16)
+    {
+        size_t align = -(uintptr_t)p & 15;
+        if (align)
+        {
+            mask = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128((const __m128i *)p), needle));
+            if (align > n) align = n;
+            mask &= (1u << align) - 1;
+            if (mask) return (void *)(p + __builtin_ctz(mask));
+            p += align;
+            n -= align;
+        }
+
+        /* aligned bulk: 64 bytes per iteration */
+        while (n >= 64)
+        {
+            __m128i v0 = _mm_load_si128((const __m128i *)(p +  0));
+            __m128i v1 = _mm_load_si128((const __m128i *)(p + 16));
+            __m128i v2 = _mm_load_si128((const __m128i *)(p + 32));
+            __m128i v3 = _mm_load_si128((const __m128i *)(p + 48));
+            __m128i c0 = _mm_cmpeq_epi8(v0, needle);
+            __m128i c1 = _mm_cmpeq_epi8(v1, needle);
+            __m128i c2 = _mm_cmpeq_epi8(v2, needle);
+            __m128i c3 = _mm_cmpeq_epi8(v3, needle);
+            __m128i any = _mm_or_si128(_mm_or_si128(c0, c1), _mm_or_si128(c2, c3));
+            if (_mm_movemask_epi8(any))
+            {
+                mask = _mm_movemask_epi8(c0); if (mask) return (void *)(p + __builtin_ctz(mask));
+                mask = _mm_movemask_epi8(c1); if (mask) return (void *)(p + 16 + __builtin_ctz(mask));
+                mask = _mm_movemask_epi8(c2); if (mask) return (void *)(p + 32 + __builtin_ctz(mask));
+                mask = _mm_movemask_epi8(c3); return (void *)(p + 48 + __builtin_ctz(mask));
+            }
+            p += 64; n -= 64;
+        }
+
+        /* aligned tail: 16 bytes per iteration */
+        while (n >= 16)
+        {
+            mask = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_load_si128((const __m128i *)p), needle));
+            if (mask) return (void *)(p + __builtin_ctz(mask));
+            p += 16; n -= 16;
+        }
+    }
+
+    /* scalar tail */
+    while (n--)
+    {
+        if (*p == c) return (void *)p;
+        p++;
+    }
+    return NULL;
+}
+
+/* ---- SIMD strlen: scan for null terminator ---- */
+
+static size_t strlen_sse2(const char *str)
+{
+    const char *s = str;
+    __m128i zero = _mm_setzero_si128();
+    int mask;
+    size_t align;
+
+    /* handle unaligned head: read from aligned boundary, mask off leading bytes */
+    align = (uintptr_t)s & 15;
+    if (align)
+    {
+        const __m128i *aligned_p = (const __m128i *)((uintptr_t)s & ~(uintptr_t)15);
+        mask = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_load_si128(aligned_p), zero));
+        mask >>= align; /* discard bytes before s */
+        if (mask) return __builtin_ctz(mask);
+        s += 16 - align;
+    }
+
+    /* aligned bulk: 64 bytes per iteration */
+    for (;;)
+    {
+        __m128i v0 = _mm_load_si128((const __m128i *)(s +  0));
+        __m128i v1 = _mm_load_si128((const __m128i *)(s + 16));
+        __m128i v2 = _mm_load_si128((const __m128i *)(s + 32));
+        __m128i v3 = _mm_load_si128((const __m128i *)(s + 48));
+        __m128i c0 = _mm_cmpeq_epi8(v0, zero);
+        __m128i c1 = _mm_cmpeq_epi8(v1, zero);
+        __m128i c2 = _mm_cmpeq_epi8(v2, zero);
+        __m128i c3 = _mm_cmpeq_epi8(v3, zero);
+        __m128i any = _mm_or_si128(_mm_or_si128(c0, c1), _mm_or_si128(c2, c3));
+        if (_mm_movemask_epi8(any))
+        {
+            mask = _mm_movemask_epi8(c0); if (mask) return (s - str) + __builtin_ctz(mask);
+            mask = _mm_movemask_epi8(c1); if (mask) return (s - str) + 16 + __builtin_ctz(mask);
+            mask = _mm_movemask_epi8(c2); if (mask) return (s - str) + 32 + __builtin_ctz(mask);
+            mask = _mm_movemask_epi8(c3); return (s - str) + 48 + __builtin_ctz(mask);
+        }
+        s += 64;
+    }
+}
+
+/* ---- SIMD memcmp: compare two buffers ---- */
+
+static int memcmp_sse2(const unsigned char *p1, const unsigned char *p2, size_t n)
+{
+    int mask;
+    size_t align;
+
+    /* unaligned head: align p1 to 16 bytes */
+    align = -(uintptr_t)p1 & 15;
+    if (align > n) align = n;
+    if (align)
+    {
+        const unsigned char *end = p1 + align;
+        while (p1 < end)
+        {
+            if (*p1 != *p2) return *p1 > *p2 ? 1 : -1;
+            p1++; p2++;
+        }
+        n -= align;
+    }
+
+    /* aligned bulk on p1, unaligned loads on p2: 64 bytes per iteration */
+    while (n >= 64)
+    {
+        __m128i a0 = _mm_load_si128((const __m128i *)(p1 +  0));
+        __m128i a1 = _mm_load_si128((const __m128i *)(p1 + 16));
+        __m128i a2 = _mm_load_si128((const __m128i *)(p1 + 32));
+        __m128i a3 = _mm_load_si128((const __m128i *)(p1 + 48));
+        __m128i b0 = _mm_loadu_si128((const __m128i *)(p2 +  0));
+        __m128i b1 = _mm_loadu_si128((const __m128i *)(p2 + 16));
+        __m128i b2 = _mm_loadu_si128((const __m128i *)(p2 + 32));
+        __m128i b3 = _mm_loadu_si128((const __m128i *)(p2 + 48));
+        __m128i eq0 = _mm_cmpeq_epi8(a0, b0);
+        __m128i eq1 = _mm_cmpeq_epi8(a1, b1);
+        __m128i eq2 = _mm_cmpeq_epi8(a2, b2);
+        __m128i eq3 = _mm_cmpeq_epi8(a3, b3);
+        __m128i all = _mm_and_si128(_mm_and_si128(eq0, eq1), _mm_and_si128(eq2, eq3));
+        if (_mm_movemask_epi8(all) != 0xFFFF)
+        {
+            mask = _mm_movemask_epi8(eq0);
+            if (mask != 0xFFFF) { int i = __builtin_ctz(~mask); return p1[i] > p2[i] ? 1 : -1; }
+            mask = _mm_movemask_epi8(eq1);
+            if (mask != 0xFFFF) { int i = 16 + __builtin_ctz(~mask); return p1[i] > p2[i] ? 1 : -1; }
+            mask = _mm_movemask_epi8(eq2);
+            if (mask != 0xFFFF) { int i = 32 + __builtin_ctz(~mask); return p1[i] > p2[i] ? 1 : -1; }
+            mask = _mm_movemask_epi8(eq3);
+            { int i = 48 + __builtin_ctz(~mask); return p1[i] > p2[i] ? 1 : -1; }
+        }
+        p1 += 64; p2 += 64; n -= 64;
+    }
+
+    /* 16-byte tail */
+    while (n >= 16)
+    {
+        __m128i v1 = _mm_load_si128((const __m128i *)p1);
+        __m128i v2 = _mm_loadu_si128((const __m128i *)p2);
+        mask = _mm_movemask_epi8(_mm_cmpeq_epi8(v1, v2));
+        if (mask != 0xFFFF)
+        {
+            int i = __builtin_ctz(~mask);
+            return p1[i] > p2[i] ? 1 : -1;
+        }
+        p1 += 16; p2 += 16; n -= 16;
+    }
+
+    /* scalar tail */
+    while (n--)
+    {
+        if (*p1 != *p2) return *p1 > *p2 ? 1 : -1;
+        p1++; p2++;
+    }
+    return 0;
+}
+
+#ifdef WINE_SIMD_DISABLE_SSE2
+#undef WINE_SIMD_DISABLE_SSE2
+#ifdef __clang__
+#pragma clang attribute pop
+#else
+#pragma GCC pop_options
+#endif
+#endif
+
+#endif /* __i386__ || __x86_64__ */
 
 WINE_DEFAULT_DEBUG_CHANNEL(msvcrt);
 
@@ -1568,9 +1768,14 @@ int CDECL _atoldbl(_LDOUBLE *value, char *str)
  */
 size_t __cdecl strlen(const char *str)
 {
-    const char *s = str;
-    while (*s) s++;
-    return s - str;
+#if defined(__i386__) || (defined(__x86_64__) && !defined(__arm64ec__))
+    if (sse2_supported) return strlen_sse2(str);
+#endif
+    {
+        const char *s = str;
+        while (*s) s++;
+        return s - str;
+    }
 }
 
 /******************************************************************
@@ -2771,23 +2976,28 @@ static inline int memcmp_blocks(const void *ptr1, const void *ptr2, size_t size)
  */
 int __cdecl memcmp(const void *ptr1, const void *ptr2, size_t n)
 {
-    const unsigned char *p1 = ptr1, *p2 = ptr2;
-    size_t align;
-    int result;
+#if defined(__i386__) || (defined(__x86_64__) && !defined(__arm64ec__))
+    if (sse2_supported) return memcmp_sse2(ptr1, ptr2, n);
+#endif
+    {
+        const unsigned char *p1 = ptr1, *p2 = ptr2;
+        size_t align;
+        int result;
 
-    if (n < sizeof(uint64_t))
-        return memcmp_bytes(p1, p2, n);
+        if (n < sizeof(uint64_t))
+            return memcmp_bytes(p1, p2, n);
 
-    align = -(size_t)p1 & (sizeof(uint64_t) - 1);
+        align = -(size_t)p1 & (sizeof(uint64_t) - 1);
 
-    if ((result = memcmp_bytes(p1, p2, align)))
-        return result;
+        if ((result = memcmp_bytes(p1, p2, align)))
+            return result;
 
-    p1 += align;
-    p2 += align;
-    n  -= align;
+        p1 += align;
+        p2 += align;
+        n  -= align;
 
-    return memcmp_blocks(p1, p2, n);
+        return memcmp_blocks(p1, p2, n);
+    }
 }
 
 #if defined(__i386__) || (defined(__x86_64__) && !defined(__arm64ec__))
@@ -3324,10 +3534,14 @@ char* __cdecl strrchr(const char *str, int c)
  */
 void* __cdecl memchr(const void *ptr, int c, size_t n)
 {
-    const unsigned char *p = ptr;
-
-    for (p = ptr; n; n--, p++) if (*p == (unsigned char)c) return (void *)(ULONG_PTR)p;
-    return NULL;
+#if defined(__i386__) || (defined(__x86_64__) && !defined(__arm64ec__))
+    if (sse2_supported) return memchr_sse2(ptr, (unsigned char)c, n);
+#endif
+    {
+        const unsigned char *p = ptr;
+        for (p = ptr; n; n--, p++) if (*p == (unsigned char)c) return (void *)(ULONG_PTR)p;
+        return NULL;
+    }
 }
 
 /*********************************************************************

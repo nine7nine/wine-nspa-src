@@ -200,6 +200,10 @@ DWORD WINAPI RtlRunOnceComplete( RTL_RUN_ONCE *once, ULONG flags, void *context 
 ULONG    WINAPI NtNspaGetUnixTid(void);
 NTSTATUS WINAPI NtNspaLockCriticalSectionPI( void *address );
 NTSTATUS WINAPI NtNspaUnlockCriticalSectionPI( void *address );
+NTSTATUS WINAPI NtNspaCondWaitPI( void *condvar_futex, LONG condvar_val,
+                                   void *pi_mutex, const LARGE_INTEGER *timeout );
+NTSTATUS WINAPI NtNspaCondSignalPI( void *condvar_futex, void *pi_mutex );
+NTSTATUS WINAPI NtNspaCondBroadcastPI( void *condvar_futex, void *pi_mutex );
 
 /* Get the Linux kernel TID for the calling thread.
  *
@@ -492,6 +496,152 @@ static NTSTATUS nspa_cs_leave_pi( RTL_CRITICAL_SECTION *crit )
 
 /* ================================================================== *
  *                  End NSPA RT v2.3 CS-PI helpers                     *
+ * ================================================================== */
+
+
+/* ================================================================== *
+ *           NSPA RT v3 — Win32 Condvar PI (requeue-PI)                *
+ *                                                                     *
+ *  RtlSleepConditionVariableCS with PI uses FUTEX_WAIT_REQUEUE_PI so  *
+ *  that waiters are atomically requeued from the condvar futex onto    *
+ *  the CS's PI mutex (LockSemaphore). This closes the priority        *
+ *  inversion window between condvar wake and CS reacquire.            *
+ *                                                                     *
+ *  The signal side needs both the condvar address and the PI mutex     *
+ *  address (Win32 WakeConditionVariable only takes the condvar), so   *
+ *  we maintain a small mapping table set by waiters, read by signalers.*
+ * ================================================================== */
+
+#define CONDVAR_PI_MAP_SIZE 64
+#define CONDVAR_PI_MAP_MASK (CONDVAR_PI_MAP_SIZE - 1)
+
+/* Tombstone for deleted hash table entries. Probing continues past
+ * tombstones but stops at NULL — this prevents open-addressing deletion
+ * from breaking probe chains for colliding entries. */
+#define CONDVAR_PI_TOMBSTONE ((const void *)(ULONG_PTR)~(ULONG_PTR)0)
+
+struct condvar_pi_entry
+{
+    volatile const void *condvar_addr;   /* NULL=empty, TOMBSTONE=deleted, else=live */
+    volatile LONG       *pi_mutex_addr;
+    volatile LONG        refcount;
+};
+
+static struct condvar_pi_entry condvar_pi_map[CONDVAR_PI_MAP_SIZE];
+static LONG condvar_pi_map_lock;
+
+static inline void condvar_pi_lock( LONG *lock )
+{
+    while (InterlockedCompareExchange( lock, 1, 0 ))
+        YieldProcessor();
+}
+
+static inline void condvar_pi_unlock( LONG *lock )
+{
+    InterlockedExchange( lock, 0 );
+}
+
+static inline ULONG condvar_pi_hash( const void *addr )
+{
+    return (ULONG)((ULONG_PTR)addr >> 4) & CONDVAR_PI_MAP_MASK;
+}
+
+/* Register condvar→mutex mapping. Called by waiters before sleeping.
+ * Multiple waiters on the same condvar share one entry (refcounted). */
+static void condvar_pi_register( const void *condvar_addr, LONG *pi_mutex_addr )
+{
+    ULONG idx = condvar_pi_hash( condvar_addr );
+    ULONG first_reusable = CONDVAR_PI_MAP_SIZE;  /* sentinel: no reusable slot found */
+    ULONG i;
+
+    condvar_pi_lock( &condvar_pi_map_lock );
+    for (i = 0; i < CONDVAR_PI_MAP_SIZE; i++)
+    {
+        ULONG slot = (idx + i) & CONDVAR_PI_MAP_MASK;
+        const volatile void *addr = condvar_pi_map[slot].condvar_addr;
+
+        if (addr == condvar_addr)
+        {
+            /* Existing entry for this condvar — bump refcount */
+            condvar_pi_map[slot].refcount++;
+            condvar_pi_unlock( &condvar_pi_map_lock );
+            return;
+        }
+        if (!addr)
+        {
+            /* End of probe chain — insert here (or in earlier tombstone) */
+            break;
+        }
+        if (addr == CONDVAR_PI_TOMBSTONE && first_reusable == CONDVAR_PI_MAP_SIZE)
+            first_reusable = slot;
+    }
+    /* Use first available slot: prefer a tombstone earlier in the chain,
+     * otherwise use the empty slot at position i. */
+    {
+        ULONG insert = (first_reusable < CONDVAR_PI_MAP_SIZE)
+                        ? first_reusable : ((idx + i) & CONDVAR_PI_MAP_MASK);
+        condvar_pi_map[insert].condvar_addr  = condvar_addr;
+        condvar_pi_map[insert].pi_mutex_addr = pi_mutex_addr;
+        condvar_pi_map[insert].refcount      = 1;
+    }
+    condvar_pi_unlock( &condvar_pi_map_lock );
+}
+
+/* Deregister condvar→mutex mapping. Called by waiters on wake/timeout.
+ * Only tombstones the entry when the last waiter deregisters. */
+static void condvar_pi_deregister( const void *condvar_addr )
+{
+    ULONG idx = condvar_pi_hash( condvar_addr );
+    ULONG i;
+
+    condvar_pi_lock( &condvar_pi_map_lock );
+    for (i = 0; i < CONDVAR_PI_MAP_SIZE; i++)
+    {
+        ULONG slot = (idx + i) & CONDVAR_PI_MAP_MASK;
+        const volatile void *addr = condvar_pi_map[slot].condvar_addr;
+
+        if (addr == condvar_addr)
+        {
+            if (--condvar_pi_map[slot].refcount == 0)
+            {
+                condvar_pi_map[slot].condvar_addr  = CONDVAR_PI_TOMBSTONE;
+                condvar_pi_map[slot].pi_mutex_addr = NULL;
+            }
+            break;
+        }
+        if (!addr) break;  /* end of chain — not found (shouldn't happen) */
+        /* skip tombstones — continue probing */
+    }
+    condvar_pi_unlock( &condvar_pi_map_lock );
+}
+
+/* Look up the PI mutex for a condvar. Called by signalers. */
+static LONG *condvar_pi_lookup( const void *condvar_addr )
+{
+    ULONG idx = condvar_pi_hash( condvar_addr );
+    LONG *result = NULL;
+    ULONG i;
+
+    condvar_pi_lock( &condvar_pi_map_lock );
+    for (i = 0; i < CONDVAR_PI_MAP_SIZE; i++)
+    {
+        ULONG slot = (idx + i) & CONDVAR_PI_MAP_MASK;
+        const volatile void *addr = condvar_pi_map[slot].condvar_addr;
+
+        if (addr == condvar_addr)
+        {
+            result = (LONG *)condvar_pi_map[slot].pi_mutex_addr;
+            break;
+        }
+        if (!addr) break;  /* end of chain */
+        /* skip tombstones — continue probing */
+    }
+    condvar_pi_unlock( &condvar_pi_map_lock );
+    return result;
+}
+
+/* ================================================================== *
+ *               End NSPA RT v3 Condvar PI helpers                     *
  * ================================================================== */
 
 
@@ -1174,6 +1324,21 @@ void WINAPI RtlInitializeConditionVariable( RTL_CONDITION_VARIABLE *variable )
  */
 void WINAPI RtlWakeConditionVariable( RTL_CONDITION_VARIABLE *variable )
 {
+    if (nspa_cs_pi_active())
+    {
+        LONG *pi_mutex = condvar_pi_lookup( variable );
+        if (pi_mutex)
+        {
+            /* PI signal: unix side increments condvar + FUTEX_CMP_REQUEUE_PI */
+            NTSTATUS status = NtNspaCondSignalPI( &variable->Ptr, pi_mutex );
+            if (status == STATUS_SUCCESS)
+                return;  /* woke a PI waiter — done */
+            /* No PI waiters or error: condvar was already incremented by unix.
+             * Wake one non-PI waiter if any exist. */
+            RtlWakeAddressSingle( variable );
+            return;
+        }
+    }
     InterlockedIncrement( (LONG *)&variable->Ptr );
     RtlWakeAddressSingle( variable );
 }
@@ -1185,6 +1350,18 @@ void WINAPI RtlWakeConditionVariable( RTL_CONDITION_VARIABLE *variable )
  */
 void WINAPI RtlWakeAllConditionVariable( RTL_CONDITION_VARIABLE *variable )
 {
+    if (nspa_cs_pi_active())
+    {
+        LONG *pi_mutex = condvar_pi_lookup( variable );
+        if (pi_mutex)
+        {
+            /* PI broadcast: unix side increments + requeues all PI waiters
+             * onto PI mutex. Also wake any non-PI waiters via normal path. */
+            NtNspaCondBroadcastPI( &variable->Ptr, pi_mutex );
+            RtlWakeAddressAll( variable );
+            return;
+        }
+    }
     InterlockedIncrement( (LONG *)&variable->Ptr );
     RtlWakeAddressAll( variable );
 }
@@ -1207,13 +1384,54 @@ void WINAPI RtlWakeAllConditionVariable( RTL_CONDITION_VARIABLE *variable )
 NTSTATUS WINAPI RtlSleepConditionVariableCS( RTL_CONDITION_VARIABLE *variable, RTL_CRITICAL_SECTION *crit,
                                              const LARGE_INTEGER *timeout )
 {
-    int value = *(int *)&variable->Ptr;
-    NTSTATUS status;
+    /* PI path: FUTEX_WAIT_REQUEUE_PI closes the PI gap between condvar wake
+     * and CS reacquire. Only used when CS-PI is active and we hold the CS
+     * non-recursively (RecursionCount == 1). */
+    if (nspa_cs_pi_active() && crit->RecursionCount == 1)
+    {
+        DWORD win_tid = GetCurrentThreadId();
+        LONG *futex = (LONG *)&crit->LockSemaphore;
+        int value = *(int *)&variable->Ptr;
+        NTSTATUS status;
 
-    RtlLeaveCriticalSection( crit );
-    status = RtlWaitOnAddress( &variable->Ptr, &value, sizeof(value), timeout );
-    RtlEnterCriticalSection( crit );
-    return status;
+        /* Register condvar→mutex mapping so the signal side can discover
+         * the PI mutex address (Win32 WakeConditionVariable only takes condvar). */
+        condvar_pi_register( variable, futex );
+
+        /* Release CS bookkeeping. The actual FUTEX_UNLOCK_PI happens on the
+         * unix side, atomically before FUTEX_WAIT_REQUEUE_PI. */
+        crit->RecursionCount = 0;
+        crit->OwningThread   = 0;
+        InterlockedDecrement( &crit->LockCount );
+
+        status = NtNspaCondWaitPI( &variable->Ptr, (LONG)value, futex, timeout );
+
+        /* On ANY return, the unix side ensured we own the PI mutex
+         * (either via kernel requeue, manual FUTEX_LOCK_PI, or because
+         * FUTEX_UNLOCK_PI never happened). Restore CS bookkeeping. */
+        InterlockedIncrement( &crit->LockCount );
+        crit->OwningThread   = ULongToHandle( win_tid );
+        crit->RecursionCount = 1;
+        condvar_pi_deregister( variable );
+
+        if (status == STATUS_SUCCESS || status == STATUS_TIMEOUT)
+            return status;
+
+        /* Requeue-PI failed (STATUS_NOT_SUPPORTED, STATUS_UNSUCCESSFUL, etc.).
+         * CS is owned and restored. Fall through to normal condvar wait
+         * (PI leave/enter still works for FUTEX_LOCK_PI-based CSes). */
+    }
+
+    /* Normal (non-PI) path */
+    {
+        int value = *(int *)&variable->Ptr;
+        NTSTATUS status;
+
+        RtlLeaveCriticalSection( crit );
+        status = RtlWaitOnAddress( &variable->Ptr, &value, sizeof(value), timeout );
+        RtlEnterCriticalSection( crit );
+        return status;
+    }
 }
 
 /***********************************************************************

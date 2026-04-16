@@ -156,6 +156,18 @@ static inline int futex_wake_one( const LONG *addr )
 #ifndef FUTEX_UNLOCK_PI_PRIVATE
 #define FUTEX_UNLOCK_PI_PRIVATE (FUTEX_UNLOCK_PI | FUTEX_PRIVATE_FLAG)
 #endif
+#ifndef FUTEX_WAIT_REQUEUE_PI
+#define FUTEX_WAIT_REQUEUE_PI   11
+#endif
+#ifndef FUTEX_CMP_REQUEUE_PI
+#define FUTEX_CMP_REQUEUE_PI    12
+#endif
+#ifndef FUTEX_WAIT_REQUEUE_PI_PRIVATE
+#define FUTEX_WAIT_REQUEUE_PI_PRIVATE  (FUTEX_WAIT_REQUEUE_PI | FUTEX_PRIVATE_FLAG)
+#endif
+#ifndef FUTEX_CMP_REQUEUE_PI_PRIVATE
+#define FUTEX_CMP_REQUEUE_PI_PRIVATE   (FUTEX_CMP_REQUEUE_PI | FUTEX_PRIVATE_FLAG)
+#endif
 
 static inline int futex_lock_pi( LONG *addr )
 {
@@ -165,6 +177,20 @@ static inline int futex_lock_pi( LONG *addr )
 static inline int futex_unlock_pi( LONG *addr )
 {
     return syscall( __NR_futex, addr, FUTEX_UNLOCK_PI_PRIVATE, 0, NULL, 0, 0 );
+}
+
+static inline int futex_wait_requeue_pi( LONG *condvar, int val,
+                                          const struct timespec *abstime, LONG *pi_mutex )
+{
+    return syscall( __NR_futex, condvar, FUTEX_WAIT_REQUEUE_PI_PRIVATE,
+                    val, abstime, pi_mutex, 0 );
+}
+
+static inline int futex_cmp_requeue_pi( LONG *condvar, int nr_wake,
+                                         int nr_requeue, LONG *pi_mutex, int val )
+{
+    return syscall( __NR_futex, condvar, FUTEX_CMP_REQUEUE_PI_PRIVATE,
+                    nr_wake, (void *)(long)nr_requeue, pi_mutex, val );
 }
 
 #elif defined(__APPLE__)
@@ -4150,6 +4176,200 @@ NTSTATUS WINAPI NtNspaUnlockCriticalSectionPI( void *address )
     if (ret == 0) return STATUS_SUCCESS;
     if (errno == ENOSYS) return STATUS_NOT_SUPPORTED;
     return STATUS_UNSUCCESSFUL;
+#else
+    return STATUS_NOT_SUPPORTED;
+#endif
+}
+
+
+/***********************************************************************
+ *             NtNspaCondWaitPI (NTDLL.@)
+ *
+ * NSPA RT v3 — condvar wait with PI via FUTEX_WAIT_REQUEUE_PI.
+ *
+ * Atomically releases the PI mutex (FUTEX_UNLOCK_PI), then sleeps on the
+ * condvar futex via FUTEX_WAIT_REQUEUE_PI. On signal, the kernel requeues
+ * the waiter directly onto the PI mutex's wait chain — zero gap.
+ *
+ * Contract: on ANY return, the caller owns the PI mutex.
+ *   STATUS_SUCCESS       — signaled, own via kernel requeue or manual relock
+ *   STATUS_TIMEOUT       — timed out, reacquired via FUTEX_LOCK_PI
+ *   STATUS_NOT_SUPPORTED — kernel lacks requeue-PI; CS was never released
+ *   STATUS_UNSUCCESSFUL  — other futex error; reacquired via FUTEX_LOCK_PI
+ */
+NTSTATUS WINAPI NtNspaCondWaitPI( void *condvar_futex, LONG condvar_val,
+                                   void *pi_mutex, const LARGE_INTEGER *timeout )
+{
+#ifdef USE_FUTEX
+    LONG *condvar = condvar_futex;
+    LONG *mutex   = pi_mutex;
+    struct timespec abstime;
+    struct timespec *pts = NULL;
+    int ret, err;
+
+    if (!condvar || !mutex) return STATUS_INVALID_PARAMETER;
+
+    /* Convert NT timeout to absolute CLOCK_MONOTONIC timespec */
+    if (timeout && timeout->QuadPart != TIMEOUT_INFINITE)
+    {
+        LONGLONG relative_100ns;
+
+        if (timeout->QuadPart < 0)
+            relative_100ns = -timeout->QuadPart;
+        else
+        {
+            LARGE_INTEGER now;
+            NtQuerySystemTime( &now );
+            relative_100ns = timeout->QuadPart - now.QuadPart;
+            if (relative_100ns < 0) relative_100ns = 0;
+        }
+
+        clock_gettime( CLOCK_MONOTONIC, &abstime );
+        abstime.tv_nsec += (relative_100ns % TICKSPERSEC) * 100;
+        abstime.tv_sec  += relative_100ns / TICKSPERSEC;
+        if (abstime.tv_nsec >= 1000000000L)
+        {
+            abstime.tv_sec++;
+            abstime.tv_nsec -= 1000000000L;
+        }
+        pts = &abstime;
+    }
+
+    /* Release the PI mutex — equivalent to RtlLeaveCriticalSection's
+     * FUTEX_UNLOCK_PI, but done here to keep it close to the WAIT. */
+    ret = futex_unlock_pi( mutex );
+    if (ret == -1)
+    {
+        if (errno == ENOSYS) return STATUS_NOT_SUPPORTED;
+        /* Unlock failed for another reason — CS state is inconsistent.
+         * Best we can do is return with the mutex still held. */
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    /* Sleep on the condvar futex. The kernel atomically checks
+     * *condvar == condvar_val, then sleeps. On signal via
+     * FUTEX_CMP_REQUEUE_PI, we get requeued onto the PI mutex. */
+    do {
+        ret = futex_wait_requeue_pi( condvar, condvar_val, pts, mutex );
+        err = errno;
+    } while (ret == -1 && err == EINTR);
+
+    if (ret == 0)
+        return STATUS_SUCCESS;  /* kernel requeued us — we own the PI mutex */
+
+    /* Error path: must manually reacquire the PI mutex before returning. */
+    {
+        int lret;
+        do {
+            lret = futex_lock_pi( mutex );
+        } while (lret == -1 && errno == EINTR);
+    }
+
+    if (err == EAGAIN)
+        return STATUS_SUCCESS;  /* condvar value changed — signal raced with us */
+    if (err == ETIMEDOUT)
+        return STATUS_TIMEOUT;
+    if (err == ENOSYS)
+        return STATUS_NOT_SUPPORTED;
+
+    return STATUS_UNSUCCESSFUL;
+#else
+    return STATUS_NOT_SUPPORTED;
+#endif
+}
+
+
+/***********************************************************************
+ *             NtNspaCondSignalPI (NTDLL.@)
+ *
+ * NSPA RT v3 — condvar signal with PI via FUTEX_CMP_REQUEUE_PI.
+ *
+ * Increments the condvar generation counter and wakes one PI waiter,
+ * requeuing it onto the PI mutex. If no PI waiters are queued, returns
+ * STATUS_NO_MORE_ENTRIES so the PE side can fall back to RtlWakeAddressSingle.
+ *
+ *   STATUS_SUCCESS        — woke/requeued at least one PI waiter
+ *   STATUS_NO_MORE_ENTRIES— no PI waiters on condvar futex queue
+ *   STATUS_NOT_SUPPORTED  — kernel lacks FUTEX_CMP_REQUEUE_PI
+ */
+NTSTATUS WINAPI NtNspaCondSignalPI( void *condvar_futex, void *pi_mutex )
+{
+#ifdef USE_FUTEX
+    LONG *condvar = condvar_futex;
+    LONG *mutex   = pi_mutex;
+    int ret;
+    LONG val;
+
+    if (!condvar || !mutex) return STATUS_INVALID_PARAMETER;
+
+    /* Increment the condvar generation counter exactly once per signal.
+     * On EAGAIN (concurrent signal changed the value between our read and
+     * the kernel's check), just re-read the current value and retry — do
+     * NOT re-increment, or we'll burn N generation numbers per signal. */
+    InterlockedIncrement( condvar );
+
+    for (;;)
+    {
+        val = *(volatile LONG *)condvar;
+
+        /* Wake 1, requeue 0 — exactly one waiter moves to the PI mutex. */
+        ret = futex_cmp_requeue_pi( condvar, 1, 0, mutex, val );
+
+        if (ret > 0)
+            return STATUS_SUCCESS;      /* woke a PI waiter */
+        if (ret == 0)
+            return STATUS_NO_MORE_ENTRIES; /* no PI waiters on queue */
+        if (errno == EAGAIN)
+            continue;                   /* value changed, re-read and retry */
+        if (errno == ENOSYS)
+            return STATUS_NOT_SUPPORTED;
+        return STATUS_UNSUCCESSFUL;
+    }
+#else
+    return STATUS_NOT_SUPPORTED;
+#endif
+}
+
+
+/***********************************************************************
+ *             NtNspaCondBroadcastPI (NTDLL.@)
+ *
+ * NSPA RT v3 — condvar broadcast with PI via FUTEX_CMP_REQUEUE_PI.
+ *
+ * Increments the condvar counter, wakes one PI waiter, and requeues all
+ * remaining PI waiters directly onto the PI mutex — no thundering herd.
+ *
+ *   STATUS_SUCCESS        — woke/requeued PI waiters (or none queued)
+ *   STATUS_NOT_SUPPORTED  — kernel lacks FUTEX_CMP_REQUEUE_PI
+ */
+NTSTATUS WINAPI NtNspaCondBroadcastPI( void *condvar_futex, void *pi_mutex )
+{
+#ifdef USE_FUTEX
+    LONG *condvar = condvar_futex;
+    LONG *mutex   = pi_mutex;
+    int ret;
+    LONG val;
+
+    if (!condvar || !mutex) return STATUS_INVALID_PARAMETER;
+
+    /* Increment once, then retry by re-reading on EAGAIN. */
+    InterlockedIncrement( condvar );
+
+    for (;;)
+    {
+        val = *(volatile LONG *)condvar;
+
+        /* Wake 1, requeue all remaining onto PI mutex. */
+        ret = futex_cmp_requeue_pi( condvar, 1, INT_MAX, mutex, val );
+
+        if (ret >= 0)
+            return STATUS_SUCCESS;
+        if (errno == EAGAIN)
+            continue;
+        if (errno == ENOSYS)
+            return STATUS_NOT_SUPPORTED;
+        return STATUS_UNSUCCESSFUL;
+    }
 #else
     return STATUS_NOT_SUPPORTED;
 #endif

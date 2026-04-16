@@ -64,6 +64,7 @@ tests=(
     "ntsync-d8 ntsync 8 4 100000 3 10"
     "ntsync-d12 ntsync 12 8 50000 3 16"
     "socket-io socket-io"
+    "condvar-pi condvar-pi"
 )
 if [[ "$INCLUDE_PRIORITY" == "1" ]]; then
     tests+=("priority")

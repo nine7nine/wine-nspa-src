@@ -63,6 +63,7 @@ tests=(
     "ntsync-d4 ntsync 4 4 100000 8 5"
     "ntsync-d8 ntsync 8 4 100000 3 10"
     "ntsync-d12 ntsync 12 8 50000 3 16"
+    "socket-io socket-io"
 )
 if [[ "$INCLUDE_PRIORITY" == "1" ]]; then
     tests+=("priority")
@@ -113,7 +114,7 @@ run_one() {
     local log_file="$LOG_DIR/${mode}_${name}.log"
     local env_extra=()
     if [[ "$mode" == "rt" ]]; then
-        env_extra=("NSPA_RT_PRIO=$RT_PRIO" "NSPA_RT_POLICY=$RT_POLICY")
+        env_extra=("NSPA_RT_PRIO=$RT_PRIO" "NSPA_RT_POLICY=$RT_POLICY" "WINEPRELOADREMAPVDSO=force")
     fi
 
     printf '  %-16s  ' "$name"

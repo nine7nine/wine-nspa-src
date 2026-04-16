@@ -3981,6 +3981,200 @@ static int cmd_srw_bench(int argc, char **argv)
 }
 
 /* ════════════════════════════════════════════════════════════════════════
+ *   cmd_condvar_pi — Win32 condvar PI validation test
+ *
+ *   Validates that RtlSleepConditionVariableCS + RtlWakeConditionVariable
+ *   correctly use FUTEX_WAIT_REQUEUE_PI / FUTEX_CMP_REQUEUE_PI when CS-PI
+ *   is active (NSPA_RT_PRIO set).
+ *
+ *   Architecture:
+ *     - 1 RT waiter thread (TIME_CRITICAL) that loops:
+ *         EnterCS → SleepConditionVariableCS → check predicate → LeaveCS
+ *     - 1 signaler thread (NORMAL) that loops:
+ *         EnterCS → set predicate → LeaveCS → WakeConditionVariable
+ *     - N load threads (NORMAL, tight CPU busy loops) to starve non-PI threads
+ *
+ *   With condvar PI: the signaler gets boosted when the RT waiter is waiting,
+ *   so the signaler runs promptly even under load. The RT waiter's wake-to-CS
+ *   reacquire has zero PI gap (kernel requeue).
+ *
+ *   Without condvar PI (or without NSPA_RT_PRIO): the signaler competes with
+ *   load threads for CPU, so the RT waiter's total cycle time is longer.
+ *
+ *   PASS condition: functional correctness (all iterations complete, no hangs,
+ *   predicate always true on wake). Latency is reported for comparison.
+ * ════════════════════════════════════════════════════════════════════════ */
+
+#define CONDVAR_PI_ITERATIONS  500
+#define CONDVAR_PI_LOAD_THREADS 4
+#define CONDVAR_PI_SIGNAL_WORK  50000  /* iterations of busy work per signal */
+
+static CRITICAL_SECTION cv_pi_cs;
+static CONDITION_VARIABLE cv_pi_cv;
+static volatile LONG cv_pi_predicate;
+static volatile LONG cv_pi_done;
+static volatile LONG cv_pi_waiter_ready;
+
+struct condvar_pi_result {
+    LONGLONG min_us;
+    LONGLONG max_us;
+    LONGLONG sum_us;
+    int count;
+};
+
+static DWORD WINAPI condvar_pi_waiter_thread(void *arg)
+{
+    struct condvar_pi_result *res = (struct condvar_pi_result *)arg;
+    LARGE_INTEGER freq, t0, t1;
+    int i;
+
+    QueryPerformanceFrequency(&freq);
+    res->min_us = LLONG_MAX;
+    res->max_us = 0;
+    res->sum_us = 0;
+    res->count  = 0;
+
+    for (i = 0; i < CONDVAR_PI_ITERATIONS; i++)
+    {
+        EnterCriticalSection(&cv_pi_cs);
+        cv_pi_predicate = 0;
+        InterlockedExchange(&cv_pi_waiter_ready, 1);
+
+        QueryPerformanceCounter(&t0);
+        while (!cv_pi_predicate)
+            SleepConditionVariableCS(&cv_pi_cv, &cv_pi_cs, INFINITE);
+        QueryPerformanceCounter(&t1);
+
+        LeaveCriticalSection(&cv_pi_cs);
+
+        {
+            LONGLONG us = (t1.QuadPart - t0.QuadPart) * 1000000LL / freq.QuadPart;
+            if (us < res->min_us) res->min_us = us;
+            if (us > res->max_us) res->max_us = us;
+            res->sum_us += us;
+            res->count++;
+        }
+    }
+    return 0;
+}
+
+static DWORD WINAPI condvar_pi_signaler_thread(void *arg)
+{
+    volatile LONG dummy = 0;
+    int i, j;
+    (void)arg;
+
+    for (i = 0; i < CONDVAR_PI_ITERATIONS; i++)
+    {
+        /* Wait until the waiter is ready */
+        while (!cv_pi_waiter_ready)
+            SwitchToThread();
+        InterlockedExchange(&cv_pi_waiter_ready, 0);
+
+        /* Simulate work (makes the PI boost measurable under load) */
+        for (j = 0; j < CONDVAR_PI_SIGNAL_WORK; j++)
+            dummy += j;
+
+        EnterCriticalSection(&cv_pi_cs);
+        cv_pi_predicate = 1;
+        LeaveCriticalSection(&cv_pi_cs);
+        WakeConditionVariable(&cv_pi_cv);
+    }
+    (void)dummy;
+    return 0;
+}
+
+static DWORD WINAPI condvar_pi_load_thread(void *arg)
+{
+    volatile LONG x = 0;
+    (void)arg;
+    while (!cv_pi_done)
+    {
+        int i;
+        for (i = 0; i < 100000; i++)
+            x += i;
+    }
+    (void)x;
+    return 0;
+}
+
+static int cmd_condvar_pi(int argc, char **argv)
+{
+    HANDLE waiter, signaler;
+    HANDLE load[CONDVAR_PI_LOAD_THREADS];
+    struct condvar_pi_result result;
+    int i;
+    (void)argc; (void)argv;
+
+    printf("== condvar-pi: Win32 condvar PI (requeue-PI) validation ==\n\n");
+    printf("  config: %d iterations, %d load threads, %d signal-work iters\n",
+           CONDVAR_PI_ITERATIONS, CONDVAR_PI_LOAD_THREADS, CONDVAR_PI_SIGNAL_WORK);
+    printf("  NSPA_RT_PRIO=%s\n\n",
+           getenv("NSPA_RT_PRIO") ? getenv("NSPA_RT_PRIO") : "(unset)");
+
+    InitializeCriticalSection(&cv_pi_cs);
+    InitializeConditionVariable(&cv_pi_cv);
+    cv_pi_predicate = 0;
+    cv_pi_done = 0;
+    cv_pi_waiter_ready = 0;
+    memset(&result, 0, sizeof(result));
+
+    /* Start load threads */
+    for (i = 0; i < CONDVAR_PI_LOAD_THREADS; i++)
+    {
+        load[i] = CreateThread(NULL, 0, condvar_pi_load_thread, NULL, 0, NULL);
+        SetThreadPriority(load[i], THREAD_PRIORITY_NORMAL);
+    }
+
+    /* Start signaler (NORMAL priority) */
+    signaler = CreateThread(NULL, 0, condvar_pi_signaler_thread, NULL, 0, NULL);
+    SetThreadPriority(signaler, THREAD_PRIORITY_NORMAL);
+
+    /* Start waiter (TIME_CRITICAL — becomes SCHED_FIFO under NSPA_RT_PRIO) */
+    waiter = CreateThread(NULL, 0, condvar_pi_waiter_thread, &result, 0, NULL);
+    SetThreadPriority(waiter, THREAD_PRIORITY_TIME_CRITICAL);
+
+    /* Wait for test completion */
+    WaitForSingleObject(waiter, 30000);
+    WaitForSingleObject(signaler, 30000);
+
+    /* Stop load threads */
+    InterlockedExchange(&cv_pi_done, 1);
+    WaitForMultipleObjects(CONDVAR_PI_LOAD_THREADS, load, TRUE, 5000);
+
+    for (i = 0; i < CONDVAR_PI_LOAD_THREADS; i++)
+        CloseHandle(load[i]);
+    CloseHandle(signaler);
+    CloseHandle(waiter);
+    DeleteCriticalSection(&cv_pi_cs);
+
+    printf("-- results --\n");
+    printf("  iterations         : %d of %d\n", result.count, CONDVAR_PI_ITERATIONS);
+    printf("  min wait           : %lld us\n", (long long)result.min_us);
+    printf("  max wait           : %lld us\n", (long long)result.max_us);
+    printf("  avg wait           : %lld us\n",
+           result.count ? (long long)(result.sum_us / result.count) : 0LL);
+
+    printf("\n-- interpretation --\n");
+    printf("  Run with and without NSPA_RT_PRIO and compare avg/max wait:\n");
+    printf("    with PI:    signaler gets boosted, avg should be low (~signal work time)\n");
+    printf("    without PI: signaler competes with load, avg should be higher\n\n");
+
+    if (result.count == CONDVAR_PI_ITERATIONS)
+    {
+        printf("  PASS\n");
+        return 0;
+    }
+    else
+    {
+        printf("  FAIL (only %d of %d iterations completed)\n",
+               result.count, CONDVAR_PI_ITERATIONS);
+        return 1;
+    }
+}
+
+
+/* ════════════════════════════════════════════════════════════════════════
  *   Command dispatch
  * ════════════════════════════════════════════════════════════════════════ */
 
@@ -4004,6 +4198,7 @@ static struct command commands[] = {
     { "ntsync",          "NTSync kernel driver PI + priority-ordered wakeup (5 sub-tests)",  cmd_ntsync        },
     { "socket-io",       "async TCP loopback latency (io_uring Phase 3 baseline/compare)",  cmd_socket_io     },
     { "srw-bench",       "SRW lock contention benchmark (acquire latency + ops/sec)",      cmd_srw_bench     },
+    { "condvar-pi",      "Win32 condvar PI requeue-PI validation (RT waiter + load)",      cmd_condvar_pi    },
     { "help",            "show this help",                                                  cmd_help          },
     { NULL, NULL, NULL }
 };

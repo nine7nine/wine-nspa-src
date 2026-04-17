@@ -23,6 +23,7 @@
 #pragma makedep unix
 #endif
 
+#include <pthread.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
@@ -63,11 +64,56 @@ struct nspa_cache_entry
     mem_size_t           object_offset;  /* shared_object locator offset */
 };
 
-/* Per-thread state lives in user_thread_info via a dedicated field.
- * For this first cut we keep the table static-per-thread using TLS
- * allocated lazily on first use. */
-static __thread struct nspa_cache_entry nspa_cache[NSPA_CACHE_SLOTS];
-static __thread int nspa_cache_init_done;
+/* Per-thread cache via pthread_key + lazy heap allocation.
+ *
+ * ELF __thread TLS was tried first, but PE-created threads in Ableton
+ * (DWM-Sync, AudioCalc, VST hosts) fault on their first access to a
+ * __thread static declared inside win32u — the dynamic-TLS block for
+ * this module isn't set up for every PE-spawned thread by the time it
+ * enters win32u.  The fault is swallowed by PE-side SEH and the thread
+ * retries on the next message, burning 100% CPU without surfacing any
+ * error (see project_msg_bypass_tls_fault.md).
+ *
+ * pthread TLS is initialised by glibc at pthread_create (which Wine
+ * uses to back CreateThread), so pthread_getspecific is safe on any
+ * thread that the process's scheduler can dispatch, regardless of
+ * which TEB/loader layer created it.  Lazy heap allocation on first
+ * access keeps cost to one calloc per message-sending thread.
+ */
+static pthread_key_t nspa_cache_tls_key;
+static pthread_once_t nspa_cache_tls_once = PTHREAD_ONCE_INIT;
+
+static void nspa_cache_tls_destructor( void *p )
+{
+    free( p );
+}
+
+static void nspa_cache_tls_init_once( void )
+{
+    pthread_key_create( &nspa_cache_tls_key, nspa_cache_tls_destructor );
+}
+
+/* Returns this thread's cache array, allocating on first use.
+ * Returns NULL if allocation failed — caller must fall back to server. */
+static struct nspa_cache_entry *nspa_cache_get( void )
+{
+    struct nspa_cache_entry *cache;
+
+    pthread_once( &nspa_cache_tls_once, nspa_cache_tls_init_once );
+
+    cache = pthread_getspecific( nspa_cache_tls_key );
+    if (cache) return cache;
+
+    cache = calloc( NSPA_CACHE_SLOTS, sizeof(*cache) );
+    if (!cache) return NULL;
+
+    if (pthread_setspecific( nspa_cache_tls_key, cache ) != 0)
+    {
+        free( cache );
+        return NULL;
+    }
+    return cache;
+}
 
 static BOOL nspa_bypass_disabled( void )
 {
@@ -125,21 +171,14 @@ static unsigned int ring_reserve_slot( volatile nspa_msg_ring_t *ring )
  * slots.
  * --------------------------------------------------------------------- */
 
-static void nspa_cache_init( void )
-{
-    if (nspa_cache_init_done) return;
-    memset( nspa_cache, 0, sizeof(nspa_cache) );
-    nspa_cache_init_done = 1;
-}
-
-static struct nspa_cache_entry *nspa_cache_find( DWORD tid )
+static struct nspa_cache_entry *nspa_cache_find( struct nspa_cache_entry *cache, DWORD tid )
 {
     unsigned int h = (tid * 2654435761u) & (NSPA_CACHE_SLOTS - 1);
     unsigned int i;
 
     for (i = 0; i < NSPA_CACHE_SLOTS; i++)
     {
-        struct nspa_cache_entry *e = &nspa_cache[(h + i) & (NSPA_CACHE_SLOTS - 1)];
+        struct nspa_cache_entry *e = &cache[(h + i) & (NSPA_CACHE_SLOTS - 1)];
         if (e->tid == tid) return e;
         if (e->tid == 0)   return e;   /* first free slot — reserve for caller */
     }
@@ -209,13 +248,13 @@ static BOOL nspa_populate_cache_entry( DWORD tid, struct nspa_cache_entry *entry
  * regression notes in docs/send-message-bypass-design.md §15.4). */
 static struct nspa_cache_entry *nspa_lookup_peer( DWORD tid )
 {
-    struct nspa_cache_entry *entry;
+    struct nspa_cache_entry *cache, *entry;
 
     if (!tid) return NULL;
 
-    nspa_cache_init();
+    if (!(cache = nspa_cache_get())) return NULL;  /* TLS alloc failed */
 
-    entry = nspa_cache_find( tid );
+    entry = nspa_cache_find( cache, tid );
     if (!entry) return NULL;       /* cache full */
     if (entry->tid == tid)
     {
@@ -530,6 +569,9 @@ BOOL nspa_try_send_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
     DWORD own_tid;
     BOOL is_notify;
     int waits = 0;
+
+    TRACE_(nspa_bypass)( "PROBE try_send_ring enter dest=%04x type=%u hwnd=%p msg=%04x\n",
+                         (UINT)dest_tid, type_enum, hwnd, msg );
 
     if (nspa_bypass_disabled())
     {

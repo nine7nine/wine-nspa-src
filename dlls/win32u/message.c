@@ -40,6 +40,7 @@
 WINE_DEFAULT_DEBUG_CHANNEL(msg);
 WINE_DECLARE_DEBUG_CHANNEL(key);
 WINE_DECLARE_DEBUG_CHANNEL(relay);
+WINE_DECLARE_DEBUG_CHANNEL(nspa_bypass);
 
 #define QS_DRIVER       0x80000000
 #define QS_HARDWARE     0x40000000
@@ -3703,6 +3704,9 @@ static BOOL put_message_in_queue( const struct send_message_info *info, size_t *
     int i;
     timeout_t timeout = TIMEOUT_INFINITE;
 
+    TRACE_(nspa_bypass)( "PROBE put_message_in_queue entry dest=%04x type=%u hwnd=%p msg=%04x\n",
+                         (UINT)info->dest_tid, info->type, info->hwnd, info->msg );
+
     /* Check for INFINITE timeout for compatibility with Win9x,
      * although Windows >= NT does not do so
      */
@@ -3896,20 +3900,48 @@ static LRESULT send_inter_thread_message( const struct send_message_info *info, 
     size_t reply_size = 0;
     LRESULT ring_result = 0;
 
+    TRACE_(nspa_bypass)( "PROBE send_inter_thread_message entry dest=%04x type=%u hwnd=%p msg=%04x\n",
+                         (UINT)info->dest_tid, info->type, info->hwnd, info->msg );
+
     TRACE( "hwnd %p msg %x (%s) wp %lx lp %lx\n",
            info->hwnd, info->msg, debugstr_msg_name(info->msg, info->hwnd),
            (long)info->wparam, info->lparam );
 
     user_check_not_lock();
 
+    TRACE_(nspa_bypass)( "PROBE post-user-lock dest=%04x type=%u\n",
+                         (UINT)info->dest_tid, info->type );
+
     /* NSPA: fast path for same-process cross-thread MSG_ASCII / MSG_UNICODE /
      * MSG_NOTIFY via the shmem ring + reply ring.  On success the reply has
-     * already been received and *res_ptr is filled. */
-    if (nspa_try_send_ring( info->dest_tid, info->type, info->hwnd, info->msg,
-                            info->wparam, info->lparam, &ring_result ))
+     * already been received and *res_ptr is filled.
+     *
+     * SEH guard: some PE-created threads (Ableton DWM-Sync observed) fault
+     * inside the ring path for reasons still under investigation.  Rather
+     * than let the fault trigger an unwind-and-retry loop that chews 100 %
+     * CPU with no diagnostic, catch it here, log, and fall through to the
+     * server path. */
     {
-        if (res_ptr) *res_ptr = ring_result;
-        return 1;
+        BOOL bypass_ret = FALSE;
+        __TRY
+        {
+            bypass_ret = nspa_try_send_ring( info->dest_tid, info->type, info->hwnd, info->msg,
+                                             info->wparam, info->lparam, &ring_result );
+        }
+        __EXCEPT
+        {
+            WARN_(nspa_bypass)( "nspa_try_send_ring faulted for dest=%04x type=%u hwnd=%p msg=%04x — falling back to server\n",
+                                (UINT)info->dest_tid, info->type, info->hwnd, info->msg );
+            bypass_ret = FALSE;
+        }
+        __ENDTRY
+        TRACE_(nspa_bypass)( "PROBE post-bypass ret=%d dest=%04x type=%u\n",
+                             bypass_ret, (UINT)info->dest_tid, info->type );
+        if (bypass_ret)
+        {
+            if (res_ptr) *res_ptr = ring_result;
+            return 1;
+        }
     }
 
     if (!put_message_in_queue( info, &reply_size )) return 0;

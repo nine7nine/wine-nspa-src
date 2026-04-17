@@ -236,6 +236,7 @@ static inline unsigned int nspa_ring_status_bits( const struct msg_queue *queue 
 static inline int nspa_ring_arb_disabled(void);
 static inline int nspa_ring_wake_syn_disabled(void);
 static inline int nspa_ring_alloc_disabled(void);
+static inline int nspa_locator_disabled(void);
 
 /* set the caret window in a given thread input, requires write lock on the thread input shared member */
 static void set_caret_window( struct thread_input *input, input_shm_t *shared, user_handle_t win )
@@ -350,7 +351,7 @@ static struct msg_queue *create_msg_queue( struct thread *thread, struct thread_
             shared->changed_mask = 0;
             shared->changed_bits = 0;
             shared->internal_bits = 0;
-            if (queue->nspa_shared)
+            if (queue->nspa_shared && !nspa_locator_disabled())
                 shared->nspa_bypass_locator = get_shared_object_locator( queue->nspa_shared );
             else
                 memset( (void *)&shared->nspa_bypass_locator, 0, sizeof(shared->nspa_bypass_locator) );
@@ -1052,6 +1053,7 @@ static void free_message( struct message *msg )
 static int nspa_server_ring_arb_off = -1;
 static int nspa_server_wake_syn_off = -1;
 static int nspa_server_alloc_off    = -1;
+static int nspa_server_locator_off  = -1;
 
 static inline int nspa_ring_arb_disabled(void)
 {
@@ -1078,6 +1080,20 @@ static inline int nspa_ring_alloc_disabled(void)
     if (nspa_server_alloc_off == -1)
         nspa_server_alloc_off = (getenv("NSPA_MSG_BYPASS_SERVER_NO_ALLOC") != NULL);
     return nspa_server_alloc_off;
+}
+
+/* NSPA_MSG_BYPASS_SERVER_NO_LOCATOR: allocate nspa_shared normally but
+ * force queue_shm_t.nspa_bypass_locator and nspa_get_thread_queue's
+ * reply->bypass_locator to zero, so clients see "no bypass object"
+ * even though the server-side allocation happened.  Disambiguates
+ * whether the regression is in the allocation/memory-pressure pattern
+ * (bug persists with this flag set) or in client-side consumers of
+ * the locator (bug clears with this flag set). */
+static inline int nspa_locator_disabled(void)
+{
+    if (nspa_server_locator_off == -1)
+        nspa_server_locator_off = (getenv("NSPA_MSG_BYPASS_SERVER_NO_LOCATOR") != NULL);
+    return nspa_server_locator_off;
 }
 
 static inline int nspa_ring_has_pending_posted( const struct msg_queue *queue )
@@ -3404,7 +3420,7 @@ DECL_HANDLER(nspa_get_thread_queue)
     if (queue)
     {
         reply->locator = get_shared_object_locator( queue->shared );
-        if (queue->nspa_shared)
+        if (queue->nspa_shared && !nspa_locator_disabled())
             reply->bypass_locator = get_shared_object_locator( queue->nspa_shared );
         else
             memset( &reply->bypass_locator, 0, sizeof(reply->bypass_locator) );

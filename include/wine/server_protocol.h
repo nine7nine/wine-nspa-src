@@ -1079,6 +1079,12 @@ typedef volatile struct
 
 typedef volatile struct
 {
+    nspa_msg_ring_t      nspa_msg_ring;
+    nspa_reply_ring_t    nspa_reply_ring;
+} nspa_queue_bypass_shm_t;
+
+typedef volatile struct
+{
     timeout_t            access_time;
     unsigned int         wake_mask;
     unsigned int         wake_bits;
@@ -1086,9 +1092,7 @@ typedef volatile struct
     unsigned int         changed_bits;
     unsigned int         internal_bits;
     int                  hooks_count[NB_HOOKS];
-
-    nspa_msg_ring_t      nspa_msg_ring;
-    nspa_reply_ring_t    nspa_reply_ring;
+    struct obj_locator   nspa_bypass_locator;
 } queue_shm_t;
 
 typedef volatile struct
@@ -6260,8 +6264,9 @@ struct nspa_get_thread_queue_reply
 {
     struct reply_header __header;
     struct obj_locator locator;
+    struct obj_locator bypass_locator;
     obj_handle_t    sync_handle;
-    char __pad_28[4];
+    char __pad_44[4];
 };
 
 

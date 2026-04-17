@@ -827,16 +827,20 @@ SHORT WINAPI NtUserGetAsyncKeyState( INT key )
 /***********************************************************************
  *           get_shared_queue_bits
  */
-static inline UINT nspa_queue_status_bits( const queue_shm_t *queue_shm )
+static inline UINT nspa_queue_status_bits( const nspa_queue_bypass_shm_t *queue_bypass )
 {
-    return __atomic_load_n( &queue_shm->nspa_msg_ring.pending_count, __ATOMIC_ACQUIRE ) ?
+    return queue_bypass &&
+           __atomic_load_n( &queue_bypass->nspa_msg_ring.pending_count, __ATOMIC_ACQUIRE ) ?
            (QS_POSTMESSAGE | QS_ALLPOSTMESSAGE) : 0;
 }
 
-static inline UINT nspa_queue_changed_bits( const queue_shm_t *queue_shm )
+static inline UINT nspa_queue_changed_bits( const nspa_queue_bypass_shm_t *queue_bypass )
 {
-    unsigned int seq = __atomic_load_n( &queue_shm->nspa_msg_ring.change_seq, __ATOMIC_ACQUIRE );
-    unsigned int ack = __atomic_load_n( &queue_shm->nspa_msg_ring.change_ack_seq, __ATOMIC_ACQUIRE );
+    unsigned int seq, ack;
+
+    if (!queue_bypass) return 0;
+    seq = __atomic_load_n( &queue_bypass->nspa_msg_ring.change_seq, __ATOMIC_ACQUIRE );
+    ack = __atomic_load_n( &queue_bypass->nspa_msg_ring.change_ack_seq, __ATOMIC_ACQUIRE );
 
     return seq != ack ? (QS_POSTMESSAGE | QS_ALLPOSTMESSAGE) : 0;
 }
@@ -850,8 +854,9 @@ static BOOL get_shared_queue_bits( UINT *wake_bits, UINT *changed_bits )
     *wake_bits = *changed_bits = 0;
     while ((status = get_shared_queue( &lock, &queue_shm )) == STATUS_PENDING)
     {
-        UINT ring_bits = nspa_queue_status_bits( queue_shm );
-        UINT changed_ring_bits = nspa_queue_changed_bits( queue_shm );
+        const nspa_queue_bypass_shm_t *queue_bypass = get_queue_bypass_shm( queue_shm );
+        UINT ring_bits = nspa_queue_status_bits( queue_bypass );
+        UINT changed_ring_bits = nspa_queue_changed_bits( queue_bypass );
         *wake_bits = queue_shm->wake_bits | ring_bits;
         *changed_bits = queue_shm->changed_bits | changed_ring_bits;
     }

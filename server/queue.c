@@ -334,8 +334,13 @@ static struct msg_queue *create_msg_queue( struct thread *thread, struct thread_
         for (i = 0; i < NB_MSG_KINDS; i++) list_init( &queue->msg_list[i] );
 
         if (!(queue->sync = create_internal_sync( 1, 0 ))) goto error;
-        if (!nspa_ring_alloc_disabled() &&
-            !(queue->nspa_shared = alloc_shared_object( sizeof(*queue->nspa_shared) ))) goto error;
+        /* NSPA lazy alloc: queue->nspa_shared stays NULL at creation.  It is
+         * allocated on demand by nspa_ensure_shared() the first time a peer
+         * or this queue itself needs the bypass ring.  Threads that never
+         * participate in cross-thread bypass messaging never allocate one.
+         * This replaces the unconditional 10 KB-per-queue allocation that
+         * was the root of the library-panel regression (docs/send-message-
+         * bypass-design.md §15.11). */
         if (!(queue->shared = alloc_shared_object( sizeof(*queue->shared) )))
         {
             release_object( queue );
@@ -351,23 +356,10 @@ static struct msg_queue *create_msg_queue( struct thread *thread, struct thread_
             shared->changed_mask = 0;
             shared->changed_bits = 0;
             shared->internal_bits = 0;
-            if (queue->nspa_shared && !nspa_locator_disabled())
-                shared->nspa_bypass_locator = get_shared_object_locator( queue->nspa_shared );
-            else
-                memset( (void *)&shared->nspa_bypass_locator, 0, sizeof(shared->nspa_bypass_locator) );
+            /* Lazy: locator starts zero.  nspa_ensure_shared() sets it later. */
+            memset( (void *)&shared->nspa_bypass_locator, 0, sizeof(shared->nspa_bypass_locator) );
         }
         SHARED_WRITE_END;
-
-        if (queue->nspa_shared)
-        {
-            SHARED_WRITE_BEGIN( queue->nspa_shared, nspa_queue_bypass_shm_t )
-            {
-                memset( (void *)&shared->nspa_msg_ring, 0, sizeof(shared->nspa_msg_ring) );
-                memset( (void *)&shared->nspa_reply_ring, 0, sizeof(shared->nspa_reply_ring) );
-                shared->nspa_msg_ring.active = 1;  /* ring usable from creation */
-            }
-            SHARED_WRITE_END;
-        }
 
         thread->queue = queue;
 
@@ -1094,6 +1086,43 @@ static inline int nspa_locator_disabled(void)
     if (nspa_server_locator_off == -1)
         nspa_server_locator_off = (getenv("NSPA_MSG_BYPASS_SERVER_NO_LOCATOR") != NULL);
     return nspa_server_locator_off;
+}
+
+/* Lazy-allocate per-queue nspa_shared (bypass msg+reply rings).  Queues
+ * are created with nspa_shared == NULL; this function allocates on first
+ * demand and publishes the locator into queue_shm so clients can find it.
+ *
+ * Called from nspa_get_thread_queue handler when a peer queries this
+ * queue (→ peer is about to bypass-post to us).  Idempotent: if already
+ * allocated, returns immediately.  Gated by NSPA_MSG_BYPASS_SERVER_NO_ALLOC
+ * (returns 0 without allocating when set). */
+static int nspa_ensure_shared( struct msg_queue *queue )
+{
+    if (queue->nspa_shared) return 1;
+    if (nspa_ring_alloc_disabled()) return 0;
+
+    if (!(queue->nspa_shared = alloc_shared_object( sizeof(*queue->nspa_shared) )))
+        return 0;
+
+    SHARED_WRITE_BEGIN( queue->nspa_shared, nspa_queue_bypass_shm_t )
+    {
+        memset( (void *)&shared->nspa_msg_ring, 0, sizeof(shared->nspa_msg_ring) );
+        memset( (void *)&shared->nspa_reply_ring, 0, sizeof(shared->nspa_reply_ring) );
+        shared->nspa_msg_ring.active = 1;
+    }
+    SHARED_WRITE_END;
+
+    /* Publish the locator so clients can reach the ring via queue_shm.
+     * Clients that read a partial-written locator will fail the id check
+     * in find_shared_session_object and fall through to the server path;
+     * next read sees the full locator and bypass engages. */
+    SHARED_WRITE_BEGIN( queue->shared, queue_shm_t )
+    {
+        shared->nspa_bypass_locator = get_shared_object_locator( queue->nspa_shared );
+    }
+    SHARED_WRITE_END;
+
+    return 1;
 }
 
 static inline int nspa_ring_has_pending_posted( const struct msg_queue *queue )
@@ -3420,7 +3449,12 @@ DECL_HANDLER(nspa_get_thread_queue)
     if (queue)
     {
         reply->locator = get_shared_object_locator( queue->shared );
-        if (queue->nspa_shared && !nspa_locator_disabled())
+        /* Lazy-allocate the bypass ring on first peer query.  Queues that
+         * are never targets of a cross-thread bypass post stay unallocated
+         * — this is the fix for the Ableton library-panel regression where
+         * the unconditional per-queue allocation caused pathological
+         * behaviour (docs/send-message-bypass-design.md §15.11). */
+        if (nspa_ensure_shared( queue ) && !nspa_locator_disabled())
             reply->bypass_locator = get_shared_object_locator( queue->nspa_shared );
         else
             memset( &reply->bypass_locator, 0, sizeof(reply->bypass_locator) );

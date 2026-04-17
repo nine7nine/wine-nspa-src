@@ -1095,6 +1095,12 @@ typedef volatile struct
 
 typedef volatile struct
 {
+    nspa_msg_ring_t      nspa_msg_ring;    /* incoming messages (senders -> me) */
+    nspa_reply_ring_t    nspa_reply_ring;  /* replies to my SendMessage calls (receivers -> me) */
+} nspa_queue_bypass_shm_t;
+
+typedef volatile struct
+{
     timeout_t            access_time;      /* last time the queue was accessed */
     unsigned int         wake_mask;        /* wakeup mask */
     unsigned int         wake_bits;        /* wakeup bits */
@@ -1102,9 +1108,7 @@ typedef volatile struct
     unsigned int         changed_bits;     /* changed wakeup bits */
     unsigned int         internal_bits;    /* internal queue bits */
     int                  hooks_count[NB_HOOKS];  /* active hooks count */
-    /* NSPA: cross-thread message bypass rings (trailing) */
-    nspa_msg_ring_t      nspa_msg_ring;    /* incoming messages (senders -> me) */
-    nspa_reply_ring_t    nspa_reply_ring;  /* replies to my SendMessage calls (receivers -> me) */
+    struct obj_locator   nspa_bypass_locator;  /* external shared object for bypass rings */
 } queue_shm_t;
 
 typedef volatile struct
@@ -4371,6 +4375,7 @@ enum inproc_sync_type
 @REQ(nspa_get_thread_queue)
     thread_id_t     tid;          /* target thread id */
 @REPLY
-    struct obj_locator locator;   /* shared session object locator for target queue */
-    obj_handle_t    sync_handle;  /* handle to the queue's sync object (ntsync event) */
+    struct obj_locator locator;          /* shared session object locator for target queue */
+    struct obj_locator bypass_locator;   /* shared session object locator for target bypass rings */
+    obj_handle_t    sync_handle;         /* handle to the queue's sync object (ntsync event) */
 @END

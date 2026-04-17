@@ -2383,5 +2383,6 @@ C_ASSERT( sizeof(struct d3dkmt_mutex_release_request) == 40 );
 C_ASSERT( offsetof(struct nspa_get_thread_queue_request, tid) == 12 );
 C_ASSERT( sizeof(struct nspa_get_thread_queue_request) == 16 );
 C_ASSERT( offsetof(struct nspa_get_thread_queue_reply, locator) == 8 );
-C_ASSERT( offsetof(struct nspa_get_thread_queue_reply, sync_handle) == 24 );
-C_ASSERT( sizeof(struct nspa_get_thread_queue_reply) == 32 );
+C_ASSERT( offsetof(struct nspa_get_thread_queue_reply, bypass_locator) == 24 );
+C_ASSERT( offsetof(struct nspa_get_thread_queue_reply, sync_handle) == 40 );
+C_ASSERT( sizeof(struct nspa_get_thread_queue_reply) == 48 );

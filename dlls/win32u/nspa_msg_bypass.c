@@ -280,7 +280,7 @@ BOOL nspa_try_post_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
     if (status)
     {
         nspa_clear_cache_entry( entry );
-        WARN( "failed to signal bypass queue %lu\n", dest_tid );
+        WARN( "failed to signal bypass queue %u\n", dest_tid );
     }
     return TRUE;
 }

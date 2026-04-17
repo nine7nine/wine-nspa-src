@@ -2966,16 +2966,22 @@ static int peek_message( MSG *msg, const struct peek_message_filter *filter )
         wake_mask = filter->mask & (QS_SENDMESSAGE | QS_SMRESULT);
 
         /* NSPA: drain the cross-thread shmem ring first.  If it yields
-         * a message matching our filter, skip the server round-trip. */
+         * a message matching our filter, skip the server round-trip.
+         *
+         * The ring has its own head/tail atomics; we don't need the queue
+         * seqlock here — get_shared_queue only serves to lazy-populate the
+         * thread-local shared_queue pointer.  Calling it once is enough;
+         * the returned pointer is stable for the life of the queue. */
         {
             struct object_lock nspa_lock = OBJECT_LOCK_INIT;
             const queue_shm_t *nspa_queue_shm = NULL;
-            UINT nspa_qstatus, nspa_slot_type = 0;
+            UINT nspa_slot_type = 0;
             MSG nspa_msg;
             BOOL nspa_hit = FALSE;
 
             memset( &nspa_msg, 0, sizeof(nspa_msg) );
-            while ((nspa_qstatus = get_shared_queue( &nspa_lock, &nspa_queue_shm )) == STATUS_PENDING)
+            get_shared_queue( &nspa_lock, &nspa_queue_shm );
+            if (nspa_queue_shm)
                 nspa_hit = nspa_drain_peek( nspa_queue_shm, hwnd, first, last, flags,
                                             &nspa_msg, &nspa_slot_type );
             if (nspa_hit)

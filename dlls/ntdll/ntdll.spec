@@ -1751,6 +1751,7 @@
 @ cdecl -norelay wine_server_call(ptr)
 @ cdecl wine_server_fd_to_handle(long long long ptr)
 @ cdecl wine_server_handle_to_fd(long long ptr ptr)
+@ cdecl wine_server_signal_internal_sync(long)
 
 # Unix interface
 @ stdcall __wine_unix_spawnvp(long ptr)

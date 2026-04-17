@@ -53,6 +53,7 @@ NTSYSAPI void CDECL wine_server_send_fd( int fd );
 NTSYSAPI unsigned int CDECL wine_server_call( void *req_ptr );
 NTSYSAPI NTSTATUS CDECL wine_server_fd_to_handle( int fd, unsigned int access, unsigned int attributes, HANDLE *handle );
 NTSYSAPI NTSTATUS CDECL wine_server_handle_to_fd( HANDLE handle, unsigned int access, int *unix_fd, unsigned int *options );
+NTSYSAPI NTSTATUS CDECL wine_server_signal_internal_sync( HANDLE handle );
 
 /* do a server call and set the last error code */
 static inline unsigned int wine_server_call_err( void *req_ptr )

@@ -1049,6 +1049,7 @@ typedef volatile struct
     unsigned int type;              /* enum message_type */
     user_handle_t win;              /* window handle (target) */
     unsigned int msg;               /* message code */
+    unsigned int  post_seq;         /* canonical posted ordering vs server queue */
     lparam_t      wparam;
     lparam_t      lparam;
     int           x;                /* cursor x at send time */
@@ -1068,6 +1069,9 @@ typedef volatile struct
     unsigned int tail;              /* consumer index */
     unsigned int overflow;          /* count of fallback-to-server from ring-full */
     unsigned int active;            /* 0 = ring inactive (receiver not set up yet) */
+    unsigned int pending_count;     /* ring-owned posted work pending in this queue */
+    unsigned int next_post_seq;     /* next canonical posted sequence number */
+    unsigned int __pad[2];
     nspa_msg_slot_t slots[NSPA_MSG_RING_SLOTS];
 } nspa_msg_ring_t;
 

@@ -1335,6 +1335,13 @@ static BOOL nspa_get_current_rt_params( unsigned int *policy, unsigned int *prio
 #endif
 }
 
+NTSTATUS CDECL wine_server_signal_internal_sync( HANDLE handle )
+{
+    struct wine_server_signal_internal_sync_params params = { handle };
+
+    return unixcall_wine_server_signal_internal_sync( &params );
+}
+
 NTSTATUS unixcall_wine_server_signal_internal_sync( void *args )
 {
     const struct wine_server_signal_internal_sync_params *params = args;

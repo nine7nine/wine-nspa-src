@@ -60,6 +60,34 @@ struct nspa_cache_entry
 static __thread struct nspa_cache_entry nspa_cache[NSPA_CACHE_SLOTS];
 static __thread int nspa_cache_init_done;
 
+/* Handle to *our own* queue->sync event.  Acquired lazily on first drain
+ * so the receiver can reset the event after emptying the ring.  Without
+ * this, queue->sync (manual-reset) stays signalled forever once a ring
+ * send fires it, producing a 100% CPU busy-peek loop. */
+static __thread HANDLE nspa_own_sync_handle;
+
+/* Acquire a handle to this thread's own queue->sync for reset after drain.
+ * One-time server round-trip per thread; cached in TLS thereafter. */
+static HANDLE nspa_get_own_sync_handle( void )
+{
+    HANDLE h = NULL;
+    NTSTATUS status;
+
+    if (nspa_own_sync_handle) return nspa_own_sync_handle;
+
+    SERVER_START_REQ( nspa_get_thread_queue )
+    {
+        req->tid = HandleToULong( NtCurrentTeb()->ClientId.UniqueThread );
+        if (!(status = wine_server_call( req )))
+            h = wine_server_ptr_handle( reply->sync_handle );
+    }
+    SERVER_END_REQ;
+
+    if (status || !h) return NULL;
+    nspa_own_sync_handle = h;
+    return h;
+}
+
 /* ---------------------------------------------------------------------
  * Ring helpers — atomic ops over shared memory.
  *
@@ -213,11 +241,32 @@ BOOL nspa_try_post_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
     ring = &((queue_shm_t *)entry->queue_shm)->nspa_msg_ring;
     if (!ring->active) return FALSE;
 
-    /* Skip the ring if a message hook is active on the receiver — the
-     * server runs the hook chain for posted messages. */
-    if (entry->queue_shm->hooks_count[0 /* WH_MSGFILTER-WH_MINHOOK */] != 0 ||
-        entry->queue_shm->hooks_count[3 /* WH_GETMESSAGE-WH_MINHOOK */] != 0)
-        return FALSE;
+    /* Skip the ring if a hook is active on the receiver that may need
+     * server-side observation or ordering.  WH_MIN == -1, so index is
+     * (WH_X - WH_MINHOOK).
+     *
+     *   WH_MSGFILTER      (-1) → [0]  — filter dialog-loop msgs
+     *   WH_JOURNALRECORD  ( 0) → [1]  — records every message
+     *   WH_JOURNALPLAYBACK( 1) → [2]  — injects synthesized messages
+     *   WH_GETMESSAGE     ( 3) → [4]  — observes each delivered msg
+     *   WH_CALLWNDPROC    ( 4) → [5]  — SEND-path only, but gate for safety
+     *   WH_SYSMSGFILTER   ( 6) → [7]  — system-wide msg filter
+     *
+     * WH_GETMESSAGE actually fires on the *receiver* regardless of
+     * transport (see message.c call_hooks at delivery), but journal
+     * hooks can inject/record at the server layer and must not be
+     * bypassed.  Gating on all of these is defensive and cheap: six
+     * dirty-hot shmem reads, no syscall. */
+    {
+        const volatile int *hc = entry->queue_shm->hooks_count;
+        if (hc[WH_MSGFILTER       - WH_MINHOOK] != 0 ||
+            hc[WH_JOURNALRECORD   - WH_MINHOOK] != 0 ||
+            hc[WH_JOURNALPLAYBACK - WH_MINHOOK] != 0 ||
+            hc[WH_GETMESSAGE      - WH_MINHOOK] != 0 ||
+            hc[WH_CALLWNDPROC     - WH_MINHOOK] != 0 ||
+            hc[WH_SYSMSGFILTER    - WH_MINHOOK] != 0)
+            return FALSE;
+    }
 
     idx = ring_reserve_slot( ring );
     if (idx == ~0u) return FALSE;   /* FULL — fall back to server */
@@ -356,7 +405,52 @@ BOOL nspa_drain_peek( const queue_shm_t *queue_shm, HWND hwnd, UINT first, UINT 
         cursor++;
     }
     if (cursor != tail)
+    {
         __atomic_store_n( &ring->tail, cursor, __ATOMIC_RELEASE );
+        tail = cursor;
+    }
+
+    /* If our consume emptied the ring, we must clear QS_POSTMESSAGE from
+     * wake_bits/changed_bits AND reset queue->sync.  The sender's path is:
+     *     reserve slot → publish (state=READY) → OR wake_bits → NtSetEvent
+     * queue->sync is manual-reset (server/queue.c create_internal_sync(1,0)),
+     * so once signalled it stays signalled until *someone* resets it.
+     * The normal server-drain path handles this via clear_queue_bits()
+     * + reset_sync() when get_message empties msg_list[].  For ring-drained
+     * messages the server never sees them, so the receiver must do it here.
+     *
+     * Race handling: a sender may slip in between our emptiness-check and
+     * our clear/reset.  Standard "check, clear, re-check, restore-if-raced"
+     * pattern — NtResetEvent is a syscall and serves as a full barrier, so
+     * the re-read of head sees any store the sender made before its own
+     * NtSetEvent. */
+    head = __atomic_load_n( &ring->head, __ATOMIC_ACQUIRE );
+    if (tail == head)
+    {
+        volatile queue_shm_t *q = (volatile queue_shm_t *)queue_shm;
+        HANDLE sync_h;
+
+        __atomic_fetch_and( (volatile unsigned int *)&q->wake_bits,
+                            ~(unsigned int)(QS_POSTMESSAGE | QS_ALLPOSTMESSAGE),
+                            __ATOMIC_SEQ_CST );
+        __atomic_fetch_and( (volatile unsigned int *)&q->changed_bits,
+                            ~(unsigned int)(QS_POSTMESSAGE | QS_ALLPOSTMESSAGE),
+                            __ATOMIC_SEQ_CST );
+
+        if ((sync_h = nspa_get_own_sync_handle()))
+            NtResetEvent( sync_h, NULL );
+
+        /* Re-check for a sender that raced us between drain and reset */
+        head = __atomic_load_n( &ring->head, __ATOMIC_ACQUIRE );
+        if (tail != head)
+        {
+            __atomic_fetch_or( (volatile unsigned int *)&q->wake_bits,
+                               QS_POSTMESSAGE | QS_ALLPOSTMESSAGE, __ATOMIC_RELEASE );
+            __atomic_fetch_or( (volatile unsigned int *)&q->changed_bits,
+                               QS_POSTMESSAGE | QS_ALLPOSTMESSAGE, __ATOMIC_RELEASE );
+            if (sync_h) NtSetEvent( sync_h, NULL );
+        }
+    }
 
     return TRUE;
 }

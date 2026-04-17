@@ -1935,3 +1935,41 @@ NTSTATUS WINAPI wow64_NtNspaUnlockCriticalSectionPI( UINT *args )
 
     return NtNspaUnlockCriticalSectionPI( address );
 }
+
+
+/**********************************************************************
+ *           wow64_NtNspaCondWaitPI
+ */
+NTSTATUS WINAPI wow64_NtNspaCondWaitPI( UINT *args )
+{
+    void                *condvar_futex = get_ptr( &args );
+    LONG                 condvar_val   = get_ulong( &args );
+    void                *pi_mutex      = get_ptr( &args );
+    const LARGE_INTEGER *timeout       = get_ptr( &args );
+
+    return NtNspaCondWaitPI( condvar_futex, condvar_val, pi_mutex, timeout );
+}
+
+
+/**********************************************************************
+ *           wow64_NtNspaCondSignalPI
+ */
+NTSTATUS WINAPI wow64_NtNspaCondSignalPI( UINT *args )
+{
+    void *condvar_futex = get_ptr( &args );
+    void *pi_mutex      = get_ptr( &args );
+
+    return NtNspaCondSignalPI( condvar_futex, pi_mutex );
+}
+
+
+/**********************************************************************
+ *           wow64_NtNspaCondBroadcastPI
+ */
+NTSTATUS WINAPI wow64_NtNspaCondBroadcastPI( UINT *args )
+{
+    void *condvar_futex = get_ptr( &args );
+    void *pi_mutex      = get_ptr( &args );
+
+    return NtNspaCondBroadcastPI( condvar_futex, pi_mutex );
+}

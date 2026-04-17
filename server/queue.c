@@ -139,6 +139,7 @@ struct msg_queue
     struct hook_table     *hooks;           /* hook table */
     int                    keystate_lock;   /* owns an input keystate lock */
     queue_shm_t           *shared;          /* queue in session shared memory */
+    nspa_queue_bypass_shm_t *nspa_shared;   /* external shared object for bypass rings */
 };
 
 struct hotkey
@@ -320,6 +321,7 @@ static struct msg_queue *create_msg_queue( struct thread *thread, struct thread_
         queue->input           = (struct thread_input *)grab_object( input );
         queue->hooks           = NULL;
         queue->keystate_lock   = 0;
+        queue->nspa_shared     = NULL;
         list_init( &queue->send_result );
         list_init( &queue->callback_result );
         list_init( &queue->pending_timers );
@@ -327,6 +329,7 @@ static struct msg_queue *create_msg_queue( struct thread *thread, struct thread_
         for (i = 0; i < NB_MSG_KINDS; i++) list_init( &queue->msg_list[i] );
 
         if (!(queue->sync = create_internal_sync( 1, 0 ))) goto error;
+        if (!(queue->nspa_shared = alloc_shared_object( sizeof(*queue->nspa_shared) ))) goto error;
         if (!(queue->shared = alloc_shared_object( sizeof(*queue->shared) )))
         {
             release_object( queue );
@@ -342,7 +345,12 @@ static struct msg_queue *create_msg_queue( struct thread *thread, struct thread_
             shared->changed_mask = 0;
             shared->changed_bits = 0;
             shared->internal_bits = 0;
-            /* NSPA: zero the bypass rings so head/tail/active start defined */
+            shared->nspa_bypass_locator = get_shared_object_locator( queue->nspa_shared );
+        }
+        SHARED_WRITE_END;
+
+        SHARED_WRITE_BEGIN( queue->nspa_shared, nspa_queue_bypass_shm_t )
+        {
             memset( (void *)&shared->nspa_msg_ring, 0, sizeof(shared->nspa_msg_ring) );
             memset( (void *)&shared->nspa_reply_ring, 0, sizeof(shared->nspa_reply_ring) );
             shared->nspa_msg_ring.active = 1;  /* ring usable from creation */
@@ -728,7 +736,7 @@ void add_queue_hook_count( struct thread *thread, unsigned int index, int count 
 static inline int get_queue_status( struct msg_queue *queue )
 {
     queue_shm_t *queue_shm = queue->shared;
-    unsigned int ring_bits = __atomic_load_n( &queue_shm->nspa_msg_ring.pending_count, __ATOMIC_ACQUIRE ) ?
+    unsigned int ring_bits = __atomic_load_n( &queue->nspa_shared->nspa_msg_ring.pending_count, __ATOMIC_ACQUIRE ) ?
                              (QS_POSTMESSAGE | QS_ALLPOSTMESSAGE) : 0;
     return ((queue_shm->wake_bits | ring_bits) & queue_shm->wake_mask) ||
            ((queue_shm->changed_bits | nspa_ring_changed_bits( queue )) & queue_shm->changed_mask) ||
@@ -1021,7 +1029,7 @@ static void free_message( struct message *msg )
 
 static inline int nspa_ring_has_pending_posted( const struct msg_queue *queue )
 {
-    return __atomic_load_n( &queue->shared->nspa_msg_ring.pending_count, __ATOMIC_ACQUIRE ) != 0;
+    return __atomic_load_n( &queue->nspa_shared->nspa_msg_ring.pending_count, __ATOMIC_ACQUIRE ) != 0;
 }
 
 static inline unsigned int nspa_ring_status_bits( const struct msg_queue *queue )
@@ -1031,7 +1039,7 @@ static inline unsigned int nspa_ring_status_bits( const struct msg_queue *queue 
 
 static inline unsigned int nspa_ring_changed_bits( const struct msg_queue *queue )
 {
-    volatile nspa_msg_ring_t *ring = &queue->shared->nspa_msg_ring;
+    volatile nspa_msg_ring_t *ring = &queue->nspa_shared->nspa_msg_ring;
     unsigned int seq = __atomic_load_n( &ring->change_seq, __ATOMIC_ACQUIRE );
     unsigned int ack = __atomic_load_n( &ring->change_ack_seq, __ATOMIC_ACQUIRE );
 
@@ -1040,7 +1048,7 @@ static inline unsigned int nspa_ring_changed_bits( const struct msg_queue *queue
 
 static inline void nspa_ring_ack_changes( const struct msg_queue *queue )
 {
-    volatile nspa_msg_ring_t *ring = &queue->shared->nspa_msg_ring;
+    volatile nspa_msg_ring_t *ring = &queue->nspa_shared->nspa_msg_ring;
     unsigned int seq = __atomic_load_n( &ring->change_seq, __ATOMIC_ACQUIRE );
 
     __atomic_store_n( &ring->change_ack_seq, seq, __ATOMIC_RELEASE );
@@ -1048,7 +1056,7 @@ static inline void nspa_ring_ack_changes( const struct msg_queue *queue )
 
 static inline unsigned int nspa_alloc_post_seq( struct msg_queue *queue )
 {
-    return __atomic_add_fetch( &queue->shared->nspa_msg_ring.next_post_seq, 1, __ATOMIC_RELAXED );
+    return __atomic_add_fetch( &queue->nspa_shared->nspa_msg_ring.next_post_seq, 1, __ATOMIC_RELAXED );
 }
 
 static inline int nspa_seq_before( unsigned int a, unsigned int b )
@@ -1243,7 +1251,7 @@ static int find_nspa_posted_message( struct msg_queue *queue, user_handle_t win,
                                      unsigned int first, unsigned int last,
                                      struct nspa_posted_match *match )
 {
-    volatile nspa_msg_ring_t *ring = &queue->shared->nspa_msg_ring;
+    volatile nspa_msg_ring_t *ring = &queue->nspa_shared->nspa_msg_ring;
     unsigned int head, tail, cursor;
     volatile nspa_msg_slot_t *best = NULL;
     unsigned int best_seq = 0;
@@ -1280,7 +1288,7 @@ static int find_nspa_posted_message( struct msg_queue *queue, user_handle_t win,
 
 static void consume_nspa_posted_message( struct msg_queue *queue, struct nspa_posted_match *match )
 {
-    volatile nspa_msg_ring_t *ring = &queue->shared->nspa_msg_ring;
+    volatile nspa_msg_ring_t *ring = &queue->nspa_shared->nspa_msg_ring;
     unsigned int head, tail, cursor;
 
     __atomic_store_n( &match->slot->state, NSPA_MSG_STATE_CONSUMED, __ATOMIC_RELEASE );
@@ -1487,6 +1495,7 @@ static void msg_queue_destroy( struct object *obj )
     release_object( queue->input );
     if (queue->hooks) release_object( queue->hooks );
     if (queue->fd) release_object( queue->fd );
+    if (queue->nspa_shared) free_shared_object( queue->nspa_shared );
     if (queue->shared) free_shared_object( queue->shared );
     if (queue->sync) release_object( queue->sync );
 }
@@ -3241,6 +3250,7 @@ DECL_HANDLER(nspa_get_thread_queue)
     if (queue)
     {
         reply->locator = get_shared_object_locator( queue->shared );
+        reply->bypass_locator = get_shared_object_locator( queue->nspa_shared );
         /* EVENT_MODIFY_STATE lets the peer call NtSetEvent; SYNCHRONIZE for completeness */
         reply->sync_handle = alloc_handle( current->process, queue->sync,
                                            EVENT_MODIFY_STATE | SYNCHRONIZE, 0 );

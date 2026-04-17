@@ -39,10 +39,10 @@ WINE_DEFAULT_DEBUG_CHANNEL(msg);
  *
  * Open-addressed linear-probed hash on wineserver thread_id.  Small and
  * bounded (32 entries) — far more than a DAW thread typically targets
- * in a 30-second window.  Entries cache the peer queue's shared-object
- * locator (id + offset) and sync handle; we re-resolve the shared object
- * on each use so thread exit / queue teardown / TID reuse don't leave us
- * writing through a raw stale queue pointer.
+ * in a 30-second window.  Entries cache the peer queue bypass object's
+ * shared-object locator (id + offset) and sync handle; we re-resolve the
+ * shared object on each use so thread exit / queue teardown / TID reuse
+ * don't leave us writing through a raw stale queue pointer.
  * --------------------------------------------------------------------- */
 
 #define NSPA_CACHE_SLOTS 32
@@ -131,14 +131,14 @@ static void nspa_clear_cache_entry( struct nspa_cache_entry *entry )
     if (sync_handle) NtClose( sync_handle );
 }
 
-static const queue_shm_t *nspa_get_cached_queue_shm( const struct nspa_cache_entry *entry )
+static const nspa_queue_bypass_shm_t *nspa_get_cached_bypass_shm( const struct nspa_cache_entry *entry )
 {
     const shared_object_t *object;
 
     if (!entry->tid) return NULL;
     if (!(object = find_shared_session_object( entry->object_id, entry->object_offset )))
         return NULL;
-    return &object->shm.queue;
+    return (const nspa_queue_bypass_shm_t *)&object->shm;
 }
 
 /* Do the server lookup to populate a cache slot.  Returns TRUE on success. */
@@ -154,7 +154,7 @@ static BOOL nspa_populate_cache_entry( DWORD tid, struct nspa_cache_entry *entry
         req->tid = tid;
         if (!(status = wine_server_call( req )))
         {
-            locator = reply->locator;
+            locator = reply->bypass_locator;
             sync_handle = wine_server_ptr_handle( reply->sync_handle );
         }
     }
@@ -189,7 +189,7 @@ static struct nspa_cache_entry *nspa_lookup_peer( DWORD tid )
     if (!entry) return NULL;       /* cache full */
     if (entry->tid == tid)
     {
-        if (nspa_get_cached_queue_shm( entry )) return entry;
+        if (nspa_get_cached_bypass_shm( entry )) return entry;
         nspa_clear_cache_entry( entry );
     }
 
@@ -210,7 +210,7 @@ BOOL nspa_try_post_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
                          UINT msg, LPARAM wparam, LPARAM lparam )
 {
     struct nspa_cache_entry *entry;
-    const queue_shm_t *queue_shm;
+    const nspa_queue_bypass_shm_t *queue_bypass;
     volatile nspa_msg_ring_t *ring;
     volatile nspa_msg_slot_t *slot;
     NTSTATUS status;
@@ -225,14 +225,14 @@ BOOL nspa_try_post_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
     entry = nspa_lookup_peer( dest_tid );
     if (!entry) return FALSE;
 
-    queue_shm = nspa_get_cached_queue_shm( entry );
-    if (!queue_shm)
+    queue_bypass = nspa_get_cached_bypass_shm( entry );
+    if (!queue_bypass)
     {
         nspa_clear_cache_entry( entry );
         return FALSE;
     }
 
-    ring = &((queue_shm_t *)queue_shm)->nspa_msg_ring;
+    ring = &((nspa_queue_bypass_shm_t *)queue_bypass)->nspa_msg_ring;
     if (!ring->active) return FALSE;
 
     idx = ring_reserve_slot( ring );

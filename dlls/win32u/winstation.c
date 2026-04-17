@@ -56,6 +56,7 @@ struct session_thread_data
 {
     const shared_object_t *shared_desktop;         /* thread desktop shared session cached object */
     const shared_object_t *shared_queue;           /* thread message queue shared session cached object */
+    const shared_object_t *shared_queue_bypass;    /* current thread queue bypass shared object */
     struct shared_input_cache shared_input;        /* current thread input shared session cached object */
     struct shared_input_cache shared_foreground;   /* foreground thread input shared session cached object */
     struct shared_input_cache other_thread_input;  /* other thread input shared session cached object */
@@ -253,6 +254,7 @@ NTSTATUS get_shared_queue( struct object_lock *lock, const queue_shm_t **queue_s
         SERVER_END_REQ;
 
         data->shared_queue = find_shared_session_object( locator.id, locator.offset );
+        data->shared_queue_bypass = NULL;
         if (!(object = data->shared_queue)) return STATUS_INVALID_HANDLE;
     }
 
@@ -265,6 +267,22 @@ NTSTATUS get_shared_queue( struct object_lock *lock, const queue_shm_t **queue_s
     }
 
     return STATUS_SUCCESS;
+}
+
+const nspa_queue_bypass_shm_t *get_queue_bypass_shm( const queue_shm_t *queue_shm )
+{
+    struct session_thread_data *data = get_session_thread_data();
+    const shared_object_t *object = data->shared_queue_bypass;
+
+    if (!object)
+    {
+        object = find_shared_session_object( queue_shm->nspa_bypass_locator.id,
+                                             queue_shm->nspa_bypass_locator.offset );
+        if (!object) return NULL;
+        data->shared_queue_bypass = object;
+    }
+
+    return (const nspa_queue_bypass_shm_t *)&object->shm;
 }
 
 static NTSTATUS try_get_shared_input( UINT tid, struct object_lock *lock, const input_shm_t **input_shm,

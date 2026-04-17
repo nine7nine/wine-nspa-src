@@ -2898,10 +2898,13 @@ static BOOL check_queue_bits( UINT wake_mask, UINT changed_mask, UINT signal_bit
 
     while ((status = get_shared_queue( &lock, &queue_shm )) == STATUS_PENDING)
     {
-        UINT ring_bits = __atomic_load_n( &queue_shm->nspa_msg_ring.pending_count, __ATOMIC_ACQUIRE ) ?
+        const nspa_queue_bypass_shm_t *queue_bypass = get_queue_bypass_shm( queue_shm );
+        UINT ring_bits = queue_bypass &&
+                         __atomic_load_n( &queue_bypass->nspa_msg_ring.pending_count, __ATOMIC_ACQUIRE ) ?
                          (QS_POSTMESSAGE | QS_ALLPOSTMESSAGE) : 0;
-        UINT ring_changed = (__atomic_load_n( &queue_shm->nspa_msg_ring.change_seq, __ATOMIC_ACQUIRE ) !=
-                             __atomic_load_n( &queue_shm->nspa_msg_ring.change_ack_seq, __ATOMIC_ACQUIRE )) ?
+        UINT ring_changed = queue_bypass &&
+                            (__atomic_load_n( &queue_bypass->nspa_msg_ring.change_seq, __ATOMIC_ACQUIRE ) !=
+                             __atomic_load_n( &queue_bypass->nspa_msg_ring.change_ack_seq, __ATOMIC_ACQUIRE )) ?
                             (QS_POSTMESSAGE | QS_ALLPOSTMESSAGE) : 0;
         UINT wake = queue_shm->wake_bits | ring_bits;
         UINT changed = queue_shm->changed_bits | ring_changed;
@@ -3285,10 +3288,13 @@ static BOOL is_queue_signaled(void)
 
     while ((status = get_shared_queue( &lock, &queue_shm )) == STATUS_PENDING)
     {
-        UINT ring_bits = __atomic_load_n( &queue_shm->nspa_msg_ring.pending_count, __ATOMIC_ACQUIRE ) ?
+        const nspa_queue_bypass_shm_t *queue_bypass = get_queue_bypass_shm( queue_shm );
+        UINT ring_bits = queue_bypass &&
+                         __atomic_load_n( &queue_bypass->nspa_msg_ring.pending_count, __ATOMIC_ACQUIRE ) ?
                          (QS_POSTMESSAGE | QS_ALLPOSTMESSAGE) : 0;
-        UINT ring_changed = (__atomic_load_n( &queue_shm->nspa_msg_ring.change_seq, __ATOMIC_ACQUIRE ) !=
-                             __atomic_load_n( &queue_shm->nspa_msg_ring.change_ack_seq, __ATOMIC_ACQUIRE )) ?
+        UINT ring_changed = queue_bypass &&
+                            (__atomic_load_n( &queue_bypass->nspa_msg_ring.change_seq, __ATOMIC_ACQUIRE ) !=
+                             __atomic_load_n( &queue_bypass->nspa_msg_ring.change_ack_seq, __ATOMIC_ACQUIRE )) ?
                             (QS_POSTMESSAGE | QS_ALLPOSTMESSAGE) : 0;
         signaled = ((queue_shm->wake_bits | ring_bits) & queue_shm->wake_mask) ||
                    ((queue_shm->changed_bits | ring_changed) & queue_shm->changed_mask);

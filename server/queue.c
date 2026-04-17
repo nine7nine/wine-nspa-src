@@ -230,6 +230,7 @@ static unsigned int cursor_history_latest;
 
 static void queue_hardware_message( struct desktop *desktop, struct message *msg, int always_queue );
 static void free_message( struct message *msg );
+static inline unsigned int nspa_ring_changed_bits( const struct msg_queue *queue );
 
 /* set the caret window in a given thread input, requires write lock on the thread input shared member */
 static void set_caret_window( struct thread_input *input, input_shm_t *shared, user_handle_t win )
@@ -730,7 +731,7 @@ static inline int get_queue_status( struct msg_queue *queue )
     unsigned int ring_bits = __atomic_load_n( &queue_shm->nspa_msg_ring.pending_count, __ATOMIC_ACQUIRE ) ?
                              (QS_POSTMESSAGE | QS_ALLPOSTMESSAGE) : 0;
     return ((queue_shm->wake_bits | ring_bits) & queue_shm->wake_mask) ||
-           (queue_shm->changed_bits & queue_shm->changed_mask) ||
+           ((queue_shm->changed_bits | nspa_ring_changed_bits( queue )) & queue_shm->changed_mask) ||
             queue_shm->internal_bits;
 }
 
@@ -1026,6 +1027,23 @@ static inline int nspa_ring_has_pending_posted( const struct msg_queue *queue )
 static inline unsigned int nspa_ring_status_bits( const struct msg_queue *queue )
 {
     return nspa_ring_has_pending_posted( queue ) ? (QS_POSTMESSAGE | QS_ALLPOSTMESSAGE) : 0;
+}
+
+static inline unsigned int nspa_ring_changed_bits( const struct msg_queue *queue )
+{
+    volatile nspa_msg_ring_t *ring = &queue->shared->nspa_msg_ring;
+    unsigned int seq = __atomic_load_n( &ring->change_seq, __ATOMIC_ACQUIRE );
+    unsigned int ack = __atomic_load_n( &ring->change_ack_seq, __ATOMIC_ACQUIRE );
+
+    return seq != ack ? (QS_POSTMESSAGE | QS_ALLPOSTMESSAGE) : 0;
+}
+
+static inline void nspa_ring_ack_changes( const struct msg_queue *queue )
+{
+    volatile nspa_msg_ring_t *ring = &queue->shared->nspa_msg_ring;
+    unsigned int seq = __atomic_load_n( &ring->change_seq, __ATOMIC_ACQUIRE );
+
+    __atomic_store_n( &ring->change_ack_seq, seq, __ATOMIC_RELEASE );
 }
 
 static inline unsigned int nspa_alloc_post_seq( struct msg_queue *queue )
@@ -3281,7 +3299,7 @@ DECL_HANDLER(set_queue_mask)
         shared->wake_mask    = req->wake_mask;
         shared->changed_mask = req->changed_mask;
         reply->wake_bits     = shared->wake_bits | nspa_ring_status_bits( queue );
-        reply->changed_bits  = shared->changed_bits;
+        reply->changed_bits  = shared->changed_bits | nspa_ring_changed_bits( queue );
     }
     SHARED_WRITE_END;
 
@@ -3302,10 +3320,11 @@ DECL_HANDLER(get_queue_status)
     SHARED_WRITE_BEGIN( queue_shm, queue_shm_t )
     {
         reply->wake_bits      = shared->wake_bits | nspa_ring_status_bits( queue );
-        reply->changed_bits   = shared->changed_bits;
+        reply->changed_bits   = shared->changed_bits | nspa_ring_changed_bits( queue );
         shared->changed_bits &= ~req->clear_bits;
     }
     SHARED_WRITE_END;
+    if (req->clear_bits & (QS_POSTMESSAGE | QS_ALLPOSTMESSAGE)) nspa_ring_ack_changes( queue );
 
     if (!get_queue_status( queue )) reset_sync( queue->sync );
 }
@@ -3507,6 +3526,7 @@ DECL_HANDLER(get_message)
         if (filter & QS_PAINT) shared->changed_bits &= ~QS_PAINT;
     }
     SHARED_WRITE_END;
+    if (filter & QS_POSTMESSAGE) nspa_ring_ack_changes( queue );
 
     if (!get_queue_status( queue )) reset_sync( queue->sync );
 

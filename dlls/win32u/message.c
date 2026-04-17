@@ -103,6 +103,12 @@ struct received_message_info
     MSG   msg;
     UINT  flags;  /* InSendMessageEx return flags */
     struct received_message_info *prev;
+    /* NSPA: populated when this message came from a shmem-ring SEND slot so
+     * reply_message() can write the result back via the ring instead of
+     * calling the server.  Both fields zero when the message came from the
+     * legacy server-side SEND_MESSAGE list. */
+    DWORD nspa_sender_tid;
+    UINT  nspa_reply_slot;
 };
 
 struct packed_hook_extra_info
@@ -2112,6 +2118,18 @@ static void reply_message( struct received_message_info *info, LRESULT result, M
     if (info == get_user_thread_info()->receive_info)
         NtUserGetThreadInfo()->receive_flags = info->flags;
 
+    /* NSPA: ring-origin message — write reply directly to sender's reply
+     * ring instead of routing via wineserver reply_message. */
+    if (info->nspa_sender_tid && remove)
+    {
+        if (nspa_write_ring_reply( info->nspa_sender_tid, info->nspa_reply_slot,
+                                   result, NULL, 0 ))
+            return;
+        /* On failure fall through to server reply_message — the slot may
+         * have timed out or the sender may have gone away, in which case
+         * the server request will also no-op harmlessly. */
+    }
+
     if (info->type == MSG_OTHER_PROCESS && !replied)
     {
         if (!msg) msg = &info->msg;
@@ -2903,15 +2921,23 @@ static BOOL check_queue_bits( UINT wake_mask, UINT changed_mask, UINT signal_bit
     while ((status = get_shared_queue( &lock, &queue_shm )) == STATUS_PENDING)
     {
         const nspa_queue_bypass_shm_t *queue_bypass = get_queue_bypass_shm( queue_shm );
-        UINT ring_bits = queue_bypass &&
-                         __atomic_load_n( &queue_bypass->nspa_msg_ring.pending_count, __ATOMIC_ACQUIRE ) ?
-                         (QS_POSTMESSAGE | QS_ALLPOSTMESSAGE) : 0;
-        UINT ring_changed = queue_bypass &&
-                            (__atomic_load_n( &queue_bypass->nspa_msg_ring.change_seq, __ATOMIC_ACQUIRE ) !=
-                             __atomic_load_n( &queue_bypass->nspa_msg_ring.change_ack_seq, __ATOMIC_ACQUIRE )) ?
-                            (QS_POSTMESSAGE | QS_ALLPOSTMESSAGE) : 0;
-        UINT wake = queue_shm->wake_bits | ring_bits;
-        UINT changed = queue_shm->changed_bits | ring_changed;
+        UINT ring_total = queue_bypass ?
+                          __atomic_load_n( &queue_bypass->nspa_msg_ring.pending_count, __ATOMIC_ACQUIRE ) : 0;
+        UINT ring_send  = queue_bypass ?
+                          __atomic_load_n( &queue_bypass->nspa_msg_ring.pending_send_count, __ATOMIC_ACQUIRE ) : 0;
+        UINT ring_bits = 0;
+        UINT ring_changed = 0;
+        UINT wake;
+        UINT changed;
+        if (ring_total > ring_send) ring_bits |= QS_POSTMESSAGE | QS_ALLPOSTMESSAGE;
+        if (ring_send)              ring_bits |= QS_SENDMESSAGE;
+        if (queue_bypass &&
+            __atomic_load_n( &queue_bypass->nspa_msg_ring.change_seq, __ATOMIC_ACQUIRE ) !=
+            __atomic_load_n( &queue_bypass->nspa_msg_ring.change_ack_seq, __ATOMIC_ACQUIRE ))
+            ring_changed |= QS_POSTMESSAGE | QS_ALLPOSTMESSAGE;
+        if (ring_send) ring_changed |= QS_SENDMESSAGE;
+        wake = queue_shm->wake_bits | ring_bits;
+        changed = queue_shm->changed_bits | ring_changed;
 
         if (internal) skip = !(queue_shm->internal_bits & QS_HARDWARE);
         /* if the masks need an update */
@@ -2997,15 +3023,17 @@ static int peek_message( MSG *msg, const struct peek_message_filter *filter )
             if (!(res = wine_server_call( req )))
             {
                 size = wine_server_reply_size( reply );
-                info.type        = reply->type;
-                info.msg.hwnd    = wine_server_ptr_handle( reply->win );
-                info.msg.message = reply->msg;
-                info.msg.wParam  = reply->wparam;
-                info.msg.lParam  = reply->lparam;
-                info.msg.time    = reply->time;
-                info.msg.pt.x    = reply->x;
-                info.msg.pt.y    = reply->y;
-                hw_id            = 0;
+                info.type             = reply->type;
+                info.msg.hwnd         = wine_server_ptr_handle( reply->win );
+                info.msg.message      = reply->msg;
+                info.msg.wParam       = reply->wparam;
+                info.msg.lParam       = reply->lparam;
+                info.msg.time         = reply->time;
+                info.msg.pt.x         = reply->x;
+                info.msg.pt.y         = reply->y;
+                info.nspa_sender_tid  = reply->nspa_sender_tid;
+                info.nspa_reply_slot  = reply->nspa_reply_slot;
+                hw_id                 = 0;
             }
             else buffer_size = reply->total;
         }
@@ -3283,6 +3311,21 @@ static HANDLE get_server_queue_handle(void)
     return ret;
 }
 
+/* NSPA: exposed to nspa_msg_bypass.c so the msg-bypass sender can wait
+ * on our own queue sync without duplicating the lazy-init logic. */
+HANDLE nspa_get_own_server_queue_handle( void )
+{
+    return get_server_queue_handle();
+}
+
+/* NSPA: exposed to nspa_msg_bypass.c so the send-bypass wait loop can
+ * drain incoming sent messages and avoid cross-send deadlock.  Equivalent
+ * to the call wait_message_reply makes on QS_SENDMESSAGE. */
+void nspa_process_sent_messages( void )
+{
+    process_sent_messages();
+}
+
 static BOOL is_queue_signaled(void)
 {
     struct object_lock lock = OBJECT_LOCK_INIT;
@@ -3293,13 +3336,19 @@ static BOOL is_queue_signaled(void)
     while ((status = get_shared_queue( &lock, &queue_shm )) == STATUS_PENDING)
     {
         const nspa_queue_bypass_shm_t *queue_bypass = get_queue_bypass_shm( queue_shm );
-        UINT ring_bits = queue_bypass &&
-                         __atomic_load_n( &queue_bypass->nspa_msg_ring.pending_count, __ATOMIC_ACQUIRE ) ?
-                         (QS_POSTMESSAGE | QS_ALLPOSTMESSAGE) : 0;
-        UINT ring_changed = queue_bypass &&
-                            (__atomic_load_n( &queue_bypass->nspa_msg_ring.change_seq, __ATOMIC_ACQUIRE ) !=
-                             __atomic_load_n( &queue_bypass->nspa_msg_ring.change_ack_seq, __ATOMIC_ACQUIRE )) ?
-                            (QS_POSTMESSAGE | QS_ALLPOSTMESSAGE) : 0;
+        UINT ring_total = queue_bypass ?
+                          __atomic_load_n( &queue_bypass->nspa_msg_ring.pending_count, __ATOMIC_ACQUIRE ) : 0;
+        UINT ring_send  = queue_bypass ?
+                          __atomic_load_n( &queue_bypass->nspa_msg_ring.pending_send_count, __ATOMIC_ACQUIRE ) : 0;
+        UINT ring_bits = 0;
+        UINT ring_changed = 0;
+        if (ring_total > ring_send) ring_bits |= QS_POSTMESSAGE | QS_ALLPOSTMESSAGE;
+        if (ring_send)              ring_bits |= QS_SENDMESSAGE;
+        if (queue_bypass &&
+            __atomic_load_n( &queue_bypass->nspa_msg_ring.change_seq, __ATOMIC_ACQUIRE ) !=
+            __atomic_load_n( &queue_bypass->nspa_msg_ring.change_ack_seq, __ATOMIC_ACQUIRE ))
+            ring_changed |= QS_POSTMESSAGE | QS_ALLPOSTMESSAGE;
+        if (ring_send) ring_changed |= QS_SENDMESSAGE;
         signaled = ((queue_shm->wake_bits | ring_bits) & queue_shm->wake_mask) ||
                    ((queue_shm->changed_bits | ring_changed) & queue_shm->changed_mask);
     }
@@ -3845,12 +3894,23 @@ static LRESULT retrieve_reply( const struct send_message_info *info,
 static LRESULT send_inter_thread_message( const struct send_message_info *info, LRESULT *res_ptr )
 {
     size_t reply_size = 0;
+    LRESULT ring_result = 0;
 
     TRACE( "hwnd %p msg %x (%s) wp %lx lp %lx\n",
            info->hwnd, info->msg, debugstr_msg_name(info->msg, info->hwnd),
            (long)info->wparam, info->lparam );
 
     user_check_not_lock();
+
+    /* NSPA: fast path for same-process cross-thread MSG_ASCII / MSG_UNICODE /
+     * MSG_NOTIFY via the shmem ring + reply ring.  On success the reply has
+     * already been received and *res_ptr is filled. */
+    if (nspa_try_send_ring( info->dest_tid, info->type, info->hwnd, info->msg,
+                            info->wparam, info->lparam, &ring_result ))
+    {
+        if (res_ptr) *res_ptr = ring_result;
+        return 1;
+    }
 
     if (!put_message_in_queue( info, &reply_size )) return 0;
 

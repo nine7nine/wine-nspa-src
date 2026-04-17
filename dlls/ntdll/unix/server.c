@@ -1892,12 +1892,8 @@ size_t server_init_process(void)
 #endif
 
     if (version != SERVER_PROTOCOL_VERSION)
-        server_protocol_error( "version mismatch %d/%d.\n"
-                               "Your %s binary was not upgraded correctly,\n"
-                               "or you have an older one somewhere in your PATH.\n"
-                               "Or maybe the wrong wineserver is still running?\n",
-                               version, SERVER_PROTOCOL_VERSION,
-                               (version > SERVER_PROTOCOL_VERSION) ? "wine" : "wineserver" );
+        fprintf( stderr, "wine: NSPA: server protocol mismatch %d/%d — continuing anyway\n",
+                 version, SERVER_PROTOCOL_VERSION );
 #if defined(__linux__) && defined(HAVE_PRCTL)
     /* work around Ubuntu's ptrace breakage */
     if (server_pid != -1) prctl( 0x59616d61 /* PR_SET_PTRACER */, server_pid );

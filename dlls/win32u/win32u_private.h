@@ -39,6 +39,15 @@ extern void release_clipboard_owner( HWND hwnd );
 /* nspa_msg_bypass.c — cross-thread SendMessage shmem-ring bypass */
 extern BOOL nspa_try_post_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
                                 UINT msg, LPARAM wparam, LPARAM lparam );
+extern BOOL nspa_try_send_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
+                                UINT msg, LPARAM wparam, LPARAM lparam,
+                                LRESULT *result_out );
+extern BOOL nspa_write_ring_reply( DWORD sender_tid, UINT reply_slot_idx,
+                                   LRESULT result, const void *data, UINT data_size );
+
+/* message.c — exposed so nspa_msg_bypass.c can wait on our own queue sync. */
+extern HANDLE nspa_get_own_server_queue_handle( void );
+extern void   nspa_process_sent_messages( void );
 
 /* cursoricon.c */
 extern BOOL process_wine_setcursor( HWND hwnd, HWND window, HCURSOR handle );

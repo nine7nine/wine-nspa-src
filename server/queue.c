@@ -232,6 +232,7 @@ static unsigned int cursor_history_latest;
 static void queue_hardware_message( struct desktop *desktop, struct message *msg, int always_queue );
 static void free_message( struct message *msg );
 static inline unsigned int nspa_ring_changed_bits( const struct msg_queue *queue );
+static inline unsigned int nspa_ring_status_bits( const struct msg_queue *queue );
 
 /* set the caret window in a given thread input, requires write lock on the thread input shared member */
 static void set_caret_window( struct thread_input *input, input_shm_t *shared, user_handle_t win )
@@ -736,8 +737,7 @@ void add_queue_hook_count( struct thread *thread, unsigned int index, int count 
 static inline int get_queue_status( struct msg_queue *queue )
 {
     queue_shm_t *queue_shm = queue->shared;
-    unsigned int ring_bits = __atomic_load_n( &queue->nspa_shared->nspa_msg_ring.pending_count, __ATOMIC_ACQUIRE ) ?
-                             (QS_POSTMESSAGE | QS_ALLPOSTMESSAGE) : 0;
+    unsigned int ring_bits = nspa_ring_status_bits( queue );
     return ((queue_shm->wake_bits | ring_bits) & queue_shm->wake_mask) ||
            ((queue_shm->changed_bits | nspa_ring_changed_bits( queue )) & queue_shm->changed_mask) ||
             queue_shm->internal_bits;
@@ -1029,12 +1029,25 @@ static void free_message( struct message *msg )
 
 static inline int nspa_ring_has_pending_posted( const struct msg_queue *queue )
 {
-    return __atomic_load_n( &queue->nspa_shared->nspa_msg_ring.pending_count, __ATOMIC_ACQUIRE ) != 0;
+    volatile nspa_msg_ring_t *ring = &queue->nspa_shared->nspa_msg_ring;
+    unsigned int total = __atomic_load_n( &ring->pending_count, __ATOMIC_ACQUIRE );
+    unsigned int send  = __atomic_load_n( &ring->pending_send_count, __ATOMIC_ACQUIRE );
+    /* POSTED pending = total - send. Clamp against transient underflow if
+     * total has been decremented ahead of send on a SEND consume. */
+    return total > send;
+}
+
+static inline int nspa_ring_has_pending_send( const struct msg_queue *queue )
+{
+    return __atomic_load_n( &queue->nspa_shared->nspa_msg_ring.pending_send_count, __ATOMIC_ACQUIRE ) != 0;
 }
 
 static inline unsigned int nspa_ring_status_bits( const struct msg_queue *queue )
 {
-    return nspa_ring_has_pending_posted( queue ) ? (QS_POSTMESSAGE | QS_ALLPOSTMESSAGE) : 0;
+    unsigned int bits = 0;
+    if (nspa_ring_has_pending_posted( queue )) bits |= QS_POSTMESSAGE | QS_ALLPOSTMESSAGE;
+    if (nspa_ring_has_pending_send( queue ))   bits |= QS_SENDMESSAGE;
+    return bits;
 }
 
 static inline unsigned int nspa_ring_changed_bits( const struct msg_queue *queue )
@@ -1042,8 +1055,11 @@ static inline unsigned int nspa_ring_changed_bits( const struct msg_queue *queue
     volatile nspa_msg_ring_t *ring = &queue->nspa_shared->nspa_msg_ring;
     unsigned int seq = __atomic_load_n( &ring->change_seq, __ATOMIC_ACQUIRE );
     unsigned int ack = __atomic_load_n( &ring->change_ack_seq, __ATOMIC_ACQUIRE );
+    unsigned int bits = 0;
 
-    return seq != ack ? (QS_POSTMESSAGE | QS_ALLPOSTMESSAGE) : 0;
+    if (seq != ack) bits |= QS_POSTMESSAGE | QS_ALLPOSTMESSAGE;
+    if (nspa_ring_has_pending_send( queue )) bits |= QS_SENDMESSAGE;
+    return bits;
 }
 
 static inline void nspa_ring_ack_changes( const struct msg_queue *queue )
@@ -1181,6 +1197,8 @@ static void receive_message( struct msg_queue *queue, struct message *msg,
     reply->x      = msg->x;
     reply->y      = msg->y;
     reply->time   = msg->time;
+    reply->nspa_sender_tid = 0;
+    reply->nspa_reply_slot = 0;
 
     if (msg->data) set_reply_data_ptr( msg->data, msg->data_size );
 
@@ -1247,9 +1265,15 @@ struct nspa_posted_match
     unsigned int seq;
 };
 
-static int find_nspa_posted_message( struct msg_queue *queue, user_handle_t win,
-                                     unsigned int first, unsigned int last,
-                                     struct nspa_posted_match *match )
+/* Type-class masks for ring slot matching. */
+#define NSPA_TYPE_MASK_POSTED (1u << MSG_POSTED)
+#define NSPA_TYPE_MASK_SEND   ((1u << MSG_ASCII) | (1u << MSG_UNICODE) | (1u << MSG_NOTIFY))
+
+/* Find the earliest-seq READY ring slot whose type is in the given mask
+ * and whose win+msg pass the filter.  Returns 1 on match. */
+static int find_nspa_ring_message( struct msg_queue *queue, unsigned int type_mask,
+                                   user_handle_t win, unsigned int first, unsigned int last,
+                                   struct nspa_posted_match *match )
 {
     volatile nspa_msg_ring_t *ring = &queue->nspa_shared->nspa_msg_ring;
     unsigned int head, tail, cursor;
@@ -1266,8 +1290,10 @@ static int find_nspa_posted_message( struct msg_queue *queue, user_handle_t win,
         volatile nspa_msg_slot_t *slot = &ring->slots[cursor & (NSPA_MSG_RING_SLOTS - 1)];
         unsigned int state = __atomic_load_n( &slot->state, __ATOMIC_ACQUIRE );
         unsigned int seq;
+        unsigned int slot_type = slot->type;
 
         if (state != NSPA_MSG_STATE_READY) continue;
+        if (slot_type >= 32 || !(type_mask & (1u << slot_type))) continue;
         if (!match_window( win, slot->win )) continue;
         if (!check_msg_filter( slot->msg, first, last )) continue;
 
@@ -1286,13 +1312,33 @@ static int find_nspa_posted_message( struct msg_queue *queue, user_handle_t win,
     return 1;
 }
 
-static void consume_nspa_posted_message( struct msg_queue *queue, struct nspa_posted_match *match )
+/* POSTED-only convenience wrapper, preserves legacy find_nspa_posted_message
+ * semantics for the get_posted_message arbitration. */
+static int find_nspa_posted_message( struct msg_queue *queue, user_handle_t win,
+                                     unsigned int first, unsigned int last,
+                                     struct nspa_posted_match *match )
+{
+    return find_nspa_ring_message( queue, NSPA_TYPE_MASK_POSTED, win, first, last, match );
+}
+
+/* SEND-class variant: matches MSG_ASCII/MSG_UNICODE/MSG_NOTIFY. */
+static int find_nspa_send_message( struct msg_queue *queue, user_handle_t win,
+                                   unsigned int first, unsigned int last,
+                                   struct nspa_posted_match *match )
+{
+    return find_nspa_ring_message( queue, NSPA_TYPE_MASK_SEND, win, first, last, match );
+}
+
+static void consume_nspa_ring_message( struct msg_queue *queue, struct nspa_posted_match *match )
 {
     volatile nspa_msg_ring_t *ring = &queue->nspa_shared->nspa_msg_ring;
     unsigned int head, tail, cursor;
+    unsigned int slot_type = match->slot->type;
+    int is_send = (slot_type < 32) && (NSPA_TYPE_MASK_SEND & (1u << slot_type));
 
     __atomic_store_n( &match->slot->state, NSPA_MSG_STATE_CONSUMED, __ATOMIC_RELEASE );
     __atomic_fetch_sub( &ring->pending_count, 1, __ATOMIC_ACQ_REL );
+    if (is_send) __atomic_fetch_sub( &ring->pending_send_count, 1, __ATOMIC_ACQ_REL );
 
     tail = __atomic_load_n( &ring->tail, __ATOMIC_ACQUIRE );
     head = __atomic_load_n( &ring->head, __ATOMIC_ACQUIRE );
@@ -1307,14 +1353,20 @@ static void consume_nspa_posted_message( struct msg_queue *queue, struct nspa_po
 
     if (cursor != tail) __atomic_store_n( &ring->tail, cursor, __ATOMIC_RELEASE );
 
-    if (list_empty( &queue->msg_list[POST_MESSAGE] ) && !queue->quit_message && !nspa_ring_has_pending_posted( queue ))
+    if (!is_send && list_empty( &queue->msg_list[POST_MESSAGE] ) && !queue->quit_message &&
+        !nspa_ring_has_pending_posted( queue ))
         clear_queue_bits( queue, QS_POSTMESSAGE|QS_ALLPOSTMESSAGE );
+    if (is_send && list_empty( &queue->msg_list[SEND_MESSAGE] ) &&
+        __atomic_load_n( &ring->pending_send_count, __ATOMIC_ACQUIRE ) == 0)
+        clear_queue_bits( queue, QS_SENDMESSAGE );
 }
 
-static int return_nspa_posted_message( struct msg_queue *queue, struct nspa_posted_match *match,
-                                       unsigned int flags, struct get_message_reply *reply )
+static int return_nspa_ring_message( struct msg_queue *queue, struct nspa_posted_match *match,
+                                     unsigned int flags, struct get_message_reply *reply )
 {
     volatile nspa_msg_slot_t *slot = match->slot;
+    unsigned int slot_type = slot->type;
+    int is_send = (slot_type < 32) && (NSPA_TYPE_MASK_SEND & (1u << slot_type));
 
     reply->total  = 0;
     reply->type   = slot->type;
@@ -1326,7 +1378,21 @@ static int return_nspa_posted_message( struct msg_queue *queue, struct nspa_post
     reply->y      = slot->y;
     reply->time   = slot->time;
 
-    if (flags & PM_REMOVE) consume_nspa_posted_message( queue, match );
+    /* Reply routing for SEND slots: populate sender_tid + reply slot index
+     * so the client's reply_message() can write back via the ring instead
+     * of through the server. */
+    if (is_send)
+    {
+        reply->nspa_sender_tid = slot->sender_tid;
+        reply->nspa_reply_slot = slot->reply_slot;
+    }
+    else
+    {
+        reply->nspa_sender_tid = 0;
+        reply->nspa_reply_slot = 0;
+    }
+
+    if (flags & PM_REMOVE) consume_nspa_ring_message( queue, match );
     return 1;
 }
 
@@ -1340,7 +1406,7 @@ static int get_posted_message( struct msg_queue *queue, user_handle_t win,
     int have_ring = find_nspa_posted_message( queue, win, first, last, &ring_match );
 
     if (have_ring && (!msg || nspa_seq_before( ring_match.seq, msg->post_seq )))
-        return return_nspa_posted_message( queue, &ring_match, flags, reply );
+        return return_nspa_ring_message( queue, &ring_match, flags, reply );
     if (!msg) return 0;
 
     reply->total = msg->data_size;
@@ -1357,6 +1423,8 @@ static int get_posted_message( struct msg_queue *queue, user_handle_t win,
     reply->x      = msg->x;
     reply->y      = msg->y;
     reply->time   = msg->time;
+    reply->nspa_sender_tid = 0;
+    reply->nspa_reply_slot = 0;
 
     if (flags & PM_REMOVE)
     {
@@ -1371,6 +1439,21 @@ static int get_posted_message( struct msg_queue *queue, user_handle_t win,
     else if (msg->data) set_reply_data( msg->data, msg->data_size );
 
     return 1;
+}
+
+/* Dispatch a SEND-class ring slot (MSG_ASCII/UNICODE/NOTIFY) if present.
+ * Takes precedence over server-allocated msg_list[SEND_MESSAGE] entries;
+ * NSPA_TYPE_MASK_SEND slots are NSPA bypass-originated and must deliver
+ * via the ring-reply path (nspa_sender_tid + nspa_reply_slot in reply). */
+static int get_nspa_ring_send_message( struct msg_queue *queue, user_handle_t win,
+                                       unsigned int first, unsigned int last,
+                                       unsigned int flags,
+                                       struct get_message_reply *reply )
+{
+    struct nspa_posted_match ring_match;
+
+    if (!find_nspa_send_message( queue, win, first, last, &ring_match )) return 0;
+    return return_nspa_ring_message( queue, &ring_match, flags, reply );
 }
 
 static int get_quit_message( struct msg_queue *queue, unsigned int flags,
@@ -3512,6 +3595,13 @@ DECL_HANDLER(get_message)
         shared->access_time = monotonic_time;
     }
     SHARED_WRITE_END;
+
+    /* first check for ring-delivered sent messages (NSPA bypass) — these
+     * take precedence over server-allocated msg_list entries because the
+     * sender is actively waiting on its own reply ring and we want to
+     * minimise latency. */
+    if (get_nspa_ring_send_message( queue, get_win, 0, ~0U, req->flags, reply ))
+        return;
 
     /* first check for sent messages */
     if ((ptr = list_head( &queue->msg_list[SEND_MESSAGE] )))

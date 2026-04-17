@@ -1069,10 +1069,12 @@ typedef volatile struct
     unsigned int tail;              /* consumer index */
     unsigned int overflow;          /* count of fallback-to-server from ring-full */
     unsigned int active;            /* 0 = ring inactive (receiver not set up yet) */
-    unsigned int pending_count;     /* ring-owned posted work pending in this queue */
+    unsigned int pending_count;     /* total READY ring slots (posted + send combined) */
+    unsigned int pending_send_count;/* subset that are SEND-type (ASCII/UNICODE/NOTIFY) */
     unsigned int next_post_seq;     /* next canonical posted sequence number */
     unsigned int change_seq;        /* bumped once each time a READY ring post is published */
     unsigned int change_ack_seq;    /* last published change sequence acknowledged by owner */
+    unsigned int __pad;
     nspa_msg_slot_t slots[NSPA_MSG_RING_SLOTS];
 } nspa_msg_ring_t;
 
@@ -2502,6 +2504,8 @@ enum message_type
     int             x;         /* message x position */
     int             y;         /* message y position */
     unsigned int    time;      /* message time */
+    unsigned int    nspa_sender_tid; /* NSPA: ring sender tid (0 if not ring) */
+    unsigned int    nspa_reply_slot; /* NSPA: ring reply slot index */
     data_size_t     total;     /* total size of extra data */
     VARARG(data,message_data); /* message data for sent messages */
 @END

@@ -1027,6 +1027,35 @@ static void free_message( struct message *msg )
     free( msg );
 }
 
+/* Subsystem kill-switches for isolating the library-panel regression.
+ *
+ *   NSPA_MSG_BYPASS_SERVER_NO_RING_ARB — get_posted_message / get_message
+ *     ring-first arbitration is skipped; server always uses the legacy
+ *     msg_list path.
+ *   NSPA_MSG_BYPASS_SERVER_NO_WAKE_SYN — wake-bit / changed-bit
+ *     synthesis from ring state is suppressed; wake_bits returns only
+ *     the legacy `shared->wake_bits`.
+ *
+ * Both are evaluated at wineserver start and cached.  Independent of
+ * client-side NSPA_ENABLE_MSG_BYPASS so the plumbing can be A/B tested
+ * with bypass on.  See docs/send-message-bypass-design.md §15.10. */
+static int nspa_server_ring_arb_off = -1;
+static int nspa_server_wake_syn_off = -1;
+
+static inline int nspa_ring_arb_disabled(void)
+{
+    if (nspa_server_ring_arb_off == -1)
+        nspa_server_ring_arb_off = (getenv("NSPA_MSG_BYPASS_SERVER_NO_RING_ARB") != NULL);
+    return nspa_server_ring_arb_off;
+}
+
+static inline int nspa_ring_wake_syn_disabled(void)
+{
+    if (nspa_server_wake_syn_off == -1)
+        nspa_server_wake_syn_off = (getenv("NSPA_MSG_BYPASS_SERVER_NO_WAKE_SYN") != NULL);
+    return nspa_server_wake_syn_off;
+}
+
 static inline int nspa_ring_has_pending_posted( const struct msg_queue *queue )
 {
     volatile nspa_msg_ring_t *ring = &queue->nspa_shared->nspa_msg_ring;
@@ -1045,6 +1074,7 @@ static inline int nspa_ring_has_pending_send( const struct msg_queue *queue )
 static inline unsigned int nspa_ring_status_bits( const struct msg_queue *queue )
 {
     unsigned int bits = 0;
+    if (nspa_ring_wake_syn_disabled()) return 0;
     if (nspa_ring_has_pending_posted( queue )) bits |= QS_POSTMESSAGE | QS_ALLPOSTMESSAGE;
     if (nspa_ring_has_pending_send( queue ))   bits |= QS_SENDMESSAGE;
     return bits;
@@ -1052,10 +1082,15 @@ static inline unsigned int nspa_ring_status_bits( const struct msg_queue *queue 
 
 static inline unsigned int nspa_ring_changed_bits( const struct msg_queue *queue )
 {
-    volatile nspa_msg_ring_t *ring = &queue->nspa_shared->nspa_msg_ring;
-    unsigned int seq = __atomic_load_n( &ring->change_seq, __ATOMIC_ACQUIRE );
-    unsigned int ack = __atomic_load_n( &ring->change_ack_seq, __ATOMIC_ACQUIRE );
+    volatile nspa_msg_ring_t *ring;
+    unsigned int seq, ack;
     unsigned int bits = 0;
+
+    if (nspa_ring_wake_syn_disabled()) return 0;
+
+    ring = &queue->nspa_shared->nspa_msg_ring;
+    seq = __atomic_load_n( &ring->change_seq, __ATOMIC_ACQUIRE );
+    ack = __atomic_load_n( &ring->change_ack_seq, __ATOMIC_ACQUIRE );
 
     if (seq != ack) bits |= QS_POSTMESSAGE | QS_ALLPOSTMESSAGE;
     if (nspa_ring_has_pending_send( queue )) bits |= QS_SENDMESSAGE;
@@ -1403,7 +1438,8 @@ static int get_posted_message( struct msg_queue *queue, user_handle_t win,
 {
     struct nspa_posted_match ring_match;
     struct message *msg = find_posted_message( queue, win, first, last );
-    int have_ring = find_nspa_posted_message( queue, win, first, last, &ring_match );
+    int have_ring = nspa_ring_arb_disabled() ? 0 :
+                    find_nspa_posted_message( queue, win, first, last, &ring_match );
 
     if (have_ring && (!msg || nspa_seq_before( ring_match.seq, msg->post_seq )))
         return return_nspa_ring_message( queue, &ring_match, flags, reply );
@@ -3599,8 +3635,10 @@ DECL_HANDLER(get_message)
     /* first check for ring-delivered sent messages (NSPA bypass) — these
      * take precedence over server-allocated msg_list entries because the
      * sender is actively waiting on its own reply ring and we want to
-     * minimise latency. */
-    if (get_nspa_ring_send_message( queue, get_win, 0, ~0U, req->flags, reply ))
+     * minimise latency.  Gated by NSPA_MSG_BYPASS_SERVER_NO_RING_ARB for
+     * A/B isolation of the library-panel regression (§15.10). */
+    if (!nspa_ring_arb_disabled() &&
+        get_nspa_ring_send_message( queue, get_win, 0, ~0U, req->flags, reply ))
         return;
 
     /* first check for sent messages */

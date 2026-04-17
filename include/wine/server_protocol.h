@@ -1055,7 +1055,8 @@ typedef volatile struct
     unsigned int active;
     unsigned int pending_count;
     unsigned int next_post_seq;
-    unsigned int __pad[2];
+    unsigned int change_seq;
+    unsigned int change_ack_seq;
     nspa_msg_slot_t slots[NSPA_MSG_RING_SLOTS];
 } nspa_msg_ring_t;
 

@@ -1071,7 +1071,8 @@ typedef volatile struct
     unsigned int active;            /* 0 = ring inactive (receiver not set up yet) */
     unsigned int pending_count;     /* ring-owned posted work pending in this queue */
     unsigned int next_post_seq;     /* next canonical posted sequence number */
-    unsigned int __pad[2];
+    unsigned int change_seq;        /* bumped once each time a READY ring post is published */
+    unsigned int change_ack_seq;    /* last published change sequence acknowledged by owner */
     nspa_msg_slot_t slots[NSPA_MSG_RING_SLOTS];
 } nspa_msg_ring_t;
 

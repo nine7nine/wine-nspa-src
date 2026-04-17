@@ -833,6 +833,14 @@ static inline UINT nspa_queue_status_bits( const queue_shm_t *queue_shm )
            (QS_POSTMESSAGE | QS_ALLPOSTMESSAGE) : 0;
 }
 
+static inline UINT nspa_queue_changed_bits( const queue_shm_t *queue_shm )
+{
+    unsigned int seq = __atomic_load_n( &queue_shm->nspa_msg_ring.change_seq, __ATOMIC_ACQUIRE );
+    unsigned int ack = __atomic_load_n( &queue_shm->nspa_msg_ring.change_ack_seq, __ATOMIC_ACQUIRE );
+
+    return seq != ack ? (QS_POSTMESSAGE | QS_ALLPOSTMESSAGE) : 0;
+}
+
 static BOOL get_shared_queue_bits( UINT *wake_bits, UINT *changed_bits )
 {
     struct object_lock lock = OBJECT_LOCK_INIT;
@@ -843,8 +851,9 @@ static BOOL get_shared_queue_bits( UINT *wake_bits, UINT *changed_bits )
     while ((status = get_shared_queue( &lock, &queue_shm )) == STATUS_PENDING)
     {
         UINT ring_bits = nspa_queue_status_bits( queue_shm );
+        UINT changed_ring_bits = nspa_queue_changed_bits( queue_shm );
         *wake_bits = queue_shm->wake_bits | ring_bits;
-        *changed_bits = queue_shm->changed_bits;
+        *changed_bits = queue_shm->changed_bits | changed_ring_bits;
     }
 
     if (status) return FALSE;

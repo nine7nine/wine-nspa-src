@@ -2904,8 +2904,11 @@ static BOOL check_queue_bits( UINT wake_mask, UINT changed_mask, UINT signal_bit
     {
         UINT ring_bits = __atomic_load_n( &queue_shm->nspa_msg_ring.pending_count, __ATOMIC_ACQUIRE ) ?
                          (QS_POSTMESSAGE | QS_ALLPOSTMESSAGE) : 0;
+        UINT ring_changed = (__atomic_load_n( &queue_shm->nspa_msg_ring.change_seq, __ATOMIC_ACQUIRE ) !=
+                             __atomic_load_n( &queue_shm->nspa_msg_ring.change_ack_seq, __ATOMIC_ACQUIRE )) ?
+                            (QS_POSTMESSAGE | QS_ALLPOSTMESSAGE) : 0;
         UINT wake = queue_shm->wake_bits | ring_bits;
-        UINT changed = queue_shm->changed_bits;
+        UINT changed = queue_shm->changed_bits | ring_changed;
 
         if (internal) skip = !(queue_shm->internal_bits & QS_HARDWARE);
         /* if the masks need an update */
@@ -3288,8 +3291,11 @@ static BOOL is_queue_signaled(void)
     {
         UINT ring_bits = __atomic_load_n( &queue_shm->nspa_msg_ring.pending_count, __ATOMIC_ACQUIRE ) ?
                          (QS_POSTMESSAGE | QS_ALLPOSTMESSAGE) : 0;
+        UINT ring_changed = (__atomic_load_n( &queue_shm->nspa_msg_ring.change_seq, __ATOMIC_ACQUIRE ) !=
+                             __atomic_load_n( &queue_shm->nspa_msg_ring.change_ack_seq, __ATOMIC_ACQUIRE )) ?
+                            (QS_POSTMESSAGE | QS_ALLPOSTMESSAGE) : 0;
         signaled = ((queue_shm->wake_bits | ring_bits) & queue_shm->wake_mask) ||
-                   (queue_shm->changed_bits & queue_shm->changed_mask);
+                   ((queue_shm->changed_bits | ring_changed) & queue_shm->changed_mask);
     }
     if (status) return FALSE;
 

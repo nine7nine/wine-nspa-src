@@ -82,6 +82,7 @@ struct message
     enum message_type      type;      /* message type */
     user_handle_t          win;       /* window handle */
     unsigned int           msg;       /* message code */
+    unsigned int           post_seq;  /* canonical posted ordering vs ring bypass */
     lparam_t               wparam;    /* parameters */
     lparam_t               lparam;    /* parameters */
     int                    x;         /* message position */
@@ -726,7 +727,9 @@ void add_queue_hook_count( struct thread *thread, unsigned int index, int count 
 static inline int get_queue_status( struct msg_queue *queue )
 {
     queue_shm_t *queue_shm = queue->shared;
-    return (queue_shm->wake_bits & queue_shm->wake_mask) ||
+    unsigned int ring_bits = __atomic_load_n( &queue_shm->nspa_msg_ring.pending_count, __ATOMIC_ACQUIRE ) ?
+                             (QS_POSTMESSAGE | QS_ALLPOSTMESSAGE) : 0;
+    return ((queue_shm->wake_bits | ring_bits) & queue_shm->wake_mask) ||
            (queue_shm->changed_bits & queue_shm->changed_mask) ||
             queue_shm->internal_bits;
 }
@@ -1015,6 +1018,26 @@ static void free_message( struct message *msg )
     free( msg );
 }
 
+static inline int nspa_ring_has_pending_posted( const struct msg_queue *queue )
+{
+    return __atomic_load_n( &queue->shared->nspa_msg_ring.pending_count, __ATOMIC_ACQUIRE ) != 0;
+}
+
+static inline unsigned int nspa_ring_status_bits( const struct msg_queue *queue )
+{
+    return nspa_ring_has_pending_posted( queue ) ? (QS_POSTMESSAGE | QS_ALLPOSTMESSAGE) : 0;
+}
+
+static inline unsigned int nspa_alloc_post_seq( struct msg_queue *queue )
+{
+    return __atomic_add_fetch( &queue->shared->nspa_msg_ring.next_post_seq, 1, __ATOMIC_RELAXED );
+}
+
+static inline int nspa_seq_before( unsigned int a, unsigned int b )
+{
+    return (int)(a - b) < 0;
+}
+
 /* remove (and free) a message from a message list */
 static void remove_queue_message( struct msg_queue *queue, struct message *msg,
                                   enum message_kind kind )
@@ -1026,7 +1049,7 @@ static void remove_queue_message( struct msg_queue *queue, struct message *msg,
         if (list_empty( &queue->msg_list[kind] )) clear_queue_bits( queue, QS_SENDMESSAGE );
         break;
     case POST_MESSAGE:
-        if (list_empty( &queue->msg_list[kind] ) && !queue->quit_message)
+        if (list_empty( &queue->msg_list[kind] ) && !queue->quit_message && !nspa_ring_has_pending_posted( queue ))
             clear_queue_bits( queue, QS_POSTMESSAGE|QS_ALLPOSTMESSAGE );
         if (msg->msg == WM_HOTKEY && --queue->hotkey_count == 0)
             clear_queue_bits( queue, QS_HOTKEY );
@@ -1178,24 +1201,122 @@ static int match_window( user_handle_t win, user_handle_t msg_win )
     return is_child_window( win, msg_win );
 }
 
+static struct message *find_posted_message( struct msg_queue *queue, user_handle_t win,
+                                            unsigned int first, unsigned int last )
+{
+    struct message *msg;
+
+    LIST_FOR_EACH_ENTRY( msg, &queue->msg_list[POST_MESSAGE], struct message, entry )
+    {
+        if (!match_window( win, msg->win )) continue;
+        if (!check_msg_filter( msg->msg, first, last )) continue;
+        return msg;
+    }
+    return NULL;
+}
+
+struct nspa_posted_match
+{
+    volatile nspa_msg_slot_t *slot;
+    unsigned int seq;
+};
+
+static int find_nspa_posted_message( struct msg_queue *queue, user_handle_t win,
+                                     unsigned int first, unsigned int last,
+                                     struct nspa_posted_match *match )
+{
+    volatile nspa_msg_ring_t *ring = &queue->shared->nspa_msg_ring;
+    unsigned int head, tail, cursor;
+    volatile nspa_msg_slot_t *best = NULL;
+    unsigned int best_seq = 0;
+
+    if (!ring->active) return 0;
+
+    head = __atomic_load_n( &ring->head, __ATOMIC_ACQUIRE );
+    tail = __atomic_load_n( &ring->tail, __ATOMIC_ACQUIRE );
+
+    for (cursor = tail; (int)(cursor - head) < 0; cursor++)
+    {
+        volatile nspa_msg_slot_t *slot = &ring->slots[cursor & (NSPA_MSG_RING_SLOTS - 1)];
+        unsigned int state = __atomic_load_n( &slot->state, __ATOMIC_ACQUIRE );
+        unsigned int seq;
+
+        if (state != NSPA_MSG_STATE_READY) continue;
+        if (!match_window( win, slot->win )) continue;
+        if (!check_msg_filter( slot->msg, first, last )) continue;
+
+        seq = slot->post_seq;
+        if (!best || nspa_seq_before( seq, best_seq ))
+        {
+            best = slot;
+            best_seq = seq;
+        }
+    }
+
+    if (!best) return 0;
+
+    match->slot = best;
+    match->seq = best_seq;
+    return 1;
+}
+
+static void consume_nspa_posted_message( struct msg_queue *queue, struct nspa_posted_match *match )
+{
+    volatile nspa_msg_ring_t *ring = &queue->shared->nspa_msg_ring;
+    unsigned int head, tail, cursor;
+
+    __atomic_store_n( &match->slot->state, NSPA_MSG_STATE_CONSUMED, __ATOMIC_RELEASE );
+    __atomic_fetch_sub( &ring->pending_count, 1, __ATOMIC_ACQ_REL );
+
+    tail = __atomic_load_n( &ring->tail, __ATOMIC_ACQUIRE );
+    head = __atomic_load_n( &ring->head, __ATOMIC_ACQUIRE );
+
+    for (cursor = tail; (int)(cursor - head) < 0; cursor++)
+    {
+        volatile nspa_msg_slot_t *slot = &ring->slots[cursor & (NSPA_MSG_RING_SLOTS - 1)];
+
+        if (__atomic_load_n( &slot->state, __ATOMIC_ACQUIRE ) != NSPA_MSG_STATE_CONSUMED) break;
+        __atomic_store_n( &slot->state, NSPA_MSG_STATE_EMPTY, __ATOMIC_RELEASE );
+    }
+
+    if (cursor != tail) __atomic_store_n( &ring->tail, cursor, __ATOMIC_RELEASE );
+
+    if (list_empty( &queue->msg_list[POST_MESSAGE] ) && !queue->quit_message && !nspa_ring_has_pending_posted( queue ))
+        clear_queue_bits( queue, QS_POSTMESSAGE|QS_ALLPOSTMESSAGE );
+}
+
+static int return_nspa_posted_message( struct msg_queue *queue, struct nspa_posted_match *match,
+                                       unsigned int flags, struct get_message_reply *reply )
+{
+    volatile nspa_msg_slot_t *slot = match->slot;
+
+    reply->total  = 0;
+    reply->type   = slot->type;
+    reply->win    = slot->win;
+    reply->msg    = slot->msg;
+    reply->wparam = slot->wparam;
+    reply->lparam = slot->lparam;
+    reply->x      = slot->x;
+    reply->y      = slot->y;
+    reply->time   = slot->time;
+
+    if (flags & PM_REMOVE) consume_nspa_posted_message( queue, match );
+    return 1;
+}
+
 /* retrieve a posted message */
 static int get_posted_message( struct msg_queue *queue, user_handle_t win,
                                unsigned int first, unsigned int last, unsigned int flags,
                                struct get_message_reply *reply )
 {
-    struct message *msg;
+    struct nspa_posted_match ring_match;
+    struct message *msg = find_posted_message( queue, win, first, last );
+    int have_ring = find_nspa_posted_message( queue, win, first, last, &ring_match );
 
-    /* check against the filters */
-    LIST_FOR_EACH_ENTRY( msg, &queue->msg_list[POST_MESSAGE], struct message, entry )
-    {
-        if (!match_window( win, msg->win )) continue;
-        if (!check_msg_filter( msg->msg, first, last )) continue;
-        goto found; /* found one */
-    }
-    return 0;
+    if (have_ring && (!msg || nspa_seq_before( ring_match.seq, msg->post_seq )))
+        return return_nspa_posted_message( queue, &ring_match, flags, reply );
+    if (!msg) return 0;
 
-    /* return it to the app */
-found:
     reply->total = msg->data_size;
     if (msg->data_size > get_reply_max_size())
     {
@@ -1243,7 +1364,7 @@ static int get_quit_message( struct msg_queue *queue, unsigned int flags,
         if (flags & PM_REMOVE)
         {
             queue->quit_message = 0;
-            if (list_empty( &queue->msg_list[POST_MESSAGE] ))
+            if (list_empty( &queue->msg_list[POST_MESSAGE] ) && !nspa_ring_has_pending_posted( queue ))
                 clear_queue_bits( queue, QS_POSTMESSAGE|QS_ALLPOSTMESSAGE );
         }
         return 1;
@@ -1800,6 +1921,7 @@ found:
     msg->type      = MSG_POSTED;
     msg->win       = hotkey->win;
     msg->msg       = WM_HOTKEY;
+    msg->post_seq  = nspa_alloc_post_seq( hotkey->queue );
     msg->wparam    = hotkey->id;
     msg->lparam    = ((hotkey->vkey & 0xffff) << 16) | modifiers;
 
@@ -2895,6 +3017,7 @@ void post_message( user_handle_t win, unsigned int message, lparam_t wparam, lpa
         msg->type      = MSG_POSTED;
         msg->win       = get_user_full_handle( win );
         msg->msg       = message;
+        msg->post_seq  = nspa_alloc_post_seq( thread->queue );
         msg->wparam    = wparam;
         msg->lparam    = lparam;
         msg->result    = NULL;
@@ -3157,7 +3280,7 @@ DECL_HANDLER(set_queue_mask)
         shared->access_time  = monotonic_time;
         shared->wake_mask    = req->wake_mask;
         shared->changed_mask = req->changed_mask;
-        reply->wake_bits     = shared->wake_bits;
+        reply->wake_bits     = shared->wake_bits | nspa_ring_status_bits( queue );
         reply->changed_bits  = shared->changed_bits;
     }
     SHARED_WRITE_END;
@@ -3178,7 +3301,7 @@ DECL_HANDLER(get_queue_status)
 
     SHARED_WRITE_BEGIN( queue_shm, queue_shm_t )
     {
-        reply->wake_bits      = shared->wake_bits;
+        reply->wake_bits      = shared->wake_bits | nspa_ring_status_bits( queue );
         reply->changed_bits   = shared->changed_bits;
         shared->changed_bits &= ~req->clear_bits;
     }
@@ -3248,6 +3371,7 @@ DECL_HANDLER(send_message)
             set_queue_bits( recv_queue, QS_SENDMESSAGE );
             break;
         case MSG_POSTED:
+            msg->post_seq = nspa_alloc_post_seq( recv_queue );
             list_add_tail( &recv_queue->msg_list[POST_MESSAGE], &msg->entry );
             set_queue_bits( recv_queue, QS_POSTMESSAGE|QS_ALLPOSTMESSAGE );
             if (msg->msg == WM_HOTKEY)

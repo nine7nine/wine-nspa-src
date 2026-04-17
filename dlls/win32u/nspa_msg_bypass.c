@@ -6,8 +6,9 @@
  * ring and wakes the receiver via its queue's ntsync event.  This removes
  * ~80% of wineserver traffic measured during Ableton playback.
  *
- * Scope this increment: MSG_POSTED only.  Blocking SendMessage + reply
- * ring wiring + EVENT_SET_PI integration come in a follow-up.
+ * Scope this increment: MSG_POSTED only.  The sender stays shmem-fast-path,
+ * while wineserver regains dequeue authority and uses the ring metadata
+ * to preserve canonical posted-message ordering.
  *
  * Design doc: docs/send-message-bypass-design.md
  */
@@ -39,8 +40,8 @@ WINE_DEFAULT_DEBUG_CHANNEL(msg);
  * Open-addressed linear-probed hash on wineserver thread_id.  Small and
  * bounded (32 entries) — far more than a DAW thread typically targets
  * in a 30-second window.  Cache entries are never invalidated
- * proactively; if a slot holds a stale tid (thread exited), the NtSetEvent
- * on sync_handle will fail and we fall back to the server path, which
+ * proactively; if a slot holds a stale tid (thread exited), the sync wake
+ * will fail and we fall back to the server path, which
  * properly detects the dead thread.
  * --------------------------------------------------------------------- */
 
@@ -60,34 +61,6 @@ struct nspa_cache_entry
 static __thread struct nspa_cache_entry nspa_cache[NSPA_CACHE_SLOTS];
 static __thread int nspa_cache_init_done;
 
-/* Handle to *our own* queue->sync event.  Acquired lazily on first drain
- * so the receiver can reset the event after emptying the ring.  Without
- * this, queue->sync (manual-reset) stays signalled forever once a ring
- * send fires it, producing a 100% CPU busy-peek loop. */
-static __thread HANDLE nspa_own_sync_handle;
-
-/* Acquire a handle to this thread's own queue->sync for reset after drain.
- * One-time server round-trip per thread; cached in TLS thereafter. */
-static HANDLE nspa_get_own_sync_handle( void )
-{
-    HANDLE h = NULL;
-    NTSTATUS status;
-
-    if (nspa_own_sync_handle) return nspa_own_sync_handle;
-
-    SERVER_START_REQ( nspa_get_thread_queue )
-    {
-        req->tid = HandleToULong( NtCurrentTeb()->ClientId.UniqueThread );
-        if (!(status = wine_server_call( req )))
-            h = wine_server_ptr_handle( reply->sync_handle );
-    }
-    SERVER_END_REQ;
-
-    if (status || !h) return NULL;
-    nspa_own_sync_handle = h;
-    return h;
-}
-
 /* ---------------------------------------------------------------------
  * Ring helpers — atomic ops over shared memory.
  *
@@ -96,18 +69,8 @@ static HANDLE nspa_get_own_sync_handle( void )
  *   EMPTY -> WRITING (CAS during reserve)
  *   WRITING -> READY (release store after fill)
  *   READY -> CONSUMED (release store after dispatch)
- *   CONSUMED -> EMPTY (relaxed store during tail advance)
+ *   CONSUMED -> EMPTY (server-side tail advance during dequeue)
  * --------------------------------------------------------------------- */
-
-static inline unsigned int ring_load_head( const volatile nspa_msg_ring_t *ring )
-{
-    return __atomic_load_n( &ring->head, __ATOMIC_ACQUIRE );
-}
-
-static inline unsigned int ring_load_tail( const volatile nspa_msg_ring_t *ring )
-{
-    return __atomic_load_n( &ring->tail, __ATOMIC_ACQUIRE );
-}
 
 /* Reserve a slot index via CAS.  Returns U32_MAX on FULL. */
 static unsigned int ring_reserve_slot( volatile nspa_msg_ring_t *ring )
@@ -227,6 +190,7 @@ BOOL nspa_try_post_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
     struct nspa_cache_entry *entry;
     volatile nspa_msg_ring_t *ring;
     volatile nspa_msg_slot_t *slot;
+    NTSTATUS status;
     unsigned int idx;
 
     /* This increment: MSG_POSTED only.  Other types fall through. */
@@ -288,14 +252,11 @@ BOOL nspa_try_post_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
     slot->reply_slot  = ~0u;        /* posted = no reply expected */
     slot->data_size   = 0;
 
-    /* Publish — consumer can read the slot from here on. */
-    __atomic_store_n( &slot->state, NSPA_MSG_STATE_READY, __ATOMIC_RELEASE );
-
-    /* Update wake_bits atomically so the receiver's check_queue_bits /
-     * get_queue_status sees the pending message even if it hasn't yet
-     * drained the ring.  The seqlock is NOT bumped — these fields are
-     * single-word atomic OR'd from the server too (no struct-wide write),
-     * so torn reads aren't an issue. */
+    /* Publish queue-visible pending state before making the slot READY.
+     * The server uses ring-owned pending_count plus these bits to know
+     * there is posted work to arbitrate, even if it races a writer that
+     * hasn't completed the slot payload yet. */
+    __atomic_fetch_add( &ring->pending_count, 1, __ATOMIC_ACQ_REL );
     {
         volatile queue_shm_t *peer = (queue_shm_t *)entry->queue_shm;
         __atomic_fetch_or( (volatile unsigned int *)&peer->wake_bits,
@@ -304,153 +265,16 @@ BOOL nspa_try_post_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
                            QS_POSTMESSAGE | QS_ALLPOSTMESSAGE, __ATOMIC_RELEASE );
     }
 
-    /* Wake the receiver.  Plain NtSetEvent for MSG_POSTED — fire-and-
-     * forget, no PI propagation needed (sender is not waiting). */
-    NtSetEvent( entry->sync_handle, NULL );
-    return TRUE;
-}
+    /* Allocate the canonical posted sequence immediately before READY so
+     * ordering tracks publication, not reserve time. */
+    slot->post_seq = __atomic_add_fetch( &ring->next_post_seq, 1, __ATOMIC_RELAXED );
 
+    /* Publish — consumer can read the slot from here on. */
+    __atomic_store_n( &slot->state, NSPA_MSG_STATE_READY, __ATOMIC_RELEASE );
 
-/* ---------------------------------------------------------------------
- * Receiver side — drain our own ring during peek_message.
- *
- * We walk tail..head looking for the first slot matching the peek
- * filter (hwnd / first / last).  Non-matching slots are left in place
- * for a later peek.  Consuming a non-tail slot creates a "hole" that
- * gets reclaimed when the tail advances past it.
- *
- * Returns TRUE with @msg filled in if a message was dispatched; FALSE
- * means the caller should fall through to the existing server path.
- * --------------------------------------------------------------------- */
-
-static BOOL nspa_slot_matches( const volatile nspa_msg_slot_t *slot,
-                               HWND hwnd, UINT first, UINT last )
-{
-    HWND slot_win = (HWND)(UINT_PTR)slot->win;
-
-    if (hwnd && hwnd != (HWND)-1 && slot_win && slot_win != hwnd)
-        return FALSE;
-    if (first != 0 || last != ~0u)
-    {
-        if (slot->msg < first || slot->msg > last) return FALSE;
-    }
-    return TRUE;
-}
-
-BOOL nspa_drain_peek( const queue_shm_t *queue_shm, HWND hwnd, UINT first, UINT last,
-                      UINT flags, MSG *msg, UINT *out_type )
-{
-    volatile nspa_msg_ring_t *ring = (volatile nspa_msg_ring_t *)&queue_shm->nspa_msg_ring;
-    unsigned int tail, head, cursor;
-    volatile nspa_msg_slot_t *slot;
-    BOOL want_remove = !!(flags & PM_REMOVE);
-    unsigned int match_idx = ~0u;
-
-    if (!ring->active) return FALSE;
-
-    tail = ring_load_tail( ring );
-    head = ring_load_head( ring );
-
-    /* Scan tail..head looking for the first matching READY slot */
-    for (cursor = tail; (int)(cursor - head) < 0; cursor++)
-    {
-        unsigned int slot_idx = cursor & (NSPA_MSG_RING_SLOTS - 1);
-        unsigned int state;
-
-        slot = &ring->slots[slot_idx];
-        state = __atomic_load_n( &slot->state, __ATOMIC_ACQUIRE );
-        if (state == NSPA_MSG_STATE_WRITING) break;  /* head-of-line block */
-        if (state != NSPA_MSG_STATE_READY) continue; /* CONSUMED/EMPTY — skip */
-
-        if (nspa_slot_matches( slot, hwnd, first, last ))
-        {
-            match_idx = cursor;
-            break;
-        }
-    }
-
-    if (match_idx == ~0u) return FALSE;
-
-    slot = &ring->slots[match_idx & (NSPA_MSG_RING_SLOTS - 1)];
-
-    /* Copy out the message fields */
-    msg->hwnd    = (HWND)(UINT_PTR)slot->win;
-    msg->message = slot->msg;
-    msg->wParam  = slot->wparam;
-    msg->lParam  = slot->lparam;
-    msg->time    = slot->time;
-    msg->pt.x    = slot->x;
-    msg->pt.y    = slot->y;
-    if (out_type) *out_type = slot->type;
-
-    if (!want_remove)
-    {
-        /* PM_NOREMOVE — peek only, leave slot READY */
-        return TRUE;
-    }
-
-    /* Consume */
-    __atomic_store_n( &slot->state, NSPA_MSG_STATE_CONSUMED, __ATOMIC_RELEASE );
-
-    /* Advance tail past any leading CONSUMED slots */
-    cursor = tail;
-    while ((int)(cursor - head) < 0)
-    {
-        unsigned int slot_idx = cursor & (NSPA_MSG_RING_SLOTS - 1);
-        unsigned int state = __atomic_load_n( &ring->slots[slot_idx].state,
-                                              __ATOMIC_ACQUIRE );
-        if (state != NSPA_MSG_STATE_CONSUMED) break;
-        __atomic_store_n( &ring->slots[slot_idx].state, NSPA_MSG_STATE_EMPTY,
-                          __ATOMIC_RELEASE );
-        cursor++;
-    }
-    if (cursor != tail)
-    {
-        __atomic_store_n( &ring->tail, cursor, __ATOMIC_RELEASE );
-        tail = cursor;
-    }
-
-    /* If our consume emptied the ring, we must clear QS_POSTMESSAGE from
-     * wake_bits/changed_bits AND reset queue->sync.  The sender's path is:
-     *     reserve slot → publish (state=READY) → OR wake_bits → NtSetEvent
-     * queue->sync is manual-reset (server/queue.c create_internal_sync(1,0)),
-     * so once signalled it stays signalled until *someone* resets it.
-     * The normal server-drain path handles this via clear_queue_bits()
-     * + reset_sync() when get_message empties msg_list[].  For ring-drained
-     * messages the server never sees them, so the receiver must do it here.
-     *
-     * Race handling: a sender may slip in between our emptiness-check and
-     * our clear/reset.  Standard "check, clear, re-check, restore-if-raced"
-     * pattern — NtResetEvent is a syscall and serves as a full barrier, so
-     * the re-read of head sees any store the sender made before its own
-     * NtSetEvent. */
-    head = __atomic_load_n( &ring->head, __ATOMIC_ACQUIRE );
-    if (tail == head)
-    {
-        volatile queue_shm_t *q = (volatile queue_shm_t *)queue_shm;
-        HANDLE sync_h;
-
-        __atomic_fetch_and( (volatile unsigned int *)&q->wake_bits,
-                            ~(unsigned int)(QS_POSTMESSAGE | QS_ALLPOSTMESSAGE),
-                            __ATOMIC_SEQ_CST );
-        __atomic_fetch_and( (volatile unsigned int *)&q->changed_bits,
-                            ~(unsigned int)(QS_POSTMESSAGE | QS_ALLPOSTMESSAGE),
-                            __ATOMIC_SEQ_CST );
-
-        if ((sync_h = nspa_get_own_sync_handle()))
-            NtResetEvent( sync_h, NULL );
-
-        /* Re-check for a sender that raced us between drain and reset */
-        head = __atomic_load_n( &ring->head, __ATOMIC_ACQUIRE );
-        if (tail != head)
-        {
-            __atomic_fetch_or( (volatile unsigned int *)&q->wake_bits,
-                               QS_POSTMESSAGE | QS_ALLPOSTMESSAGE, __ATOMIC_RELEASE );
-            __atomic_fetch_or( (volatile unsigned int *)&q->changed_bits,
-                               QS_POSTMESSAGE | QS_ALLPOSTMESSAGE, __ATOMIC_RELEASE );
-            if (sync_h) NtSetEvent( sync_h, NULL );
-        }
-    }
-
+    status = wine_server_signal_internal_sync( entry->sync_handle );
+    if (status) status = NtSetEvent( entry->sync_handle, NULL );
+    if (status)
+        WARN( "failed to signal bypass queue %lu\n", dest_tid );
     return TRUE;
 }

@@ -2898,17 +2898,22 @@ static BOOL check_queue_bits( UINT wake_mask, UINT changed_mask, UINT signal_bit
 
     while ((status = get_shared_queue( &lock, &queue_shm )) == STATUS_PENDING)
     {
+        UINT ring_bits = __atomic_load_n( &queue_shm->nspa_msg_ring.pending_count, __ATOMIC_ACQUIRE ) ?
+                         (QS_POSTMESSAGE | QS_ALLPOSTMESSAGE) : 0;
+        UINT wake = queue_shm->wake_bits | ring_bits;
+        UINT changed = queue_shm->changed_bits;
+
         if (internal) skip = !(queue_shm->internal_bits & QS_HARDWARE);
         /* if the masks need an update */
         else if (queue_shm->wake_mask != wake_mask) skip = FALSE;
         else if (queue_shm->changed_mask != changed_mask) skip = FALSE;
         /* or if some bits need to be cleared, or queue is signaled */
-        else if (queue_shm->wake_bits & signal_bits) skip = FALSE;
-        else if (queue_shm->changed_bits & clear_bits) skip = FALSE;
+        else if (wake & signal_bits) skip = FALSE;
+        else if (changed & clear_bits) skip = FALSE;
         else
         {
-            *wake_bits = queue_shm->wake_bits;
-            *changed_bits = queue_shm->changed_bits;
+            *wake_bits = wake;
+            *changed_bits = changed;
             skip = get_tick_count() - (UINT64)queue_shm->access_time / 10000 < 3000; /* avoid hung queue */
         }
     }
@@ -2965,41 +2970,6 @@ static int peek_message( MSG *msg, const struct peek_message_filter *filter )
         thread_info->client_info.msg_source = prev_source;
         wake_mask = filter->mask & (QS_SENDMESSAGE | QS_SMRESULT);
 
-        /* NSPA: drain the cross-thread shmem ring first.  If it yields
-         * a message matching our filter, skip the server round-trip.
-         *
-         * The ring has its own head/tail atomics; we don't need the queue
-         * seqlock here — get_shared_queue only serves to lazy-populate the
-         * thread-local shared_queue pointer.  Calling it once is enough;
-         * the returned pointer is stable for the life of the queue. */
-        {
-            struct object_lock nspa_lock = OBJECT_LOCK_INIT;
-            const queue_shm_t *nspa_queue_shm = NULL;
-            UINT nspa_slot_type = 0;
-            MSG nspa_msg;
-            BOOL nspa_hit = FALSE;
-
-            memset( &nspa_msg, 0, sizeof(nspa_msg) );
-            get_shared_queue( &nspa_lock, &nspa_queue_shm );
-            if (nspa_queue_shm)
-                nspa_hit = nspa_drain_peek( nspa_queue_shm, hwnd, first, last, flags,
-                                            &nspa_msg, &nspa_slot_type );
-            if (nspa_hit)
-            {
-                info.type        = nspa_slot_type;
-                info.msg.hwnd    = nspa_msg.hwnd;
-                info.msg.message = nspa_msg.message;
-                info.msg.wParam  = nspa_msg.wParam;
-                info.msg.lParam  = nspa_msg.lParam;
-                info.msg.time    = nspa_msg.time;
-                info.msg.pt      = nspa_msg.pt;
-                size             = 0;    /* no extra data in a ring slot today */
-                hw_id            = 0;
-                res              = 0;
-                goto nspa_dispatch;
-            }
-        }
-
         if (check_queue_bits( wake_mask, filter->mask, wake_mask | signal_bits, filter->mask | clear_bits,
                               &wake_bits, &changed_bits, filter->internal ))
             res = STATUS_PENDING;
@@ -3047,8 +3017,6 @@ static int peek_message( MSG *msg, const struct peek_message_filter *filter )
             if (!(buffer = malloc( buffer_size ))) return -1;
             continue;
         }
-
-nspa_dispatch:
         TRACE( "got type %d msg %x (%s) hwnd %p wp %lx lp %lx\n",
                info.type, info.msg.message,
                (info.type == MSG_WINEVENT) ? "MSG_WINEVENT" : debugstr_msg_name(info.msg.message, info.msg.hwnd),
@@ -3313,8 +3281,12 @@ static BOOL is_queue_signaled(void)
     UINT status;
 
     while ((status = get_shared_queue( &lock, &queue_shm )) == STATUS_PENDING)
-        signaled = (queue_shm->wake_bits & queue_shm->wake_mask) ||
+    {
+        UINT ring_bits = __atomic_load_n( &queue_shm->nspa_msg_ring.pending_count, __ATOMIC_ACQUIRE ) ?
+                         (QS_POSTMESSAGE | QS_ALLPOSTMESSAGE) : 0;
+        signaled = ((queue_shm->wake_bits | ring_bits) & queue_shm->wake_mask) ||
                    (queue_shm->changed_bits & queue_shm->changed_mask);
+    }
     if (status) return FALSE;
 
     return signaled;

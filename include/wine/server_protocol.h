@@ -1054,9 +1054,11 @@ typedef volatile struct
     unsigned int overflow;
     unsigned int active;
     unsigned int pending_count;
+    unsigned int pending_send_count;
     unsigned int next_post_seq;
     unsigned int change_seq;
     unsigned int change_ack_seq;
+    unsigned int __pad;
     nspa_msg_slot_t slots[NSPA_MSG_RING_SLOTS];
 } nspa_msg_ring_t;
 
@@ -3245,9 +3247,11 @@ struct get_message_reply
     int             x;
     int             y;
     unsigned int    time;
+    unsigned int    nspa_sender_tid;
+    unsigned int    nspa_reply_slot;
     data_size_t     total;
     /* VARARG(data,message_data); */
-    char __pad_52[4];
+    char __pad_60[4];
 };
 
 
@@ -7207,6 +7211,6 @@ union generic_reply
     struct nspa_get_thread_queue_reply nspa_get_thread_queue_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 933
+#define SERVER_PROTOCOL_VERSION 935
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

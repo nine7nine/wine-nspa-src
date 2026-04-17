@@ -1033,6 +1033,7 @@ typedef volatile struct
     unsigned int type;
     user_handle_t win;
     unsigned int msg;
+    unsigned int  post_seq;
     lparam_t      wparam;
     lparam_t      lparam;
     int           x;
@@ -1052,6 +1053,9 @@ typedef volatile struct
     unsigned int tail;
     unsigned int overflow;
     unsigned int active;
+    unsigned int pending_count;
+    unsigned int next_post_seq;
+    unsigned int __pad[2];
     nspa_msg_slot_t slots[NSPA_MSG_RING_SLOTS];
 } nspa_msg_ring_t;
 

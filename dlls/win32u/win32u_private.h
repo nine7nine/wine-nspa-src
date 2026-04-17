@@ -39,8 +39,6 @@ extern void release_clipboard_owner( HWND hwnd );
 /* nspa_msg_bypass.c — cross-thread SendMessage shmem-ring bypass */
 extern BOOL nspa_try_post_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
                                 UINT msg, LPARAM wparam, LPARAM lparam );
-extern BOOL nspa_drain_peek( const queue_shm_t *queue_shm, HWND hwnd, UINT first,
-                             UINT last, UINT flags, MSG *msg, UINT *out_type );
 
 /* cursoricon.c */
 extern BOOL process_wine_setcursor( HWND hwnd, HWND window, HCURSOR handle );

@@ -69,6 +69,16 @@
 # ifndef NTSYNC_INDEX_URING_READY
 #  define NTSYNC_INDEX_URING_READY 0xFFFFFFFEu
 # endif
+# ifndef NTSYNC_IOC_EVENT_SET_PI
+struct ntsync_event_set_pi_args
+{
+    __u32 flags;
+    __u32 policy;
+    __u32 prio;
+    __u32 __pad;
+};
+#  define NTSYNC_IOC_EVENT_SET_PI _IOW('N', 0x8e, struct ntsync_event_set_pi_args)
+# endif
 #endif
 
 #include "ntstatus.h"
@@ -397,6 +407,14 @@ static NTSTATUS linux_set_event_obj( int obj, LONG *prev_state )
     return STATUS_SUCCESS;
 }
 
+static NTSTATUS linux_set_event_obj_pi( int obj, unsigned int policy, unsigned int prio )
+{
+    struct ntsync_event_set_pi_args args = {.flags = 0, .policy = policy, .prio = prio, .__pad = 0};
+
+    if (ioctl( obj, NTSYNC_IOC_EVENT_SET_PI, &args ) < 0) return errno_to_status( errno );
+    return STATUS_SUCCESS;
+}
+
 
 static NTSTATUS linux_reset_event_obj( int obj, LONG *prev_state )
 {
@@ -542,6 +560,11 @@ static NTSTATUS linux_query_semaphore_obj( int obj, SEMAPHORE_BASIC_INFORMATION 
 }
 
 static NTSTATUS linux_set_event_obj( int obj, LONG *prev_state )
+{
+    return STATUS_NOT_IMPLEMENTED;
+}
+
+static NTSTATUS linux_set_event_obj_pi( int obj, unsigned int policy, unsigned int prio )
 {
     return STATUS_NOT_IMPLEMENTED;
 }
@@ -1282,6 +1305,80 @@ void ntdll_signal_event_direct( HANDLE event )
     linux_set_event_obj( sync->fd, NULL );
     release_inproc_sync( sync );
 }
+
+static BOOL nspa_get_current_rt_params( unsigned int *policy, unsigned int *prio )
+{
+#if defined(HAVE_SCHED_H) && defined(SCHED_FIFO) && defined(SCHED_RR)
+    struct ntdll_thread_data *data = ntdll_get_thread_data();
+    struct sched_param param;
+    int cached_policy = data->nspa_rt_cached_policy;
+    int cached_prio = data->nspa_rt_cached_prio;
+
+    if ((cached_policy == SCHED_FIFO || cached_policy == SCHED_RR) && cached_prio > 0)
+    {
+        *policy = cached_policy;
+        *prio = cached_prio;
+        return TRUE;
+    }
+
+    cached_policy = sched_getscheduler( 0 );
+    if (cached_policy != SCHED_FIFO && cached_policy != SCHED_RR) return FALSE;
+    if (sched_getparam( 0, &param ) < 0 || param.sched_priority <= 0) return FALSE;
+
+    data->nspa_rt_cached_policy = cached_policy;
+    data->nspa_rt_cached_prio = param.sched_priority;
+    *policy = cached_policy;
+    *prio = param.sched_priority;
+    return TRUE;
+#else
+    return FALSE;
+#endif
+}
+
+NTSTATUS unixcall_wine_server_signal_internal_sync( void *args )
+{
+    const struct wine_server_signal_internal_sync_params *params = args;
+    struct inproc_sync stack, *sync = &stack;
+    unsigned int policy, prio;
+    NTSTATUS ret;
+
+    if (inproc_device_fd < 0) return STATUS_NOT_IMPLEMENTED;
+    if ((ret = get_inproc_sync( params->handle, INPROC_SYNC_UNKNOWN, EVENT_MODIFY_STATE, &stack, &sync )))
+        return ret;
+
+    switch (sync->type)
+    {
+    case INPROC_SYNC_EVENT:
+    case INPROC_SYNC_INTERNAL:
+        if (nspa_get_current_rt_params( &policy, &prio ))
+        {
+            ret = linux_set_event_obj_pi( sync->fd, policy, prio );
+            if (ret == STATUS_NOT_IMPLEMENTED || ret == STATUS_INVALID_DEVICE_REQUEST || ret == STATUS_INVALID_PARAMETER)
+                ret = linux_set_event_obj( sync->fd, NULL );
+        }
+        else ret = linux_set_event_obj( sync->fd, NULL );
+        break;
+    default:
+        ret = STATUS_OBJECT_TYPE_MISMATCH;
+        break;
+    }
+
+    release_inproc_sync( sync );
+    return ret;
+}
+
+#ifdef _WIN64
+NTSTATUS wow64_wine_server_signal_internal_sync( void *args )
+{
+    struct
+    {
+        ULONG handle;
+    } const *params32 = args;
+    struct wine_server_signal_internal_sync_params params = { ULongToHandle( params32->handle ) };
+
+    return unixcall_wine_server_signal_internal_sync( &params );
+}
+#endif
 
 static NTSTATUS inproc_wait( DWORD count, const HANDLE *handles, WAIT_TYPE type,
                              BOOLEAN alertable, const LARGE_INTEGER *timeout )

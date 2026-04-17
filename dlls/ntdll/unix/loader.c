@@ -1016,6 +1016,7 @@ static const unixlib_entry_t unix_call_funcs[] =
     unixcall_wine_server_call,
     unixcall_wine_server_fd_to_handle,
     unixcall_wine_server_handle_to_fd,
+    unixcall_wine_server_signal_internal_sync,
     unixcall_wine_spawnvp,
     system_time_precise,
 };
@@ -1034,6 +1035,7 @@ const unixlib_entry_t unix_call_wow64_funcs[] =
     wow64_wine_server_call,
     wow64_wine_server_fd_to_handle,
     wow64_wine_server_handle_to_fd,
+    wow64_wine_server_signal_internal_sync,
     wow64_wine_spawnvp,
     system_time_precise,
 };

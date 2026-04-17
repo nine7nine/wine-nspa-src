@@ -827,6 +827,12 @@ SHORT WINAPI NtUserGetAsyncKeyState( INT key )
 /***********************************************************************
  *           get_shared_queue_bits
  */
+static inline UINT nspa_queue_status_bits( const queue_shm_t *queue_shm )
+{
+    return __atomic_load_n( &queue_shm->nspa_msg_ring.pending_count, __ATOMIC_ACQUIRE ) ?
+           (QS_POSTMESSAGE | QS_ALLPOSTMESSAGE) : 0;
+}
+
 static BOOL get_shared_queue_bits( UINT *wake_bits, UINT *changed_bits )
 {
     struct object_lock lock = OBJECT_LOCK_INIT;
@@ -836,7 +842,8 @@ static BOOL get_shared_queue_bits( UINT *wake_bits, UINT *changed_bits )
     *wake_bits = *changed_bits = 0;
     while ((status = get_shared_queue( &lock, &queue_shm )) == STATUS_PENDING)
     {
-        *wake_bits = queue_shm->wake_bits;
+        UINT ring_bits = nspa_queue_status_bits( queue_shm );
+        *wake_bits = queue_shm->wake_bits | ring_bits;
         *changed_bits = queue_shm->changed_bits;
     }
 

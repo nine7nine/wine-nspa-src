@@ -3436,6 +3436,16 @@ NTSTATUS CDECL wine_server_handle_to_fd( HANDLE handle, unsigned int access, int
     return WINE_UNIX_CALL( unix_wine_server_handle_to_fd, &params );
 }
 
+/***********************************************************************
+ *           wine_server_signal_internal_sync (NTDLL.@)
+ */
+NTSTATUS CDECL wine_server_signal_internal_sync( HANDLE handle )
+{
+    struct wine_server_signal_internal_sync_params params = { handle };
+
+    return WINE_UNIX_CALL( unix_wine_server_signal_internal_sync, &params );
+}
+
 /******************************************************************
  *		LdrLoadDll (NTDLL.@)
  */

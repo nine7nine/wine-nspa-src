@@ -39,10 +39,10 @@ WINE_DEFAULT_DEBUG_CHANNEL(msg);
  *
  * Open-addressed linear-probed hash on wineserver thread_id.  Small and
  * bounded (32 entries) — far more than a DAW thread typically targets
- * in a 30-second window.  Cache entries are never invalidated
- * proactively; if a slot holds a stale tid (thread exited), the sync wake
- * will fail and we fall back to the server path, which
- * properly detects the dead thread.
+ * in a 30-second window.  Entries cache the peer queue's shared-object
+ * locator (id + offset) and sync handle; we re-resolve the shared object
+ * on each use so thread exit / queue teardown / TID reuse don't leave us
+ * writing through a raw stale queue pointer.
  * --------------------------------------------------------------------- */
 
 #define NSPA_CACHE_SLOTS 32
@@ -50,9 +50,9 @@ WINE_DEFAULT_DEBUG_CHANNEL(msg);
 struct nspa_cache_entry
 {
     DWORD                tid;            /* 0 = empty slot */
-    const queue_shm_t   *queue_shm;      /* session-shared queue for that tid */
     HANDLE               sync_handle;    /* event handle for queue->sync */
-    ULONG                object_id;      /* shared_object_t.id at lookup time (stale-detect) */
+    object_id_t          object_id;      /* shared_object_t.id at lookup time */
+    mem_size_t           object_offset;  /* shared_object locator offset */
 };
 
 /* Per-thread state lives in user_thread_info via a dedicated field.
@@ -123,6 +123,24 @@ static struct nspa_cache_entry *nspa_cache_find( DWORD tid )
     return NULL; /* table full */
 }
 
+static void nspa_clear_cache_entry( struct nspa_cache_entry *entry )
+{
+    HANDLE sync_handle = entry->sync_handle;
+
+    memset( entry, 0, sizeof(*entry) );
+    if (sync_handle) NtClose( sync_handle );
+}
+
+static const queue_shm_t *nspa_get_cached_queue_shm( const struct nspa_cache_entry *entry )
+{
+    const shared_object_t *object;
+
+    if (!entry->tid) return NULL;
+    if (!(object = find_shared_session_object( entry->object_id, entry->object_offset )))
+        return NULL;
+    return &object->shm.queue;
+}
+
 /* Do the server lookup to populate a cache slot.  Returns TRUE on success. */
 static BOOL nspa_populate_cache_entry( DWORD tid, struct nspa_cache_entry *entry )
 {
@@ -151,9 +169,9 @@ static BOOL nspa_populate_cache_entry( DWORD tid, struct nspa_cache_entry *entry
     }
 
     entry->tid         = tid;
-    entry->queue_shm   = &object->shm.queue;
     entry->sync_handle = sync_handle;
-    entry->object_id   = (ULONG)locator.id;
+    entry->object_id   = locator.id;
+    entry->object_offset = locator.offset;
     return TRUE;
 }
 
@@ -169,7 +187,11 @@ static struct nspa_cache_entry *nspa_lookup_peer( DWORD tid )
 
     entry = nspa_cache_find( tid );
     if (!entry) return NULL;       /* cache full */
-    if (entry->tid == tid) return entry;
+    if (entry->tid == tid)
+    {
+        if (nspa_get_cached_queue_shm( entry )) return entry;
+        nspa_clear_cache_entry( entry );
+    }
 
     if (!nspa_populate_cache_entry( tid, entry )) return NULL;
     return entry;
@@ -188,6 +210,7 @@ BOOL nspa_try_post_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
                          UINT msg, LPARAM wparam, LPARAM lparam )
 {
     struct nspa_cache_entry *entry;
+    const queue_shm_t *queue_shm;
     volatile nspa_msg_ring_t *ring;
     volatile nspa_msg_slot_t *slot;
     NTSTATUS status;
@@ -202,35 +225,15 @@ BOOL nspa_try_post_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
     entry = nspa_lookup_peer( dest_tid );
     if (!entry) return FALSE;
 
-    ring = &((queue_shm_t *)entry->queue_shm)->nspa_msg_ring;
-    if (!ring->active) return FALSE;
-
-    /* Skip the ring if a hook is active on the receiver that may need
-     * server-side observation or ordering.  WH_MIN == -1, so index is
-     * (WH_X - WH_MINHOOK).
-     *
-     *   WH_MSGFILTER      (-1) → [0]  — filter dialog-loop msgs
-     *   WH_JOURNALRECORD  ( 0) → [1]  — records every message
-     *   WH_JOURNALPLAYBACK( 1) → [2]  — injects synthesized messages
-     *   WH_GETMESSAGE     ( 3) → [4]  — observes each delivered msg
-     *   WH_CALLWNDPROC    ( 4) → [5]  — SEND-path only, but gate for safety
-     *   WH_SYSMSGFILTER   ( 6) → [7]  — system-wide msg filter
-     *
-     * WH_GETMESSAGE actually fires on the *receiver* regardless of
-     * transport (see message.c call_hooks at delivery), but journal
-     * hooks can inject/record at the server layer and must not be
-     * bypassed.  Gating on all of these is defensive and cheap: six
-     * dirty-hot shmem reads, no syscall. */
+    queue_shm = nspa_get_cached_queue_shm( entry );
+    if (!queue_shm)
     {
-        const volatile int *hc = entry->queue_shm->hooks_count;
-        if (hc[WH_MSGFILTER       - WH_MINHOOK] != 0 ||
-            hc[WH_JOURNALRECORD   - WH_MINHOOK] != 0 ||
-            hc[WH_JOURNALPLAYBACK - WH_MINHOOK] != 0 ||
-            hc[WH_GETMESSAGE      - WH_MINHOOK] != 0 ||
-            hc[WH_CALLWNDPROC     - WH_MINHOOK] != 0 ||
-            hc[WH_SYSMSGFILTER    - WH_MINHOOK] != 0)
-            return FALSE;
+        nspa_clear_cache_entry( entry );
+        return FALSE;
     }
+
+    ring = &((queue_shm_t *)queue_shm)->nspa_msg_ring;
+    if (!ring->active) return FALSE;
 
     idx = ring_reserve_slot( ring );
     if (idx == ~0u) return FALSE;   /* FULL — fall back to server */
@@ -258,7 +261,7 @@ BOOL nspa_try_post_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
      * hasn't completed the slot payload yet. */
     __atomic_fetch_add( &ring->pending_count, 1, __ATOMIC_ACQ_REL );
     {
-        volatile queue_shm_t *peer = (queue_shm_t *)entry->queue_shm;
+        volatile queue_shm_t *peer = (queue_shm_t *)queue_shm;
         __atomic_fetch_or( (volatile unsigned int *)&peer->wake_bits,
                            QS_POSTMESSAGE | QS_ALLPOSTMESSAGE, __ATOMIC_RELEASE );
         __atomic_fetch_or( (volatile unsigned int *)&peer->changed_bits,
@@ -275,6 +278,9 @@ BOOL nspa_try_post_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
     status = wine_server_signal_internal_sync( entry->sync_handle );
     if (status) status = NtSetEvent( entry->sync_handle, NULL );
     if (status)
+    {
+        nspa_clear_cache_entry( entry );
         WARN( "failed to signal bypass queue %lu\n", dest_tid );
+    }
     return TRUE;
 }

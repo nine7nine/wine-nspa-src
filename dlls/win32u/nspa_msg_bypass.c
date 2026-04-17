@@ -33,6 +33,7 @@
 #include "wine/server.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(msg);
+WINE_DECLARE_DEBUG_CHANNEL(nspa_bypass);
 
 
 /* ---------------------------------------------------------------------
@@ -225,10 +226,35 @@ BOOL nspa_try_post_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
     NTSTATUS status;
     unsigned int idx;
 
-    if (nspa_bypass_disabled()) return FALSE;
+    if (nspa_bypass_disabled())
+    {
+        TRACE_(nspa_bypass)( "skip disabled tid=%04x dest=%04x hwnd=%p msg=%04x\n",
+                             HandleToULong(NtCurrentTeb()->ClientId.UniqueThread),
+                             (UINT)dest_tid, hwnd, msg );
+        return FALSE;
+    }
 
     /* This increment: MSG_POSTED only.  Other types fall through. */
     if (type_enum != MSG_POSTED) return FALSE;
+
+    /* Original design scope is same-process cross-thread window messages.
+     * Thread-messages (hwnd == 0) and same-thread posts have semantics the
+     * ring does not currently preserve — e.g. WebView2 / auth pumps expect
+     * PostThreadMessage and self-post to match the server's queue rules
+     * exactly — so fall back to the server path for those. */
+    if (!hwnd)
+    {
+        TRACE_(nspa_bypass)( "skip thread-msg tid=%04x dest=%04x msg=%04x\n",
+                             HandleToULong(NtCurrentTeb()->ClientId.UniqueThread),
+                             (UINT)dest_tid, msg );
+        return FALSE;
+    }
+    if (dest_tid == HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ))
+    {
+        TRACE_(nspa_bypass)( "skip self-post tid=%04x hwnd=%p msg=%04x\n",
+                             (UINT)dest_tid, hwnd, msg );
+        return FALSE;
+    }
 
     /* No DDE through the ring — the server handles DDE specially. */
     if (msg >= WM_DDE_FIRST && msg <= WM_DDE_LAST) return FALSE;
@@ -287,5 +313,8 @@ BOOL nspa_try_post_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
         nspa_clear_cache_entry( entry );
         WARN( "failed to signal bypass queue %u\n", dest_tid );
     }
+    TRACE_(nspa_bypass)( "post tid=%04x dest=%04x hwnd=%p msg=%04x wp=%lx lp=%lx\n",
+                         HandleToULong(NtCurrentTeb()->ClientId.UniqueThread),
+                         (UINT)dest_tid, hwnd, msg, (unsigned long)wparam, (unsigned long)lparam );
     return TRUE;
 }

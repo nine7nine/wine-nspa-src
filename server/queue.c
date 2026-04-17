@@ -1392,6 +1392,7 @@ static int find_nspa_ring_message( struct msg_queue *queue, unsigned int type_ma
     unsigned int head, tail, cursor;
     volatile nspa_msg_slot_t *best = NULL;
     unsigned int best_seq = 0;
+    int scanned = 0, filtered_win = 0, filtered_type = 0, filtered_msg = 0, filtered_state = 0;
 
     if (!queue->nspa_shared) return 0;
     ring = &queue->nspa_shared->nspa_msg_ring;
@@ -1407,10 +1408,11 @@ static int find_nspa_ring_message( struct msg_queue *queue, unsigned int type_ma
         unsigned int seq;
         unsigned int slot_type = slot->type;
 
-        if (state != NSPA_MSG_STATE_READY) continue;
-        if (slot_type >= 32 || !(type_mask & (1u << slot_type))) continue;
-        if (!match_window( win, slot->win )) continue;
-        if (!check_msg_filter( slot->msg, first, last )) continue;
+        scanned++;
+        if (state != NSPA_MSG_STATE_READY) { filtered_state++; continue; }
+        if (slot_type >= 32 || !(type_mask & (1u << slot_type))) { filtered_type++; continue; }
+        if (!match_window( win, slot->win )) { filtered_win++; continue; }
+        if (!check_msg_filter( slot->msg, first, last )) { filtered_msg++; continue; }
 
         seq = slot->post_seq;
         if (!best || nspa_seq_before( seq, best_seq ))
@@ -1418,6 +1420,17 @@ static int find_nspa_ring_message( struct msg_queue *queue, unsigned int type_ma
             best = slot;
             best_seq = seq;
         }
+    }
+
+    {
+        static int post_debug = -1;
+        if (post_debug == -1) post_debug = (getenv("NSPA_POST_DEBUG") != NULL);
+        if (post_debug && (scanned || best))
+            fprintf( stderr, "nspa_post_debug: find_nspa_ring_message mask=%x win=%08x first=%x last=%x "
+                     "scanned=%d state_skip=%d type_skip=%d win_skip=%d msg_skip=%d best_seq=%u match=%d\n",
+                     type_mask, (unsigned)win, first, last, scanned,
+                     filtered_state, filtered_type, filtered_win, filtered_msg,
+                     best_seq, best ? 1 : 0 );
     }
 
     if (!best) return 0;
@@ -1493,6 +1506,15 @@ static int return_nspa_ring_message( struct msg_queue *queue, struct nspa_posted
     reply->y      = slot->y;
     reply->time   = slot->time;
 
+    {
+        static int post_debug = -1;
+        if (post_debug == -1) post_debug = (getenv("NSPA_POST_DEBUG") != NULL);
+        if (post_debug)
+            fprintf( stderr, "nspa_post_debug: return_nspa_ring_message slot=%p win=%08x msg=%04x type=%u seq=%u wparam=%lx lparam=%lx\n",
+                     slot, slot->win, slot->msg, slot_type, match->seq,
+                     (unsigned long)slot->wparam, (unsigned long)slot->lparam );
+    }
+
     /* Reply routing for SEND slots: populate sender_tid + reply slot index
      * so the client's reply_message() can write back via the ring instead
      * of through the server. */
@@ -1520,6 +1542,16 @@ static int get_posted_message( struct msg_queue *queue, user_handle_t win,
     struct message *msg = find_posted_message( queue, win, first, last );
     int have_ring = nspa_ring_arb_disabled() ? 0 :
                     find_nspa_posted_message( queue, win, first, last, &ring_match );
+
+    {
+        static int post_debug = -1;
+        if (post_debug == -1) post_debug = (getenv("NSPA_POST_DEBUG") != NULL);
+        if (post_debug)
+            fprintf( stderr, "nspa_post_debug: get_posted_message win=%08x first=%x last=%x have_ring=%d msg=%p%s%s\n",
+                     (unsigned)win, first, last, have_ring, msg,
+                     have_ring ? " ring_seq=" : "",
+                     have_ring ? (msg ? " cmp_with_msg_seq" : " (no-legacy)") : "" );
+    }
 
     if (have_ring && (!msg || nspa_seq_before( ring_match.seq, msg->post_seq )))
         return return_nspa_ring_message( queue, &ring_match, flags, reply );

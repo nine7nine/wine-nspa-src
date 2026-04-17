@@ -1013,6 +1013,81 @@ typedef volatile struct
     unsigned __int64     keystate_serial;  /* keystate update counter */
 } desktop_shm_t;
 
+/* NSPA: cross-thread SendMessage bypass — per-queue shmem rings.
+ *
+ * Each thread's queue carries an incoming message ring (written by other
+ * threads in the same process; drained by the owning thread's message pump)
+ * and an outgoing reply ring (written by receivers of our SendMessage calls;
+ * drained by the sender waiting for the reply).
+ *
+ * Server keeps the authoritative legacy path for the long tail (cross-process,
+ * hardware, hooks, callback results).  Ring is a fast-path supplement.
+ *
+ * Sizing: 64 incoming slots * 128 B = 8 KB; 16 reply slots * 96 B = 1.5 KB.
+ * Inline payload fits common WParam/LParam + short strings; larger messages
+ * fall back to the server path.
+ */
+#define NSPA_MSG_RING_SLOTS       64
+#define NSPA_MSG_INLINE_MAX       64
+#define NSPA_REPLY_RING_SLOTS     16
+#define NSPA_REPLY_INLINE_MAX     64
+
+/* nspa_msg_slot.state values */
+#define NSPA_MSG_STATE_EMPTY      0   /* slot is free (initial) */
+#define NSPA_MSG_STATE_WRITING    1   /* producer has reserved, still filling */
+#define NSPA_MSG_STATE_READY      2   /* producer done; consumer may dispatch */
+#define NSPA_MSG_STATE_CONSUMED   3   /* consumer done; ready to recycle */
+
+/* nspa_reply_slot.state values */
+#define NSPA_REPLY_STATE_FREE     0   /* reply slot free, sender may allocate */
+#define NSPA_REPLY_STATE_PENDING  1   /* sender allocated, awaiting receiver */
+#define NSPA_REPLY_STATE_READY    2   /* receiver wrote reply; sender may read */
+
+typedef volatile struct
+{
+    unsigned int state;             /* state enum (see NSPA_MSG_STATE_*) */
+    unsigned int type;              /* enum message_type */
+    user_handle_t win;              /* window handle (target) */
+    unsigned int msg;               /* message code */
+    lparam_t      wparam;
+    lparam_t      lparam;
+    int           x;                /* cursor x at send time */
+    int           y;
+    unsigned int  time;             /* message time */
+    unsigned int  sender_tid;       /* wineserver thread_id of sender (for reply routing) */
+    unsigned int  sender_pid;       /* wineserver process_id of sender */
+    unsigned int  reply_slot;       /* index into sender's reply ring, or ~0u if no-reply */
+    unsigned int  data_size;        /* bytes used in data[] */
+    unsigned int  __pad;
+    unsigned char data[NSPA_MSG_INLINE_MAX];
+} nspa_msg_slot_t;
+
+typedef volatile struct
+{
+    unsigned int head;              /* producer index (monotonic, wraps mod NSPA_MSG_RING_SLOTS) */
+    unsigned int tail;              /* consumer index */
+    unsigned int overflow;          /* count of fallback-to-server from ring-full */
+    unsigned int active;            /* 0 = ring inactive (receiver not set up yet) */
+    nspa_msg_slot_t slots[NSPA_MSG_RING_SLOTS];
+} nspa_msg_ring_t;
+
+typedef volatile struct
+{
+    unsigned int state;             /* NSPA_REPLY_STATE_* */
+    unsigned int error;             /* NTSTATUS from receiver */
+    lparam_t     result;            /* message result (LRESULT) */
+    unsigned int data_size;
+    unsigned int generation;        /* bumped each time slot is recycled — sender checks for ABA */
+    unsigned char data[NSPA_REPLY_INLINE_MAX];
+} nspa_reply_slot_t;
+
+typedef volatile struct
+{
+    unsigned int next_alloc;        /* hint for next free slot */
+    unsigned int __pad[3];
+    nspa_reply_slot_t slots[NSPA_REPLY_RING_SLOTS];
+} nspa_reply_ring_t;
+
 typedef volatile struct
 {
     timeout_t            access_time;      /* last time the queue was accessed */
@@ -1022,6 +1097,9 @@ typedef volatile struct
     unsigned int         changed_bits;     /* changed wakeup bits */
     unsigned int         internal_bits;    /* internal queue bits */
     int                  hooks_count[NB_HOOKS];  /* active hooks count */
+    /* NSPA: cross-thread message bypass rings (trailing) */
+    nspa_msg_ring_t      nspa_msg_ring;    /* incoming messages (senders -> me) */
+    nspa_reply_ring_t    nspa_reply_ring;  /* replies to my SendMessage calls (receivers -> me) */
 } queue_shm_t;
 
 typedef volatile struct
@@ -4279,4 +4357,15 @@ enum inproc_sync_type
     unsigned __int64    fence_value;    /* semaphore fence value */
     data_size_t         runtime_size;   /* size of client runtime data */
     VARARG(runtime,bytes);              /* client runtime data */
+@END
+
+
+/* NSPA: look up another thread's queue locator + sync handle for cross-thread
+ * SendMessage bypass.  Appended at end of the protocol to avoid shifting the
+ * request_type enum values for existing requests. */
+@REQ(nspa_get_thread_queue)
+    thread_id_t     tid;          /* target thread id */
+@REPLY
+    struct obj_locator locator;   /* shared session object locator for target queue */
+    obj_handle_t    sync_handle;  /* handle to the queue's sync object (ntsync event) */
 @END

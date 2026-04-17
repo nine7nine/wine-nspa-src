@@ -256,17 +256,10 @@ BOOL nspa_try_post_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
     slot->data_size   = 0;
 
     /* Publish queue-visible pending state before making the slot READY.
-     * The server uses ring-owned pending_count plus these bits to know
-     * there is posted work to arbitrate, even if it races a writer that
-     * hasn't completed the slot payload yet. */
+     * The server uses ring-owned pending_count to know there is posted
+     * work to arbitrate, even if it races a writer that hasn't completed
+     * the slot payload yet. */
     __atomic_fetch_add( &ring->pending_count, 1, __ATOMIC_ACQ_REL );
-    {
-        volatile queue_shm_t *peer = (queue_shm_t *)queue_shm;
-        __atomic_fetch_or( (volatile unsigned int *)&peer->wake_bits,
-                           QS_POSTMESSAGE | QS_ALLPOSTMESSAGE, __ATOMIC_RELEASE );
-        __atomic_fetch_or( (volatile unsigned int *)&peer->changed_bits,
-                           QS_POSTMESSAGE | QS_ALLPOSTMESSAGE, __ATOMIC_RELEASE );
-    }
 
     /* Allocate the canonical posted sequence immediately before READY so
      * ordering tracks publication, not reserve time. */
@@ -274,6 +267,7 @@ BOOL nspa_try_post_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
 
     /* Publish — consumer can read the slot from here on. */
     __atomic_store_n( &slot->state, NSPA_MSG_STATE_READY, __ATOMIC_RELEASE );
+    __atomic_add_fetch( &ring->change_seq, 1, __ATOMIC_RELEASE );
 
     status = wine_server_signal_internal_sync( entry->sync_handle );
     if (status) status = NtSetEvent( entry->sync_handle, NULL );

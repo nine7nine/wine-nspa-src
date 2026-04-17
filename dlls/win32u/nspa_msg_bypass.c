@@ -18,6 +18,7 @@
 #endif
 
 #include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "ntstatus.h"
@@ -60,6 +61,14 @@ struct nspa_cache_entry
  * allocated lazily on first use. */
 static __thread struct nspa_cache_entry nspa_cache[NSPA_CACHE_SLOTS];
 static __thread int nspa_cache_init_done;
+
+static BOOL nspa_bypass_disabled( void )
+{
+    static int cached = -1;
+
+    if (cached == -1) cached = getenv( "NSPA_DISABLE_MSG_BYPASS" ) ? 1 : 0;
+    return cached;
+}
 
 /* ---------------------------------------------------------------------
  * Ring helpers — atomic ops over shared memory.
@@ -215,6 +224,8 @@ BOOL nspa_try_post_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
     volatile nspa_msg_slot_t *slot;
     NTSTATUS status;
     unsigned int idx;
+
+    if (nspa_bypass_disabled()) return FALSE;
 
     /* This increment: MSG_POSTED only.  Other types fall through. */
     if (type_enum != MSG_POSTED) return FALSE;

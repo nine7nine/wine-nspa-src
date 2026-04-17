@@ -375,7 +375,11 @@ static void call_req_handler_shm( struct thread *thread, struct request_shm *req
     if (debug_level) trace_request();
 
     if (req < REQ_NB_REQUESTS)
+    {
+        unsigned long long nspa_t0 = nspa_profile_start();
         req_handlers[req]( &current->req, (union generic_reply *)&request_shm->u.reply );
+        nspa_profile_end( req, nspa_t0, current->id, current->unix_tid );
+    }
     else
         set_error( STATUS_NOT_IMPLEMENTED );
 
@@ -432,7 +436,11 @@ static void call_req_handler( struct thread *thread )
     if (debug_level) trace_request();
 
     if (req < REQ_NB_REQUESTS)
+    {
+        unsigned long long nspa_t0 = nspa_profile_start();
         req_handlers[req]( &current->req, &reply );
+        nspa_profile_end( req, nspa_t0, current->id, current->unix_tid );
+    }
     else
         set_error( STATUS_NOT_IMPLEMENTED );
 

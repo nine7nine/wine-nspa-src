@@ -97,6 +97,8 @@ static struct handler *handler_sigterm;
 static struct handler *handler_sigint;
 static struct handler *handler_sigchld;
 static struct handler *handler_sigio;
+static struct handler *handler_sigusr1;
+static struct handler *handler_sigusr2;
 
 static int watchdog;
 
@@ -192,10 +194,34 @@ static void sigint_callback(void)
     shutdown_master_socket();
 }
 
+/* NSPA: SIGUSR1 callback — dump request profile */
+static void sigusr1_callback(void)
+{
+    nspa_profile_dump();
+}
+
+/* NSPA: SIGUSR2 callback — reset request profile counters */
+static void sigusr2_callback(void)
+{
+    nspa_profile_reset();
+}
+
 /* SIGHUP handler */
 static void do_sighup( int signum )
 {
     do_signal( handler_sighup );
+}
+
+/* NSPA: SIGUSR1 handler */
+static void do_sigusr1( int signum )
+{
+    do_signal( handler_sigusr1 );
+}
+
+/* NSPA: SIGUSR2 handler */
+static void do_sigusr2( int signum )
+{
+    do_signal( handler_sigusr2 );
 }
 
 /* SIGTERM handler */
@@ -276,6 +302,8 @@ void init_signals(void)
     if (!(handler_sigint  = create_handler( sigint_callback ))) goto error;
     if (!(handler_sigchld = create_handler( sigchld_callback ))) goto error;
     if (!(handler_sigio   = create_handler( sigio_callback ))) goto error;
+    if (!(handler_sigusr1 = create_handler( sigusr1_callback ))) goto error;
+    if (!(handler_sigusr2 = create_handler( sigusr2_callback ))) goto error;
 
     sigemptyset( &blocked_sigset );
     sigaddset( &blocked_sigset, SIGCHLD );
@@ -285,6 +313,8 @@ void init_signals(void)
     sigaddset( &blocked_sigset, SIGIO );
     sigaddset( &blocked_sigset, SIGQUIT );
     sigaddset( &blocked_sigset, SIGTERM );
+    sigaddset( &blocked_sigset, SIGUSR1 );
+    sigaddset( &blocked_sigset, SIGUSR2 );
 #ifdef SIG_PTHREAD_CANCEL
     sigaddset( &blocked_sigset, SIG_PTHREAD_CANCEL );
 #endif
@@ -305,6 +335,10 @@ void init_signals(void)
     action.sa_handler = do_sigterm;
     sigaction( SIGQUIT, &action, NULL );
     sigaction( SIGTERM, &action, NULL );
+    action.sa_handler = do_sigusr1;
+    sigaction( SIGUSR1, &action, NULL );
+    action.sa_handler = do_sigusr2;
+    sigaction( SIGUSR2, &action, NULL );
     if (core_dump_disabled())
     {
         action.sa_handler = do_sigsegv;

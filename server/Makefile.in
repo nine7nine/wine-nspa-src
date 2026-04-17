@@ -24,6 +24,7 @@ SOURCES = \
 	mapping.c \
 	mutex.c \
 	named_pipe.c \
+	nspa_profile.c \
 	object.c \
 	process.c \
 	procfs.c \

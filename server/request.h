@@ -69,6 +69,15 @@ extern int server_dir_fd, config_dir_fd;
 extern void trace_request(void);
 extern void trace_reply( enum request req, const union generic_reply *reply );
 
+/* NSPA profiling (nspa_profile.c) */
+extern void nspa_profile_init(void);
+extern int  nspa_profile_active(void);
+extern unsigned long long nspa_profile_start(void);
+extern void nspa_profile_end( unsigned int req, unsigned long long start_ns,
+                              unsigned int thread_id, int unix_tid );
+extern void nspa_profile_dump(void);
+extern void nspa_profile_reset(void);
+
 /* get current tick count to return to client */
 static inline unsigned int get_tick_count(void)
 {

@@ -1654,6 +1654,13 @@ static void dump_varargs_monitor_infos( const char *prefix, data_size_t size )
     remove_data( size );
 }
 
+/* NSPA profiling accessor */
+const char *get_request_name( unsigned int req )
+{
+    if (req >= REQ_NB_REQUESTS) return "<invalid>";
+    return req_names[req];
+}
+
 void trace_request(void)
 {
     enum request req = current->req.request_header.req;

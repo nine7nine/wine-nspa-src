@@ -67,7 +67,14 @@ static BOOL nspa_bypass_disabled( void )
 {
     static int cached = -1;
 
-    if (cached == -1) cached = getenv( "NSPA_DISABLE_MSG_BYPASS" ) ? 1 : 0;
+    if (cached == -1)
+    {
+        /* Opt-in: off by default while the feature is being stabilised.
+         * Legacy NSPA_DISABLE_MSG_BYPASS=1 still forces off. */
+        if (getenv( "NSPA_DISABLE_MSG_BYPASS" )) cached = 1;
+        else if (getenv( "NSPA_ENABLE_MSG_BYPASS" )) cached = 0;
+        else cached = 1;
+    }
     return cached;
 }
 
@@ -235,7 +242,13 @@ BOOL nspa_try_post_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
     }
 
     /* This increment: MSG_POSTED only.  Other types fall through. */
-    if (type_enum != MSG_POSTED) return FALSE;
+    if (type_enum != MSG_POSTED)
+    {
+        TRACE_(nspa_bypass)( "skip not-posted type=%u tid=%04x dest=%04x hwnd=%p msg=%04x\n",
+                             type_enum, HandleToULong(NtCurrentTeb()->ClientId.UniqueThread),
+                             (UINT)dest_tid, hwnd, msg );
+        return FALSE;
+    }
 
     /* Original design scope is same-process cross-thread window messages.
      * Thread-messages (hwnd == 0) and same-thread posts have semantics the
@@ -257,23 +270,50 @@ BOOL nspa_try_post_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
     }
 
     /* No DDE through the ring — the server handles DDE specially. */
-    if (msg >= WM_DDE_FIRST && msg <= WM_DDE_LAST) return FALSE;
+    if (msg >= WM_DDE_FIRST && msg <= WM_DDE_LAST)
+    {
+        TRACE_(nspa_bypass)( "skip dde tid=%04x dest=%04x hwnd=%p msg=%04x\n",
+                             HandleToULong(NtCurrentTeb()->ClientId.UniqueThread),
+                             (UINT)dest_tid, hwnd, msg );
+        return FALSE;
+    }
 
     entry = nspa_lookup_peer( dest_tid );
-    if (!entry) return FALSE;
+    if (!entry)
+    {
+        TRACE_(nspa_bypass)( "skip lookup-fail tid=%04x dest=%04x hwnd=%p msg=%04x\n",
+                             HandleToULong(NtCurrentTeb()->ClientId.UniqueThread),
+                             (UINT)dest_tid, hwnd, msg );
+        return FALSE;
+    }
 
     queue_bypass = nspa_get_cached_bypass_shm( entry );
     if (!queue_bypass)
     {
+        TRACE_(nspa_bypass)( "skip no-bypass-shm tid=%04x dest=%04x hwnd=%p msg=%04x\n",
+                             HandleToULong(NtCurrentTeb()->ClientId.UniqueThread),
+                             (UINT)dest_tid, hwnd, msg );
         nspa_clear_cache_entry( entry );
         return FALSE;
     }
 
     ring = &((nspa_queue_bypass_shm_t *)queue_bypass)->nspa_msg_ring;
-    if (!ring->active) return FALSE;
+    if (!ring->active)
+    {
+        TRACE_(nspa_bypass)( "skip ring-inactive tid=%04x dest=%04x hwnd=%p msg=%04x\n",
+                             HandleToULong(NtCurrentTeb()->ClientId.UniqueThread),
+                             (UINT)dest_tid, hwnd, msg );
+        return FALSE;
+    }
 
     idx = ring_reserve_slot( ring );
-    if (idx == ~0u) return FALSE;   /* FULL — fall back to server */
+    if (idx == ~0u)
+    {
+        TRACE_(nspa_bypass)( "skip ring-full tid=%04x dest=%04x hwnd=%p msg=%04x\n",
+                             HandleToULong(NtCurrentTeb()->ClientId.UniqueThread),
+                             (UINT)dest_tid, hwnd, msg );
+        return FALSE;
+    }
 
     slot = &ring->slots[idx & (NSPA_MSG_RING_SLOTS - 1)];
 

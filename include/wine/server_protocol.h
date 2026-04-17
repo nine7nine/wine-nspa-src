@@ -997,6 +997,81 @@ typedef volatile struct
     unsigned __int64     keystate_serial;
 } desktop_shm_t;
 
+/* NSPA: cross-thread SendMessage bypass — per-queue shmem rings.
+ *
+ * Each thread's queue carries an incoming message ring (written by other
+ * threads in the same process; drained by the owning thread's message pump)
+ * and an outgoing reply ring (written by receivers of our SendMessage calls;
+ * drained by the sender waiting for the reply).
+ *
+ * Server keeps the authoritative legacy path for the long tail (cross-process,
+ * hardware, hooks, callback results).  Ring is a fast-path supplement.
+ *
+ * Sizing: 64 incoming slots * 128 B = 8 KB; 16 reply slots * 96 B = 1.5 KB.
+ * Inline payload fits common WParam/LParam + short strings; larger messages
+ * fall back to the server path.
+ */
+#define NSPA_MSG_RING_SLOTS       64
+#define NSPA_MSG_INLINE_MAX       64
+#define NSPA_REPLY_RING_SLOTS     16
+#define NSPA_REPLY_INLINE_MAX     64
+
+
+#define NSPA_MSG_STATE_EMPTY      0
+#define NSPA_MSG_STATE_WRITING    1
+#define NSPA_MSG_STATE_READY      2
+#define NSPA_MSG_STATE_CONSUMED   3
+
+
+#define NSPA_REPLY_STATE_FREE     0
+#define NSPA_REPLY_STATE_PENDING  1
+#define NSPA_REPLY_STATE_READY    2
+
+typedef volatile struct
+{
+    unsigned int state;
+    unsigned int type;
+    user_handle_t win;
+    unsigned int msg;
+    lparam_t      wparam;
+    lparam_t      lparam;
+    int           x;
+    int           y;
+    unsigned int  time;
+    unsigned int  sender_tid;
+    unsigned int  sender_pid;
+    unsigned int  reply_slot;
+    unsigned int  data_size;
+    unsigned int  __pad;
+    unsigned char data[NSPA_MSG_INLINE_MAX];
+} nspa_msg_slot_t;
+
+typedef volatile struct
+{
+    unsigned int head;
+    unsigned int tail;
+    unsigned int overflow;
+    unsigned int active;
+    nspa_msg_slot_t slots[NSPA_MSG_RING_SLOTS];
+} nspa_msg_ring_t;
+
+typedef volatile struct
+{
+    unsigned int state;
+    unsigned int error;
+    lparam_t     result;
+    unsigned int data_size;
+    unsigned int generation;
+    unsigned char data[NSPA_REPLY_INLINE_MAX];
+} nspa_reply_slot_t;
+
+typedef volatile struct
+{
+    unsigned int next_alloc;
+    unsigned int __pad[3];
+    nspa_reply_slot_t slots[NSPA_REPLY_RING_SLOTS];
+} nspa_reply_ring_t;
+
 typedef volatile struct
 {
     timeout_t            access_time;
@@ -1006,6 +1081,9 @@ typedef volatile struct
     unsigned int         changed_bits;
     unsigned int         internal_bits;
     int                  hooks_count[NB_HOOKS];
+
+    nspa_msg_ring_t      nspa_msg_ring;
+    nspa_reply_ring_t    nspa_reply_ring;
 } queue_shm_t;
 
 typedef volatile struct
@@ -6165,6 +6243,23 @@ struct d3dkmt_mutex_release_reply
 };
 
 
+/* NSPA: look up another thread's queue locator + sync handle for cross-thread
+ * SendMessage bypass.  Appended at end of the protocol to avoid shifting the
+ * request_type enum values for existing requests. */
+struct nspa_get_thread_queue_request
+{
+    struct request_header __header;
+    thread_id_t     tid;
+};
+struct nspa_get_thread_queue_reply
+{
+    struct reply_header __header;
+    struct obj_locator locator;
+    obj_handle_t    sync_handle;
+    char __pad_28[4];
+};
+
+
 enum request
 {
     REQ_new_process,
@@ -6473,6 +6568,7 @@ enum request
     REQ_d3dkmt_object_open_name,
     REQ_d3dkmt_mutex_acquire,
     REQ_d3dkmt_mutex_release,
+    REQ_nspa_get_thread_queue,
     REQ_NB_REQUESTS
 };
 
@@ -6786,6 +6882,7 @@ union generic_request
     struct d3dkmt_object_open_name_request d3dkmt_object_open_name_request;
     struct d3dkmt_mutex_acquire_request d3dkmt_mutex_acquire_request;
     struct d3dkmt_mutex_release_request d3dkmt_mutex_release_request;
+    struct nspa_get_thread_queue_request nspa_get_thread_queue_request;
 };
 union generic_reply
 {
@@ -7097,6 +7194,7 @@ union generic_reply
     struct d3dkmt_object_open_name_reply d3dkmt_object_open_name_reply;
     struct d3dkmt_mutex_acquire_reply d3dkmt_mutex_acquire_reply;
     struct d3dkmt_mutex_release_reply d3dkmt_mutex_release_reply;
+    struct nspa_get_thread_queue_reply nspa_get_thread_queue_reply;
 };
 
 #define SERVER_PROTOCOL_VERSION 933

@@ -340,6 +340,10 @@ static struct msg_queue *create_msg_queue( struct thread *thread, struct thread_
             shared->changed_mask = 0;
             shared->changed_bits = 0;
             shared->internal_bits = 0;
+            /* NSPA: zero the bypass rings so head/tail/active start defined */
+            memset( (void *)&shared->nspa_msg_ring, 0, sizeof(shared->nspa_msg_ring) );
+            memset( (void *)&shared->nspa_reply_ring, 0, sizeof(shared->nspa_reply_ring) );
+            shared->nspa_msg_ring.active = 1;  /* ring usable from creation */
         }
         SHARED_WRITE_END;
 
@@ -3070,6 +3074,27 @@ DECL_HANDLER(get_msg_queue)
 {
     struct msg_queue *queue = get_current_queue();
     if (queue) reply->locator = get_shared_object_locator( queue->shared );
+}
+
+
+/* NSPA: look up another thread's queue locator + sync handle for send-message bypass */
+DECL_HANDLER(nspa_get_thread_queue)
+{
+    struct thread *thread;
+    struct msg_queue *queue;
+
+    reply->sync_handle = 0;
+    if (!(thread = get_thread_from_id( req->tid ))) return;
+
+    queue = thread->queue;
+    if (queue)
+    {
+        reply->locator = get_shared_object_locator( queue->shared );
+        /* EVENT_MODIFY_STATE lets the peer call NtSetEvent; SYNCHRONIZE for completeness */
+        reply->sync_handle = alloc_handle( current->process, queue->sync,
+                                           EVENT_MODIFY_STATE | SYNCHRONIZE, 0 );
+    }
+    release_object( thread );
 }
 
 

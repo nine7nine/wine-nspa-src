@@ -2969,6 +2969,35 @@ static int peek_message( MSG *msg, const struct peek_message_filter *filter )
         thread_info->client_info.msg_source = prev_source;
         wake_mask = filter->mask & (QS_SENDMESSAGE | QS_SMRESULT);
 
+        /* NSPA: drain the cross-thread shmem ring first.  If it yields
+         * a message matching our filter, skip the server round-trip. */
+        {
+            struct object_lock nspa_lock = OBJECT_LOCK_INIT;
+            const queue_shm_t *nspa_queue_shm = NULL;
+            UINT nspa_qstatus, nspa_slot_type = 0;
+            MSG nspa_msg;
+            BOOL nspa_hit = FALSE;
+
+            memset( &nspa_msg, 0, sizeof(nspa_msg) );
+            while ((nspa_qstatus = get_shared_queue( &nspa_lock, &nspa_queue_shm )) == STATUS_PENDING)
+                nspa_hit = nspa_drain_peek( nspa_queue_shm, hwnd, first, last, flags,
+                                            &nspa_msg, &nspa_slot_type );
+            if (nspa_hit)
+            {
+                info.type        = nspa_slot_type;
+                info.msg.hwnd    = nspa_msg.hwnd;
+                info.msg.message = nspa_msg.message;
+                info.msg.wParam  = nspa_msg.wParam;
+                info.msg.lParam  = nspa_msg.lParam;
+                info.msg.time    = nspa_msg.time;
+                info.msg.pt      = nspa_msg.pt;
+                size             = 0;    /* no extra data in a ring slot today */
+                hw_id            = 0;
+                res              = 0;
+                goto nspa_dispatch;
+            }
+        }
+
         if (check_queue_bits( wake_mask, filter->mask, wake_mask | signal_bits, filter->mask | clear_bits,
                               &wake_bits, &changed_bits, filter->internal ))
             res = STATUS_PENDING;
@@ -3017,6 +3046,7 @@ static int peek_message( MSG *msg, const struct peek_message_filter *filter )
             continue;
         }
 
+nspa_dispatch:
         TRACE( "got type %d msg %x (%s) hwnd %p wp %lx lp %lx\n",
                info.type, info.msg.message,
                (info.type == MSG_WINEVENT) ? "MSG_WINEVENT" : debugstr_msg_name(info.msg.message, info.msg.hwnd),
@@ -3678,6 +3708,16 @@ static BOOL put_message_in_queue( const struct send_message_info *info, size_t *
         params.lparam   = info->lparam;
         params.dest_tid = info->dest_tid;
         res = KeUserModeCallback( NtUserPostDDEMessage, &params, sizeof(params), &ret_ptr, &ret_len );
+        goto done;
+    }
+
+    /* NSPA: try the cross-thread shmem-ring fast path for plain posted
+     * messages with no packed vararg data. */
+    if (info->type == MSG_POSTED && data.count == 0 &&
+        nspa_try_post_ring( info->dest_tid, info->type, info->hwnd,
+                            info->msg, info->wparam, info->lparam ))
+    {
+        res = 0;
         goto done;
     }
 

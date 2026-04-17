@@ -3077,7 +3077,11 @@ DECL_HANDLER(get_msg_queue)
 }
 
 
-/* NSPA: look up another thread's queue locator + sync handle for send-message bypass */
+/* NSPA: look up another thread's queue locator + sync handle for send-message bypass.
+ *
+ * Same-process only: the ring carries HWND / WPARAM / LPARAM values that are only
+ * meaningful in the sender's address space and handle table.  Cross-process
+ * PostMessage must continue to go through the server's authoritative path. */
 DECL_HANDLER(nspa_get_thread_queue)
 {
     struct thread *thread;
@@ -3085,6 +3089,12 @@ DECL_HANDLER(nspa_get_thread_queue)
 
     reply->sync_handle = 0;
     if (!(thread = get_thread_from_id( req->tid ))) return;
+
+    if (thread->process != current->process)
+    {
+        release_object( thread );
+        return;   /* sync_handle stays 0, client falls back to server path */
+    }
 
     queue = thread->queue;
     if (queue)

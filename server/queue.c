@@ -233,6 +233,9 @@ static void queue_hardware_message( struct desktop *desktop, struct message *msg
 static void free_message( struct message *msg );
 static inline unsigned int nspa_ring_changed_bits( const struct msg_queue *queue );
 static inline unsigned int nspa_ring_status_bits( const struct msg_queue *queue );
+static inline int nspa_ring_arb_disabled(void);
+static inline int nspa_ring_wake_syn_disabled(void);
+static inline int nspa_ring_alloc_disabled(void);
 
 /* set the caret window in a given thread input, requires write lock on the thread input shared member */
 static void set_caret_window( struct thread_input *input, input_shm_t *shared, user_handle_t win )
@@ -330,7 +333,8 @@ static struct msg_queue *create_msg_queue( struct thread *thread, struct thread_
         for (i = 0; i < NB_MSG_KINDS; i++) list_init( &queue->msg_list[i] );
 
         if (!(queue->sync = create_internal_sync( 1, 0 ))) goto error;
-        if (!(queue->nspa_shared = alloc_shared_object( sizeof(*queue->nspa_shared) ))) goto error;
+        if (!nspa_ring_alloc_disabled() &&
+            !(queue->nspa_shared = alloc_shared_object( sizeof(*queue->nspa_shared) ))) goto error;
         if (!(queue->shared = alloc_shared_object( sizeof(*queue->shared) )))
         {
             release_object( queue );
@@ -346,17 +350,23 @@ static struct msg_queue *create_msg_queue( struct thread *thread, struct thread_
             shared->changed_mask = 0;
             shared->changed_bits = 0;
             shared->internal_bits = 0;
-            shared->nspa_bypass_locator = get_shared_object_locator( queue->nspa_shared );
+            if (queue->nspa_shared)
+                shared->nspa_bypass_locator = get_shared_object_locator( queue->nspa_shared );
+            else
+                memset( (void *)&shared->nspa_bypass_locator, 0, sizeof(shared->nspa_bypass_locator) );
         }
         SHARED_WRITE_END;
 
-        SHARED_WRITE_BEGIN( queue->nspa_shared, nspa_queue_bypass_shm_t )
+        if (queue->nspa_shared)
         {
-            memset( (void *)&shared->nspa_msg_ring, 0, sizeof(shared->nspa_msg_ring) );
-            memset( (void *)&shared->nspa_reply_ring, 0, sizeof(shared->nspa_reply_ring) );
-            shared->nspa_msg_ring.active = 1;  /* ring usable from creation */
+            SHARED_WRITE_BEGIN( queue->nspa_shared, nspa_queue_bypass_shm_t )
+            {
+                memset( (void *)&shared->nspa_msg_ring, 0, sizeof(shared->nspa_msg_ring) );
+                memset( (void *)&shared->nspa_reply_ring, 0, sizeof(shared->nspa_reply_ring) );
+                shared->nspa_msg_ring.active = 1;  /* ring usable from creation */
+            }
+            SHARED_WRITE_END;
         }
-        SHARED_WRITE_END;
 
         thread->queue = queue;
 
@@ -1041,6 +1051,7 @@ static void free_message( struct message *msg )
  * with bypass on.  See docs/send-message-bypass-design.md §15.10. */
 static int nspa_server_ring_arb_off = -1;
 static int nspa_server_wake_syn_off = -1;
+static int nspa_server_alloc_off    = -1;
 
 static inline int nspa_ring_arb_disabled(void)
 {
@@ -1056,11 +1067,27 @@ static inline int nspa_ring_wake_syn_disabled(void)
     return nspa_server_wake_syn_off;
 }
 
+/* NSPA_MSG_BYPASS_SERVER_NO_ALLOC: skip per-queue nspa_shared allocation
+ * entirely so queue_shared_t.nspa_bypass_locator stays zero and the bypass
+ * infrastructure is effectively absent at runtime.  Used to isolate whether
+ * the library-panel regression is caused by the structural plumbing
+ * (allocation + locator propagation) rather than the ring arbitration or
+ * wake-bit synthesis subsystems. */
+static inline int nspa_ring_alloc_disabled(void)
+{
+    if (nspa_server_alloc_off == -1)
+        nspa_server_alloc_off = (getenv("NSPA_MSG_BYPASS_SERVER_NO_ALLOC") != NULL);
+    return nspa_server_alloc_off;
+}
+
 static inline int nspa_ring_has_pending_posted( const struct msg_queue *queue )
 {
-    volatile nspa_msg_ring_t *ring = &queue->nspa_shared->nspa_msg_ring;
-    unsigned int total = __atomic_load_n( &ring->pending_count, __ATOMIC_ACQUIRE );
-    unsigned int send  = __atomic_load_n( &ring->pending_send_count, __ATOMIC_ACQUIRE );
+    volatile nspa_msg_ring_t *ring;
+    unsigned int total, send;
+    if (!queue->nspa_shared) return 0;
+    ring = &queue->nspa_shared->nspa_msg_ring;
+    total = __atomic_load_n( &ring->pending_count, __ATOMIC_ACQUIRE );
+    send  = __atomic_load_n( &ring->pending_send_count, __ATOMIC_ACQUIRE );
     /* POSTED pending = total - send. Clamp against transient underflow if
      * total has been decremented ahead of send on a SEND consume. */
     return total > send;
@@ -1068,6 +1095,7 @@ static inline int nspa_ring_has_pending_posted( const struct msg_queue *queue )
 
 static inline int nspa_ring_has_pending_send( const struct msg_queue *queue )
 {
+    if (!queue->nspa_shared) return 0;
     return __atomic_load_n( &queue->nspa_shared->nspa_msg_ring.pending_send_count, __ATOMIC_ACQUIRE ) != 0;
 }
 
@@ -1087,6 +1115,7 @@ static inline unsigned int nspa_ring_changed_bits( const struct msg_queue *queue
     unsigned int bits = 0;
 
     if (nspa_ring_wake_syn_disabled()) return 0;
+    if (!queue->nspa_shared) return 0;
 
     ring = &queue->nspa_shared->nspa_msg_ring;
     seq = __atomic_load_n( &ring->change_seq, __ATOMIC_ACQUIRE );
@@ -1099,14 +1128,18 @@ static inline unsigned int nspa_ring_changed_bits( const struct msg_queue *queue
 
 static inline void nspa_ring_ack_changes( const struct msg_queue *queue )
 {
-    volatile nspa_msg_ring_t *ring = &queue->nspa_shared->nspa_msg_ring;
-    unsigned int seq = __atomic_load_n( &ring->change_seq, __ATOMIC_ACQUIRE );
+    volatile nspa_msg_ring_t *ring;
+    unsigned int seq;
 
+    if (!queue->nspa_shared) return;
+    ring = &queue->nspa_shared->nspa_msg_ring;
+    seq = __atomic_load_n( &ring->change_seq, __ATOMIC_ACQUIRE );
     __atomic_store_n( &ring->change_ack_seq, seq, __ATOMIC_RELEASE );
 }
 
 static inline unsigned int nspa_alloc_post_seq( struct msg_queue *queue )
 {
+    if (!queue->nspa_shared) return 0;
     return __atomic_add_fetch( &queue->nspa_shared->nspa_msg_ring.next_post_seq, 1, __ATOMIC_RELAXED );
 }
 
@@ -1310,11 +1343,13 @@ static int find_nspa_ring_message( struct msg_queue *queue, unsigned int type_ma
                                    user_handle_t win, unsigned int first, unsigned int last,
                                    struct nspa_posted_match *match )
 {
-    volatile nspa_msg_ring_t *ring = &queue->nspa_shared->nspa_msg_ring;
+    volatile nspa_msg_ring_t *ring;
     unsigned int head, tail, cursor;
     volatile nspa_msg_slot_t *best = NULL;
     unsigned int best_seq = 0;
 
+    if (!queue->nspa_shared) return 0;
+    ring = &queue->nspa_shared->nspa_msg_ring;
     if (!ring->active) return 0;
 
     head = __atomic_load_n( &ring->head, __ATOMIC_ACQUIRE );
@@ -3369,7 +3404,10 @@ DECL_HANDLER(nspa_get_thread_queue)
     if (queue)
     {
         reply->locator = get_shared_object_locator( queue->shared );
-        reply->bypass_locator = get_shared_object_locator( queue->nspa_shared );
+        if (queue->nspa_shared)
+            reply->bypass_locator = get_shared_object_locator( queue->nspa_shared );
+        else
+            memset( &reply->bypass_locator, 0, sizeof(reply->bypass_locator) );
         /* EVENT_MODIFY_STATE lets the peer call NtSetEvent; SYNCHRONIZE for completeness */
         reply->sync_handle = alloc_handle( current->process, queue->sync,
                                            EVENT_MODIFY_STATE | SYNCHRONIZE, 0 );

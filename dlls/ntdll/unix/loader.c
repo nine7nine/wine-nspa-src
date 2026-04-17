@@ -2137,8 +2137,30 @@ static void reexec_loader( int argc, char *argv[], char *extra_arg )
         memcpy( new_argv + 2, argv + 1, argc * sizeof(*argv) );
     }
 
-    /* default to 32-bit loader to support 32-bit prefixes */
-    if (machine == IMAGE_FILE_MACHINE_AMD64) machine = IMAGE_FILE_MACHINE_I386;
+    /* Default to 32-bit loader to support legacy 32-bit-prefix installs,
+     * but only if an i386-unix ntdll.so is actually present.  Upstream
+     * unconditionally downgrades AMD64 -> I386 and relies on the
+     * exec-level fallback in loader_exec() to recover if the 32-bit
+     * loader is missing.  That fallback covers file-not-found, but not
+     * the case where a stale 32-bit wine-preloader exec's successfully
+     * and only fails at ntdll.so load time — by then the parent has
+     * already exec'd away.  Wine 11's build system has no rules for
+     * i386-unix targets at all (new-Wow64 design); 32-bit PE runs
+     * in-process via wow64.dll translation.  So check that a valid
+     * 32-bit ntdll.so is installed before attempting the downgrade. */
+    if (machine == IMAGE_FILE_MACHINE_AMD64)
+    {
+        char *alt_ntdll = NULL;
+        struct stat st;
+        int have_32bit = 0;
+
+        if (asprintf( &alt_ntdll, "%s/i386-unix/ntdll.so", dll_dir ) > 0)
+        {
+            have_32bit = (stat( alt_ntdll, &st ) == 0 && st.st_size > 1024);
+            free( alt_ntdll );
+        }
+        if (have_32bit) machine = IMAGE_FILE_MACHINE_I386;
+    }
 
     loader_exec( new_argv, machine );
     fatal_error( "could not exec the wine loader\n" );

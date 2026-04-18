@@ -21,9 +21,11 @@
 #include "config.h"
 
 #include <assert.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <poll.h>
 #include <limits.h>
@@ -1126,6 +1128,7 @@ static int nspa_ensure_shared( struct msg_queue *queue )
         if (post_debug)
         {
             struct thread *owner = NULL;
+            char owner_comm[32] = "?", caller_comm[32] = "?";
             /* Walk current process threads to find the owner of this queue. */
             if (current && current->process)
             {
@@ -1133,8 +1136,39 @@ static int nspa_ensure_shared( struct msg_queue *queue )
                 LIST_FOR_EACH_ENTRY( t, &current->process->thread_list, struct thread, proc_entry )
                     if (t->queue == queue) { owner = t; break; }
             }
-            fprintf( stderr, "nspa_post_debug: nspa_ensure_shared allocated for queue owner_tid=%04x (caller_tid=%04x)\n",
-                     owner ? owner->id : 0, current ? current->id : 0 );
+            if (owner && owner->unix_tid > 0)
+            {
+                char path[64];
+                int fd;
+                char *nl;
+                snprintf(path, sizeof(path), "/proc/%d/comm", owner->unix_tid);
+                if ((fd = open(path, O_RDONLY)) >= 0)
+                {
+                    ssize_t n = read(fd, owner_comm, sizeof(owner_comm)-1);
+                    if (n > 0) owner_comm[n] = 0;
+                    else owner_comm[0] = 0;
+                    close(fd);
+                }
+                if ((nl = strchr(owner_comm, '\n'))) *nl = 0;
+            }
+            if (current && current->unix_tid > 0)
+            {
+                char path[64];
+                int fd;
+                char *nl;
+                snprintf(path, sizeof(path), "/proc/%d/comm", current->unix_tid);
+                if ((fd = open(path, O_RDONLY)) >= 0)
+                {
+                    ssize_t n = read(fd, caller_comm, sizeof(caller_comm)-1);
+                    if (n > 0) caller_comm[n] = 0;
+                    else caller_comm[0] = 0;
+                    close(fd);
+                }
+                if ((nl = strchr(caller_comm, '\n'))) *nl = 0;
+            }
+            fprintf( stderr, "nspa_post_debug: nspa_ensure_shared allocated owner_tid=%04x(%s) caller_tid=%04x(%s)\n",
+                     owner ? owner->id : 0, owner_comm,
+                     current ? current->id : 0, caller_comm );
         }
     }
 
@@ -3516,13 +3550,35 @@ DECL_HANDLER(nspa_get_thread_queue)
     queue = thread->queue;
     if (queue)
     {
+        static int skip_speculative = -1;
+        int caller_ready;
+
         reply->locator = get_shared_object_locator( queue->shared );
-        /* Lazy-allocate the bypass ring on first peer query.  Queues that
-         * are never targets of a cross-thread bypass post stay unallocated
-         * — this is the fix for the Ableton library-panel regression where
-         * the unconditional per-queue allocation caused pathological
-         * behaviour (docs/send-message-bypass-design.md §15.11). */
-        if (nspa_ensure_shared( queue ) && !nspa_locator_disabled())
+        /* NSPA_SKIP_SPECULATIVE_ALLOC: don't allocate peer's bypass shm
+         * unless the caller's own queue is already allocated.  The
+         * speculative allocation pattern (e.g. DWM-Sync SEND attempt
+         * that allocates MainThread's bypass ring then falls back to
+         * server because DWM-Sync's own bypass isn't ready) leaves
+         * unused bypass infrastructure on the peer queue, which is
+         * associated with the Ableton library-panel regression.  See
+         * project_msg_bypass_final_state_20260417.md. */
+        if (skip_speculative == -1)
+            skip_speculative = (getenv("NSPA_SKIP_SPECULATIVE_ALLOC") != NULL);
+        caller_ready = !skip_speculative ||
+                       (current && current->queue && current->queue->nspa_shared);
+
+        {
+            static int post_debug2 = -1;
+            if (post_debug2 == -1) post_debug2 = (getenv("NSPA_POST_DEBUG") != NULL);
+            if (post_debug2)
+                fprintf( stderr, "nspa_post_debug: nspa_get_thread_queue target_tid=%04x caller_tid=%04x caller_own_nspa_shared=%p caller_ready=%d skip_spec=%d\n",
+                         queue && current ? (current->process == thread->process ? thread->id : 0) : 0,
+                         current ? current->id : 0,
+                         current && current->queue ? (void*)current->queue->nspa_shared : NULL,
+                         caller_ready, skip_speculative );
+        }
+
+        if (caller_ready && nspa_ensure_shared( queue ) && !nspa_locator_disabled())
             reply->bypass_locator = get_shared_object_locator( queue->nspa_shared );
         else
             memset( &reply->bypass_locator, 0, sizeof(reply->bypass_locator) );

@@ -271,25 +271,19 @@ NTSTATUS get_shared_queue( struct object_lock *lock, const queue_shm_t **queue_s
 
 const nspa_queue_bypass_shm_t *get_queue_bypass_shm( const queue_shm_t *queue_shm )
 {
-    struct session_thread_data *data = get_session_thread_data();
-    const shared_object_t *object;
     static int ignore_locator = -1;
+
+    (void)queue_shm;  /* memfd redesign: own ring is resolved via TLS, not
+                       * queue_shm->nspa_bypass_locator. */
 
     if (ignore_locator == -1)
         ignore_locator = (getenv("NSPA_CLIENT_IGNORE_LOCATOR") != NULL);
     if (ignore_locator) return NULL;
 
-    object = data->shared_queue_bypass;
-
-    if (!object)
-    {
-        object = find_shared_session_object( queue_shm->nspa_bypass_locator.id,
-                                             queue_shm->nspa_bypass_locator.offset );
-        if (!object) return NULL;
-        data->shared_queue_bypass = object;
-    }
-
-    return (const nspa_queue_bypass_shm_t *)&object->shm;
+    /* Delegate to the memfd-era TLS-cached own-bypass lookup.  Callers
+     * (check_queue_bits, get_shared_queue_bits) always pass the current
+     * thread's own queue_shm, so "own ring" is the correct answer. */
+    return nspa_get_own_bypass_shm_public();
 }
 
 static NTSTATUS try_get_shared_input( UINT tid, struct object_lock *lock, const input_shm_t **input_shm,

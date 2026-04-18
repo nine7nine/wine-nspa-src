@@ -53,6 +53,16 @@ extern BOOL nspa_write_ring_reply( DWORD sender_tid, UINT reply_slot_idx,
  * SENDs. */
 extern const nspa_queue_bypass_shm_t *nspa_get_own_bypass_shm_public( void );
 
+/* Phase 4.6: pop a ring SEND from own ring client-side, eliminating the
+ * wineserver get_message RTT on the dispatch hot path.  Called from
+ * peek_message before the server request.  Returns TRUE if a SEND-class
+ * msg was claimed (CAS READY->CONSUMED); all *_out params populated. */
+extern BOOL nspa_try_pop_own_ring_send( HWND filter_hwnd, UINT first, UINT last,
+                                        UINT *type_out, UINT *msg_out,
+                                        WPARAM *wp_out, LPARAM *lp_out,
+                                        DWORD *time_out, UINT *sender_tid_out,
+                                        UINT *reply_slot_out, HWND *win_out );
+
 /* message.c — exposed so nspa_msg_bypass.c can wait on our own queue sync. */
 extern HANDLE nspa_get_own_server_queue_handle( void );
 extern void   nspa_process_sent_messages( void );

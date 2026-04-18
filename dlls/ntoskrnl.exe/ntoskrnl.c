@@ -2705,11 +2705,15 @@ LONG WINAPI KeInsertQueue(PRKQUEUE Queue, PLIST_ENTRY Entry)
 
 /***********************************************************************
  *           KeInsertQueueDpc   (NTOSKRNL.EXE.@)
+ *
+ * Queue a DPC for asynchronous dispatch.  Returns FALSE if a DPC for
+ * this KDPC object is already queued (matches Windows).  Backed by the
+ * dedicated DPC dispatcher thread; see dpc.c.
  */
 BOOLEAN WINAPI KeInsertQueueDpc(PRKDPC Dpc, PVOID SystemArgument1, PVOID SystemArgument2)
 {
-    FIXME( "stub: (%p %p %p)\n", Dpc, SystemArgument1, SystemArgument2 );
-    return TRUE;
+    TRACE( "(%p %p %p)\n", Dpc, SystemArgument1, SystemArgument2 );
+    return dpc_queue_immediate( Dpc, SystemArgument1, SystemArgument2 );
 }
 
 /**********************************************************************

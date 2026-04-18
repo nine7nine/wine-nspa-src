@@ -39,6 +39,25 @@ enum object_type
 
 DECLARE_CRITICAL_SECTION(sync_cs);
 
+/* Exposed to dpc.c so the dispatcher thread can signal a fired timer
+ * and clear Inserted on one-shot completion without extern'ing the
+ * file-static sync_cs. */
+void sync_timer_signal( KTIMER *timer )
+{
+    EnterCriticalSection( &sync_cs );
+    timer->Header.SignalState = TRUE;
+    if (timer->Header.WaitListHead.Blink)
+        SetEvent( timer->Header.WaitListHead.Blink );
+    LeaveCriticalSection( &sync_cs );
+}
+
+void sync_timer_clear_inserted( KTIMER *timer )
+{
+    EnterCriticalSection( &sync_cs );
+    timer->Header.Inserted = FALSE;
+    LeaveCriticalSection( &sync_cs );
+}
+
 /***********************************************************************
  *           KeWaitForMultipleObjects   (NTOSKRNL.EXE.@)
  */
@@ -477,24 +496,6 @@ void FASTCALL KeReleaseGuardedMutex(PKGUARDED_MUTEX mutex)
     /* FIXME: Leave Guarded Region */
 }
 
-static void CALLBACK ke_timer_complete_proc(PTP_CALLBACK_INSTANCE instance, void *timer_, PTP_TIMER tp_timer)
-{
-    KTIMER *timer = timer_;
-    KDPC *dpc = timer->Dpc;
-
-    TRACE("instance %p, timer %p, tp_timer %p.\n", instance, timer, tp_timer);
-
-    if (dpc && dpc->DeferredRoutine)
-        dpc->DeferredRoutine(dpc, dpc->DeferredContext, dpc->SystemArgument1, dpc->SystemArgument2);
-
-    EnterCriticalSection( &sync_cs );
-    timer->Header.SignalState = TRUE;
-    if (timer->Header.WaitListHead.Blink)
-        SetEvent(timer->Header.WaitListHead.Blink);
-    LeaveCriticalSection( &sync_cs );
-}
-
-
 /***********************************************************************
  *           KeInitializeTimerEx   (NTOSKRNL.EXE.@)
  */
@@ -543,17 +544,13 @@ BOOLEAN WINAPI KeSetTimerEx( KTIMER *timer, LARGE_INTEGER duetime, LONG period, 
     timer->Period = period;
     timer->Dpc = dpc;
 
-    /* For short-period DPC timers (< 10ms), use a dedicated thread with
-     * a waitable timer for sub-ms resolution. Threadpool timers have
-     * ~15ms minimum resolution which makes dpclat show terrible numbers. */
-    if (!timer->TimerListEntry.Blink)
-        timer->TimerListEntry.Blink = (void *)CreateThreadpoolTimer(ke_timer_complete_proc, timer, NULL);
-
-    if (!timer->TimerListEntry.Blink)
-        ERR("Could not create thread pool timer.\n");
-
-    SetThreadpoolTimer((TP_TIMER *)timer->TimerListEntry.Blink, (FILETIME *)&duetime, period, 0);
     LeaveCriticalSection( &sync_cs );
+
+    /* Hand off to the dedicated DPC dispatcher for sub-ms fire accuracy.
+     * The threadpool-timer path we used before quantised worker dispatch
+     * to ~15ms; dpc.c waits on an NTSync-backed event with a relative
+     * timeout, hrtimer-precise on PREEMPT_RT. */
+    dpc_arm_timer( timer, duetime, period, dpc );
 
     return ret;
 }
@@ -564,21 +561,12 @@ BOOLEAN WINAPI KeCancelTimer( KTIMER *timer )
 
     TRACE("timer %p.\n", timer);
 
+    /* Pull any pending queue entry for this timer first.  Matches
+     * Windows fire-and-forget cancel: if a DeferredRoutine is already
+     * running we do not wait for it. */
+    dpc_cancel_timer( timer );
+
     EnterCriticalSection( &sync_cs );
-    if (timer->TimerListEntry.Blink)
-    {
-        SetThreadpoolTimer((TP_TIMER *)timer->TimerListEntry.Blink, NULL, 0, 0);
-
-        LeaveCriticalSection( &sync_cs );
-        WaitForThreadpoolTimerCallbacks((TP_TIMER *)timer->TimerListEntry.Blink, TRUE);
-        EnterCriticalSection( &sync_cs );
-
-        if (timer->TimerListEntry.Blink)
-        {
-            CloseThreadpoolTimer((TP_TIMER *)timer->TimerListEntry.Blink);
-            timer->TimerListEntry.Blink = NULL;
-        }
-    }
     timer->Header.SignalState = FALSE;
     if (timer->Header.WaitListHead.Blink && !*((ULONG_PTR *)&timer->Header.WaitListHead.Flink))
     {

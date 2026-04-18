@@ -625,6 +625,126 @@ const nspa_queue_bypass_shm_t *nspa_get_own_bypass_shm_public( void )
     return nspa_get_own_bypass_shm();
 }
 
+/* Opt-in: NSPA_ENABLE_CLIENT_RING_DISPATCH=1 makes peek_message scan the
+ * own ring for SEND-class msgs BEFORE issuing the wineserver get_message
+ * request.  This is the Phase 4.6 dispatch-latency fix: removes the
+ * server RTT from the hot SEND dispatch path so MainThread can consume
+ * ring SENDs within microseconds instead of tens of milliseconds.
+ * Default off until validated. */
+static int nspa_client_ring_dispatch_enabled( void )
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *v = getenv( "NSPA_ENABLE_CLIENT_RING_DISPATCH" );
+        cached = (v && *v && *v != '0');
+    }
+    return cached;
+}
+
+/* Walk own ring tail forward, marking CONSUMED slots as EMPTY and
+ * advancing tail.  Mirrors server's consume_nspa_ring_message tail
+ * advance.  Safe for single-thread-advance; MainThread is the typical
+ * consumer.  If server also advances via its own consume path, the
+ * atomics race harmlessly: last writer wins and tail only moves
+ * forward past EMPTY slots. */
+static void nspa_client_advance_own_ring_tail( volatile nspa_msg_ring_t *ring )
+{
+    unsigned int tail = __atomic_load_n( &ring->tail, __ATOMIC_ACQUIRE );
+    unsigned int head = __atomic_load_n( &ring->head, __ATOMIC_ACQUIRE );
+    unsigned int cursor;
+
+    for (cursor = tail; (int)(cursor - head) < 0; cursor++)
+    {
+        volatile nspa_msg_slot_t *slot = &ring->slots[cursor & (NSPA_MSG_RING_SLOTS - 1)];
+        if (__atomic_load_n( &slot->state, __ATOMIC_ACQUIRE ) != NSPA_MSG_STATE_CONSUMED) break;
+        __atomic_store_n( &slot->state, NSPA_MSG_STATE_EMPTY, __ATOMIC_RELEASE );
+    }
+    if (cursor != tail)
+        __atomic_store_n( &ring->tail, cursor, __ATOMIC_RELEASE );
+}
+
+/* Scan own ring for a SEND-class msg in READY state matching (win, first,
+ * last) filter.  On match: CAS-claim (READY -> CONSUMED), decrement counts,
+ * fill info, and (caller-chosen) advance tail.  Returns TRUE if a msg was
+ * claimed; info is populated.  FALSE = no match / opt-in gate off / bypass
+ * disabled / cross-process window filter (can't match client-side without
+ * server's window tree).
+ *
+ * Called from peek_message BEFORE the wineserver get_message request —
+ * eliminates the server RTT for ring SEND dispatch (Phase 4.6). */
+BOOL nspa_try_pop_own_ring_send( HWND filter_hwnd, UINT first, UINT last,
+                                 UINT *type_out, UINT *msg_out,
+                                 WPARAM *wp_out, LPARAM *lp_out,
+                                 DWORD *time_out, UINT *sender_tid_out,
+                                 UINT *reply_slot_out, HWND *win_out )
+{
+    const nspa_queue_bypass_shm_t *own = nspa_get_own_bypass_shm_public();
+    volatile nspa_msg_ring_t *ring;
+    unsigned int head, tail, cursor;
+
+    if (!nspa_client_ring_dispatch_enabled()) return FALSE;
+    if (!own) return FALSE;
+
+    /* Only the "any window" case can be handled correctly client-side.
+     * Specific-window or parent-child filter needs is_child_window on
+     * the server's window tree; fall back to server in that case. */
+    if (filter_hwnd) return FALSE;
+
+    ring = (volatile nspa_msg_ring_t *)&own->nspa_msg_ring;
+    if (!ring->active) return FALSE;
+
+    head = __atomic_load_n( &ring->head, __ATOMIC_ACQUIRE );
+    tail = __atomic_load_n( &ring->tail, __ATOMIC_ACQUIRE );
+
+    for (cursor = tail; (int)(cursor - head) < 0; cursor++)
+    {
+        volatile nspa_msg_slot_t *slot = &ring->slots[cursor & (NSPA_MSG_RING_SLOTS - 1)];
+        unsigned int state = __atomic_load_n( &slot->state, __ATOMIC_ACQUIRE );
+        unsigned int type;
+        unsigned int slot_msg;
+        unsigned int expected;
+
+        if (state != NSPA_MSG_STATE_READY) continue;
+        type = slot->type;
+        if (type >= 32) continue;
+        /* SEND-class only for Phase 4.6 — POSTs still dispatch via
+         * server arbitration (works fine today). */
+        if (!((1u << type) & ((1u << MSG_ASCII) | (1u << MSG_UNICODE) | (1u << MSG_NOTIFY))))
+            continue;
+
+        slot_msg = slot->msg;
+        if (slot_msg < first || slot_msg > last) continue;
+
+        /* CAS claim: READY -> CONSUMED.  If it fails, someone else got
+         * this slot (server arbitration); continue scanning. */
+        expected = NSPA_MSG_STATE_READY;
+        if (!__atomic_compare_exchange_n( &slot->state, &expected,
+                                          NSPA_MSG_STATE_CONSUMED, 0,
+                                          __ATOMIC_ACQUIRE, __ATOMIC_RELAXED ))
+            continue;
+
+        /* Got it — pull fields out before decrementing counts (slot
+         * contents stay intact through CONSUMED state). */
+        *type_out       = type;
+        *msg_out        = slot_msg;
+        *wp_out         = (WPARAM)slot->wparam;
+        *lp_out         = (LPARAM)slot->lparam;
+        *time_out       = slot->time;
+        *sender_tid_out = slot->sender_tid;
+        *reply_slot_out = slot->reply_slot;
+        *win_out        = wine_server_ptr_handle( slot->win );
+
+        __atomic_fetch_sub( &ring->pending_count, 1, __ATOMIC_ACQ_REL );
+        __atomic_fetch_sub( &ring->pending_send_count, 1, __ATOMIC_ACQ_REL );
+
+        nspa_client_advance_own_ring_tail( ring );
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
 /* Write a reply to a remote sender's reply slot and wake them.
  * Called by the receiver after its window proc returns, if the message
  * came from a ring slot (sender_tid != 0, reply_slot_idx in range).

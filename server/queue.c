@@ -3693,6 +3693,24 @@ DECL_HANDLER(nspa_get_thread_queue)
 }
 
 
+/* NSPA: bootstrap the caller's OWN bypass ring.  Synchronous SEND bypass
+ * needs the sender's reply ring, not the peer's — this handler is what
+ * client calls on first SEND attempt to get a fd for its own queue. */
+DECL_HANDLER(nspa_ensure_own_bypass)
+{
+    struct msg_queue *queue = get_current_queue();
+
+    reply->fd_sent = 0;
+    if (!queue) return;
+    if (!nspa_ensure_shared( queue )) return;
+    if (queue->nspa_bypass_fd == -1) return;
+    /* Token is 0 here — there's no pre-known handle to match against, and
+     * the fd always arrives in-order immediately after the reply. */
+    if (send_client_fd( current->process, queue->nspa_bypass_fd, 0 ) == 0)
+        reply->fd_sent = 1;
+}
+
+
 /* set the file descriptor associated to the current thread queue */
 DECL_HANDLER(set_queue_fd)
 {

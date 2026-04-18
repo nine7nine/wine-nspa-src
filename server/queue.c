@@ -1104,6 +1104,24 @@ static int nspa_ensure_shared( struct msg_queue *queue )
     if (!(queue->nspa_shared = alloc_shared_object( sizeof(*queue->nspa_shared) )))
         return 0;
 
+    {
+        static int post_debug = -1;
+        if (post_debug == -1) post_debug = (getenv("NSPA_POST_DEBUG") != NULL);
+        if (post_debug)
+        {
+            struct thread *owner = NULL;
+            /* Walk current process threads to find the owner of this queue. */
+            if (current && current->process)
+            {
+                struct thread *t;
+                LIST_FOR_EACH_ENTRY( t, &current->process->thread_list, struct thread, proc_entry )
+                    if (t->queue == queue) { owner = t; break; }
+            }
+            fprintf( stderr, "nspa_post_debug: nspa_ensure_shared allocated for queue owner_tid=%04x (caller_tid=%04x)\n",
+                     owner ? owner->id : 0, current ? current->id : 0 );
+        }
+    }
+
     SHARED_WRITE_BEGIN( queue->nspa_shared, nspa_queue_bypass_shm_t )
     {
         memset( (void *)&shared->nspa_msg_ring, 0, sizeof(shared->nspa_msg_ring) );

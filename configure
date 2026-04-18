@@ -684,6 +684,7 @@ GPHOTO2_PORT_LIBS
 GPHOTO2_PORT_CFLAGS
 GPHOTO2_LIBS
 GPHOTO2_CFLAGS
+URING_LIBS
 USB_LIBS
 USB_CFLAGS
 SANE_LIBS
@@ -976,6 +977,7 @@ with_pulse
 with_sane
 with_sdl
 with_udev
+with_uring
 with_usb
 with_v4l2
 with_vulkan
@@ -2626,6 +2628,7 @@ Optional Packages:
   --without-sane          do not use SANE (scanner support)
   --without-sdl           do not use SDL
   --without-udev          do not use udev (plug and play support)
+  --without-uring         do not use the liburing library (io_uring support)
   --without-usb           do not use the libusb library
   --without-v4l2          do not use v4l2 (video capture)
   --without-vulkan        do not use Vulkan
@@ -4569,6 +4572,13 @@ fi
 if test ${with_udev+y}
 then :
   withval=$with_udev;
+fi
+
+
+# Check whether --with-uring was given.
+if test ${with_uring+y}
+then :
+  withval=$with_uring; if test "x$withval" = "xno"; then ac_cv_header_liburing_h=no; fi
 fi
 
 
@@ -10895,6 +10905,12 @@ ac_fn_c_check_header_compile "$LINENO" "gettext-po.h" "ac_cv_header_gettext_po_h
 if test "x$ac_cv_header_gettext_po_h" = xyes
 then :
   printf "%s\n" "#define HAVE_GETTEXT_PO_H 1" >>confdefs.h
+
+fi
+ac_fn_c_check_header_compile "$LINENO" "liburing.h" "ac_cv_header_liburing_h" "$ac_includes_default"
+if test "x$ac_cv_header_liburing_h" = xyes
+then :
+  printf '%s\n' "#define HAVE_LIBURING_H 1" >>confdefs.h
 
 fi
 ac_fn_c_check_header_compile "$LINENO" "link.h" "ac_cv_header_link_h" "$ac_includes_default"
@@ -18177,6 +18193,69 @@ esac
 enable_wineusb_sys=${enable_wineusb_sys:-no}
 fi
 
+if test "$ac_cv_header_liburing_h" = "yes"
+then
+    { printf '%s\n' "$as_me:${as_lineno-$LINENO}: checking for io_uring_queue_init in -luring" >&5
+printf %s "checking for io_uring_queue_init in -luring... " >&6; }
+if test ${ac_cv_lib_uring_io_uring_queue_init+y}
+then :
+  printf %s "(cached) " >&6
+else case e in #(
+  e) ac_check_lib_save_LIBS=$LIBS
+LIBS="-luring  $LIBS"
+cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+/* Override any GCC internal prototype to avoid an error.
+   Use char because int might match the return type of a GCC
+   builtin and then its argument prototype would still apply.
+   The 'extern "C"' is for builds by C++ compilers;
+   although this is not generally supported in C code supporting it here
+   has little cost and some practical benefit (sr 110532).  */
+#ifdef __cplusplus
+extern "C"
+#endif
+char io_uring_queue_init (void);
+int
+main (void)
+{
+return io_uring_queue_init ();
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_link "$LINENO"
+then :
+  ac_cv_lib_uring_io_uring_queue_init=yes
+else case e in #(
+  e) ac_cv_lib_uring_io_uring_queue_init=no ;;
+esac
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.beam \
+    conftest$ac_exeext conftest.$ac_ext
+LIBS=$ac_check_lib_save_LIBS ;;
+esac
+fi
+{ printf '%s\n' "$as_me:${as_lineno-$LINENO}: result: $ac_cv_lib_uring_io_uring_queue_init" >&5
+printf '%s\n' "$ac_cv_lib_uring_io_uring_queue_init" >&6; }
+if test "x$ac_cv_lib_uring_io_uring_queue_init" = xyes
+then :
+  URING_LIBS="-luring"
+
+fi
+
+fi
+if test "x$ac_cv_lib_uring_io_uring_queue_init" != xyes -a "x$URING_LIBS" = x
+then :
+  case "x$with_uring" in
+  x)   as_fn_append wine_notices "|liburing ${notice_platform}development files not found, io_uring acceleration will not be available." ;;
+  xno) ;;
+  *)   as_fn_error $? "liburing ${notice_platform}development files not found, io_uring acceleration will not be available.
+This is an error since --with-uring was requested." "$LINENO" 5 ;;
+esac
+
+fi
+
 if test "x$with_v4l2" != "xno"
 then
     { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for -lv4l2" >&5
@@ -25184,6 +25263,7 @@ SANE_CFLAGS = $SANE_CFLAGS
 SANE_LIBS = $SANE_LIBS
 USB_CFLAGS = $USB_CFLAGS
 USB_LIBS = $USB_LIBS
+URING_LIBS = $URING_LIBS
 GPHOTO2_CFLAGS = $GPHOTO2_CFLAGS
 GPHOTO2_LIBS = $GPHOTO2_LIBS
 GPHOTO2_PORT_CFLAGS = $GPHOTO2_PORT_CFLAGS

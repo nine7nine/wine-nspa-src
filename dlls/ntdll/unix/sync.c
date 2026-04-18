@@ -2987,29 +2987,32 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
 
 #if defined(HAVE_CLOCK_GETTIME) && defined(HAVE_CLOCK_NANOSLEEP)
         /* NSPA: use clock_nanosleep FIRST for sub-ms precision.
-         * This must run before NtYieldExecution — the yield causes a
-         * full scheduler round-trip that adds 1-15ms of jitter on non-RT
-         * threads. clock_nanosleep on an RT kernel gives ~50-100ns. */
+         * Relative NT timeouts (ticks < 0) are interval intent — compute the
+         * deadline on CLOCK_MONOTONIC so NTP steps cannot shift or skip the
+         * wake. Absolute NT filetimes (ticks > 0) are wall-clock intent —
+         * keep CLOCK_REALTIME. */
         if (ticks != 0)
         {
             struct timespec ts;
+            clockid_t clock_id;
             int err;
 
             if (ticks < 0)
             {
-                clock_gettime( CLOCK_REALTIME, &ts );
+                clock_id = CLOCK_MONOTONIC;
+                clock_gettime( CLOCK_MONOTONIC, &ts );
                 ts.tv_sec += (time_t)(-ticks / TICKSPERSEC);
                 ts.tv_nsec += (long)((-ticks % TICKSPERSEC) * 100);
                 if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
             }
             else
             {
+                clock_id = CLOCK_REALTIME;
                 ts.tv_sec = (time_t)((ticks / TICKSPERSEC) - SECS_1601_TO_1970);
                 ts.tv_nsec = (long)((ticks % TICKSPERSEC) * 100);
             }
 
-            usleep(0);  /* brief yield without full scheduler round-trip */
-            while ((err = clock_nanosleep( CLOCK_REALTIME, TIMER_ABSTIME, &ts, NULL )) == EINTR);
+            while ((err = clock_nanosleep( clock_id, TIMER_ABSTIME, &ts, NULL )) == EINTR);
             if (!err) return STATUS_SUCCESS;
         }
 #endif

@@ -29,6 +29,10 @@
 #include <unistd.h>
 #include <poll.h>
 #include <limits.h>
+#include <sys/mman.h>
+#ifdef HAVE_SYS_MEMFD_H
+#include <sys/memfd.h>
+#endif
 
 #include "ntstatus.h"
 #include "windef.h"
@@ -141,7 +145,9 @@ struct msg_queue
     struct hook_table     *hooks;           /* hook table */
     int                    keystate_lock;   /* owns an input keystate lock */
     queue_shm_t           *shared;          /* queue in session shared memory */
-    nspa_queue_bypass_shm_t *nspa_shared;   /* external shared object for bypass rings */
+    nspa_queue_bypass_shm_t *nspa_shared;   /* mmap of nspa_bypass_fd (server-side view) */
+    int                    nspa_bypass_fd;  /* memfd backing nspa_shared (-1 if unallocated) */
+    size_t                 nspa_bypass_size;/* size of the memfd / mmap */
 };
 
 struct hotkey
@@ -238,7 +244,6 @@ static inline unsigned int nspa_ring_status_bits( const struct msg_queue *queue 
 static inline int nspa_ring_arb_disabled(void);
 static inline int nspa_ring_wake_syn_disabled(void);
 static inline int nspa_ring_alloc_disabled(void);
-static inline int nspa_locator_disabled(void);
 static inline int nspa_seq_ops_disabled(void);
 
 /* set the caret window in a given thread input, requires write lock on the thread input shared member */
@@ -330,6 +335,8 @@ static struct msg_queue *create_msg_queue( struct thread *thread, struct thread_
         queue->hooks           = NULL;
         queue->keystate_lock   = 0;
         queue->nspa_shared     = NULL;
+        queue->nspa_bypass_fd  = -1;
+        queue->nspa_bypass_size = 0;
         list_init( &queue->send_result );
         list_init( &queue->callback_result );
         list_init( &queue->pending_timers );
@@ -1048,7 +1055,6 @@ static void free_message( struct message *msg )
 static int nspa_server_ring_arb_off = -1;
 static int nspa_server_wake_syn_off = -1;
 static int nspa_server_alloc_off    = -1;
-static int nspa_server_locator_off  = -1;
 static int nspa_server_seq_off      = -1;
 
 static inline int nspa_ring_arb_disabled(void)
@@ -1076,20 +1082,6 @@ static inline int nspa_ring_alloc_disabled(void)
     if (nspa_server_alloc_off == -1)
         nspa_server_alloc_off = (getenv("NSPA_MSG_BYPASS_SERVER_NO_ALLOC") != NULL);
     return nspa_server_alloc_off;
-}
-
-/* NSPA_MSG_BYPASS_SERVER_NO_LOCATOR: allocate nspa_shared normally but
- * force queue_shm_t.nspa_bypass_locator and nspa_get_thread_queue's
- * reply->bypass_locator to zero, so clients see "no bypass object"
- * even though the server-side allocation happened.  Disambiguates
- * whether the regression is in the allocation/memory-pressure pattern
- * (bug persists with this flag set) or in client-side consumers of
- * the locator (bug clears with this flag set). */
-static inline int nspa_locator_disabled(void)
-{
-    if (nspa_server_locator_off == -1)
-        nspa_server_locator_off = (getenv("NSPA_MSG_BYPASS_SERVER_NO_LOCATOR") != NULL);
-    return nspa_server_locator_off;
 }
 
 /* NSPA_MSG_BYPASS_SERVER_NO_SEQ: suppress the two remaining per-message
@@ -1151,13 +1143,79 @@ static int nspa_queue_owner_is_process_first_thread( struct msg_queue *queue )
     return (first == owner);
 }
 
+/* Allocate a memfd-backed bypass shmem region for @queue.  The ring lives
+ * OUTSIDE Wine's session shmem so its allocation doesn't touch any of the
+ * session_object_t / shared_object_t machinery that couples queue_shm_t
+ * seqlocks to bypass-ring lifecycle (the 2026-04-17 library-panel
+ * regression was traced to that coupling).
+ *
+ * On success: queue->nspa_bypass_fd is the memfd, queue->nspa_shared
+ * points at the server-side mmap of that memfd, and queue->nspa_bypass_size
+ * records the mapped length for cleanup.
+ *
+ * Clients receive the fd via send_client_fd() from the nspa_get_thread_queue
+ * handler and mmap it into their own address space (see Phase 2). */
+static int nspa_alloc_bypass_shm( struct msg_queue *queue )
+{
+#ifdef HAVE_MEMFD_CREATE
+    const size_t size = sizeof(*queue->nspa_shared);
+    void *map;
+    int fd;
+
+    fd = memfd_create( "wine-nspa-bypass", MFD_CLOEXEC );
+    if (fd == -1) return 0;
+
+    if (ftruncate( fd, size ) == -1)
+    {
+        close( fd );
+        return 0;
+    }
+
+    map = mmap( NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0 );
+    if (map == MAP_FAILED)
+    {
+        close( fd );
+        return 0;
+    }
+
+    /* Single-threaded server context — memset is sufficient and no seqlock
+     * is needed because no client can yet see the fd (it has not been
+     * sent).  Ring slot state machines maintain their own per-slot atomics
+     * once the ring is live. */
+    memset( map, 0, size );
+    ((nspa_queue_bypass_shm_t *)map)->nspa_msg_ring.active = 1;
+
+    queue->nspa_bypass_fd   = fd;
+    queue->nspa_bypass_size = size;
+    queue->nspa_shared      = (nspa_queue_bypass_shm_t *)map;
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+static void nspa_free_bypass_shm( struct msg_queue *queue )
+{
+    if (queue->nspa_shared && queue->nspa_bypass_size)
+    {
+        munmap( (void *)queue->nspa_shared, queue->nspa_bypass_size );
+        queue->nspa_shared = NULL;
+    }
+    if (queue->nspa_bypass_fd != -1)
+    {
+        close( queue->nspa_bypass_fd );
+        queue->nspa_bypass_fd = -1;
+    }
+    queue->nspa_bypass_size = 0;
+}
+
 static int nspa_ensure_shared( struct msg_queue *queue )
 {
     if (queue->nspa_shared) return 1;
     if (nspa_ring_alloc_disabled()) return 0;
     if (nspa_exclude_main_thread() && nspa_queue_owner_is_process_first_thread( queue )) return 0;
 
-    if (!(queue->nspa_shared = alloc_shared_object( sizeof(*queue->nspa_shared) )))
+    if (!nspa_alloc_bypass_shm( queue ))
         return 0;
 
     {
@@ -1210,24 +1268,11 @@ static int nspa_ensure_shared( struct msg_queue *queue )
         }
     }
 
-    SHARED_WRITE_BEGIN( queue->nspa_shared, nspa_queue_bypass_shm_t )
-    {
-        memset( (void *)&shared->nspa_msg_ring, 0, sizeof(shared->nspa_msg_ring) );
-        memset( (void *)&shared->nspa_reply_ring, 0, sizeof(shared->nspa_reply_ring) );
-        shared->nspa_msg_ring.active = 1;
-    }
-    SHARED_WRITE_END;
-
-    /* Publish the locator so clients can reach the ring via queue_shm.
-     * Clients that read a partial-written locator will fail the id check
-     * in find_shared_session_object and fall through to the server path;
-     * next read sees the full locator and bypass engages. */
-    SHARED_WRITE_BEGIN( queue->shared, queue_shm_t )
-    {
-        shared->nspa_bypass_locator = get_shared_object_locator( queue->nspa_shared );
-    }
-    SHARED_WRITE_END;
-
+    /* Ring is zeroed + active flag set inside nspa_alloc_bypass_shm.
+     * queue_shm_t.nspa_bypass_locator is not touched — the locator field
+     * is retired by the memfd redesign (Phase 2 removes it from the
+     * protocol).  Clients discover the ring via send_client_fd() from
+     * the nspa_get_thread_queue handler. */
     return 1;
 }
 
@@ -1834,7 +1879,7 @@ static void msg_queue_destroy( struct object *obj )
     release_object( queue->input );
     if (queue->hooks) release_object( queue->hooks );
     if (queue->fd) release_object( queue->fd );
-    if (queue->nspa_shared) free_shared_object( queue->nspa_shared );
+    nspa_free_bypass_shm( queue );
     if (queue->shared) free_shared_object( queue->shared );
     if (queue->sync) release_object( queue->sync );
 }
@@ -3624,13 +3669,25 @@ DECL_HANDLER(nspa_get_thread_queue)
                          caller_ready );
         }
 
-        if (caller_ready && nspa_ensure_shared( queue ) && !nspa_locator_disabled())
-            reply->bypass_locator = get_shared_object_locator( queue->nspa_shared );
-        else
-            memset( &reply->bypass_locator, 0, sizeof(reply->bypass_locator) );
+        /* Locator field is retired by the memfd redesign — its .id doubles
+         * as a "bypass fd follows this reply" sentinel during Phase 1.
+         * Client checks reply->bypass_locator.id != 0 → call
+         * wine_server_receive_fd().  Phase 2 replaces this with a proper
+         * protocol field. */
+        memset( &reply->bypass_locator, 0, sizeof(reply->bypass_locator) );
         /* EVENT_MODIFY_STATE lets the peer call NtSetEvent; SYNCHRONIZE for completeness */
         reply->sync_handle = alloc_handle( current->process, queue->sync,
                                            EVENT_MODIFY_STATE | SYNCHRONIZE, 0 );
+
+        /* Allocate the bypass shmem if the caller is ready, then deliver
+         * the memfd via send_client_fd().  sync_handle doubles as the
+         * matching token so the client assert is unambiguous. */
+        if (caller_ready && reply->sync_handle && nspa_ensure_shared( queue ) &&
+            queue->nspa_bypass_fd != -1 &&
+            send_client_fd( current->process, queue->nspa_bypass_fd, reply->sync_handle ) == 0)
+        {
+            reply->bypass_locator.id = 1;  /* Phase-1 sentinel: fd was sent */
+        }
     }
     release_object( thread );
 }

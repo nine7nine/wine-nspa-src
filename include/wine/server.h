@@ -50,6 +50,7 @@ struct __server_request_info
 };
 
 NTSYSAPI void CDECL wine_server_send_fd( int fd );
+NTSYSAPI int CDECL wine_server_receive_fd( obj_handle_t *handle );
 NTSYSAPI unsigned int CDECL wine_server_call( void *req_ptr );
 NTSYSAPI NTSTATUS CDECL wine_server_fd_to_handle( int fd, unsigned int access, unsigned int attributes, HANDLE *handle );
 NTSYSAPI NTSTATUS CDECL wine_server_handle_to_fd( HANDLE handle, unsigned int access, int *unix_fd, unsigned int *options );

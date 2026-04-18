@@ -3529,6 +3529,15 @@ static void dump_nspa_get_thread_queue_reply( const struct nspa_get_thread_queue
     fprintf( stderr, ", sync_handle=%04x", req->sync_handle );
 }
 
+static void dump_nspa_ensure_own_bypass_request( const struct nspa_ensure_own_bypass_request *req )
+{
+}
+
+static void dump_nspa_ensure_own_bypass_reply( const struct nspa_ensure_own_bypass_reply *req )
+{
+    fprintf( stderr, " fd_sent=%d", req->fd_sent );
+}
+
 typedef void (*dump_func)( const void *req );
 
 static const dump_func req_dumpers[REQ_NB_REQUESTS] =
@@ -3840,6 +3849,7 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_d3dkmt_mutex_acquire_request,
     (dump_func)dump_d3dkmt_mutex_release_request,
     (dump_func)dump_nspa_get_thread_queue_request,
+    (dump_func)dump_nspa_ensure_own_bypass_request,
 };
 
 static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
@@ -4151,6 +4161,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_d3dkmt_mutex_acquire_reply,
     NULL,
     (dump_func)dump_nspa_get_thread_queue_reply,
+    (dump_func)dump_nspa_ensure_own_bypass_reply,
 };
 
 static const char * const req_names[REQ_NB_REQUESTS] =
@@ -4462,6 +4473,7 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "d3dkmt_mutex_acquire",
     "d3dkmt_mutex_release",
     "nspa_get_thread_queue",
+    "nspa_ensure_own_bypass",
 };
 
 static const struct

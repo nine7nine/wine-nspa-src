@@ -314,6 +314,7 @@ DECL_HANDLER(d3dkmt_object_open_name);
 DECL_HANDLER(d3dkmt_mutex_acquire);
 DECL_HANDLER(d3dkmt_mutex_release);
 DECL_HANDLER(nspa_get_thread_queue);
+DECL_HANDLER(nspa_ensure_own_bypass);
 
 typedef void (*req_handler)( const void *req, void *reply );
 static const req_handler req_handlers[REQ_NB_REQUESTS] =
@@ -625,6 +626,7 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_d3dkmt_mutex_acquire,
     (req_handler)req_d3dkmt_mutex_release,
     (req_handler)req_nspa_get_thread_queue,
+    (req_handler)req_nspa_ensure_own_bypass,
 };
 
 C_ASSERT( sizeof(abstime_t) == 8 );
@@ -2388,3 +2390,6 @@ C_ASSERT( offsetof(struct nspa_get_thread_queue_reply, locator) == 8 );
 C_ASSERT( offsetof(struct nspa_get_thread_queue_reply, bypass_locator) == 24 );
 C_ASSERT( offsetof(struct nspa_get_thread_queue_reply, sync_handle) == 40 );
 C_ASSERT( sizeof(struct nspa_get_thread_queue_reply) == 48 );
+C_ASSERT( sizeof(struct nspa_ensure_own_bypass_request) == 16 );
+C_ASSERT( offsetof(struct nspa_ensure_own_bypass_reply, fd_sent) == 8 );
+C_ASSERT( sizeof(struct nspa_ensure_own_bypass_reply) == 16 );

@@ -4380,6 +4380,18 @@ enum inproc_sync_type
     thread_id_t     tid;          /* target thread id */
 @REPLY
     struct obj_locator locator;          /* shared session object locator for target queue */
-    struct obj_locator bypass_locator;   /* shared session object locator for target bypass rings */
+    struct obj_locator bypass_locator;   /* Phase-1 sentinel: .id != 0 means fd follows via SCM_RIGHTS */
     obj_handle_t    sync_handle;         /* handle to the queue's sync object (ntsync event) */
+@END
+
+
+/* NSPA: bootstrap the CALLER's own bypass shm ring.  Needed for synchronous
+ * SEND-class bypass (the sender allocates a reply slot in ITS OWN reply
+ * ring).  Server allocates nspa_shared for the current queue if not present
+ * and delivers the memfd via send_client_fd.  reply->fd_sent is 1 when the
+ * fd follows the reply on the socket, 0 otherwise (allocation failed, or
+ * the opt-in gate blocked this thread). */
+@REQ(nspa_ensure_own_bypass)
+@REPLY
+    int             fd_sent;     /* 1 = fd follows on socket, 0 = no fd */
 @END

@@ -489,18 +489,86 @@ BOOL nspa_try_post_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
  * immediately after publishing.
  * --------------------------------------------------------------------- */
 
-/* Fetch our own queue's bypass shm (cached per-thread inside winstation). */
+/* Fetch our own queue's bypass shm.
+ *
+ * Post-memfd-redesign: each thread gets its own mmap of the server-allocated
+ * bypass ring via the nspa_ensure_own_bypass protocol request, cached in
+ * pthread TLS to avoid repeated server round-trips.
+ *
+ * Sentinel values in the TLS slot:
+ *   NULL          = never queried
+ *   (void *)-1    = queried, server had no bypass (negative cache)
+ *   valid ptr     = queried, positive — points at mmap'd ring
+ */
+static pthread_key_t nspa_own_tls_key;
+static pthread_once_t nspa_own_tls_once = PTHREAD_ONCE_INIT;
+#define NSPA_OWN_NEG ((const nspa_queue_bypass_shm_t *)(intptr_t)-1)
+
+static void nspa_own_tls_destructor( void *p )
+{
+    /* Note: mmap is shared across threads so we don't munmap on thread
+     * exit.  The server-side fd owner (the queue) is what controls ring
+     * lifetime; thread exit just drops this cache. */
+}
+
+static void nspa_own_tls_init_once( void )
+{
+    pthread_key_create( &nspa_own_tls_key, nspa_own_tls_destructor );
+}
+
 static const nspa_queue_bypass_shm_t *nspa_get_own_bypass_shm( void )
 {
-    struct object_lock lock = OBJECT_LOCK_INIT;
-    const queue_shm_t *queue_shm = NULL;
-    const nspa_queue_bypass_shm_t *bypass = NULL;
+    const nspa_queue_bypass_shm_t *cached;
+    int fd_sent = 0;
     NTSTATUS status;
+    int fd = -1;
+    void *map = NULL;
+    size_t map_size = sizeof(nspa_queue_bypass_shm_t);
 
-    while ((status = get_shared_queue( &lock, &queue_shm )) == STATUS_PENDING)
-        bypass = get_queue_bypass_shm( queue_shm );
-    if (status) return NULL;
-    return bypass;
+    pthread_once( &nspa_own_tls_once, nspa_own_tls_init_once );
+
+    cached = pthread_getspecific( nspa_own_tls_key );
+    if (cached == NSPA_OWN_NEG) return NULL;
+    if (cached) return cached;
+
+    /* First-call path: bootstrap own bypass ring via new server request. */
+    SERVER_START_REQ( nspa_ensure_own_bypass )
+    {
+        if (!(status = wine_server_call( req )))
+            fd_sent = reply->fd_sent;
+    }
+    SERVER_END_REQ;
+
+    if (status || !fd_sent)
+    {
+        pthread_setspecific( nspa_own_tls_key, (void *)NSPA_OWN_NEG );
+        return NULL;
+    }
+
+    {
+        obj_handle_t fd_token = 0;
+        fd = wine_server_receive_fd( &fd_token );
+        if (fd == -1)
+        {
+            pthread_setspecific( nspa_own_tls_key, (void *)NSPA_OWN_NEG );
+            return NULL;
+        }
+
+        map = mmap( NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, 0 );
+        close( fd );
+
+        if (map == MAP_FAILED)
+        {
+            pthread_setspecific( nspa_own_tls_key, (void *)NSPA_OWN_NEG );
+            return NULL;
+        }
+
+        if (mlock( map, map_size ) != 0)
+            TRACE_(nspa_bypass)( "own-bypass mlock failed; continuing unpinned\n" );
+    }
+
+    pthread_setspecific( nspa_own_tls_key, map );
+    return (const nspa_queue_bypass_shm_t *)map;
 }
 
 /* Reserve a free reply slot (CAS FREE -> PENDING).  Returns index or ~0u. */

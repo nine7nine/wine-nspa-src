@@ -6274,6 +6274,25 @@ struct nspa_get_thread_queue_reply
 };
 
 
+/* NSPA: bootstrap the CALLER's own bypass shm ring.  Needed for synchronous
+ * SEND-class bypass (the sender allocates a reply slot in ITS OWN reply
+ * ring).  Server allocates nspa_shared for the current queue if not present
+ * and delivers the memfd via send_client_fd.  reply->fd_sent is 1 when the
+ * fd follows the reply on the socket, 0 otherwise (allocation failed, or
+ * the opt-in gate blocked this thread). */
+struct nspa_ensure_own_bypass_request
+{
+    struct request_header __header;
+    char __pad_12[4];
+};
+struct nspa_ensure_own_bypass_reply
+{
+    struct reply_header __header;
+    int             fd_sent;
+    char __pad_12[4];
+};
+
+
 enum request
 {
     REQ_new_process,
@@ -6583,6 +6602,7 @@ enum request
     REQ_d3dkmt_mutex_acquire,
     REQ_d3dkmt_mutex_release,
     REQ_nspa_get_thread_queue,
+    REQ_nspa_ensure_own_bypass,
     REQ_NB_REQUESTS
 };
 
@@ -6897,6 +6917,7 @@ union generic_request
     struct d3dkmt_mutex_acquire_request d3dkmt_mutex_acquire_request;
     struct d3dkmt_mutex_release_request d3dkmt_mutex_release_request;
     struct nspa_get_thread_queue_request nspa_get_thread_queue_request;
+    struct nspa_ensure_own_bypass_request nspa_ensure_own_bypass_request;
 };
 union generic_reply
 {
@@ -7209,8 +7230,9 @@ union generic_reply
     struct d3dkmt_mutex_acquire_reply d3dkmt_mutex_acquire_reply;
     struct d3dkmt_mutex_release_reply d3dkmt_mutex_release_reply;
     struct nspa_get_thread_queue_reply nspa_get_thread_queue_reply;
+    struct nspa_ensure_own_bypass_reply nspa_ensure_own_bypass_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 935
+#define SERVER_PROTOCOL_VERSION 936
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

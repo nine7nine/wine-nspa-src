@@ -3006,35 +3006,68 @@ static int peek_message( MSG *msg, const struct peek_message_filter *filter )
         if (check_queue_bits( wake_mask, filter->mask, wake_mask | signal_bits, filter->mask | clear_bits,
                               &wake_bits, &changed_bits, filter->internal ))
             res = STATUS_PENDING;
-        else SERVER_START_REQ( get_message )
+        else
         {
-            req->internal  = filter->internal;
-            req->flags     = flags;
-            req->get_win   = wine_server_user_handle( hwnd );
-            req->get_first = first;
-            req->get_last  = last;
-            req->hw_id     = hw_id;
-            req->wake_mask = wake_mask;
-            req->changed_mask = filter->mask;
-            wine_server_set_reply( req, buffer, buffer_size );
-            if (!(res = wine_server_call( req )))
+            /* Phase 4.6: pop a ring SEND locally before issuing the
+             * wineserver get_message request.  Avoids a server RTT per
+             * SEND dispatch — the hot path for synchronous bypass. */
+            UINT pop_type, pop_msg, pop_sender, pop_slot;
+            DWORD pop_time;
+            WPARAM pop_wp;
+            LPARAM pop_lp;
+            HWND pop_win;
+            BOOL popped = (signal_bits & QS_SENDMESSAGE) &&
+                          nspa_try_pop_own_ring_send( hwnd, first, last,
+                                                      &pop_type, &pop_msg,
+                                                      &pop_wp, &pop_lp,
+                                                      &pop_time, &pop_sender,
+                                                      &pop_slot, &pop_win );
+            if (popped)
             {
-                size = wine_server_reply_size( reply );
-                info.type             = reply->type;
-                info.msg.hwnd         = wine_server_ptr_handle( reply->win );
-                info.msg.message      = reply->msg;
-                info.msg.wParam       = reply->wparam;
-                info.msg.lParam       = reply->lparam;
-                info.msg.time         = reply->time;
-                info.msg.pt.x         = reply->x;
-                info.msg.pt.y         = reply->y;
-                info.nspa_sender_tid  = reply->nspa_sender_tid;
-                info.nspa_reply_slot  = reply->nspa_reply_slot;
+                res                   = STATUS_SUCCESS;
+                size                  = 0;
+                info.type             = pop_type;
+                info.msg.hwnd         = pop_win;
+                info.msg.message      = pop_msg;
+                info.msg.wParam       = pop_wp;
+                info.msg.lParam       = pop_lp;
+                info.msg.time         = pop_time;
+                info.msg.pt.x         = 0;
+                info.msg.pt.y         = 0;
+                info.nspa_sender_tid  = pop_sender;
+                info.nspa_reply_slot  = pop_slot;
                 hw_id                 = 0;
             }
-            else buffer_size = reply->total;
+            else SERVER_START_REQ( get_message )
+            {
+                req->internal  = filter->internal;
+                req->flags     = flags;
+                req->get_win   = wine_server_user_handle( hwnd );
+                req->get_first = first;
+                req->get_last  = last;
+                req->hw_id     = hw_id;
+                req->wake_mask = wake_mask;
+                req->changed_mask = filter->mask;
+                wine_server_set_reply( req, buffer, buffer_size );
+                if (!(res = wine_server_call( req )))
+                {
+                    size = wine_server_reply_size( reply );
+                    info.type             = reply->type;
+                    info.msg.hwnd         = wine_server_ptr_handle( reply->win );
+                    info.msg.message      = reply->msg;
+                    info.msg.wParam       = reply->wparam;
+                    info.msg.lParam       = reply->lparam;
+                    info.msg.time         = reply->time;
+                    info.msg.pt.x         = reply->x;
+                    info.msg.pt.y         = reply->y;
+                    info.nspa_sender_tid  = reply->nspa_sender_tid;
+                    info.nspa_reply_slot  = reply->nspa_reply_slot;
+                    hw_id                 = 0;
+                }
+                else buffer_size = reply->total;
+            }
+            SERVER_END_REQ;
         }
-        SERVER_END_REQ;
 
         if (res)
         {

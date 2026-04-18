@@ -3550,32 +3550,40 @@ DECL_HANDLER(nspa_get_thread_queue)
     queue = thread->queue;
     if (queue)
     {
-        static int skip_speculative = -1;
         int caller_ready;
 
         reply->locator = get_shared_object_locator( queue->shared );
-        /* NSPA_SKIP_SPECULATIVE_ALLOC: don't allocate peer's bypass shm
-         * unless the caller's own queue is already allocated.  The
-         * speculative allocation pattern (e.g. DWM-Sync SEND attempt
-         * that allocates MainThread's bypass ring then falls back to
-         * server because DWM-Sync's own bypass isn't ready) leaves
-         * unused bypass infrastructure on the peer queue, which is
-         * associated with the Ableton library-panel regression.  See
-         * project_msg_bypass_final_state_20260417.md. */
-        if (skip_speculative == -1)
-            skip_speculative = (getenv("NSPA_SKIP_SPECULATIVE_ALLOC") != NULL);
-        caller_ready = !skip_speculative ||
-                       (current && current->queue && current->queue->nspa_shared);
+        /* NSPA msg-bypass: only allocate peer's bypass shm if the caller's
+         * own queue has already been allocated.  This is DEFAULT-ON safety
+         * behaviour that was root-caused 2026-04-17 — the speculative
+         * allocation pattern (e.g. DWM-Sync SEND attempt that allocates
+         * MainThread's bypass ring then falls back to server because
+         * DWM-Sync's own bypass isn't ready) disrupts library-panel
+         * message delivery in Ableton.  Set NSPA_FORCE_SPECULATIVE_ALLOC=1
+         * to opt back into the old behaviour for testing.
+         *
+         * As a consequence: bypass captures zero traffic by default until
+         * a separate bootstrap mechanism lazy-allocates the caller's OWN
+         * bypass (nspa_ensure_own from the client on first bypass attempt,
+         * TBD).  Library works + same performance as bypass-off in the
+         * meantime. */
+        {
+            static int force_speculative = -1;
+            if (force_speculative == -1)
+                force_speculative = (getenv("NSPA_FORCE_SPECULATIVE_ALLOC") != NULL);
+            caller_ready = force_speculative ||
+                           (current && current->queue && current->queue->nspa_shared);
+        }
 
         {
             static int post_debug2 = -1;
             if (post_debug2 == -1) post_debug2 = (getenv("NSPA_POST_DEBUG") != NULL);
             if (post_debug2)
-                fprintf( stderr, "nspa_post_debug: nspa_get_thread_queue target_tid=%04x caller_tid=%04x caller_own_nspa_shared=%p caller_ready=%d skip_spec=%d\n",
+                fprintf( stderr, "nspa_post_debug: nspa_get_thread_queue target_tid=%04x caller_tid=%04x caller_own_nspa_shared=%p caller_ready=%d\n",
                          queue && current ? (current->process == thread->process ? thread->id : 0) : 0,
                          current ? current->id : 0,
                          current && current->queue ? (void*)current->queue->nspa_shared : NULL,
-                         caller_ready, skip_speculative );
+                         caller_ready );
         }
 
         if (caller_ready && nspa_ensure_shared( queue ) && !nspa_locator_disabled())

@@ -272,7 +272,14 @@ NTSTATUS get_shared_queue( struct object_lock *lock, const queue_shm_t **queue_s
 const nspa_queue_bypass_shm_t *get_queue_bypass_shm( const queue_shm_t *queue_shm )
 {
     struct session_thread_data *data = get_session_thread_data();
-    const shared_object_t *object = data->shared_queue_bypass;
+    const shared_object_t *object;
+    static int ignore_locator = -1;
+
+    if (ignore_locator == -1)
+        ignore_locator = (getenv("NSPA_CLIENT_IGNORE_LOCATOR") != NULL);
+    if (ignore_locator) return NULL;
+
+    object = data->shared_queue_bypass;
 
     if (!object)
     {

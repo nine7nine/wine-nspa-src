@@ -237,6 +237,7 @@ static inline int nspa_ring_arb_disabled(void);
 static inline int nspa_ring_wake_syn_disabled(void);
 static inline int nspa_ring_alloc_disabled(void);
 static inline int nspa_locator_disabled(void);
+static inline int nspa_seq_ops_disabled(void);
 
 /* set the caret window in a given thread input, requires write lock on the thread input shared member */
 static void set_caret_window( struct thread_input *input, input_shm_t *shared, user_handle_t win )
@@ -1046,6 +1047,7 @@ static int nspa_server_ring_arb_off = -1;
 static int nspa_server_wake_syn_off = -1;
 static int nspa_server_alloc_off    = -1;
 static int nspa_server_locator_off  = -1;
+static int nspa_server_seq_off      = -1;
 
 static inline int nspa_ring_arb_disabled(void)
 {
@@ -1086,6 +1088,20 @@ static inline int nspa_locator_disabled(void)
     if (nspa_server_locator_off == -1)
         nspa_server_locator_off = (getenv("NSPA_MSG_BYPASS_SERVER_NO_LOCATOR") != NULL);
     return nspa_server_locator_off;
+}
+
+/* NSPA_MSG_BYPASS_SERVER_NO_SEQ: suppress the two remaining per-message
+ * atomic side effects that run whenever a queue has nspa_shared allocated:
+ *   - nspa_alloc_post_seq: always returns 0 (no ring-side next_post_seq bump)
+ *   - nspa_ring_ack_changes: no-op (no change_ack_seq update)
+ * Used to narrow whether these atomic operations on the per-queue bypass
+ * shmem cause the library regression independent of ring arbitration and
+ * wake-bit synthesis. */
+static inline int nspa_seq_ops_disabled(void)
+{
+    if (nspa_server_seq_off == -1)
+        nspa_server_seq_off = (getenv("NSPA_MSG_BYPASS_SERVER_NO_SEQ") != NULL);
+    return nspa_server_seq_off;
 }
 
 /* Lazy-allocate per-queue nspa_shared (bypass msg+reply rings).  Queues
@@ -1194,6 +1210,7 @@ static inline void nspa_ring_ack_changes( const struct msg_queue *queue )
     volatile nspa_msg_ring_t *ring;
     unsigned int seq;
 
+    if (nspa_seq_ops_disabled()) return;
     if (!queue->nspa_shared) return;
     ring = &queue->nspa_shared->nspa_msg_ring;
     seq = __atomic_load_n( &ring->change_seq, __ATOMIC_ACQUIRE );
@@ -1202,6 +1219,7 @@ static inline void nspa_ring_ack_changes( const struct msg_queue *queue )
 
 static inline unsigned int nspa_alloc_post_seq( struct msg_queue *queue )
 {
+    if (nspa_seq_ops_disabled()) return 0;
     if (!queue->nspa_shared) return 0;
     return __atomic_add_fetch( &queue->nspa_shared->nspa_msg_ring.next_post_seq, 1, __ATOMIC_RELAXED );
 }

@@ -1114,10 +1114,48 @@ static inline int nspa_seq_ops_disabled(void)
  * queue (→ peer is about to bypass-post to us).  Idempotent: if already
  * allocated, returns immediately.  Gated by NSPA_MSG_BYPASS_SERVER_NO_ALLOC
  * (returns 0 without allocating when set). */
+/* Opt-in gate: block nspa_shared allocation for the process's first thread
+ * (typically the main/GUI thread).  Empirically identified 2026-04-17 as
+ * the root cause of Ableton Live's library-panel regression when the
+ * msg-bypass feature is enabled — the only probe/gate combination that
+ * restores library population with bypass on is blocking this specific
+ * allocation.  Users running affected apps should set
+ * `NSPA_MSG_BYPASS_EXCLUDE_MAIN=1` together with `NSPA_ENABLE_MSG_BYPASS=1`.
+ * Left opt-in rather than default-on pending broader validation — prior
+ * untested bypass-on + no-forcing runtime paths may have latent issues
+ * that only surface once speculative allocation is re-enabled. */
+static int nspa_exclude_main_thread(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *v = getenv( "NSPA_MSG_BYPASS_EXCLUDE_MAIN" );
+        cached = (v && *v && *v != '0');
+    }
+    return cached;
+}
+
+static int nspa_queue_owner_is_process_first_thread( struct msg_queue *queue )
+{
+    struct thread *owner = NULL, *first;
+    struct process *proc;
+
+    if (!current || !current->process) return 0;
+    proc = current->process;
+
+    LIST_FOR_EACH_ENTRY( owner, &proc->thread_list, struct thread, proc_entry )
+        if (owner->queue == queue) break;
+    if (!owner || owner->queue != queue) return 0;
+
+    first = get_process_first_thread( proc );
+    return (first == owner);
+}
+
 static int nspa_ensure_shared( struct msg_queue *queue )
 {
     if (queue->nspa_shared) return 1;
     if (nspa_ring_alloc_disabled()) return 0;
+    if (nspa_exclude_main_thread() && nspa_queue_owner_is_process_first_thread( queue )) return 0;
 
     if (!(queue->nspa_shared = alloc_shared_object( sizeof(*queue->nspa_shared) )))
         return 0;

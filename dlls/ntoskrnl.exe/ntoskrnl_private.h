@@ -101,6 +101,18 @@ struct wine_driver
 
 void ObReferenceObject( void *obj );
 
+/* dpc.c — dedicated DPC dispatcher backing KeSetTimerEx / KeInsertQueueDpc
+ * with sub-ms precision, replacing the Win32-threadpool-timer path whose
+ * worker-dispatch latency quantises to ~15ms on Wine. */
+void dpc_arm_timer( KTIMER *timer, LARGE_INTEGER duetime, LONG period, KDPC *dpc );
+void dpc_cancel_timer( KTIMER *timer );
+BOOL dpc_queue_immediate( KDPC *dpc, void *arg1, void *arg2 );
+
+/* Helpers exposed by sync.c so dpc.c can update KTIMER state under
+ * sync_cs without needing direct access to that file-static lock. */
+void sync_timer_signal( KTIMER *timer );
+void sync_timer_clear_inserted( KTIMER *timer );
+
 void pnp_manager_start(void);
 void pnp_manager_stop_driver( struct wine_driver *driver );
 void pnp_manager_stop(void);

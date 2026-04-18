@@ -54,7 +54,15 @@ struct system_clock
 
 static REFERENCE_TIME get_current_time(void)
 {
-    return (REFERENCE_TIME)timeGetTime() * 10000;
+    LARGE_INTEGER qpc, qpf;
+    QueryPerformanceCounter(&qpc);
+    QueryPerformanceFrequency(&qpf);
+    /* QPC ticks → 100ns (REFERENCE_TIME).  timeGetTime() gave 1ms
+     * resolution and wrapped every 49.7 days; QPC is monotonic,
+     * sub-µs, and 64-bit.  Split the multiply to avoid overflow when
+     * qpf does not divide qpc evenly. */
+    return qpc.QuadPart / qpf.QuadPart * 10000000
+         + qpc.QuadPart % qpf.QuadPart * 10000000 / qpf.QuadPart;
 }
 
 static inline struct system_clock *impl_from_IUnknown(IUnknown *iface)

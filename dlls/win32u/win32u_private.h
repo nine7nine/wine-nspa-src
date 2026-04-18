@@ -44,6 +44,14 @@ extern BOOL nspa_try_send_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
                                 LRESULT *result_out );
 extern BOOL nspa_write_ring_reply( DWORD sender_tid, UINT reply_slot_idx,
                                    LRESULT result, const void *data, UINT data_size );
+/* Memfd-era replacement for the old queue_shm_t.nspa_bypass_locator
+ * resolution.  Returns current thread's own bypass ring mmap (bootstrapping
+ * via server request on first call), or NULL if bypass is off / server
+ * couldn't provide a ring.  Exposed so get_queue_bypass_shm() and
+ * check_queue_bits() can include ring-synthesised wake bits in the local
+ * shmem check, avoiding the server round-trip to learn of pending ring
+ * SENDs. */
+extern const nspa_queue_bypass_shm_t *nspa_get_own_bypass_shm_public( void );
 
 /* message.c — exposed so nspa_msg_bypass.c can wait on our own queue sync. */
 extern HANDLE nspa_get_own_server_queue_handle( void );

@@ -536,18 +536,18 @@ static const nspa_queue_bypass_shm_t *nspa_get_own_bypass_shm( void )
     void *map = NULL;
     size_t map_size = sizeof(nspa_queue_bypass_shm_t);
 
-    /* OPT-IN: SEND-class bypass requires the caller's own reply ring to be
-     * allocated, which unlocks capturing ~75% more of the bypass attempts
-     * than POST-only Phase 3.  But the current dispatch path hits a 5 s
-     * send-timeout wall under Ableton's message rate — MainThread can't
-     * drain SEND-class ring slots fast enough before senders time out,
-     * producing a stale-slot retry storm that pegs MainThread's CPU.
-     *
-     * Root cause of that latency is under investigation.  Until resolved,
-     * this gate keeps Phase 4 infrastructure dormant — feature captures
-     * POST-class only (Phase 3 behaviour, validated).  Set
-     * NSPA_ENABLE_OWN_BOOTSTRAP=1 to opt in. */
-    if (!nspa_own_bootstrap_enabled()) return NULL;
+    /* Bootstrap own ring on first call regardless of send-opt-in flag.
+     * Dual purpose:
+     * 1. Local wake-bit synthesis in check_queue_bits() needs the own
+     *    ring's pending_count to include ring activity in the fast-path
+     *    local shmem check — without it, check_queue_bits returns
+     *    "nothing to do" for ring-pending SENDs and the thread never
+     *    wakes the dispatcher until some other trigger fires.
+     * 2. Reply slot reservation for SEND-class bypass (gated opt-in via
+     *    NSPA_ENABLE_OWN_BOOTSTRAP in nspa_try_send_ring — that's the
+     *    dispatch-latency-sensitive path).
+     */
+    if (nspa_bypass_disabled()) return NULL;
 
     pthread_once( &nspa_own_tls_once, nspa_own_tls_init_once );
 
@@ -615,6 +615,14 @@ static unsigned int nspa_reply_ring_reserve( volatile nspa_reply_ring_t *ring )
         }
     }
     return ~0u;
+}
+
+/* Public wrapper so winstation.c and input.c's wake-bit synthesis can
+ * resolve the current thread's own bypass ring via the memfd-era TLS
+ * cache instead of the retired queue_shm_t.nspa_bypass_locator. */
+const nspa_queue_bypass_shm_t *nspa_get_own_bypass_shm_public( void )
+{
+    return nspa_get_own_bypass_shm();
 }
 
 /* Write a reply to a remote sender's reply slot and wake them.
@@ -775,6 +783,17 @@ BOOL nspa_try_send_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
     /* Sync sends need our own reply ring + sync handle. */
     if (!is_notify)
     {
+        /* SEND bypass remains opt-in via NSPA_ENABLE_OWN_BOOTSTRAP until
+         * the dispatch-latency fix (Phase 4.5 client-side ring-SEND pump)
+         * lands.  Own ring is still bootstrapped for wake-bit synthesis
+         * (nspa_get_own_bypass_shm is called elsewhere); only using the
+         * reply ring for synchronous SEND is gated. */
+        if (!nspa_own_bootstrap_enabled())
+        {
+            TRACE_(nspa_bypass)( "send skip send-opt-in-disabled dest=%04x msg=%04x\n",
+                                 (UINT)dest_tid, msg );
+            return FALSE;
+        }
         own_bypass = nspa_get_own_bypass_shm();
         if (!own_bypass)
         {

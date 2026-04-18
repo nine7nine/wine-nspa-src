@@ -27,6 +27,8 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -60,8 +62,8 @@ struct nspa_cache_entry
 {
     DWORD                tid;            /* 0 = empty slot */
     HANDLE               sync_handle;    /* event handle for queue->sync */
-    object_id_t          object_id;      /* shared_object_t.id at lookup time */
-    mem_size_t           object_offset;  /* shared_object locator offset */
+    nspa_queue_bypass_shm_t *mapped_ptr; /* mmap of peer's bypass memfd (or NULL for negative cache) */
+    size_t               mapped_size;    /* for munmap on clear */
 };
 
 /* Per-thread cache via pthread_key + lazy heap allocation.
@@ -188,52 +190,99 @@ static struct nspa_cache_entry *nspa_cache_find( struct nspa_cache_entry *cache,
 static void nspa_clear_cache_entry( struct nspa_cache_entry *entry )
 {
     HANDLE sync_handle = entry->sync_handle;
+    void *mapped = (void *)entry->mapped_ptr;
+    size_t mapped_size = entry->mapped_size;
 
     memset( entry, 0, sizeof(*entry) );
+    if (mapped && mapped_size) munmap( mapped, mapped_size );
     if (sync_handle) NtClose( sync_handle );
 }
 
 static const nspa_queue_bypass_shm_t *nspa_get_cached_bypass_shm( const struct nspa_cache_entry *entry )
 {
-    const shared_object_t *object;
-
-    if (!entry->tid) return NULL;
-    if (!(object = find_shared_session_object( entry->object_id, entry->object_offset )))
-        return NULL;
-    return (const nspa_queue_bypass_shm_t *)&object->shm;
+    /* Post-memfd-redesign: the shmem is a private mmap held by this cache
+     * entry. No session-shmem lookup needed. NULL mapped_ptr = negative
+     * cache (peer has no bypass ring available). */
+    if (!entry->tid || !entry->mapped_ptr) return NULL;
+    return entry->mapped_ptr;
 }
 
 /* Do the server lookup to populate a cache slot.  Returns TRUE on success. */
 static BOOL nspa_populate_cache_entry( DWORD tid, struct nspa_cache_entry *entry )
 {
-    struct obj_locator locator = {0};
     HANDLE sync_handle = 0;
-    const shared_object_t *object;
+    unsigned int has_bypass_fd = 0;
     NTSTATUS status;
+    int fd = -1;
+    void *map = NULL;
+    size_t map_size = sizeof(nspa_queue_bypass_shm_t);
 
     SERVER_START_REQ( nspa_get_thread_queue )
     {
         req->tid = tid;
         if (!(status = wine_server_call( req )))
         {
-            locator = reply->bypass_locator;
-            sync_handle = wine_server_ptr_handle( reply->sync_handle );
+            sync_handle   = wine_server_ptr_handle( reply->sync_handle );
+            /* Phase-1 sentinel: bypass_locator.id != 0 means server sent an
+             * fd via SCM_RIGHTS on this reply.  Phase 2 replaces the
+             * sentinel with a proper protocol field. */
+            has_bypass_fd = (unsigned int)reply->bypass_locator.id;
         }
     }
     SERVER_END_REQ;
 
     if (status || !sync_handle) return FALSE;
 
-    object = find_shared_session_object( locator.id, locator.offset );
-    if (!object) {
+    if (!has_bypass_fd)
+    {
+        /* Server has no bypass ring for this peer — close the sync handle
+         * we don't need and let the caller install a negative-cache
+         * sentinel (tid set, mapped_ptr NULL).  Returning FALSE is the
+         * existing contract for "peer unreachable via bypass". */
         NtClose( sync_handle );
         return FALSE;
     }
 
+    {
+        obj_handle_t fd_token = 0;
+        fd = wine_server_receive_fd( &fd_token );
+        if (fd == -1 || wine_server_ptr_handle( fd_token ) != sync_handle)
+        {
+            /* Protocol mismatch — close what we have and fall back. */
+            if (fd != -1) close( fd );
+            NtClose( sync_handle );
+            return FALSE;
+        }
+
+        /* MAP_POPULATE prefaults all pages so the RT fast path never takes
+         * a minor page fault on first ring access.  Size is small (10 KB),
+         * prefault cost is fixed and paid once per peer off the RT path. */
+        map = mmap( NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, 0 );
+        close( fd );   /* mmap holds its own reference */
+
+        if (map == MAP_FAILED)
+        {
+            NtClose( sync_handle );
+            return FALSE;
+        }
+
+        /* mlock the region so no future demand-paging happens on RT-critical
+         * ring accesses.  If mlock fails (RLIMIT_MEMLOCK), we log and
+         * continue — the bypass still works, just may take minor faults on
+         * the first touch of a cold page under memory pressure. */
+        if (mlock( map, map_size ) != 0)
+            TRACE_(nspa_bypass)( "mlock failed for tid=%04x (RLIMIT_MEMLOCK?); continuing without pinning\n",
+                                 (UINT)tid );
+    }
+
+    /* Positive cache (has_bypass_fd) OR negative cache (bypass inert for
+     * this peer).  Negative cache is represented by tid set + mapped_ptr
+     * NULL; it avoids re-issuing the server round-trip on every subsequent
+     * send to the same peer. */
     entry->tid         = tid;
     entry->sync_handle = sync_handle;
-    entry->object_id   = locator.id;
-    entry->object_offset = locator.offset;
+    entry->mapped_ptr  = (nspa_queue_bypass_shm_t *)map;
+    entry->mapped_size = map ? map_size : 0;
     return TRUE;
 }
 
@@ -258,21 +307,19 @@ static struct nspa_cache_entry *nspa_lookup_peer( DWORD tid )
     if (!entry) return NULL;       /* cache full */
     if (entry->tid == tid)
     {
-        /* Positive cache: resolve the shared object. */
-        if (entry->sync_handle && nspa_get_cached_bypass_shm( entry )) return entry;
-        /* Negative cache sentinel: tid set but no sync_handle = known bad. */
-        if (!entry->sync_handle) return NULL;
-        /* Stale positive — object was invalidated, retry. */
-        nspa_clear_cache_entry( entry );
+        /* Positive cache: mapped_ptr holds the peer's ring mmap. */
+        if (entry->mapped_ptr) return entry;
+        /* Negative cache: tid set, mapped_ptr NULL (server had no bypass). */
+        return NULL;
     }
 
     if (!nspa_populate_cache_entry( tid, entry ))
     {
         /* Leave a negative-cache sentinel so we don't retry on every post. */
-        entry->tid           = tid;
-        entry->sync_handle   = NULL;
-        entry->object_id     = 0;
-        entry->object_offset = 0;
+        entry->tid         = tid;
+        entry->sync_handle = NULL;
+        entry->mapped_ptr  = NULL;
+        entry->mapped_size = 0;
         return NULL;
     }
     return entry;

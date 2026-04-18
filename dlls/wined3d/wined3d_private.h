@@ -3646,8 +3646,11 @@ enum wined3d_cs_queue_id
 #define WINED3D_CS_SPIN_COUNT           2000u
 /* How long to wait for commands when there are active queries, in µs. */
 #define WINED3D_CS_COMMAND_WAIT_WITH_QUERIES_TIMEOUT 100
-/* How long to wait for the CS from the client thread, in µs. */
-#define WINED3D_CS_CLIENT_WAIT_TIMEOUT  0
+/* How long to wait for the CS from the client thread, in µs.
+ * Was 0 (yield-only); under SCHED_FIFO a yield to the same priority is a
+ * no-op, so the spin-then-yield path starved a SCHED_OTHER wined3d CS
+ * worker sharing the CPU. 100µs lets the worker actually run. */
+#define WINED3D_CS_CLIENT_WAIT_TIMEOUT  100
 #define WINED3D_CS_QUEUE_MASK           (WINED3D_CS_QUEUE_SIZE - 1)
 
 C_ASSERT(!(WINED3D_CS_QUEUE_SIZE & (WINED3D_CS_QUEUE_SIZE - 1)));

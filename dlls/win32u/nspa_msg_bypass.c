@@ -516,6 +516,17 @@ static void nspa_own_tls_init_once( void )
     pthread_key_create( &nspa_own_tls_key, nspa_own_tls_destructor );
 }
 
+static int nspa_own_bootstrap_enabled( void )
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *v = getenv( "NSPA_ENABLE_OWN_BOOTSTRAP" );
+        cached = (v && *v && *v != '0');
+    }
+    return cached;
+}
+
 static const nspa_queue_bypass_shm_t *nspa_get_own_bypass_shm( void )
 {
     const nspa_queue_bypass_shm_t *cached;
@@ -524,6 +535,19 @@ static const nspa_queue_bypass_shm_t *nspa_get_own_bypass_shm( void )
     int fd = -1;
     void *map = NULL;
     size_t map_size = sizeof(nspa_queue_bypass_shm_t);
+
+    /* OPT-IN: SEND-class bypass requires the caller's own reply ring to be
+     * allocated, which unlocks capturing ~75% more of the bypass attempts
+     * than POST-only Phase 3.  But the current dispatch path hits a 5 s
+     * send-timeout wall under Ableton's message rate — MainThread can't
+     * drain SEND-class ring slots fast enough before senders time out,
+     * producing a stale-slot retry storm that pegs MainThread's CPU.
+     *
+     * Root cause of that latency is under investigation.  Until resolved,
+     * this gate keeps Phase 4 infrastructure dormant — feature captures
+     * POST-class only (Phase 3 behaviour, validated).  Set
+     * NSPA_ENABLE_OWN_BOOTSTRAP=1 to opt in. */
+    if (!nspa_own_bootstrap_enabled()) return NULL;
 
     pthread_once( &nspa_own_tls_once, nspa_own_tls_init_once );
 

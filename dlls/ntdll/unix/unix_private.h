@@ -294,6 +294,23 @@ extern void init_startup_info(void);
  * dlls/ntdll/unix/thread.c. */
 extern void nspa_rt_set_cached_priocls( int cls );
 extern void nspa_rt_map_remove( HANDLE handle );
+
+/* NSPA local NT timer dispatcher (dlls/ntdll/unix/nspa_local_timer.c).
+ * Each entry point returns STATUS_NOT_IMPLEMENTED when the feature gate is
+ * off or the handle is not a managed timer, signalling the caller to fall
+ * through to the server path. */
+extern NTSTATUS nspa_local_timer_create( HANDLE *handle, ACCESS_MASK access,
+                                         const OBJECT_ATTRIBUTES *attr,
+                                         TIMER_TYPE timer_type );
+extern NTSTATUS nspa_local_timer_set( HANDLE handle, const LARGE_INTEGER *when,
+                                      PTIMER_APC_ROUTINE callback, void *arg,
+                                      ULONG period, BOOLEAN *previous_state );
+extern NTSTATUS nspa_local_timer_cancel( HANDLE handle, BOOLEAN *previous_state );
+extern NTSTATUS nspa_local_timer_query( HANDLE handle, TIMER_BASIC_INFORMATION *info );
+extern void     nspa_local_timer_close( HANDLE handle );
+extern NTSTATUS nspa_local_timer_check_duplicate( HANDLE source_handle, HANDLE source_process,
+                                                  HANDLE target_process );
+extern NTSTATUS nspa_local_timer_register_duplicate( HANDLE source_handle, HANDLE new_handle );
 extern void *create_startup_info( const UNICODE_STRING *nt_image, ULONG process_flags,
                                   const RTL_USER_PROCESS_PARAMETERS *params,
                                   const struct pe_image_info *pe_info, DWORD *info_size );

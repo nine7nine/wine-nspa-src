@@ -56,6 +56,7 @@ SOURCES = \
 	unix/io_uring.c \
 	unix/loader.c \
 	unix/loadorder.c \
+	unix/nspa_local_timer.c \
 	unix/process.c \
 	unix/registry.c \
 	unix/security.c \

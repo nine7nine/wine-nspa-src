@@ -63,6 +63,18 @@ extern BOOL nspa_try_pop_own_ring_send( HWND filter_hwnd, UINT first, UINT last,
                                         DWORD *time_out, UINT *sender_tid_out,
                                         UINT *reply_slot_out, HWND *win_out );
 
+/* NSPA Phase B — local WM_TIMER dispatcher (dlls/win32u/nspa_local_wm_timer.c).
+ * STATUS_NOT_IMPLEMENTED on any entry point means "caller falls through to
+ * the server path" (id=0, cross-process hwnd, or gate off). */
+extern NTSTATUS nspa_local_wm_timer_set( HWND hwnd, UINT_PTR id, UINT timeout,
+                                         UINT msg, WNDPROC winproc,
+                                         UINT_PTR *out_id );
+extern NTSTATUS nspa_local_wm_timer_kill( HWND hwnd, UINT_PTR id, UINT msg );
+extern BOOL     nspa_try_pop_own_timer_ring( HWND filter_hwnd, UINT first, UINT last,
+                                             HWND *out_hwnd, UINT *out_msg,
+                                             WPARAM *out_wparam, LPARAM *out_lparam,
+                                             DWORD *out_time );
+
 /* message.c — exposed so nspa_msg_bypass.c can wait on our own queue sync. */
 extern HANDLE nspa_get_own_server_queue_handle( void );
 extern void   nspa_process_sent_messages( void );

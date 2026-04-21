@@ -3022,6 +3022,31 @@ static int peek_message( MSG *msg, const struct peek_message_filter *filter )
                                                       &pop_wp, &pop_lp,
                                                       &pop_time, &pop_sender,
                                                       &pop_slot, &pop_win );
+            /* NSPA Phase B: if no SEND was popped and the filter admits
+             * WM_TIMER, try the local-dispatcher timer ring before
+             * falling through to the wineserver get_message RTT. */
+            if (!popped && (signal_bits & QS_TIMER))
+            {
+                HWND  tim_hwnd;
+                UINT  tim_msg;
+                WPARAM tim_wp;
+                LPARAM tim_lp;
+                DWORD tim_time;
+                if (nspa_try_pop_own_timer_ring( hwnd, first, last,
+                                                 &tim_hwnd, &tim_msg,
+                                                 &tim_wp, &tim_lp, &tim_time ))
+                {
+                    pop_type   = MSG_POSTED;
+                    pop_msg    = tim_msg;
+                    pop_win    = tim_hwnd;
+                    pop_wp     = tim_wp;
+                    pop_lp     = tim_lp;
+                    pop_time   = tim_time;
+                    pop_sender = 0;
+                    pop_slot   = 0;
+                    popped     = TRUE;
+                }
+            }
             if (popped)
             {
                 res                   = STATUS_SUCCESS;
@@ -4596,6 +4621,19 @@ UINT_PTR WINAPI NtUserSetTimer( HWND hwnd, UINT_PTR id, UINT timeout, TIMERPROC 
 
     timeout = min( max( USER_TIMER_MINIMUM, timeout ), USER_TIMER_MAXIMUM );
 
+    /* NSPA Phase B: try the local WM_TIMER dispatcher first.  Returns
+     * STATUS_NOT_IMPLEMENTED for id=0, cross-process hwnd, or gate off —
+     * fall through to the server path in those cases. */
+    {
+        UINT_PTR local_id = 0;
+        NTSTATUS st = nspa_local_wm_timer_set( hwnd, id, timeout, WM_TIMER, winproc, &local_id );
+        if (st == STATUS_SUCCESS)
+        {
+            TRACE( "[nspa] Added %p %lx %p timeout %d\n", hwnd, (long)id, winproc, timeout );
+            return local_id;
+        }
+    }
+
     SERVER_START_REQ( set_win_timer )
     {
         req->win    = wine_server_user_handle( hwnd );
@@ -4627,6 +4665,13 @@ UINT_PTR WINAPI NtUserSetSystemTimer( HWND hwnd, UINT_PTR id, UINT timeout )
 
     timeout = min( max( USER_TIMER_MINIMUM, timeout ), USER_TIMER_MAXIMUM );
 
+    /* NSPA Phase B: local dispatch path (same as NtUserSetTimer). */
+    {
+        UINT_PTR local_id = 0;
+        NTSTATUS st = nspa_local_wm_timer_set( hwnd, id, timeout, WM_SYSTIMER, 0, &local_id );
+        if (st == STATUS_SUCCESS) return local_id;
+    }
+
     SERVER_START_REQ( set_win_timer )
     {
         req->win    = wine_server_user_handle( hwnd );
@@ -4653,6 +4698,12 @@ BOOL WINAPI NtUserKillTimer( HWND hwnd, UINT_PTR id )
 {
     BOOL ret;
 
+    /* NSPA Phase B: if this is one of ours, remove locally.  Any
+     * slot already published to the ring stays READY and will be
+     * drained by peek_message — NT guarantees delivery of WM_TIMER
+     * already queued at KillTimer time. */
+    if (nspa_local_wm_timer_kill( hwnd, id, WM_TIMER ) == STATUS_SUCCESS) return TRUE;
+
     SERVER_START_REQ( kill_win_timer )
     {
         req->win = wine_server_user_handle( hwnd );
@@ -4670,6 +4721,9 @@ BOOL WINAPI NtUserKillTimer( HWND hwnd, UINT_PTR id )
 BOOL WINAPI NtUserKillSystemTimer( HWND hwnd, UINT_PTR id )
 {
     BOOL ret;
+
+    /* NSPA Phase B: same routing as NtUserKillTimer for WM_SYSTIMER. */
+    if (nspa_local_wm_timer_kill( hwnd, id, WM_SYSTIMER ) == STATUS_SUCCESS) return TRUE;
 
     SERVER_START_REQ( kill_win_timer )
     {

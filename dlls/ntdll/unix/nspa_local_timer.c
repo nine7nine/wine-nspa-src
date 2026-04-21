@@ -150,6 +150,13 @@ static void init_table_buckets(void)
 static inline BOOL nspa_local_timers_active(void)
 {
     pthread_once( &gate_once, init_feature_gate );
+    /* Ensure the hash buckets are initialised before any entry point
+     * runs find_entry().  Without this, NtClose -> nspa_local_timer_close
+     * can reach find_entry() before any NtCreateTimer ever did — the
+     * buckets would be zero memory and LIST_FOR_EACH_ENTRY would deref
+     * a NULL next pointer on the first handle passed through close. */
+    if (nspa_local_timers_enabled == 1)
+        pthread_once( &table_once, init_table_buckets );
     return nspa_local_timers_enabled == 1;
 }
 

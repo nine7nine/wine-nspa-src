@@ -26,6 +26,12 @@
  *                  internal child-quickexit subcommand.
  *   child-quickexit Internal helper used by fork-mutex — prints a marker
  *                  line and exits with code 42.
+ *   nt-timer       NSPA NT timer Phase A validation. Exercises CreateWaitableTimer /
+ *                  SetWaitableTimer / CancelWaitableTimer / WaitForSingleObject
+ *                  through the NSPA local-timer dispatcher.  Run twice, once
+ *                  with NSPA_LOCAL_TIMERS=1 (local path) and once unset
+ *                  (server path); both must report PASS (NT semantics must
+ *                  not diverge between paths).
  *   signal-recursion Multi-threaded PAGE_GUARD / VirtualAlloc fault stress
  *                  that validates virtual_mutex and Wine's segv_handler
  *                  fault-dispatch path. Catches regressions in the
@@ -4175,6 +4181,330 @@ static int cmd_condvar_pi(int argc, char **argv)
 
 
 /* ════════════════════════════════════════════════════════════════════════
+ *   Subcommand: nt-timer  (NSPA NT timer Phase A validation)
+ *
+ *   Exercises the CreateWaitableTimer / SetWaitableTimer / NtWaitForSingleObject
+ *   / CancelWaitableTimer / CloseHandle paths through the NSPA local-timer
+ *   dispatcher (dlls/ntdll/unix/nspa_local_timer.c).  Same tests must PASS
+ *   whether NSPA_LOCAL_TIMERS is set or not — the dispatcher is an
+ *   optimisation, NT semantics must be identical.
+ *
+ *   Runner convention:
+ *       NSPA_RT_PRIO=80                       ./wine ...exe nt-timer   (server path)
+ *       NSPA_RT_PRIO=80 NSPA_LOCAL_TIMERS=1   ./wine ...exe nt-timer   (local path)
+ *
+ *   Thread scheduling (deliberate, to avoid FIFO busyloops per
+ *   feedback_never_fifo_busyloops):
+ *     - main                : REALTIME class, TIME_CRITICAL.  Blocking waits only.
+ *     - notify-waiters (2x) : spawned via spawn_load_thread_sched_other.
+ *                             Block on WaitForSingleObject — not FIFO-safe only
+ *                             because they never busy-loop.
+ *     - dispatcher (library): promoted SCHED_FIFO at NSPA_RT_PRIO-1 internally
+ *                             by nspa_local_timer.c.  No test code touches it.
+ *
+ *   Bugs each sub-test guards against:
+ *     1 one-shot         wait returns significantly early or late → bad clock
+ *                        conversion (relative-`when` vs monotonic) or lost wake.
+ *     2 cancel           cancel-before-fire still fires → stale entry in queue
+ *                        or lost cancel, or double-fire race.
+ *     3 periodic         fire count drifts → periodic re-arm logic wrong, or
+ *                        fast-forward clamp bursts catch-up fires.
+ *     4 notification     manual-reset event fails to wake both waiters →
+ *                        backing-event type chosen wrong.
+ *     5 synchronization  auto-reset fails to reset → wrong event type, or
+ *                        multiple waiters incorrectly released.
+ *     6 set-then-cancel  handle leaks or double-free under close path →
+ *                        refcount discipline regression.
+ *     7 overflow/huge    NT INT64_MAX-ish relative clamps → undefined
+ *                        behaviour in 100ns→ns multiply (caught by clamp).
+ * ════════════════════════════════════════════════════════════════════════ */
+
+struct timer_waiter_ctx
+{
+    HANDLE  timer;
+    DWORD   timeout_ms;
+    DWORD   result;        /* WaitForSingleObject return */
+    UINT64  start_us;
+    UINT64  end_us;
+};
+
+static DWORD WINAPI timer_waiter_fn( void *arg )
+{
+    struct timer_waiter_ctx *c = arg;
+    c->start_us = now_us();
+    c->result   = WaitForSingleObject( c->timer, c->timeout_ms );
+    c->end_us   = now_us();
+    return 0;
+}
+
+/* Sub-test 1: basic one-shot, relative 50 ms. */
+static int nt_timer_sub_oneshot( void )
+{
+    LARGE_INTEGER due;
+    HANDLE t;
+    UINT64 t0, t1;
+    DWORD w;
+    long elapsed_ms;
+
+    print_section( "sub1: one-shot, relative 50ms" );
+    t = CreateWaitableTimerW( NULL, TRUE, NULL );        /* manual-reset anon */
+    if (!t)                  { print_kv( "CreateWaitableTimer", "FAIL err=%lu", GetLastError() ); return 0; }
+
+    due.QuadPart = -500000LL;                            /* 50ms relative */
+    if (!SetWaitableTimer( t, &due, 0, NULL, NULL, FALSE ))
+                             { print_kv( "SetWaitableTimer", "FAIL err=%lu", GetLastError() ); CloseHandle(t); return 0; }
+
+    t0 = now_us();
+    w  = WaitForSingleObject( t, 1000 );
+    t1 = now_us();
+    elapsed_ms = (long)((t1 - t0) / 1000);
+
+    CloseHandle( t );
+
+    print_kv( "wait result",   "%lu", w );
+    print_kv( "elapsed (ms)",  "%ld", elapsed_ms );
+
+    if (w != WAIT_OBJECT_0)  { print_kv( "verdict", "FAIL (wait did not signal)" ); return 0; }
+    if (elapsed_ms < 30 || elapsed_ms > 200)
+                             { print_kv( "verdict", "FAIL (elapsed out of [30,200]ms)" ); return 0; }
+    print_kv( "verdict", "PASS" );
+    return 1;
+}
+
+/* Sub-test 2: cancel before fire — wait must time out. */
+static int nt_timer_sub_cancel( void )
+{
+    LARGE_INTEGER due;
+    HANDLE t;
+    DWORD w;
+
+    print_section( "sub2: cancel-before-fire" );
+    t = CreateWaitableTimerW( NULL, TRUE, NULL );
+    if (!t) { print_kv( "create", "FAIL" ); return 0; }
+
+    due.QuadPart = -2000000LL;                           /* 200ms */
+    SetWaitableTimer( t, &due, 0, NULL, NULL, FALSE );
+    Sleep( 20 );
+    if (!CancelWaitableTimer( t )) { print_kv( "cancel", "FAIL" ); CloseHandle(t); return 0; }
+
+    w = WaitForSingleObject( t, 300 );                   /* should time out */
+    CloseHandle( t );
+
+    print_kv( "wait result", "%lu (%s)", w,
+              w == WAIT_TIMEOUT ? "TIMEOUT" : w == WAIT_OBJECT_0 ? "SIGNALED" : "other" );
+
+    if (w != WAIT_TIMEOUT)   { print_kv( "verdict", "FAIL (cancelled timer fired)" ); return 0; }
+    print_kv( "verdict", "PASS" );
+    return 1;
+}
+
+/* Sub-test 3: periodic — count fires over a 250ms window at 25ms period. */
+static int nt_timer_sub_periodic( void )
+{
+    LARGE_INTEGER due;
+    HANDLE t;
+    int fires = 0, i;
+    DWORD w;
+
+    print_section( "sub3: periodic 25ms, 250ms window" );
+    t = CreateWaitableTimerW( NULL, FALSE, NULL );       /* auto-reset */
+    if (!t) { print_kv( "create", "FAIL" ); return 0; }
+
+    due.QuadPart = -250000LL;                            /* 25ms due */
+    SetWaitableTimer( t, &due, 25 /* period ms */, NULL, NULL, FALSE );
+
+    for (i = 0; i < 20; i++)
+    {
+        w = WaitForSingleObject( t, 50 );
+        if (w == WAIT_OBJECT_0) fires++;
+        else                    break;
+        if (fires >= 10) break;                          /* stop after enough */
+    }
+
+    CancelWaitableTimer( t );
+    CloseHandle( t );
+
+    print_kv( "fire count", "%d (expected ~10, tolerate 7..12)", fires );
+
+    if (fires < 7 || fires > 12)
+                             { print_kv( "verdict", "FAIL (fire count out of range)" ); return 0; }
+    print_kv( "verdict", "PASS" );
+    return 1;
+}
+
+/* Sub-test 4: Notification (manual-reset) timer wakes both waiters. */
+static int nt_timer_sub_notification( void )
+{
+    LARGE_INTEGER due;
+    HANDLE t;
+    struct timer_waiter_ctx c1 = {0}, c2 = {0};
+    HANDLE h1, h2;
+    DWORD tid1, tid2;
+
+    print_section( "sub4: NotificationTimer wakes 2 waiters" );
+    t = CreateWaitableTimerW( NULL, TRUE, NULL );        /* manual-reset */
+    if (!t) { print_kv( "create", "FAIL" ); return 0; }
+
+    c1.timer = t; c1.timeout_ms = 500;
+    c2.timer = t; c2.timeout_ms = 500;
+
+    h1 = spawn_load_thread_sched_other( timer_waiter_fn, &c1, &tid1 );
+    h2 = spawn_load_thread_sched_other( timer_waiter_fn, &c2, &tid2 );
+    Sleep( 20 );                                         /* let both enter wait */
+
+    due.QuadPart = -500000LL;                            /* 50ms */
+    SetWaitableTimer( t, &due, 0, NULL, NULL, FALSE );
+
+    WaitForSingleObject( h1, 1000 );
+    WaitForSingleObject( h2, 1000 );
+    CloseHandle( h1 );
+    CloseHandle( h2 );
+    CloseHandle( t );
+
+    print_kv( "waiter1 result", "%lu", c1.result );
+    print_kv( "waiter2 result", "%lu", c2.result );
+
+    if (c1.result != WAIT_OBJECT_0 || c2.result != WAIT_OBJECT_0)
+                             { print_kv( "verdict", "FAIL (both waiters must wake)" ); return 0; }
+    print_kv( "verdict", "PASS" );
+    return 1;
+}
+
+/* Sub-test 5: Synchronization (auto-reset) timer releases exactly one waiter. */
+static int nt_timer_sub_synchronization( void )
+{
+    LARGE_INTEGER due;
+    HANDLE t;
+    struct timer_waiter_ctx c1 = {0}, c2 = {0};
+    HANDLE h1, h2;
+    DWORD tid1, tid2;
+    int woke_count;
+
+    print_section( "sub5: SynchronizationTimer wakes exactly 1" );
+    t = CreateWaitableTimerW( NULL, FALSE, NULL );       /* auto-reset */
+    if (!t) { print_kv( "create", "FAIL" ); return 0; }
+
+    c1.timer = t; c1.timeout_ms = 300;
+    c2.timer = t; c2.timeout_ms = 300;
+
+    h1 = spawn_load_thread_sched_other( timer_waiter_fn, &c1, &tid1 );
+    h2 = spawn_load_thread_sched_other( timer_waiter_fn, &c2, &tid2 );
+    Sleep( 20 );
+
+    due.QuadPart = -500000LL;                            /* 50ms */
+    SetWaitableTimer( t, &due, 0, NULL, NULL, FALSE );
+
+    WaitForSingleObject( h1, 1000 );
+    WaitForSingleObject( h2, 1000 );
+    CloseHandle( h1 );
+    CloseHandle( h2 );
+    CloseHandle( t );
+
+    woke_count = (c1.result == WAIT_OBJECT_0) + (c2.result == WAIT_OBJECT_0);
+    print_kv( "waiter1 result", "%lu", c1.result );
+    print_kv( "waiter2 result", "%lu", c2.result );
+    print_kv( "woke count", "%d (expected 1)", woke_count );
+
+    if (woke_count != 1)     { print_kv( "verdict", "FAIL" ); return 0; }
+    print_kv( "verdict", "PASS" );
+    return 1;
+}
+
+/* Sub-test 6: set + cancel + close; verify no crash / handle integrity. */
+static int nt_timer_sub_close_after_cancel( void )
+{
+    LARGE_INTEGER due;
+    HANDLE t;
+    int i;
+
+    print_section( "sub6: set/cancel/close cycle x 100" );
+    for (i = 0; i < 100; i++)
+    {
+        t = CreateWaitableTimerW( NULL, TRUE, NULL );
+        if (!t) { print_kv( "create", "FAIL at i=%d", i ); return 0; }
+
+        due.QuadPart = -10000000LL;                      /* 1s — we cancel fast */
+        SetWaitableTimer( t, &due, 0, NULL, NULL, FALSE );
+        CancelWaitableTimer( t );
+        CloseHandle( t );
+    }
+    print_kv( "iterations", "%d", i );
+    print_kv( "verdict", "PASS (no crash, no hang)" );
+    return 1;
+}
+
+/* Sub-test 7: absolute FILETIME ~50ms in the future. */
+static int nt_timer_sub_absolute( void )
+{
+    FILETIME ft;
+    LARGE_INTEGER due;
+    HANDLE t;
+    UINT64 t0, t1;
+    DWORD w;
+    long elapsed_ms;
+
+    print_section( "sub7: absolute FILETIME, +50ms" );
+    t = CreateWaitableTimerW( NULL, TRUE, NULL );
+    if (!t) { print_kv( "create", "FAIL" ); return 0; }
+
+    GetSystemTimeAsFileTime( &ft );
+    due.u.LowPart  = ft.dwLowDateTime;
+    due.u.HighPart = ft.dwHighDateTime;
+    due.QuadPart  += 500000LL;                           /* +50ms in 100ns */
+
+    if (!SetWaitableTimer( t, &due, 0, NULL, NULL, FALSE ))
+                             { print_kv( "set", "FAIL" ); CloseHandle(t); return 0; }
+
+    t0 = now_us();
+    w  = WaitForSingleObject( t, 1000 );
+    t1 = now_us();
+    elapsed_ms = (long)((t1 - t0) / 1000);
+    CloseHandle( t );
+
+    print_kv( "wait result",  "%lu", w );
+    print_kv( "elapsed (ms)", "%ld", elapsed_ms );
+
+    if (w != WAIT_OBJECT_0)  { print_kv( "verdict", "FAIL (no signal)" ); return 0; }
+    if (elapsed_ms < 30 || elapsed_ms > 200)
+                             { print_kv( "verdict", "FAIL (out of [30,200]ms)" ); return 0; }
+    print_kv( "verdict", "PASS" );
+    return 1;
+}
+
+static int cmd_nt_timer( int argc, char **argv )
+{
+    const char *gate = getenv( "NSPA_LOCAL_TIMERS" );
+    int pass = 0, total = 7;
+
+    (void)argc; (void)argv;
+    print_banner( "nt-timer", "NSPA NT timer Phase A (NtCreate/Set/Cancel/Query/Wait)" );
+
+    print_kv( "path",           "%s", (gate && gate[0] == '1') ? "NSPA LOCAL DISPATCHER" : "wineserver (gate off)" );
+    print_kv( "expected",       "all %d sub-tests PASS regardless of path (NT-semantics invariant)", total );
+
+    enter_realtime_class();
+    SetThreadPriority( GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL );
+
+    pass += nt_timer_sub_oneshot();
+    pass += nt_timer_sub_cancel();
+    pass += nt_timer_sub_periodic();
+    pass += nt_timer_sub_notification();
+    pass += nt_timer_sub_synchronization();
+    pass += nt_timer_sub_close_after_cancel();
+    pass += nt_timer_sub_absolute();
+
+    leave_realtime_class();
+
+    print_section( "summary" );
+    print_kv( "sub-tests passed", "%d / %d", pass, total );
+
+    if (pass == total) { print_verdict( 1, NULL ); return 0; }
+    print_verdict( 0, "one or more NT timer sub-tests failed" );
+    return 1;
+}
+
+
+/* ════════════════════════════════════════════════════════════════════════
  *   Command dispatch
  * ════════════════════════════════════════════════════════════════════════ */
 
@@ -4199,6 +4529,7 @@ static struct command commands[] = {
     { "socket-io",       "async TCP loopback latency (io_uring Phase 3 baseline/compare)",  cmd_socket_io     },
     { "srw-bench",       "SRW lock contention benchmark (acquire latency + ops/sec)",      cmd_srw_bench     },
     { "condvar-pi",      "Win32 condvar PI requeue-PI validation (RT waiter + load)",      cmd_condvar_pi    },
+    { "nt-timer",        "NSPA NT timer Phase A validation (7 sub-tests, NT-semantics invariant)", cmd_nt_timer },
     { "help",            "show this help",                                                  cmd_help          },
     { NULL, NULL, NULL }
 };

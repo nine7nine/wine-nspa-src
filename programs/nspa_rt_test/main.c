@@ -4505,6 +4505,238 @@ static int cmd_nt_timer( int argc, char **argv )
 
 
 /* ════════════════════════════════════════════════════════════════════════
+ *   Subcommand: wm-timer  (NSPA WM_TIMER Phase B validation)
+ *
+ *   Exercises user32::SetTimer / KillTimer / WM_TIMER delivery through
+ *   the NSPA local WM_TIMER dispatcher (dlls/win32u/nspa_local_wm_timer.c).
+ *   Same tests must PASS on both server path (NSPA_LOCAL_WM_TIMERS unset)
+ *   and local path (NSPA_LOCAL_WM_TIMERS=1) — Phase B is an optimisation,
+ *   NT semantics must not diverge.
+ *
+ *   Critical NT semantic covered: WM_TIMER coalescing.  If the message
+ *   pump stalls across N periods, the app sees ONE WM_TIMER, not N.
+ *   This is the single most likely place a naive local implementation
+ *   regresses — the coalescing sub-test is the fire drill.
+ *
+ *   Thread scheduling: main thread only.  Message-only window under
+ *   HWND_MESSAGE; PeekMessageW pump drives delivery.  No auxiliary
+ *   worker threads (single-threaded event flow is easier to reason
+ *   about for WM_TIMER ordering).
+ *
+ *   Bugs each sub-test guards against:
+ *     1 periodic     basic re-arm broken / wrong period
+ *     2 kill         stale entry in ring after kill / server both paths
+ *     3 coalesce     stalled pump does NOT see N catchup WM_TIMERs
+ *     4 re-arm       same id, new rate — old arm must be replaced
+ *     5 id=0         falls through to server (server generates id)
+ * ════════════════════════════════════════════════════════════════════════ */
+
+#ifndef WM_SYSTIMER
+#define WM_SYSTIMER 0x0118         /* private to server/user32 — not in mingw headers */
+#endif
+
+static const WCHAR WM_TIMER_TEST_CLASS[] = { 'N','S','P','A','_','W','M','_','T','I','M','E','R',0 };
+
+static HWND wm_timer_create_window( void )
+{
+    WNDCLASSEXW wc = {0};
+    ATOM cls;
+    HWND hwnd;
+
+    wc.cbSize        = sizeof(wc);
+    wc.lpfnWndProc   = DefWindowProcW;
+    wc.hInstance     = GetModuleHandleW( NULL );
+    wc.lpszClassName = WM_TIMER_TEST_CLASS;
+
+    cls = RegisterClassExW( &wc );
+    (void)cls;                                       /* ERROR_CLASS_ALREADY_EXISTS is fine */
+
+    hwnd = CreateWindowExW( 0, WM_TIMER_TEST_CLASS, WM_TIMER_TEST_CLASS, 0,
+                            0, 0, 0, 0, HWND_MESSAGE, NULL,
+                            GetModuleHandleW( NULL ), NULL );
+    return hwnd;
+}
+
+/* Pump for up to `window_ms`, counting WM_TIMER / WM_SYSTIMER messages
+ * matching `target_id` (0 = any).  Does not dispatch — just counts. */
+static int wm_timer_pump_count( HWND hwnd, DWORD window_ms, UINT_PTR target_id )
+{
+    UINT64 end = now_us() + window_ms * 1000ULL;
+    MSG msg;
+    int count = 0;
+
+    while (now_us() < end)
+    {
+        while (PeekMessageW( &msg, hwnd, 0, 0, PM_REMOVE ))
+        {
+            if ((msg.message == WM_TIMER || msg.message == WM_SYSTIMER) &&
+                (!target_id || msg.wParam == target_id))
+                count++;
+        }
+        Sleep( 1 );
+    }
+    return count;
+}
+
+/* Sub-test 1: basic periodic — 50ms rate, 250ms window, expect ~5. */
+static int wm_timer_sub_periodic( HWND hwnd )
+{
+    int count;
+
+    print_section( "wm1: periodic 50ms, 250ms window" );
+    if (!SetTimer( hwnd, 1, 50, NULL )) { print_kv( "SetTimer", "FAIL" ); return 0; }
+
+    count = wm_timer_pump_count( hwnd, 250, 1 );
+    KillTimer( hwnd, 1 );
+
+    print_kv( "WM_TIMER count", "%d (expected 3..7)", count );
+    if (count < 3 || count > 7) { print_kv( "verdict", "FAIL" ); return 0; }
+    print_kv( "verdict", "PASS" );
+    return 1;
+}
+
+/* Sub-test 2: kill before repeat — arm, pump briefly, kill, then pump
+ * and verify no more fires (at most one in-flight from before the kill). */
+static int wm_timer_sub_kill( HWND hwnd )
+{
+    int pre, post;
+
+    print_section( "wm2: kill stops future fires" );
+    if (!SetTimer( hwnd, 2, 20, NULL )) { print_kv( "SetTimer", "FAIL" ); return 0; }
+    pre = wm_timer_pump_count( hwnd, 80, 2 );       /* expect 2..4 */
+    KillTimer( hwnd, 2 );
+    post = wm_timer_pump_count( hwnd, 100, 2 );     /* expect 0..1 in-flight */
+
+    print_kv( "pre-kill count",  "%d", pre );
+    print_kv( "post-kill count", "%d (expected 0..1)", post );
+    if (post > 1) { print_kv( "verdict", "FAIL (fires after KillTimer)" ); return 0; }
+    print_kv( "verdict", "PASS" );
+    return 1;
+}
+
+/* Sub-test 3: coalescing — set 10ms timer, busy (don't pump) for 60ms,
+ * THEN pump and expect exactly one WM_TIMER.  This is the NT semantic
+ * server implements via the pending/expired list and that a naive
+ * local dispatcher will violate by delivering N catchup messages. */
+static int wm_timer_sub_coalesce( HWND hwnd )
+{
+    int count;
+    UINT64 busy_end;
+
+    print_section( "wm3: coalescing — stalled pump sees 1 WM_TIMER" );
+    if (!SetTimer( hwnd, 3, 10, NULL )) { print_kv( "SetTimer", "FAIL" ); return 0; }
+
+    /* Busy-wait without pumping for 60ms (6 periods). */
+    busy_end = now_us() + 60 * 1000;
+    while (now_us() < busy_end) { /* no PeekMessage */ }
+
+    /* Now pump very briefly — just drain once. */
+    {
+        MSG msg;
+        count = 0;
+        while (PeekMessageW( &msg, hwnd, 0, 0, PM_REMOVE ))
+            if ((msg.message == WM_TIMER || msg.message == WM_SYSTIMER) && msg.wParam == 3) count++;
+    }
+    KillTimer( hwnd, 3 );
+
+    print_kv( "WM_TIMER count", "%d (expected 1 — NT coalescing)", count );
+    if (count != 1) { print_kv( "verdict", "FAIL (coalescing regression)" ); return 0; }
+    print_kv( "verdict", "PASS" );
+    return 1;
+}
+
+/* Sub-test 4: re-arm same id with a different rate.  The old arm must
+ * be replaced; firing after re-arm happens at the new rate. */
+static int wm_timer_sub_rearm( HWND hwnd )
+{
+    int count_slow, count_fast;
+
+    print_section( "wm4: re-arm same id changes rate" );
+    if (!SetTimer( hwnd, 4, 100, NULL )) { print_kv( "SetTimer(slow)", "FAIL" ); return 0; }
+    count_slow = wm_timer_pump_count( hwnd, 50, 4 );   /* 50ms window, rate=100ms => 0 */
+
+    if (!SetTimer( hwnd, 4, 10, NULL ))  { print_kv( "SetTimer(fast)", "FAIL" ); return 0; }
+    count_fast = wm_timer_pump_count( hwnd, 100, 4 );  /* 100ms window, rate=10ms => ~10 */
+
+    KillTimer( hwnd, 4 );
+
+    print_kv( "slow-rate fires (50ms,rate=100)", "%d (expected 0)", count_slow );
+    print_kv( "fast-rate fires (100ms,rate=10)", "%d (expected 5..15)", count_fast );
+    if (count_slow > 1 || count_fast < 5 || count_fast > 15)
+    { print_kv( "verdict", "FAIL" ); return 0; }
+    print_kv( "verdict", "PASS" );
+    return 1;
+}
+
+/* Sub-test 5: id=0 with non-NULL hwnd falls through to server — NSPA
+ * local path returns STATUS_NOT_IMPLEMENTED.  Per Win32 semantics the
+ * returned value is 0 when the server stores id=0 (SetTimer docs:
+ * hwnd != NULL keeps the caller-supplied id; auto-generation only
+ * applies when hwnd is NULL).  Verify:
+ *   - SetTimer returns non-zero (1 on current Wine via !ret fallback)
+ *   - WM_TIMER arrives (wParam is whatever server stamped; don't
+ *     filter on it — we just want to see one message)
+ *   - KillTimer(hwnd, 0) unwinds cleanly */
+static int wm_timer_sub_id_zero_fallthrough( HWND hwnd )
+{
+    UINT_PTR id;
+    int count;
+
+    print_section( "wm5: id=0 falls through to server" );
+    id = SetTimer( hwnd, 0, 50, NULL );
+    if (!id) { print_kv( "SetTimer(id=0)", "FAIL" ); return 0; }
+    print_kv( "SetTimer return",   "0x%lx", (unsigned long)id );
+
+    /* Don't filter by id — server stamps the WM_TIMER wParam with the
+     * server-side timer->id, which for the hwnd-supplied id=0 case is
+     * also 0.  Accept any WM_TIMER in the pump window. */
+    count = wm_timer_pump_count( hwnd, 150, 0 );
+    KillTimer( hwnd, 0 );
+
+    print_kv( "any WM_TIMER count", "%d (expected >=1)", count );
+    if (count < 1) { print_kv( "verdict", "FAIL" ); return 0; }
+    print_kv( "verdict", "PASS" );
+    return 1;
+}
+
+static int cmd_wm_timer( int argc, char **argv )
+{
+    const char *gate = getenv( "NSPA_LOCAL_WM_TIMERS" );
+    HWND hwnd;
+    int pass = 0, total = 5;
+
+    (void)argc; (void)argv;
+    print_banner( "wm-timer", "NSPA WM_TIMER Phase B (SetTimer/KillTimer/WM_TIMER)" );
+    print_kv( "path",     "%s", (gate && gate[0] == '1') ? "NSPA LOCAL DISPATCHER" : "wineserver (gate off)" );
+    print_kv( "expected", "all %d sub-tests PASS regardless of path", total );
+
+    if (!(hwnd = wm_timer_create_window()))
+    {
+        print_verdict( 0, "CreateWindowExW failed — cannot test WM_TIMER" );
+        return 1;
+    }
+
+    enter_realtime_class();
+    SetThreadPriority( GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL );
+
+    pass += wm_timer_sub_periodic( hwnd );
+    pass += wm_timer_sub_kill( hwnd );
+    pass += wm_timer_sub_coalesce( hwnd );
+    pass += wm_timer_sub_rearm( hwnd );
+    pass += wm_timer_sub_id_zero_fallthrough( hwnd );
+
+    leave_realtime_class();
+    DestroyWindow( hwnd );
+
+    print_section( "summary" );
+    print_kv( "sub-tests passed", "%d / %d", pass, total );
+    if (pass == total) { print_verdict( 1, NULL ); return 0; }
+    print_verdict( 0, "one or more WM_TIMER sub-tests failed" );
+    return 1;
+}
+
+
+/* ════════════════════════════════════════════════════════════════════════
  *   Command dispatch
  * ════════════════════════════════════════════════════════════════════════ */
 
@@ -4530,6 +4762,7 @@ static struct command commands[] = {
     { "srw-bench",       "SRW lock contention benchmark (acquire latency + ops/sec)",      cmd_srw_bench     },
     { "condvar-pi",      "Win32 condvar PI requeue-PI validation (RT waiter + load)",      cmd_condvar_pi    },
     { "nt-timer",        "NSPA NT timer Phase A validation (7 sub-tests, NT-semantics invariant)", cmd_nt_timer },
+    { "wm-timer",        "NSPA WM_TIMER Phase B validation (5 sub-tests, coalescing+NT semantics)", cmd_wm_timer },
     { "help",            "show this help",                                                  cmd_help          },
     { NULL, NULL, NULL }
 };

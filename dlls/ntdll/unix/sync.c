@@ -2696,6 +2696,12 @@ NTSTATUS WINAPI NtCreateTimer( HANDLE *handle, ACCESS_MASK access, const OBJECT_
 
     *handle = 0;
     if (type != NotificationTimer && type != SynchronizationTimer) return STATUS_INVALID_PARAMETER;
+
+    /* NSPA: try the local timer dispatcher first.  Only anonymous timers
+     * eligible; STATUS_NOT_IMPLEMENTED falls through to the server path. */
+    ret = nspa_local_timer_create( handle, access, attr, type );
+    if (ret != STATUS_NOT_IMPLEMENTED) return ret;
+
     if ((ret = alloc_object_attributes( attr, &objattr, &len ))) return ret;
 
     SERVER_START_REQ( create_timer )
@@ -2751,6 +2757,14 @@ NTSTATUS WINAPI NtSetTimer( HANDLE handle, const LARGE_INTEGER *when, PTIMER_APC
 
     TRACE( "(%p,%p,%p,%p,%08x,0x%08x,%p)\n", handle, when, callback, arg, resume, period, state );
 
+    /* NSPA: local dispatcher if this is a managed timer. */
+    ret = nspa_local_timer_set( handle, when, callback, arg, period, state );
+    if (ret != STATUS_NOT_IMPLEMENTED)
+    {
+        if (resume && ret == STATUS_SUCCESS) return STATUS_TIMER_RESUME_IGNORED;
+        return ret;
+    }
+
     SERVER_START_REQ( set_timer )
     {
         req->handle   = wine_server_obj_handle( handle );
@@ -2777,6 +2791,10 @@ NTSTATUS WINAPI NtCancelTimer( HANDLE handle, BOOLEAN *state )
     unsigned int ret;
 
     TRACE( "handle %p, state %p\n", handle, state );
+
+    /* NSPA: local dispatcher if this is a managed timer. */
+    ret = nspa_local_timer_cancel( handle, state );
+    if (ret != STATUS_NOT_IMPLEMENTED) return ret;
 
     SERVER_START_REQ( cancel_timer )
     {
@@ -2805,6 +2823,16 @@ NTSTATUS WINAPI NtQueryTimer( HANDLE handle, TIMER_INFORMATION_CLASS class,
     {
     case TimerBasicInformation:
         if (len < sizeof(TIMER_BASIC_INFORMATION)) return STATUS_INFO_LENGTH_MISMATCH;
+
+        /* NSPA: local dispatcher if this is a managed timer.  The local
+         * path returns RemainingTime in the relative-negative-100ns shape
+         * the caller expects; skip the server conversion dance. */
+        ret = nspa_local_timer_query( handle, basic_info );
+        if (ret != STATUS_NOT_IMPLEMENTED)
+        {
+            if (ret_len) *ret_len = sizeof(TIMER_BASIC_INFORMATION);
+            return ret;
+        }
 
         SERVER_START_REQ( get_timer_info )
         {

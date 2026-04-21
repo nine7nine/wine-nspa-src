@@ -1079,10 +1079,44 @@ typedef volatile struct
     nspa_reply_slot_t slots[NSPA_REPLY_RING_SLOTS];
 } nspa_reply_ring_t;
 
+/* NSPA local-timer expiry ring.  Class-isolated co-located ring per the
+ * standing rule in project_msg_ring_class_isolated_pattern: WM_TIMER
+ * deliveries do not share the Send/Post ring's MPSC head CAS with app
+ * traffic; instead the per-process timer dispatcher is sole producer,
+ * and the queue-owning thread is sole consumer.  Head advance degenerates
+ * to a plain atomic store (no CAS contention with Send/Post) and the
+ * shape stages cleanly into the Vyukov v2 per-slot-seq redesign. */
+#define NSPA_TIMER_RING_SLOTS     64
+
+#define NSPA_TIMER_STATE_EMPTY    0
+#define NSPA_TIMER_STATE_WRITING  1
+#define NSPA_TIMER_STATE_READY    2
+#define NSPA_TIMER_STATE_CONSUMED 3
+
+typedef volatile struct
+{
+    unsigned int state;
+    user_handle_t win;
+    unsigned int  msg;
+    lparam_t      timer_id;
+    unsigned int  time;
+    unsigned int  __pad;
+} nspa_timer_slot_t;
+
+typedef volatile struct
+{
+    unsigned int head;
+    unsigned int tail;
+    unsigned int overflow;
+    unsigned int active;
+    nspa_timer_slot_t slots[NSPA_TIMER_RING_SLOTS];
+} nspa_timer_ring_t;
+
 typedef volatile struct
 {
     nspa_msg_ring_t      nspa_msg_ring;
     nspa_reply_ring_t    nspa_reply_ring;
+    nspa_timer_ring_t    nspa_timer_ring;
 } nspa_queue_bypass_shm_t;
 
 typedef volatile struct
@@ -7233,6 +7267,6 @@ union generic_reply
     struct nspa_ensure_own_bypass_reply nspa_ensure_own_bypass_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 936
+#define SERVER_PROTOCOL_VERSION 937
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

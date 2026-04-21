@@ -2297,6 +2297,12 @@ NTSTATUS WINAPI NtClose( HANDLE handle )
      * stale thread id. */
     nspa_rt_map_remove( handle );
 
+    /* NSPA: drop any local-timer entry for this handle before the server
+     * close runs.  No-op for non-timer handles.  Must run before server
+     * close so a racing NtSetTimer on the same handle value (post-recycle)
+     * can't reach a stale entry. */
+    nspa_local_timer_close( handle );
+
     if (is_client_handle( handle ))
     {
         server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );

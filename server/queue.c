@@ -1184,6 +1184,7 @@ static int nspa_alloc_bypass_shm( struct msg_queue *queue )
      * once the ring is live. */
     memset( map, 0, size );
     ((nspa_queue_bypass_shm_t *)map)->nspa_msg_ring.active = 1;
+    ((nspa_queue_bypass_shm_t *)map)->nspa_timer_ring.active = 1;
 
     queue->nspa_bypass_fd   = fd;
     queue->nspa_bypass_size = size;

@@ -625,6 +625,17 @@ const nspa_queue_bypass_shm_t *nspa_get_own_bypass_shm_public( void )
     return nspa_get_own_bypass_shm();
 }
 
+/* Public wrapper for the peer bypass-shm lookup.  NSPA Phase B
+ * (local WM_TIMER dispatcher) needs to publish expiries into the
+ * owner thread's ring when the owner is not the current thread;
+ * it uses this to reach the peer's nspa_queue_bypass_shm_t.
+ * Returns NULL if the peer is not local / not publishable. */
+const nspa_queue_bypass_shm_t *nspa_get_peer_bypass_shm_public( DWORD peer_tid )
+{
+    struct nspa_cache_entry *entry = nspa_lookup_peer( peer_tid );
+    return entry ? nspa_get_cached_bypass_shm( entry ) : NULL;
+}
+
 /* Opt-in: NSPA_ENABLE_CLIENT_RING_DISPATCH=1 makes peek_message scan the
  * own ring for SEND-class msgs BEFORE issuing the wineserver get_message
  * request.  This is the Phase 4.6 dispatch-latency fix: removes the

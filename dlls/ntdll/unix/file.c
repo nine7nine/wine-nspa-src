@@ -4643,6 +4643,13 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
            attributes, sharing, disposition, options, ea_buffer, ea_length );
 
     *handle = 0;
+
+    /* NSPA local-file diag (Phase 1A.0): categorise this open by bypass
+     * eligibility before any other work, including the NULL-attr guard.
+     * Diag-only — no behaviour change.  See nspa/docs/local-file-bypass-design.md. */
+    nspa_local_file_diag_lazy_start();
+    nspa_local_file_diag_categorize( attr, access, sharing, disposition, options );
+
     if (!attr || !attr->ObjectName) return STATUS_INVALID_PARAMETER;
 
     if (alloc_size) FIXME( "alloc_size not supported\n" );

@@ -3538,6 +3538,21 @@ static void dump_nspa_ensure_own_bypass_reply( const struct nspa_ensure_own_bypa
     fprintf( stderr, " fd_sent=%d", req->fd_sent );
 }
 
+static void dump_nspa_create_mapping_from_unix_fd_request( const struct nspa_create_mapping_from_unix_fd_request *req )
+{
+    fprintf( stderr, " fd=%d", req->fd );
+    fprintf( stderr, ", access=%08x", req->access );
+    fprintf( stderr, ", flags=%08x", req->flags );
+    fprintf( stderr, ", file_access=%08x", req->file_access );
+    dump_uint64( ", size=", &req->size );
+    dump_varargs_object_attributes( ", objattr=", cur_size );
+}
+
+static void dump_nspa_create_mapping_from_unix_fd_reply( const struct nspa_create_mapping_from_unix_fd_reply *req )
+{
+    fprintf( stderr, " handle=%04x", req->handle );
+}
+
 static void dump_nspa_get_inode_table_request( const struct nspa_get_inode_table_request *req )
 {
 }
@@ -3861,6 +3876,7 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_d3dkmt_mutex_release_request,
     (dump_func)dump_nspa_get_thread_queue_request,
     (dump_func)dump_nspa_ensure_own_bypass_request,
+    (dump_func)dump_nspa_create_mapping_from_unix_fd_request,
     (dump_func)dump_nspa_get_inode_table_request,
 };
 
@@ -4174,6 +4190,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     NULL,
     (dump_func)dump_nspa_get_thread_queue_reply,
     (dump_func)dump_nspa_ensure_own_bypass_reply,
+    (dump_func)dump_nspa_create_mapping_from_unix_fd_reply,
     (dump_func)dump_nspa_get_inode_table_reply,
 };
 
@@ -4487,6 +4504,7 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "d3dkmt_mutex_release",
     "nspa_get_thread_queue",
     "nspa_ensure_own_bypass",
+    "nspa_create_mapping_from_unix_fd",
     "nspa_get_inode_table",
 };
 

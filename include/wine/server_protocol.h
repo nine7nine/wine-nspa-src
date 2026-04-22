@@ -6396,6 +6396,32 @@ struct nspa_ensure_own_bypass_reply
 };
 
 
+/* NSPA local-file Phase 1A.3: create a section/mapping from a unix fd
+ * the client already opened locally via the bypass.  Used by NtCreateSection
+ * when promotion is needed (caller has a local-range file handle).  Server
+ * receives the inflight fd, builds an inode-tracked struct file, then runs
+ * the same mapping creation path as the regular create_mapping handler.
+ *
+ * Same shape as create_mapping but file_handle is replaced by inflight fd. */
+struct nspa_create_mapping_from_unix_fd_request
+{
+    struct request_header __header;
+    int             fd;
+    unsigned int    access;
+    unsigned int    flags;
+    unsigned int    file_access;
+    char __pad_28[4];
+    mem_size_t      size;
+    /* VARARG(objattr,object_attributes); */
+};
+struct nspa_create_mapping_from_unix_fd_reply
+{
+    struct reply_header __header;
+    obj_handle_t    handle;
+    char __pad_12[4];
+};
+
+
 /* NSPA: fetch the process-global shared inode table memfd for the
  * local-file bypass (Phase 1A.1).  Server lazily allocates a shmem region
  * on first call and returns the same fd to every caller via send_client_fd.
@@ -6728,6 +6754,7 @@ enum request
     REQ_d3dkmt_mutex_release,
     REQ_nspa_get_thread_queue,
     REQ_nspa_ensure_own_bypass,
+    REQ_nspa_create_mapping_from_unix_fd,
     REQ_nspa_get_inode_table,
     REQ_NB_REQUESTS
 };
@@ -7044,6 +7071,7 @@ union generic_request
     struct d3dkmt_mutex_release_request d3dkmt_mutex_release_request;
     struct nspa_get_thread_queue_request nspa_get_thread_queue_request;
     struct nspa_ensure_own_bypass_request nspa_ensure_own_bypass_request;
+    struct nspa_create_mapping_from_unix_fd_request nspa_create_mapping_from_unix_fd_request;
     struct nspa_get_inode_table_request nspa_get_inode_table_request;
 };
 union generic_reply
@@ -7358,9 +7386,10 @@ union generic_reply
     struct d3dkmt_mutex_release_reply d3dkmt_mutex_release_reply;
     struct nspa_get_thread_queue_reply nspa_get_thread_queue_reply;
     struct nspa_ensure_own_bypass_reply nspa_ensure_own_bypass_reply;
+    struct nspa_create_mapping_from_unix_fd_reply nspa_create_mapping_from_unix_fd_reply;
     struct nspa_get_inode_table_reply nspa_get_inode_table_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 940
+#define SERVER_PROTOCOL_VERSION 941
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

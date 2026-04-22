@@ -2290,6 +2290,12 @@ NTSTATUS WINAPI NtClose( HANDLE handle )
     if (HandleToLong( handle ) >= ~5 && HandleToLong( handle ) <= ~0)
         return STATUS_SUCCESS;
 
+    /* NSPA local-file bypass: if this is a local-file handle, clean up
+     * locally and skip the server RPC entirely.  Returns 1 if handled,
+     * 0 if handle isn't ours.  Must run before any other path since
+     * local-file handles are in our private range. */
+    if (nspa_local_file_close( handle )) return STATUS_SUCCESS;
+
     /* NSPA RT v1.2: evict any map entry for this handle. Harmless for
      * non-thread handles (the lookup just won't find it). Must run before
      * the server call so a recycled handle value can't briefly point at a

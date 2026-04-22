@@ -3538,6 +3538,17 @@ static void dump_nspa_ensure_own_bypass_reply( const struct nspa_ensure_own_bypa
     fprintf( stderr, " fd_sent=%d", req->fd_sent );
 }
 
+static void dump_nspa_get_inode_table_request( const struct nspa_get_inode_table_request *req )
+{
+}
+
+static void dump_nspa_get_inode_table_reply( const struct nspa_get_inode_table_reply *req )
+{
+    fprintf( stderr, " fd_sent=%d", req->fd_sent );
+    fprintf( stderr, ", bucket_count=%08x", req->bucket_count );
+    fprintf( stderr, ", table_size=%08x", req->table_size );
+}
+
 typedef void (*dump_func)( const void *req );
 
 static const dump_func req_dumpers[REQ_NB_REQUESTS] =
@@ -3850,6 +3861,7 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_d3dkmt_mutex_release_request,
     (dump_func)dump_nspa_get_thread_queue_request,
     (dump_func)dump_nspa_ensure_own_bypass_request,
+    (dump_func)dump_nspa_get_inode_table_request,
 };
 
 static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
@@ -4162,6 +4174,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     NULL,
     (dump_func)dump_nspa_get_thread_queue_reply,
     (dump_func)dump_nspa_ensure_own_bypass_reply,
+    (dump_func)dump_nspa_get_inode_table_reply,
 };
 
 static const char * const req_names[REQ_NB_REQUESTS] =
@@ -4474,6 +4487,7 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "d3dkmt_mutex_release",
     "nspa_get_thread_queue",
     "nspa_ensure_own_bypass",
+    "nspa_get_inode_table",
 };
 
 static const struct

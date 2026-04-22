@@ -1119,6 +1119,43 @@ typedef volatile struct
     nspa_timer_ring_t    nspa_timer_ring;
 } nspa_queue_bypass_shm_t;
 
+/* NSPA local-file bypass — Phase 1A.1 shared inode aggregation table.
+ * Server is the sole writer (under server-internal lock); clients read
+ * lock-free via per-bucket seqlock.  Each slot holds the aggregated
+ * sharing/access state for one (device, inode) currently open in any
+ * Wine process — same algorithm as server/fd.c's check_sharing.  Slot
+ * with device == 0 is empty.  Bucket size and count are fixed; clients
+ * must be prepared for "entry not present, fall back to server". */
+#define NSPA_INODE_BUCKETS               1024
+#define NSPA_INODE_SLOTS_PER_BUCKET      4
+#define NSPA_INODE_TABLE_MAGIC           0x4E5350414C49464Dull
+#define NSPA_INODE_TABLE_VERSION         1
+
+typedef volatile struct
+{
+    unsigned __int64     device;
+    unsigned __int64     inode;
+    unsigned int         refcount;
+    unsigned int         agg_existing_access;
+    unsigned int         agg_existing_sharing;
+    unsigned int         flags;
+} nspa_inode_slot_t;
+
+typedef volatile struct
+{
+    unsigned int         seq;
+    unsigned int         slot_count;
+    nspa_inode_slot_t    slots[NSPA_INODE_SLOTS_PER_BUCKET];
+} nspa_inode_bucket_t;
+
+typedef volatile struct
+{
+    unsigned __int64     magic;
+    unsigned int         version;
+    unsigned int         bucket_count;
+    nspa_inode_bucket_t  buckets[NSPA_INODE_BUCKETS];
+} nspa_inode_table_shm_t;
+
 typedef volatile struct
 {
     timeout_t            access_time;
@@ -6327,6 +6364,28 @@ struct nspa_ensure_own_bypass_reply
 };
 
 
+/* NSPA: fetch the process-global shared inode table memfd for the
+ * local-file bypass (Phase 1A.1).  Server lazily allocates a shmem region
+ * on first call and returns the same fd to every caller via send_client_fd.
+ * Clients mmap it READ-ONLY and use seqlock to read aggregated per-inode
+ * sharing/access state without taking any blocking lock.  reply->fd_sent
+ * is 1 when the fd follows on the socket, 0 if the server is unable to
+ * provide one (memfd_create unavailable etc) — clients must fall back. */
+struct nspa_get_inode_table_request
+{
+    struct request_header __header;
+    char __pad_12[4];
+};
+struct nspa_get_inode_table_reply
+{
+    struct reply_header __header;
+    int             fd_sent;
+    unsigned int    bucket_count;
+    unsigned int    table_size;
+    char __pad_20[4];
+};
+
+
 enum request
 {
     REQ_new_process,
@@ -6637,6 +6696,7 @@ enum request
     REQ_d3dkmt_mutex_release,
     REQ_nspa_get_thread_queue,
     REQ_nspa_ensure_own_bypass,
+    REQ_nspa_get_inode_table,
     REQ_NB_REQUESTS
 };
 
@@ -6952,6 +7012,7 @@ union generic_request
     struct d3dkmt_mutex_release_request d3dkmt_mutex_release_request;
     struct nspa_get_thread_queue_request nspa_get_thread_queue_request;
     struct nspa_ensure_own_bypass_request nspa_ensure_own_bypass_request;
+    struct nspa_get_inode_table_request nspa_get_inode_table_request;
 };
 union generic_reply
 {
@@ -7265,8 +7326,9 @@ union generic_reply
     struct d3dkmt_mutex_release_reply d3dkmt_mutex_release_reply;
     struct nspa_get_thread_queue_reply nspa_get_thread_queue_reply;
     struct nspa_ensure_own_bypass_reply nspa_ensure_own_bypass_reply;
+    struct nspa_get_inode_table_reply nspa_get_inode_table_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 937
+#define SERVER_PROTOCOL_VERSION 938
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

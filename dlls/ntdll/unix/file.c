@@ -4709,7 +4709,8 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
          * nspa_local_file_diag_categorize. */
         if (!attr->RootDirectory && !attr->SecurityDescriptor &&
             disposition == FILE_OPEN &&
-            !(options & (FILE_OPEN_BY_FILE_ID | FILE_DIRECTORY_FILE | FILE_DELETE_ON_CLOSE)) &&
+            !(options & (FILE_OPEN_BY_FILE_ID | FILE_DIRECTORY_FILE | FILE_DELETE_ON_CLOSE |
+                         FILE_NON_DIRECTORY_FILE)) &&
             !(access & ~(FILE_READ_DATA | FILE_READ_ATTRIBUTES | FILE_READ_EA |
                          READ_CONTROL | SYNCHRONIZE | GENERIC_READ)))
         {

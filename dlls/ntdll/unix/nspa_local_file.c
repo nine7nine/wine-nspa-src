@@ -235,11 +235,16 @@ int nspa_local_file_table_lookup( unsigned long long device, unsigned long long 
  * and FILE_DELETE_ON_CLOSE get their own counters; everything else here
  * is collapsed under "other_options".  Only options that have semantic
  * implications the bypass would mishandle are listed; advisory hints
- * (RANDOM_ACCESS, SEQUENTIAL_ONLY) are intentionally NOT here. */
+ * (RANDOM_ACCESS, SEQUENTIAL_ONLY) are intentionally NOT here.
+ *
+ * FILE_NON_DIRECTORY_FILE is the loader-specific signal — DLL loads
+ * will subsequently NtCreateSection on the handle, which requires the
+ * server to know about it.  Local handles cannot be section-mapped, so
+ * exclude this option from MVP eligibility. */
 #define NSPA_LF_DISQUALIFYING_OPTIONS \
     (FILE_NO_INTERMEDIATE_BUFFERING | FILE_WRITE_THROUGH | \
      FILE_OPEN_FOR_BACKUP_INTENT | FILE_RESERVE_OPFILTER | \
-     FILE_COMPLETE_IF_OPLOCKED)
+     FILE_COMPLETE_IF_OPLOCKED | FILE_NON_DIRECTORY_FILE)
 
 /* Forward decl — implementation appears later in the file (Slice 1A.1.c). */
 static void nspa_lf_table_open_lazy( void );

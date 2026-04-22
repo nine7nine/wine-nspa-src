@@ -18,6 +18,7 @@
 
 #include "config.h"
 
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -782,6 +783,58 @@ int nspa_local_file_table_lookup_unix_fd( HANDLE handle )
     return fd;
 }
 
+/* Compute aggregate from a slot snapshot.  Helper for the standalone
+ * check_sharing API and the atomic check-and-publish path. */
+static void nspa_lf_aggregate_from_slot( const nspa_inode_slot_t *slot,
+                                         unsigned int *agg_access,
+                                         unsigned int *agg_sharing )
+{
+    unsigned int ax = 0;
+    unsigned int sh = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    const unsigned int read_access  = FILE_READ_DATA | FILE_EXECUTE;
+    const unsigned int write_access = FILE_WRITE_DATA | FILE_APPEND_DATA;
+    const unsigned int all_access   = read_access | write_access | DELETE;
+    unsigned int i;
+
+    for (i = 0; i < NSPA_INODE_SUBENTRIES; i++)
+    {
+        unsigned int in_use = (i == 0) ? (slot->sub_refcount[0] > 0)
+                                       : (slot->pids[i] != 0);
+        if (!in_use) continue;
+        if (slot->sub_access[i] & all_access) sh &= slot->sub_sharing[i];
+        ax |= slot->sub_access[i];
+    }
+    *agg_access  = ax;
+    *agg_sharing = sh;
+}
+
+/* Apply the same algorithm as server/fd.c:check_sharing on aggregated
+ * existing state.  Returns STATUS_SHARING_VIOLATION on conflict. */
+static NTSTATUS nspa_lf_check_sharing_algorithm( unsigned int existing_access,
+                                                 unsigned int existing_sharing,
+                                                 unsigned int my_access,
+                                                 unsigned int my_sharing )
+{
+    const unsigned int read_access  = FILE_READ_DATA | FILE_EXECUTE;
+    const unsigned int write_access = FILE_WRITE_DATA | FILE_APPEND_DATA;
+    const unsigned int all_access   = read_access | write_access | DELETE;
+
+    if (((my_access & read_access)  && !(existing_sharing & FILE_SHARE_READ)) ||
+        ((my_access & write_access) && !(existing_sharing & FILE_SHARE_WRITE)) ||
+        ((my_access & DELETE)       && !(existing_sharing & FILE_SHARE_DELETE)))
+        return STATUS_SHARING_VIOLATION;
+
+    if (!(my_access & all_access))
+        return STATUS_SUCCESS;   /* zero-access opens ignore sharing */
+
+    if (((existing_access & read_access)  && !(my_sharing & FILE_SHARE_READ)) ||
+        ((existing_access & write_access) && !(my_sharing & FILE_SHARE_WRITE)) ||
+        ((existing_access & DELETE)       && !(my_sharing & FILE_SHARE_DELETE)))
+        return STATUS_SHARING_VIOLATION;
+
+    return STATUS_SUCCESS;
+}
+
 /* Replicates server/fd.c:check_sharing using slot subentries.  Called
  * by NtCreateFile bypass dispatch (Phase 1A.2.d) before opening locally.
  * Returns STATUS_SUCCESS if the new open with `my_access`/`my_sharing`
@@ -790,44 +843,316 @@ int nspa_local_file_table_lookup_unix_fd( HANDLE handle )
 NTSTATUS nspa_local_file_check_sharing( unsigned long long device, unsigned long long inode,
                                         unsigned int my_access, unsigned int my_sharing )
 {
-    const unsigned int read_access  = FILE_READ_DATA | FILE_EXECUTE;
-    const unsigned int write_access = FILE_WRITE_DATA | FILE_APPEND_DATA;
-    const unsigned int all_access   = read_access | write_access | DELETE;
     nspa_inode_slot_t snapshot;
     unsigned int agg_access = 0;
     unsigned int agg_sharing = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
-    unsigned int i;
 
     if (!nspa_local_file_table_lookup( device, inode, &snapshot ))
+        return STATUS_SUCCESS;   /* no existing opens */
+
+    nspa_lf_aggregate_from_slot( &snapshot, &agg_access, &agg_sharing );
+    return nspa_lf_check_sharing_algorithm( agg_access, agg_sharing, my_access, my_sharing );
+}
+
+/* Atomic check-sharing + publish.  Used by NtCreateFile bypass dispatch
+ * to close the TOCTOU window between the standalone check_sharing call
+ * and the publish_open call — both happen under the bucket's PI mutex
+ * in a single critical section.
+ *
+ * Returns STATUS_SUCCESS on accepted publish, STATUS_SHARING_VIOLATION
+ * if the new open would conflict with existing opens, or
+ * STATUS_INSUFFICIENT_RESOURCES on bucket / subentry overflow (caller
+ * falls back to server). */
+static NTSTATUS nspa_local_file_check_and_publish_open( unsigned long long device,
+                                                        unsigned long long inode,
+                                                        unsigned int access,
+                                                        unsigned int sharing )
+{
+    const unsigned int all_access = FILE_READ_DATA | FILE_EXECUTE
+                                  | FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE;
+    nspa_inode_bucket_t *bucket;
+    int slot_idx = -1, empty_slot_idx = -1, sub_idx = -1, empty_sub_idx = -1;
+    unsigned int i, seq, my_pid;
+    unsigned int existing_access = 0, existing_sharing = 0;
+    nspa_inode_slot_t *slot;
+    NTSTATUS status;
+
+    if (!(bucket = nspa_lf_bucket_for( device, inode ))) return STATUS_NOT_SUPPORTED;
+    my_pid = nspa_lf_self_pid();
+
+    pi_mutex_lock( nspa_lf_lock_of( bucket ) );
+
+    for (i = 0; i < NSPA_INODE_SLOTS_PER_BUCKET; i++)
     {
-        /* No existing opens — nothing to conflict with. */
-        return STATUS_SUCCESS;
+        if (bucket->slots[i].device == device && bucket->slots[i].inode == inode)
+        {
+            slot_idx = (int)i;
+            break;
+        }
+        if (bucket->slots[i].device == 0 && empty_slot_idx < 0)
+            empty_slot_idx = (int)i;
     }
 
-    /* Walk subentries and merge in-use ones into the running aggregate. */
-    for (i = 0; i < NSPA_INODE_SUBENTRIES; i++)
+    /* Compute existing aggregate from current slot state, if any. */
+    if (slot_idx >= 0)
     {
-        unsigned int in_use = (i == 0) ? (snapshot.sub_refcount[0] > 0)
-                                       : (snapshot.pids[i] != 0);
-        if (!in_use) continue;
-        if (snapshot.sub_access[i] & all_access)
-            agg_sharing &= snapshot.sub_sharing[i];
-        agg_access |= snapshot.sub_access[i];
+        nspa_inode_slot_t snap = (nspa_inode_slot_t)bucket->slots[slot_idx];
+        nspa_lf_aggregate_from_slot( &snap, &existing_access, &existing_sharing );
+        status = nspa_lf_check_sharing_algorithm( existing_access, existing_sharing,
+                                                  access, sharing );
+        if (status != STATUS_SUCCESS)
+        {
+            pi_mutex_unlock( nspa_lf_lock_of( bucket ) );
+            return status;
+        }
+    }
+    /* If slot_idx < 0, no existing entry → no possible conflict. */
+
+    if (slot_idx < 0)
+    {
+        if (empty_slot_idx < 0)
+        {
+            pi_mutex_unlock( nspa_lf_lock_of( bucket ) );
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        slot_idx = empty_slot_idx;
+    }
+    slot = (nspa_inode_slot_t *)&bucket->slots[slot_idx];
+
+    for (i = 1; i < NSPA_INODE_SUBENTRIES; i++)
+    {
+        if (slot->pids[i] == my_pid) { sub_idx = (int)i; break; }
+        if (slot->pids[i] == 0 && empty_sub_idx < 0) empty_sub_idx = (int)i;
+    }
+    if (sub_idx < 0)
+    {
+        if (empty_sub_idx < 0)
+        {
+            pi_mutex_unlock( nspa_lf_lock_of( bucket ) );
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        sub_idx = empty_sub_idx;
     }
 
-    /* Now run the same algorithm as server/fd.c:check_sharing. */
-    if (((my_access & read_access)  && !(agg_sharing & FILE_SHARE_READ)) ||
-        ((my_access & write_access) && !(agg_sharing & FILE_SHARE_WRITE)) ||
-        ((my_access & DELETE)       && !(agg_sharing & FILE_SHARE_DELETE)))
-        return STATUS_SHARING_VIOLATION;
+    seq = bucket->seq;
+    __atomic_store_n( &bucket->seq, seq + 1, __ATOMIC_RELEASE );
 
-    if (!(my_access & all_access))
-        return STATUS_SUCCESS;   /* zero-access opens ignore sharing */
+    if (slot->device == 0)
+    {
+        slot->device = device;
+        slot->inode  = inode;
+        slot->flags  = 0;
+        bucket->slot_count++;
+    }
+    if (slot->pids[sub_idx] != my_pid)
+    {
+        slot->pids[sub_idx]         = my_pid;
+        slot->sub_refcount[sub_idx] = 1;
+        slot->sub_access[sub_idx]   = access;
+        slot->sub_sharing[sub_idx]  = (access & all_access) ? sharing
+                                      : (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+    }
+    else
+    {
+        slot->sub_refcount[sub_idx]++;
+        slot->sub_access[sub_idx]  |= access;
+        if (access & all_access) slot->sub_sharing[sub_idx] &= sharing;
+    }
 
-    if (((agg_access & read_access)  && !(my_sharing & FILE_SHARE_READ)) ||
-        ((agg_access & write_access) && !(my_sharing & FILE_SHARE_WRITE)) ||
-        ((agg_access & DELETE)       && !(my_sharing & FILE_SHARE_DELETE)))
-        return STATUS_SHARING_VIOLATION;
-
+    __atomic_store_n( &bucket->seq, seq + 2, __ATOMIC_RELEASE );
+    pi_mutex_unlock( nspa_lf_lock_of( bucket ) );
     return STATUS_SUCCESS;
+}
+
+/* ---------------------------------------------------------------------
+ * Phase 1A.2.d — handle minting + bypass dispatch + NtClose routing.
+ *
+ * Local file handles use a dedicated range above CLIENT_HANDLE_BASE
+ * (sync.c) so they don't collide with NTSync handles or server handles.
+ * Bump allocator with a per-process free list for closed handles. */
+
+#define NSPA_LF_HANDLE_CAP        4096
+#define NSPA_LF_HANDLE_BASE_OFF   1024     /* offset above the first NTSync client handle */
+
+/* Cache the LOCAL_FILE_HANDLE_BASE on first use so we don't have to
+ * include sync.c internals here.  We just need a number that is below
+ * CLIENT_HANDLE_BASE but high enough to never collide with server-
+ * allocated handles.  The exact value isn't load-bearing — the
+ * is_local_file_handle check uses our own range table. */
+static unsigned int nspa_lf_handle_base;
+static int          nspa_lf_handles_in_use[NSPA_LF_HANDLE_CAP];   /* 1 if allocated */
+static unsigned int nspa_lf_handle_next;
+static pthread_mutex_t nspa_lf_handle_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void nspa_lf_handle_init_once_fn( void )
+{
+    /* Use a high fixed base.  Server handles start at 0x4 and grow; the
+     * NTSync client range starts near INPROC_SYNC_CACHE_TOTAL.  Pick a
+     * range disjoint from both: fixed bottom at 0x80000000 - cap*4. */
+    nspa_lf_handle_base = 0x80000000u - NSPA_LF_HANDLE_CAP * 4;
+    nspa_lf_handle_next = 0;
+}
+
+static pthread_once_t nspa_lf_handle_once = PTHREAD_ONCE_INIT;
+
+static HANDLE nspa_lf_alloc_handle( void )
+{
+    unsigned int i, slot;
+    HANDLE result = NULL;
+
+    pthread_once( &nspa_lf_handle_once, nspa_lf_handle_init_once_fn );
+
+    pthread_mutex_lock( &nspa_lf_handle_mutex );
+    for (i = 0; i < NSPA_LF_HANDLE_CAP; i++)
+    {
+        slot = (nspa_lf_handle_next + i) % NSPA_LF_HANDLE_CAP;
+        if (!nspa_lf_handles_in_use[slot])
+        {
+            nspa_lf_handles_in_use[slot] = 1;
+            nspa_lf_handle_next = (slot + 1) % NSPA_LF_HANDLE_CAP;
+            /* Encoded handle: nspa_lf_handle_base + slot*4 (handles
+             * are 4-byte aligned by Win32 convention). */
+            result = (HANDLE)(ULONG_PTR)(nspa_lf_handle_base + slot * 4);
+            break;
+        }
+    }
+    pthread_mutex_unlock( &nspa_lf_handle_mutex );
+    return result;
+}
+
+static void nspa_lf_free_handle( HANDLE h )
+{
+    unsigned int v = (unsigned int)(ULONG_PTR)h;
+    unsigned int slot;
+    pthread_once( &nspa_lf_handle_once, nspa_lf_handle_init_once_fn );
+    if (v < nspa_lf_handle_base) return;
+    slot = (v - nspa_lf_handle_base) / 4;
+    if (slot >= NSPA_LF_HANDLE_CAP) return;
+    pthread_mutex_lock( &nspa_lf_handle_mutex );
+    nspa_lf_handles_in_use[slot] = 0;
+    pthread_mutex_unlock( &nspa_lf_handle_mutex );
+}
+
+int nspa_local_file_is_local_handle( HANDLE h )
+{
+    unsigned int v = (unsigned int)(ULONG_PTR)h;
+    unsigned int slot;
+    pthread_once( &nspa_lf_handle_once, nspa_lf_handle_init_once_fn );
+    if (v < nspa_lf_handle_base) return 0;
+    slot = (v - nspa_lf_handle_base) / 4;
+    return slot < NSPA_LF_HANDLE_CAP;
+}
+
+/* Read the NSPA_LOCAL_FILES env gate once.  Default off until proven
+ * across multiple workloads.  Set to 1 to enable the bypass dispatch. */
+static int nspa_local_file_enabled( void )
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *v = getenv( "NSPA_LOCAL_FILES" );
+        cached = (v && *v && *v != '0') ? 1 : 0;
+    }
+    return cached;
+}
+
+/* Bypass dispatch.  Returns STATUS_SUCCESS + sets *handle on bypass
+ * success (caller skips the regular create_file RPC).  Returns
+ * STATUS_NOT_SUPPORTED if bypass is gated off, the file isn't a regular
+ * file, the table is unmappable, the bucket / subentry overflows, or
+ * any other "fall back to server" condition.  Returns a real NT error
+ * status for genuine open failures (sharing violation, no such file,
+ * permission denied) — caller propagates to the app. */
+NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
+                                     ACCESS_MASK access, ULONG sharing,
+                                     ULONG options, IO_STATUS_BLOCK *io )
+{
+    struct stat st;
+    int unix_fd;
+    int open_flags;
+    NTSTATUS status;
+    HANDLE h;
+
+    if (!nspa_local_file_enabled()) return STATUS_NOT_SUPPORTED;
+    if (nspa_lf_table_state != 1)   return STATUS_NOT_SUPPORTED;
+
+    /* stat the unix path to derive (dev, inode) for the table lookup. */
+    if (stat( unix_name, &st ) != 0)
+    {
+        /* Real open failure — let caller's normal path map errno. */
+        return STATUS_NOT_SUPPORTED;   /* fall back rather than guess errno mapping */
+    }
+    if (!S_ISREG( st.st_mode )) return STATUS_NOT_SUPPORTED;
+
+    /* Atomic check-sharing + publish_open under the bucket lock. */
+    status = nspa_local_file_check_and_publish_open(
+        (unsigned long long)st.st_dev, (unsigned long long)st.st_ino,
+        access, sharing );
+    if (status == STATUS_SHARING_VIOLATION)
+        return status;   /* real error — propagate to caller */
+    if (status != STATUS_SUCCESS)
+        return STATUS_NOT_SUPPORTED;   /* overflow/etc → fall back */
+
+    /* Open locally.  O_RDONLY for MVP read-only access; O_NOFOLLOW
+     * when caller asked for FILE_OPEN_REPARSE_POINT. */
+    open_flags = O_RDONLY;
+    if (options & FILE_OPEN_REPARSE_POINT) open_flags |= O_NOFOLLOW;
+    unix_fd = open( unix_name, open_flags );
+    if (unix_fd < 0)
+    {
+        /* Open failed — undo our publish, return fall-back. */
+        nspa_local_file_publish_close( (unsigned long long)st.st_dev,
+                                       (unsigned long long)st.st_ino );
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    h = nspa_lf_alloc_handle();
+    if (!h)
+    {
+        nspa_local_file_publish_close( (unsigned long long)st.st_dev,
+                                       (unsigned long long)st.st_ino );
+        close( unix_fd );
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    status = nspa_local_file_table_add( h, unix_fd,
+                                        (unsigned long long)st.st_dev,
+                                        (unsigned long long)st.st_ino,
+                                        access, sharing );
+    if (status != STATUS_SUCCESS)
+    {
+        nspa_lf_free_handle( h );
+        nspa_local_file_publish_close( (unsigned long long)st.st_dev,
+                                       (unsigned long long)st.st_ino );
+        close( unix_fd );
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    *handle = h;
+    if (io) io->Information = FILE_OPENED;
+    return STATUS_SUCCESS;
+}
+
+/* NtClose routing.  Called from NtClose before the existing close path.
+ * Returns 1 if the handle was a local-file handle and was fully cleaned
+ * up; 0 if not (caller continues with normal close). */
+int nspa_local_file_close( HANDLE handle )
+{
+    int unix_fd = -1;
+    unsigned long long dev = 0, ino = 0;
+
+    if (!nspa_local_file_is_local_handle( handle )) return 0;
+
+    if (!nspa_local_file_table_remove( handle, &unix_fd, &dev, &ino ))
+    {
+        /* Handle is in our range but not in our table — already closed
+         * or never tracked.  Treat as closed (best-effort). */
+        nspa_lf_free_handle( handle );
+        return 1;
+    }
+
+    nspa_local_file_publish_close( dev, ino );
+    if (unix_fd >= 0) close( unix_fd );
+    nspa_lf_free_handle( handle );
+    return 1;
 }

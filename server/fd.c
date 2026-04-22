@@ -100,6 +100,7 @@
 #include "handle.h"
 #include "process.h"
 #include "request.h"
+#include "nspa_local_file.h"
 
 #include "winternl.h"
 #include "winioctl.h"
@@ -275,6 +276,39 @@ static const struct object_ops inode_ops =
     no_close_handle,          /* close_handle */
     inode_destroy             /* destroy */
 };
+
+/* NSPA local-file bypass — recompute aggregated sharing/access state
+ * for `inode` from its current open list and publish to the shared
+ * inode-table.  Same algorithm as check_sharing's existing-state walk
+ * (below).  Called from the 3 sites where fd->inode_entry is added to
+ * or removed from inode->open.  Cheap (early-out if no client has
+ * opted in to the table) and idempotent. */
+static void nspa_publish_inode_state( struct inode *inode )
+{
+    const unsigned int read_access  = FILE_READ_DATA | FILE_EXECUTE;
+    const unsigned int write_access = FILE_WRITE_DATA | FILE_APPEND_DATA;
+    const unsigned int all_access   = read_access | write_access | DELETE;
+    unsigned int agg_sharing = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    unsigned int agg_access  = 0;
+    unsigned int refcount    = 0;
+    struct fd *fd_ptr;
+
+    if (!inode || !nspa_inode_table_is_active()) return;
+
+    LIST_FOR_EACH_ENTRY( fd_ptr, &inode->open, struct fd, inode_entry )
+    {
+        refcount++;
+        if (fd_ptr->access & all_access) agg_sharing &= fd_ptr->sharing;
+        agg_access |= fd_ptr->access;
+    }
+
+    /* Use dev_t (real device number) as key — clients can stat() locally
+     * to derive the same value, so they can look up entries by the same
+     * (dev, ino) tuple Wine sees server-side. */
+    nspa_inode_publish_slot( (unsigned long long)inode->device->dev,
+                             (unsigned long long)inode->ino,
+                             refcount, agg_access, agg_sharing );
+}
 
 /* file lock object */
 
@@ -1714,6 +1748,9 @@ static void fd_destroy( struct object *obj )
     if (fd->completion) release_object( fd->completion );
     remove_fd_locks( fd );
     list_remove( &fd->inode_entry );
+    /* NSPA local-file: republish post-removal aggregate so clients see
+     * the updated existing_access/sharing without this fd's contribution. */
+    if (fd->inode) nspa_publish_inode_state( fd->inode );
     if (fd->poll_index != -1) remove_poll_user( fd, fd->poll_index );
     free( fd->nt_name );
     if (fd->inode)
@@ -1943,6 +1980,9 @@ struct fd *dup_fd_object( struct fd *orig, unsigned int access, unsigned int sha
             set_error( err );
             goto failed;
         }
+        /* NSPA local-file: publish post-add aggregate.  If check_sharing
+         * fails above, fd_destroy republishes after the list_remove. */
+        nspa_publish_inode_state( fd->inode );
     }
     else if ((fd->unix_fd = dup( orig->unix_fd )) == -1)
     {
@@ -2143,6 +2183,10 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
         fd->closed = closed_fd;
         fd->cacheable = !inode->device->removable;
         list_add_head( &inode->open, &fd->inode_entry );
+        /* NSPA local-file: publish post-add aggregate.  If a later check
+         * in this function fails, fd is goto error → fd_destroy →
+         * republishes with this fd removed. */
+        nspa_publish_inode_state( inode );
         closed_fd = NULL;
 
         /* check directory options */

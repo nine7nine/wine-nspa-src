@@ -136,9 +136,93 @@ nspa_inode_slot_t *nspa_inode_table_find_slot( unsigned __int64 device,
     return NULL;
 }
 
-/* Slice-(a) accessors.  Slice (b) will add publish/unpublish that walk
- * inode->open and recompute aggregated state per the algorithm in
- * server/fd.c:check_sharing. */
+int nspa_inode_table_is_active( void )
+{
+    return nspa_inode_table_map != NULL;
+}
+
+/* Publish per-(device,inode) aggregated state.  See header comment for
+ * contract.  Implements the seqlock-write protocol that pairs with the
+ * client-side seqlock-read pattern (slice (c) — not yet built):
+ *
+ *   1. seq odd      = mutating (readers retry)
+ *   2. write slot   = update aggregated values
+ *   3. seq even     = stable
+ *
+ * Memory ordering: RELEASE on each seq store ensures slot writes
+ * between the two stores cannot be reordered past either fence from a
+ * reader's ACQUIRE on the seq value.
+ */
+void nspa_inode_publish_slot( unsigned long long device, unsigned long long inode_no,
+                              unsigned int refcount,
+                              unsigned int agg_existing_access,
+                              unsigned int agg_existing_sharing )
+{
+    nspa_inode_bucket_t *bucket;
+    int slot_idx = -1;
+    int empty_idx = -1;
+    unsigned int i, seq;
+    nspa_inode_slot_t *slot;
+
+    /* Defer materialising the shmem region until a client has actually
+     * fetched it.  Avoids overhead on every open if no Wine process is
+     * using the bypass. */
+    if (!nspa_inode_table_map) return;
+
+    bucket = (nspa_inode_bucket_t *)&nspa_inode_table_map->buckets[
+        nspa_inode_table_bucket( device, inode_no )];
+
+    /* Find existing slot for (device, inode) or note an empty slot. */
+    for (i = 0; i < NSPA_INODE_SLOTS_PER_BUCKET; i++)
+    {
+        if (bucket->slots[i].device == device && bucket->slots[i].inode == inode_no)
+        {
+            slot_idx = (int)i;
+            break;
+        }
+        if (bucket->slots[i].device == 0 && empty_idx < 0)
+            empty_idx = (int)i;
+    }
+
+    /* Nothing to do: refcount==0 and no existing slot. */
+    if (slot_idx < 0 && refcount == 0) return;
+
+    /* Bucket overflow: refcount>0 but no slot for us and no empty.
+     * Silent fallback — clients can't bypass this inode, but the
+     * server still does check_sharing correctly. */
+    if (slot_idx < 0 && empty_idx < 0) return;
+
+    if (slot_idx < 0) slot_idx = empty_idx;
+    slot = (nspa_inode_slot_t *)&bucket->slots[slot_idx];
+
+    seq = bucket->seq;
+    /* Seqlock begin — odd = mutating. */
+    __atomic_store_n( &bucket->seq, seq + 1, __ATOMIC_RELEASE );
+
+    if (refcount == 0)
+    {
+        slot->device                = 0;
+        slot->inode                 = 0;
+        slot->refcount              = 0;
+        slot->agg_existing_access   = 0;
+        slot->agg_existing_sharing  = 0;
+        slot->flags                 = 0;
+        if (bucket->slot_count > 0) bucket->slot_count--;
+    }
+    else
+    {
+        if (slot->device == 0) bucket->slot_count++;
+        slot->device                = device;
+        slot->inode                 = inode_no;
+        slot->refcount              = refcount;
+        slot->agg_existing_access   = agg_existing_access;
+        slot->agg_existing_sharing  = agg_existing_sharing;
+        /* flags reserved for FILE_MAPPING_* tracking — Phase 3. */
+    }
+
+    /* Seqlock end — even = stable.  Pairs with client ACQUIRE-load. */
+    __atomic_store_n( &bucket->seq, seq + 2, __ATOMIC_RELEASE );
+}
 
 DECL_HANDLER(nspa_get_inode_table)
 {

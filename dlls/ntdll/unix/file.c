@@ -4700,6 +4700,34 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
     if (status == STATUS_SUCCESS)
     {
         name_hidden = is_hidden_file( unix_name );
+        /* NSPA local-file bypass dispatch (Phase 1A.2.d): try to open
+         * locally for the eligible MVP subset before falling through to
+         * the server create_file RPC.  Returns STATUS_SUCCESS on bypass
+         * (handle minted from local range), STATUS_SHARING_VIOLATION on
+         * a real conflict (propagate), or STATUS_NOT_SUPPORTED to fall
+         * back to the existing server path.  Eligibility filter mirrors
+         * nspa_local_file_diag_categorize. */
+        if (!attr->RootDirectory && !attr->SecurityDescriptor &&
+            disposition == FILE_OPEN &&
+            !(options & (FILE_OPEN_BY_FILE_ID | FILE_DIRECTORY_FILE | FILE_DELETE_ON_CLOSE)) &&
+            !(access & ~(FILE_READ_DATA | FILE_READ_ATTRIBUTES | FILE_READ_EA |
+                         READ_CONTROL | SYNCHRONIZE | GENERIC_READ)))
+        {
+            NTSTATUS bypass = nspa_local_file_try_bypass( handle, unix_name, access,
+                                                          sharing, options, io );
+            if (bypass == STATUS_SUCCESS)
+            {
+                free( unix_name );
+                return STATUS_SUCCESS;
+            }
+            if (bypass == STATUS_SHARING_VIOLATION)
+            {
+                status = bypass;
+                goto done;
+            }
+            /* STATUS_NOT_SUPPORTED → fall through to server create_file. */
+        }
+
         status = open_unix_file( handle, unix_name, access, &new_attr, attributes,
                                  sharing, disposition, options, ea_buffer, ea_length );
     }

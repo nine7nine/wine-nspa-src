@@ -1119,26 +1119,47 @@ typedef volatile struct
     nspa_timer_ring_t    nspa_timer_ring;
 } nspa_queue_bypass_shm_t;
 
-/* NSPA local-file bypass — Phase 1A.1 shared inode aggregation table.
- * Server is the sole writer (under server-internal lock); clients read
- * lock-free via per-bucket seqlock.  Each slot holds the aggregated
- * sharing/access state for one (device, inode) currently open in any
- * Wine process — same algorithm as server/fd.c's check_sharing.  Slot
- * with device == 0 is empty.  Bucket size and count are fixed; clients
- * must be prepared for "entry not present, fall back to server". */
+/* NSPA local-file bypass — Phase 1A.2 shared inode aggregation table
+ * with per-process subentries.
+ *
+ * Each slot tracks one (device, inode) and decomposes its aggregated
+ * sharing/access state into NSPA_INODE_SUBENTRIES subentries:
+ *   subentry[0]              = server's view (server-opened fds)
+ *   subentry[1..N-1]         = each client process's view of its
+ *                              own locally-opened fds for this inode
+ *
+ * Per-process decomposition is required because clients open files
+ * locally via the bypass (Phase 1A.2.c+) and must publish their opens
+ * for OTHER processes' check_sharing to be correct.  Recompute-on-close
+ * requires each process to know its own contribution — server walks
+ * inode->open; clients walk their per-process file table.
+ *
+ * Aggregate computed on read by walking subentries and OR/ANDing.
+ *
+ * subentry[0].pid is unused (server is implicit).  Subentry is "in use"
+ * when sub_refcount > 0 (server) or pid != 0 (client).
+ *
+ * Overflow: if more than (N-1) client processes hold this inode,
+ * additional client opens fall back to server's full create_file path.
+ * N=3 client procs is sufficient for typical workloads. */
 #define NSPA_INODE_BUCKETS               1024
 #define NSPA_INODE_SLOTS_PER_BUCKET      4
+#define NSPA_INODE_SUBENTRIES            4
 #define NSPA_INODE_TABLE_MAGIC           0x4E5350414C49464Dull
-#define NSPA_INODE_TABLE_VERSION         1
+#define NSPA_INODE_TABLE_VERSION         2
 
 typedef volatile struct
 {
     unsigned __int64     device;
     unsigned __int64     inode;
-    unsigned int         refcount;
-    unsigned int         agg_existing_access;
-    unsigned int         agg_existing_sharing;
     unsigned int         flags;
+    unsigned int         _pad;
+    /* Per-process subentries.  Parallel arrays for compact layout.
+     * Index 0 reserved for server (pids[0] always 0). */
+    unsigned int         pids[NSPA_INODE_SUBENTRIES];
+    unsigned int         sub_refcount[NSPA_INODE_SUBENTRIES];
+    unsigned int         sub_access[NSPA_INODE_SUBENTRIES];
+    unsigned int         sub_sharing[NSPA_INODE_SUBENTRIES];
 } nspa_inode_slot_t;
 
 /* 64-byte storage for a librtpi pi_mutex_t.  pi_mutex_t itself is a
@@ -7340,6 +7361,6 @@ union generic_reply
     struct nspa_get_inode_table_reply nspa_get_inode_table_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 939
+#define SERVER_PROTOCOL_VERSION 940
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

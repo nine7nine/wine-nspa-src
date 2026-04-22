@@ -49,6 +49,19 @@ extern BOOL nspa_write_ring_reply( DWORD sender_tid, UINT reply_slot_idx,
  * fault-during-bypass from the ordinary reject exits.  No-op when the
  * NSPA_SEND_DIAG gate is off. */
 extern void nspa_send_diag_fault_bump( void );
+
+/* Phase 4.7: client-side POST-class pop from own ring.  Returns TRUE if
+ * a MSG_POSTED slot was claimed (READY → CONSUMED) and fields populated.
+ * Arbitration check: bails when queue_shm->wake_bits indicates server has
+ * higher-or-equal-priority work pending (QS_INPUT | QS_HOTKEY for higher
+ * priority; QS_POSTMESSAGE for FIFO-conflicting server-side POST that the
+ * server would order ahead of us).  Falls back to wineserver get_message
+ * for arbitration in those cases.  Filter semantics match the SEND pop:
+ * "any window" (filter_hwnd == NULL) only — specific-window matches
+ * still need server's window tree. */
+extern BOOL nspa_try_pop_own_ring_post( HWND filter_hwnd, UINT first, UINT last,
+                                        UINT *msg_out, WPARAM *wp_out, LPARAM *lp_out,
+                                        DWORD *time_out, HWND *win_out );
 /* Memfd-era replacement for the old queue_shm_t.nspa_bypass_locator
  * resolution.  Returns current thread's own bypass ring mmap (bootstrapping
  * via server request on first call), or NULL if bypass is off / server

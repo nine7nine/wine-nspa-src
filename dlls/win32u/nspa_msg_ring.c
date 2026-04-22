@@ -1149,6 +1149,109 @@ BOOL nspa_try_pop_own_ring_send( HWND filter_hwnd, UINT first, UINT last,
     return FALSE;
 }
 
+/* Phase 4.7: client-side POST-class pop.  Mirrors nspa_try_pop_own_ring_send
+ * but for MSG_POSTED slots, with one critical addition — arbitration check
+ * against server-side wake bits.
+ *
+ * Why arbitration matters for POST and not SEND:
+ *   - SEND messages are independent (each is a synchronous unit, no FIFO
+ *     ordering between distinct SENDs from different threads).
+ *   - POST messages are FIFO within a queue.  Win32 also enforces priority:
+ *     hardware (QS_INPUT/QS_HOTKEY) > POST > PAINT.  A blind client-side
+ *     pop of a ring POST when the server has older POSTs queued or any
+ *     hardware messages pending would deliver out of order.
+ *
+ * Arbitration rule: pop ring only when queue_shm->wake_bits indicates
+ * server has nothing of equal-or-higher priority.  set_queue_bits() sets
+ * QS_POSTMESSAGE only for server-routed posts (line 3446 in server/queue.c)
+ * — ring posts bump pending_count instead and never touch wake_bits — so
+ * a clean QS_POSTMESSAGE bit reliably means "ring POSTs are uncontested
+ * by server-queue POSTs".  Same for QS_INPUT/QS_HOTKEY (server-only signals).
+ *
+ * Race window: between reading wake_bits and CAS-claiming the slot a
+ * server-routed POST could land with an earlier post_seq.  In practice:
+ *   - Audio playback workload has near-zero server-routed POSTs (everything
+ *     ring-routed since the eager-allocate fix); race is degenerate.
+ *   - Window is microseconds; even a misorder within that window is below
+ *     the granularity any app actually observes.
+ *   - If we ever need strict ordering: re-read wake_bits after CAS; if
+ *     QS_POSTMESSAGE appeared, undo with CAS CONSUMED → READY.  Not done
+ *     here; cost > benefit at current workload.
+ */
+BOOL nspa_try_pop_own_ring_post( HWND filter_hwnd, UINT first, UINT last,
+                                 UINT *msg_out, WPARAM *wp_out, LPARAM *lp_out,
+                                 DWORD *time_out, HWND *win_out )
+{
+    const nspa_queue_bypass_shm_t *own;
+    volatile nspa_msg_ring_t *ring;
+    unsigned int head, tail, cursor;
+
+    /* Same opt-in gate as Phase 4.6 — single env var for all client-side
+     * ring dispatch behaviour. */
+    if (!nspa_client_ring_dispatch_enabled()) return FALSE;
+
+    /* Specific-window filter requires server's window tree to evaluate
+     * is_child_window correctly.  Fall back to server.  Same constraint
+     * as the SEND pop. */
+    if (filter_hwnd) return FALSE;
+
+    own = nspa_get_own_bypass_shm_public();
+    if (!own) return FALSE;
+
+    /* Arbitration: defer to server when it has higher-priority or
+     * order-conflicting work pending. */
+    {
+        struct object_lock lock = OBJECT_LOCK_INIT;
+        const queue_shm_t *queue_shm;
+        UINT status, server_pending = 0;
+
+        while ((status = get_shared_queue( &lock, &queue_shm )) == STATUS_PENDING)
+            server_pending = queue_shm->wake_bits &
+                             (QS_INPUT | QS_HOTKEY | QS_POSTMESSAGE);
+        if (status) return FALSE;
+        if (server_pending) return FALSE;
+    }
+
+    ring = (volatile nspa_msg_ring_t *)&own->nspa_msg_ring;
+    if (!ring->active) return FALSE;
+
+    head = __atomic_load_n( &ring->head, __ATOMIC_ACQUIRE );
+    tail = __atomic_load_n( &ring->tail, __ATOMIC_ACQUIRE );
+
+    for (cursor = tail; (int)(cursor - head) < 0; cursor++)
+    {
+        volatile nspa_msg_slot_t *slot = &ring->slots[cursor & (NSPA_MSG_RING_SLOTS - 1)];
+        unsigned int state = __atomic_load_n( &slot->state, __ATOMIC_ACQUIRE );
+        unsigned int slot_msg, expected;
+
+        if (state != NSPA_MSG_STATE_READY) continue;
+        if (slot->type != MSG_POSTED) continue;
+        slot_msg = slot->msg;
+        if (slot_msg < first || slot_msg > last) continue;
+
+        expected = NSPA_MSG_STATE_READY;
+        if (!__atomic_compare_exchange_n( &slot->state, &expected,
+                                          NSPA_MSG_STATE_CONSUMED, 0,
+                                          __ATOMIC_ACQUIRE, __ATOMIC_RELAXED ))
+            continue;
+
+        *msg_out  = slot_msg;
+        *wp_out   = (WPARAM)slot->wparam;
+        *lp_out   = (LPARAM)slot->lparam;
+        *time_out = slot->time;
+        *win_out  = wine_server_ptr_handle( slot->win );
+
+        /* POST decrements pending_count only — pending_send_count tracks
+         * SEND-class only and was never incremented for this slot. */
+        __atomic_fetch_sub( &ring->pending_count, 1, __ATOMIC_ACQ_REL );
+
+        nspa_client_advance_own_ring_tail( ring );
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
 /* Write a reply to a remote sender's reply slot and wake them.
  * Called by the receiver after its window proc returns, if the message
  * came from a ring slot (sender_tid != 0, reply_slot_idx in range).

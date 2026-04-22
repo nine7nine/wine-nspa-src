@@ -245,6 +245,7 @@ static inline int nspa_ring_arb_disabled(void);
 static inline int nspa_ring_wake_syn_disabled(void);
 static inline int nspa_ring_alloc_disabled(void);
 static inline int nspa_seq_ops_disabled(void);
+static int nspa_ensure_shared( struct msg_queue *queue );
 
 /* set the caret window in a given thread input, requires write lock on the thread input shared member */
 static void set_caret_window( struct thread_input *input, input_shm_t *shared, user_handle_t win )
@@ -344,13 +345,6 @@ static struct msg_queue *create_msg_queue( struct thread *thread, struct thread_
         for (i = 0; i < NB_MSG_KINDS; i++) list_init( &queue->msg_list[i] );
 
         if (!(queue->sync = create_internal_sync( 1, 0 ))) goto error;
-        /* NSPA lazy alloc: queue->nspa_shared stays NULL at creation.  It is
-         * allocated on demand by nspa_ensure_shared() the first time a peer
-         * or this queue itself needs the bypass ring.  Threads that never
-         * participate in cross-thread bypass messaging never allocate one.
-         * This replaces the unconditional 10 KB-per-queue allocation that
-         * was the root of the library-panel regression (docs/send-message-
-         * bypass-design.md §15.11). */
         if (!(queue->shared = alloc_shared_object( sizeof(*queue->shared) )))
         {
             release_object( queue );
@@ -372,6 +366,16 @@ static struct msg_queue *create_msg_queue( struct thread *thread, struct thread_
         SHARED_WRITE_END;
 
         thread->queue = queue;
+
+        /* NSPA: eager-allocate the bypass ring at queue creation so peers
+         * can reach this queue from moment-zero — no chicken-and-egg
+         * lazy-bootstrap order, no peer-lookup negative caching while we
+         * wait for the owner to do its own first ensure_own_bypass call.
+         * Idempotent + honours NSPA_MSG_BYPASS_SERVER_NO_ALLOC kill switch.
+         * Failure is non-fatal — the queue still functions on the legacy
+         * server-RPC message path; bypass simply remains absent for this
+         * queue (matches pre-2026-04-22 lazy-alloc fallback behaviour). */
+        nspa_ensure_shared( queue );
 
         if ((desktop = get_thread_desktop( thread, 0 )))
         {
@@ -3634,41 +3638,7 @@ DECL_HANDLER(nspa_get_thread_queue)
     queue = thread->queue;
     if (queue)
     {
-        int caller_ready;
-
         reply->locator = get_shared_object_locator( queue->shared );
-        /* NSPA msg-bypass: only allocate peer's bypass shm if the caller's
-         * own queue has already been allocated.  This is DEFAULT-ON safety
-         * behaviour that was root-caused 2026-04-17 — the speculative
-         * allocation pattern (e.g. DWM-Sync SEND attempt that allocates
-         * MainThread's bypass ring then falls back to server because
-         * DWM-Sync's own bypass isn't ready) disrupts library-panel
-         * message delivery in Ableton.  Set NSPA_FORCE_SPECULATIVE_ALLOC=1
-         * to opt back into the old behaviour for testing.
-         *
-         * As a consequence: bypass captures zero traffic by default until
-         * a separate bootstrap mechanism lazy-allocates the caller's OWN
-         * bypass (nspa_ensure_own from the client on first bypass attempt,
-         * TBD).  Library works + same performance as bypass-off in the
-         * meantime. */
-        {
-            static int force_speculative = -1;
-            if (force_speculative == -1)
-                force_speculative = (getenv("NSPA_FORCE_SPECULATIVE_ALLOC") != NULL);
-            caller_ready = force_speculative ||
-                           (current && current->queue && current->queue->nspa_shared);
-        }
-
-        {
-            static int post_debug2 = -1;
-            if (post_debug2 == -1) post_debug2 = (getenv("NSPA_POST_DEBUG") != NULL);
-            if (post_debug2)
-                fprintf( stderr, "nspa_post_debug: nspa_get_thread_queue target_tid=%04x caller_tid=%04x caller_own_nspa_shared=%p caller_ready=%d\n",
-                         queue && current ? (current->process == thread->process ? thread->id : 0) : 0,
-                         current ? current->id : 0,
-                         current && current->queue ? (void*)current->queue->nspa_shared : NULL,
-                         caller_ready );
-        }
 
         /* Locator field is retired by the memfd redesign — its .id doubles
          * as a "bypass fd follows this reply" sentinel during Phase 1.
@@ -3680,10 +3650,16 @@ DECL_HANDLER(nspa_get_thread_queue)
         reply->sync_handle = alloc_handle( current->process, queue->sync,
                                            EVENT_MODIFY_STATE | SYNCHRONIZE, 0 );
 
-        /* Allocate the bypass shmem if the caller is ready, then deliver
-         * the memfd via send_client_fd().  sync_handle doubles as the
-         * matching token so the client assert is unambiguous. */
-        if (caller_ready && reply->sync_handle && nspa_ensure_shared( queue ) &&
+        /* NSPA: deliver the peer's bypass memfd unconditionally.  Queues are
+         * eager-allocated at create_msg_queue time, so the ring is always
+         * present here (modulo the NSPA_MSG_BYPASS_SERVER_NO_ALLOC kill
+         * switch which makes nspa_ensure_shared a no-op).  The historical
+         * caller_ready gate that made delivery contingent on the *caller*
+         * having its own ring was a workaround for a session-shmem alloc
+         * side effect retired by the memfd redesign; with eager-allocate
+         * in place there is no remaining chicken-and-egg between caller
+         * readiness and peer ring availability. */
+        if (reply->sync_handle && nspa_ensure_shared( queue ) &&
             queue->nspa_bypass_fd != -1 &&
             send_client_fd( current->process, queue->nspa_bypass_fd, reply->sync_handle ) == 0)
         {

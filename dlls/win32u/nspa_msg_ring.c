@@ -59,7 +59,15 @@ WINE_DECLARE_DEBUG_CHANNEL(nspa_bypass);
  * don't leave us writing through a raw stale queue pointer.
  * --------------------------------------------------------------------- */
 
-#define NSPA_CACHE_SLOTS 32
+/* Per-thread bypass cache size.  Open-addressed linear-probed hash; once
+ * full, lookups for unseen tids return NULL with no eviction → the receiver-
+ * side reply path falls back to server reply_message, the sender doesn't
+ * see its ring slot fill, times out after 5s, and re-dispatches via server
+ * send_message → DUPLICATE window proc execution.  Sized at 128 to comfortably
+ * cover a DAW main thread receiving from 14 AudioCalc workers + ~20 misc
+ * UI/timer/library threads + headroom for VST plugin worker pools.  Cost is
+ * 128 × ~32B = 4 KB per producing thread (lazy-allocated). */
+#define NSPA_CACHE_SLOTS 128
 
 struct nspa_cache_entry
 {

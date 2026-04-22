@@ -1411,6 +1411,27 @@ int server_get_unix_fd( HANDLE handle, unsigned int wanted_access, int *unix_fd,
     *needs_close = 0;
     wanted_access &= FILE_READ_DATA | FILE_WRITE_DATA | FILE_APPEND_DATA;
 
+    /* NSPA local-file: if this is a local-file handle, return the
+     * cached unix_fd from our per-process file table without any
+     * server contact.  needs_close=0 because our table owns the fd
+     * lifetime; type=FD_TYPE_FILE because Phase 1A.2 only bypasses
+     * regular files; options=0 because MVP is FILE_OPEN read-only.
+     * Routes NtReadFile/NtWriteFile (and the rest of Wine's I/O paths
+     * that go through server_get_unix_fd) onto the local fd. */
+    if (nspa_local_file_is_local_handle( handle ))
+    {
+        int local_fd = nspa_local_file_table_lookup_unix_fd( handle );
+        if (local_fd >= 0)
+        {
+            *unix_fd = local_fd;
+            *needs_close = 0;
+            if (type) *type = FD_TYPE_FILE;
+            if (options) *options = 0;
+            return STATUS_SUCCESS;
+        }
+        return STATUS_INVALID_HANDLE;
+    }
+
     ret = get_cached_fd( handle, &fd, type, &access, options );
     if (ret != STATUS_INVALID_HANDLE) goto done;
 

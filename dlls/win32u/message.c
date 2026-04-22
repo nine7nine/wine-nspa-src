@@ -3990,6 +3990,7 @@ static LRESULT send_inter_thread_message( const struct send_message_info *info, 
         {
             WARN_(nspa_bypass)( "nspa_try_send_ring faulted for dest=%04x type=%u hwnd=%p msg=%04x — falling back to server\n",
                                 (UINT)info->dest_tid, info->type, info->hwnd, info->msg );
+            nspa_send_diag_fault_bump();
             bypass_ret = FALSE;
         }
         __ENDTRY

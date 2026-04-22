@@ -25,9 +25,12 @@
 
 #include <pthread.h>
 #include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "ntstatus.h"
@@ -131,6 +134,352 @@ static BOOL nspa_bypass_disabled( void )
     }
     return cached;
 }
+
+/* ---------------------------------------------------------------------
+ * T1 SEND/POST diagnostic — rejection-path counters.
+ *
+ * Opt-in via NSPA_SEND_DIAG=1.  Every exit branch of nspa_try_send_ring
+ * and nspa_try_post_ring bumps one atomic counter; a background pthread
+ * snapshots /tmp/nspa_send_diag.<pid>.log every 5 seconds and atexit()
+ * writes the final snapshot on clean exit.  The 5-second tick makes the
+ * dump robust under SIGKILL (which bypasses atexit).
+ *
+ * Cannot use SIGUSR1/2: Wine's ntdll/unix signal handlers reserve both
+ * for thread suspend / context on the client side.
+ *
+ * Forward-pointing taxonomy — each bucket maps to a scalability response:
+ *   REJ_*_RING_FULL    → Vyukov v2 (per-slot seqnum, wider ring, per-class carve-outs)
+ *   REJ_NOT_SEND_TYPE  → extend msg-bypass scope (MSG_CALLBACK etc.)
+ *   REJ_PEER_*         → bootstrap/ensure-own-bypass plumbing fix
+ *   REJ_NO_*_SHM       → session-shmem plumbing fix
+ *   REJ_*_OPT_IN_OFF   → gate-logic fix / default-on decision
+ * --------------------------------------------------------------------- */
+
+enum nspa_send_reason
+{
+    SEND_ENTRY = 0,
+    SEND_ACCEPT_SYNC,
+    SEND_ACCEPT_NOTIFY,
+    SEND_REJ_GATE_OFF,
+    SEND_REJ_NOT_SEND_TYPE,
+    SEND_REJ_NO_HWND,
+    SEND_REJ_SELF_SEND,
+    SEND_REJ_DDE,
+    SEND_REJ_PEER_FIRST_FAIL,
+    SEND_REJ_PEER_NEG_CACHE,
+    SEND_REJ_NO_DEST_SHM,
+    SEND_REJ_RING_INACTIVE,
+    SEND_REJ_SEND_OPT_IN_OFF,
+    SEND_REJ_NO_OWN_SHM,
+    SEND_REJ_REPLY_RING_FULL,
+    SEND_REJ_NO_OWN_SYNC,
+    SEND_REJ_DEST_RING_FULL,
+    SEND_REJ_REPLY_TIMEOUT,
+    SEND_REJ_FAULTED_SEH,
+    SEND_REASON_NB
+};
+
+enum nspa_post_reason
+{
+    POST_ENTRY = 0,
+    POST_ACCEPT,
+    POST_REJ_GATE_OFF,
+    POST_REJ_NOT_POSTED,
+    POST_REJ_NO_HWND,
+    POST_REJ_SELF_POST,
+    POST_REJ_DDE,
+    POST_REJ_PEER_FIRST_FAIL,
+    POST_REJ_PEER_NEG_CACHE,
+    POST_REJ_NO_DEST_SHM,
+    POST_REJ_RING_INACTIVE,
+    POST_REJ_DEST_RING_FULL,
+    POST_REASON_NB
+};
+
+static const char *const nspa_send_reason_name[SEND_REASON_NB] = {
+    "entry",
+    "accept_sync",
+    "accept_notify",
+    "rej_gate_off",
+    "rej_not_send_type",
+    "rej_no_hwnd",
+    "rej_self_send",
+    "rej_dde",
+    "rej_peer_first_fail",
+    "rej_peer_neg_cache",
+    "rej_no_dest_shm",
+    "rej_ring_inactive",
+    "rej_send_opt_in_off",
+    "rej_no_own_shm",
+    "rej_reply_ring_full",
+    "rej_no_own_sync",
+    "rej_dest_ring_full",
+    "rej_reply_timeout",
+    "rej_faulted_seh",
+};
+
+static const char *const nspa_post_reason_name[POST_REASON_NB] = {
+    "entry",
+    "accept",
+    "rej_gate_off",
+    "rej_not_posted",
+    "rej_no_hwnd",
+    "rej_self_post",
+    "rej_dde",
+    "rej_peer_first_fail",
+    "rej_peer_neg_cache",
+    "rej_no_dest_shm",
+    "rej_ring_inactive",
+    "rej_dest_ring_full",
+};
+
+static uint64_t nspa_diag_send[SEND_REASON_NB];
+static uint64_t nspa_diag_post[POST_REASON_NB];
+
+/* Per-thread breakdown — informs whether contention is concentrated on a
+ * few producer threads (e.g. AudioCalc workers) which is the signal for
+ * per-producer class rings in Vyukov v2. */
+#define NSPA_DIAG_TID_SLOTS 64
+struct nspa_diag_tid
+{
+    unsigned int tid;            /* 0 = free (CAS-claimed) */
+    uint64_t entries;
+    uint64_t accepts;
+    uint64_t rej_ring_full;      /* SEND dest_ring_full | reply_ring_full, POST dest_ring_full */
+    uint64_t rej_peer;           /* PEER_FIRST_FAIL | PEER_NEG_CACHE | NO_DEST_SHM */
+    uint64_t rej_type;           /* NOT_SEND_TYPE | NOT_POSTED (scope-miss) */
+};
+static struct nspa_diag_tid nspa_diag_tids[NSPA_DIAG_TID_SLOTS];
+static uint64_t nspa_diag_tid_overflow;
+
+static int nspa_send_diag_enabled( void )
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *v = getenv( "NSPA_SEND_DIAG" );
+        cached = (v && *v && *v != '0');
+    }
+    return cached;
+}
+
+static struct nspa_diag_tid *nspa_diag_tid_slot( unsigned int tid )
+{
+    unsigned int h = (tid * 2654435761u) & (NSPA_DIAG_TID_SLOTS - 1);
+    unsigned int i;
+
+    for (i = 0; i < NSPA_DIAG_TID_SLOTS; i++)
+    {
+        struct nspa_diag_tid *e = &nspa_diag_tids[(h + i) & (NSPA_DIAG_TID_SLOTS - 1)];
+        unsigned int cur = __atomic_load_n( &e->tid, __ATOMIC_ACQUIRE );
+        if (cur == tid) return e;
+        if (cur == 0)
+        {
+            unsigned int expected = 0;
+            if (__atomic_compare_exchange_n( &e->tid, &expected, tid, 0,
+                                             __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE ))
+                return e;
+            if (expected == tid) return e;
+            /* someone else claimed this slot for a different tid — keep probing */
+        }
+    }
+    __atomic_fetch_add( &nspa_diag_tid_overflow, 1, __ATOMIC_RELAXED );
+    return NULL;
+}
+
+static void nspa_diag_tid_bump_send( unsigned int tid, enum nspa_send_reason r )
+{
+    struct nspa_diag_tid *slot = nspa_diag_tid_slot( tid );
+    if (!slot) return;
+
+    switch (r)
+    {
+    case SEND_ENTRY:
+        __atomic_fetch_add( &slot->entries, 1, __ATOMIC_RELAXED ); break;
+    case SEND_ACCEPT_SYNC:
+    case SEND_ACCEPT_NOTIFY:
+        __atomic_fetch_add( &slot->accepts, 1, __ATOMIC_RELAXED ); break;
+    case SEND_REJ_DEST_RING_FULL:
+    case SEND_REJ_REPLY_RING_FULL:
+        __atomic_fetch_add( &slot->rej_ring_full, 1, __ATOMIC_RELAXED ); break;
+    case SEND_REJ_PEER_FIRST_FAIL:
+    case SEND_REJ_PEER_NEG_CACHE:
+    case SEND_REJ_NO_DEST_SHM:
+        __atomic_fetch_add( &slot->rej_peer, 1, __ATOMIC_RELAXED ); break;
+    case SEND_REJ_NOT_SEND_TYPE:
+        __atomic_fetch_add( &slot->rej_type, 1, __ATOMIC_RELAXED ); break;
+    default:
+        break;
+    }
+}
+
+static void nspa_diag_tid_bump_post( unsigned int tid, enum nspa_post_reason r )
+{
+    struct nspa_diag_tid *slot = nspa_diag_tid_slot( tid );
+    if (!slot) return;
+
+    switch (r)
+    {
+    case POST_ENTRY:
+        __atomic_fetch_add( &slot->entries, 1, __ATOMIC_RELAXED ); break;
+    case POST_ACCEPT:
+        __atomic_fetch_add( &slot->accepts, 1, __ATOMIC_RELAXED ); break;
+    case POST_REJ_DEST_RING_FULL:
+        __atomic_fetch_add( &slot->rej_ring_full, 1, __ATOMIC_RELAXED ); break;
+    case POST_REJ_PEER_FIRST_FAIL:
+    case POST_REJ_PEER_NEG_CACHE:
+    case POST_REJ_NO_DEST_SHM:
+        __atomic_fetch_add( &slot->rej_peer, 1, __ATOMIC_RELAXED ); break;
+    case POST_REJ_NOT_POSTED:
+        __atomic_fetch_add( &slot->rej_type, 1, __ATOMIC_RELAXED ); break;
+    default:
+        break;
+    }
+}
+
+/* Forward decl — defined below the dump function. */
+static void nspa_diag_lazy_start( void );
+
+static void nspa_send_diag_bump( enum nspa_send_reason r )
+{
+    if (!nspa_send_diag_enabled()) return;
+    __atomic_fetch_add( &nspa_diag_send[r], 1, __ATOMIC_RELAXED );
+    nspa_diag_tid_bump_send( HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ), r );
+    nspa_diag_lazy_start();
+}
+
+static void nspa_post_diag_bump( enum nspa_post_reason r )
+{
+    if (!nspa_send_diag_enabled()) return;
+    __atomic_fetch_add( &nspa_diag_post[r], 1, __ATOMIC_RELAXED );
+    nspa_diag_tid_bump_post( HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ), r );
+    nspa_diag_lazy_start();
+}
+
+/* External-facing bumper for send_inter_thread_message's __EXCEPT block. */
+void nspa_send_diag_fault_bump( void )
+{
+    if (!nspa_send_diag_enabled()) return;
+    __atomic_fetch_add( &nspa_diag_send[SEND_REJ_FAULTED_SEH], 1, __ATOMIC_RELAXED );
+    nspa_diag_lazy_start();
+}
+
+static time_t nspa_diag_start_epoch;
+
+static void nspa_diag_dump( void )
+{
+    char path[128];
+    char tmp[128];
+    FILE *f;
+    unsigned int i;
+    uint64_t send_total = 0, send_accepts = 0;
+    uint64_t post_total = 0, post_accepts = 0;
+    time_t now;
+
+    snprintf( tmp,  sizeof(tmp),  "/tmp/nspa_send_diag.%d.log.tmp", (int)getpid() );
+    snprintf( path, sizeof(path), "/tmp/nspa_send_diag.%d.log",      (int)getpid() );
+
+    if (!(f = fopen( tmp, "w" ))) return;
+
+    now = time( NULL );
+    fprintf( f, "NSPA T1 diagnostic  pid=%d  elapsed_s=%lld\n",
+             (int)getpid(), (long long)(now - nspa_diag_start_epoch) );
+    fprintf( f, "----\n" );
+
+    fprintf( f, "[send] nspa_try_send_ring\n" );
+    for (i = 0; i < SEND_REASON_NB; i++)
+    {
+        uint64_t v = __atomic_load_n( &nspa_diag_send[i], __ATOMIC_RELAXED );
+        fprintf( f, "  %-24s %llu\n", nspa_send_reason_name[i], (unsigned long long)v );
+        if (i == SEND_ACCEPT_SYNC || i == SEND_ACCEPT_NOTIFY) send_accepts += v;
+        if (i != SEND_ENTRY) send_total += v;   /* accept + all rejects */
+    }
+    {
+        uint64_t entry = __atomic_load_n( &nspa_diag_send[SEND_ENTRY], __ATOMIC_RELAXED );
+        fprintf( f, "  sanity  entry=%llu  accept+rej=%llu  delta=%lld\n",
+                 (unsigned long long)entry,
+                 (unsigned long long)send_total,
+                 (long long)(entry - send_total) );
+        fprintf( f, "  accept_rate=%.2f%%\n",
+                 entry ? (100.0 * (double)send_accepts / (double)entry) : 0.0 );
+    }
+
+    fprintf( f, "\n[post] nspa_try_post_ring\n" );
+    for (i = 0; i < POST_REASON_NB; i++)
+    {
+        uint64_t v = __atomic_load_n( &nspa_diag_post[i], __ATOMIC_RELAXED );
+        fprintf( f, "  %-24s %llu\n", nspa_post_reason_name[i], (unsigned long long)v );
+        if (i == POST_ACCEPT) post_accepts = v;
+        if (i != POST_ENTRY) post_total += v;
+    }
+    {
+        uint64_t entry = __atomic_load_n( &nspa_diag_post[POST_ENTRY], __ATOMIC_RELAXED );
+        fprintf( f, "  sanity  entry=%llu  accept+rej=%llu  delta=%lld\n",
+                 (unsigned long long)entry,
+                 (unsigned long long)post_total,
+                 (long long)(entry - post_total) );
+        fprintf( f, "  accept_rate=%.2f%%\n",
+                 entry ? (100.0 * (double)post_accepts / (double)entry) : 0.0 );
+    }
+
+    fprintf( f, "\n[per-thread]  tid       entries    accepts   ring_full    peer    type   accept%%\n" );
+    for (i = 0; i < NSPA_DIAG_TID_SLOTS; i++)
+    {
+        struct nspa_diag_tid *s = &nspa_diag_tids[i];
+        unsigned int tid = __atomic_load_n( &s->tid, __ATOMIC_RELAXED );
+        uint64_t entries, accepts, ring_full, peer, type;
+        if (!tid) continue;
+        entries   = __atomic_load_n( &s->entries,       __ATOMIC_RELAXED );
+        accepts   = __atomic_load_n( &s->accepts,       __ATOMIC_RELAXED );
+        ring_full = __atomic_load_n( &s->rej_ring_full, __ATOMIC_RELAXED );
+        peer      = __atomic_load_n( &s->rej_peer,      __ATOMIC_RELAXED );
+        type      = __atomic_load_n( &s->rej_type,      __ATOMIC_RELAXED );
+        fprintf( f, "              %6x  %10llu  %9llu  %10llu  %6llu  %6llu   %5.1f%%\n",
+                 tid,
+                 (unsigned long long)entries,
+                 (unsigned long long)accepts,
+                 (unsigned long long)ring_full,
+                 (unsigned long long)peer,
+                 (unsigned long long)type,
+                 entries ? (100.0 * (double)accepts / (double)entries) : 0.0 );
+    }
+    {
+        uint64_t overflow = __atomic_load_n( &nspa_diag_tid_overflow, __ATOMIC_RELAXED );
+        if (overflow) fprintf( f, "  tid-table overflow bumps: %llu\n", (unsigned long long)overflow );
+    }
+
+    fclose( f );
+    rename( tmp, path );
+}
+
+static void *nspa_diag_thread_main( void *arg )
+{
+    (void)arg;
+    for (;;)
+    {
+        struct timespec ts = { 5, 0 };
+        nanosleep( &ts, NULL );
+        nspa_diag_dump();
+    }
+    return NULL;
+}
+
+static pthread_once_t nspa_diag_start_once = PTHREAD_ONCE_INIT;
+
+static void nspa_diag_start_once_fn( void )
+{
+    pthread_t th;
+    nspa_diag_start_epoch = time( NULL );
+    atexit( nspa_diag_dump );
+    if (pthread_create( &th, NULL, nspa_diag_thread_main, NULL ) == 0)
+        pthread_detach( th );
+}
+
+static void nspa_diag_lazy_start( void )
+{
+    pthread_once( &nspa_diag_start_once, nspa_diag_start_once_fn );
+}
+
 
 /* ---------------------------------------------------------------------
  * Ring helpers — atomic ops over shared memory.
@@ -295,10 +644,17 @@ static BOOL nspa_populate_cache_entry( DWORD tid, struct nspa_cache_entry *entry
  * cross-process destination (the server correctly rejects it every time
  * but the round-trip itself is visible, and measurably so — see the
  * regression notes in docs/send-message-bypass-design.md §15.4). */
-static struct nspa_cache_entry *nspa_lookup_peer( DWORD tid )
+/* Three-valued variant: out-param lets the caller distinguish an existing
+ * negative-cache entry (server already said "no bypass" on a prior call —
+ * no RPC issued this time) from a first-time populate failure (RPC issued,
+ * just now rejected).  The difference matters for the T1 diagnostic:
+ * neg-cache hits indicate a persistent plumbing gap, first-fails indicate
+ * peer threads we haven't yet successfully reached. */
+static struct nspa_cache_entry *nspa_lookup_peer_ex( DWORD tid, BOOL *was_neg_cache )
 {
     struct nspa_cache_entry *cache, *entry;
 
+    if (was_neg_cache) *was_neg_cache = FALSE;
     if (!tid) return NULL;
 
     if (!(cache = nspa_cache_get())) return NULL;  /* TLS alloc failed */
@@ -310,6 +666,7 @@ static struct nspa_cache_entry *nspa_lookup_peer( DWORD tid )
         /* Positive cache: mapped_ptr holds the peer's ring mmap. */
         if (entry->mapped_ptr) return entry;
         /* Negative cache: tid set, mapped_ptr NULL (server had no bypass). */
+        if (was_neg_cache) *was_neg_cache = TRUE;
         return NULL;
     }
 
@@ -323,6 +680,11 @@ static struct nspa_cache_entry *nspa_lookup_peer( DWORD tid )
         return NULL;
     }
     return entry;
+}
+
+static struct nspa_cache_entry *nspa_lookup_peer( DWORD tid )
+{
+    return nspa_lookup_peer_ex( tid, NULL );
 }
 
 
@@ -343,12 +705,16 @@ BOOL nspa_try_post_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
     volatile nspa_msg_slot_t *slot;
     NTSTATUS status;
     unsigned int idx;
+    BOOL was_neg_cache = FALSE;
+
+    nspa_post_diag_bump( POST_ENTRY );
 
     if (nspa_bypass_disabled())
     {
         TRACE_(nspa_bypass)( "skip disabled tid=%04x dest=%04x hwnd=%p msg=%04x\n",
                              HandleToULong(NtCurrentTeb()->ClientId.UniqueThread),
                              (UINT)dest_tid, hwnd, msg );
+        nspa_post_diag_bump( POST_REJ_GATE_OFF );
         return FALSE;
     }
 
@@ -358,6 +724,7 @@ BOOL nspa_try_post_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
         TRACE_(nspa_bypass)( "skip not-posted type=%u tid=%04x dest=%04x hwnd=%p msg=%04x\n",
                              type_enum, HandleToULong(NtCurrentTeb()->ClientId.UniqueThread),
                              (UINT)dest_tid, hwnd, msg );
+        nspa_post_diag_bump( POST_REJ_NOT_POSTED );
         return FALSE;
     }
 
@@ -371,12 +738,14 @@ BOOL nspa_try_post_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
         TRACE_(nspa_bypass)( "skip thread-msg tid=%04x dest=%04x msg=%04x\n",
                              HandleToULong(NtCurrentTeb()->ClientId.UniqueThread),
                              (UINT)dest_tid, msg );
+        nspa_post_diag_bump( POST_REJ_NO_HWND );
         return FALSE;
     }
     if (dest_tid == HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ))
     {
         TRACE_(nspa_bypass)( "skip self-post tid=%04x hwnd=%p msg=%04x\n",
                              (UINT)dest_tid, hwnd, msg );
+        nspa_post_diag_bump( POST_REJ_SELF_POST );
         return FALSE;
     }
 
@@ -386,15 +755,17 @@ BOOL nspa_try_post_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
         TRACE_(nspa_bypass)( "skip dde tid=%04x dest=%04x hwnd=%p msg=%04x\n",
                              HandleToULong(NtCurrentTeb()->ClientId.UniqueThread),
                              (UINT)dest_tid, hwnd, msg );
+        nspa_post_diag_bump( POST_REJ_DDE );
         return FALSE;
     }
 
-    entry = nspa_lookup_peer( dest_tid );
+    entry = nspa_lookup_peer_ex( dest_tid, &was_neg_cache );
     if (!entry)
     {
         TRACE_(nspa_bypass)( "skip lookup-fail tid=%04x dest=%04x hwnd=%p msg=%04x\n",
                              HandleToULong(NtCurrentTeb()->ClientId.UniqueThread),
                              (UINT)dest_tid, hwnd, msg );
+        nspa_post_diag_bump( was_neg_cache ? POST_REJ_PEER_NEG_CACHE : POST_REJ_PEER_FIRST_FAIL );
         return FALSE;
     }
 
@@ -405,6 +776,7 @@ BOOL nspa_try_post_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
                              HandleToULong(NtCurrentTeb()->ClientId.UniqueThread),
                              (UINT)dest_tid, hwnd, msg );
         nspa_clear_cache_entry( entry );
+        nspa_post_diag_bump( POST_REJ_NO_DEST_SHM );
         return FALSE;
     }
 
@@ -414,6 +786,7 @@ BOOL nspa_try_post_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
         TRACE_(nspa_bypass)( "skip ring-inactive tid=%04x dest=%04x hwnd=%p msg=%04x\n",
                              HandleToULong(NtCurrentTeb()->ClientId.UniqueThread),
                              (UINT)dest_tid, hwnd, msg );
+        nspa_post_diag_bump( POST_REJ_RING_INACTIVE );
         return FALSE;
     }
 
@@ -423,6 +796,7 @@ BOOL nspa_try_post_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
         TRACE_(nspa_bypass)( "skip ring-full tid=%04x dest=%04x hwnd=%p msg=%04x\n",
                              HandleToULong(NtCurrentTeb()->ClientId.UniqueThread),
                              (UINT)dest_tid, hwnd, msg );
+        nspa_post_diag_bump( POST_REJ_DEST_RING_FULL );
         return FALSE;
     }
 
@@ -467,6 +841,7 @@ BOOL nspa_try_post_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
     TRACE_(nspa_bypass)( "post tid=%04x dest=%04x hwnd=%p msg=%04x wp=%lx lp=%lx\n",
                          HandleToULong(NtCurrentTeb()->ClientId.UniqueThread),
                          (UINT)dest_tid, hwnd, msg, (unsigned long)wparam, (unsigned long)lparam );
+    nspa_post_diag_bump( POST_ACCEPT );
     return TRUE;
 }
 
@@ -846,15 +1221,19 @@ BOOL nspa_try_send_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
     NTSTATUS status;
     DWORD own_tid;
     BOOL is_notify;
+    BOOL was_neg_cache = FALSE;
     int waits = 0;
 
     TRACE_(nspa_bypass)( "PROBE try_send_ring enter dest=%04x type=%u hwnd=%p msg=%04x\n",
                          (UINT)dest_tid, type_enum, hwnd, msg );
 
+    nspa_send_diag_bump( SEND_ENTRY );
+
     if (nspa_bypass_disabled())
     {
         TRACE_(nspa_bypass)( "send skip disabled dest=%04x hwnd=%p msg=%04x\n",
                              (UINT)dest_tid, hwnd, msg );
+        nspa_send_diag_bump( SEND_REJ_GATE_OFF );
         return FALSE;
     }
 
@@ -863,6 +1242,7 @@ BOOL nspa_try_send_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
     {
         TRACE_(nspa_bypass)( "send skip not-send-type type=%u dest=%04x msg=%04x\n",
                              type_enum, (UINT)dest_tid, msg );
+        nspa_send_diag_bump( SEND_REJ_NOT_SEND_TYPE );
         return FALSE;
     }
 
@@ -870,6 +1250,7 @@ BOOL nspa_try_send_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
     {
         TRACE_(nspa_bypass)( "send skip thread-msg dest=%04x msg=%04x\n",
                              (UINT)dest_tid, msg );
+        nspa_send_diag_bump( SEND_REJ_NO_HWND );
         return FALSE;
     }
     own_tid = HandleToULong( NtCurrentTeb()->ClientId.UniqueThread );
@@ -877,20 +1258,23 @@ BOOL nspa_try_send_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
     {
         TRACE_(nspa_bypass)( "send skip self-send dest=%04x hwnd=%p msg=%04x\n",
                              (UINT)dest_tid, hwnd, msg );
+        nspa_send_diag_bump( SEND_REJ_SELF_SEND );
         return FALSE;
     }
     if (msg >= WM_DDE_FIRST && msg <= WM_DDE_LAST)
     {
         TRACE_(nspa_bypass)( "send skip dde dest=%04x hwnd=%p msg=%04x\n",
                              (UINT)dest_tid, hwnd, msg );
+        nspa_send_diag_bump( SEND_REJ_DDE );
         return FALSE;
     }
 
-    entry = nspa_lookup_peer( dest_tid );
+    entry = nspa_lookup_peer_ex( dest_tid, &was_neg_cache );
     if (!entry)
     {
         TRACE_(nspa_bypass)( "send skip lookup-fail dest=%04x hwnd=%p msg=%04x\n",
                              (UINT)dest_tid, hwnd, msg );
+        nspa_send_diag_bump( was_neg_cache ? SEND_REJ_PEER_NEG_CACHE : SEND_REJ_PEER_FIRST_FAIL );
         return FALSE;
     }
 
@@ -900,6 +1284,7 @@ BOOL nspa_try_send_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
         nspa_clear_cache_entry( entry );
         TRACE_(nspa_bypass)( "send skip no-bypass-shm dest=%04x hwnd=%p msg=%04x\n",
                              (UINT)dest_tid, hwnd, msg );
+        nspa_send_diag_bump( SEND_REJ_NO_DEST_SHM );
         return FALSE;
     }
 
@@ -908,6 +1293,7 @@ BOOL nspa_try_send_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
     {
         TRACE_(nspa_bypass)( "send skip ring-inactive dest=%04x hwnd=%p msg=%04x\n",
                              (UINT)dest_tid, hwnd, msg );
+        nspa_send_diag_bump( SEND_REJ_RING_INACTIVE );
         return FALSE;
     }
 
@@ -923,6 +1309,7 @@ BOOL nspa_try_send_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
         {
             TRACE_(nspa_bypass)( "send skip send-opt-in-disabled dest=%04x msg=%04x\n",
                                  (UINT)dest_tid, msg );
+            nspa_send_diag_bump( SEND_REJ_SEND_OPT_IN_OFF );
             return FALSE;
         }
         own_bypass = nspa_get_own_bypass_shm();
@@ -930,6 +1317,7 @@ BOOL nspa_try_send_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
         {
             TRACE_(nspa_bypass)( "send skip no-own-bypass dest=%04x msg=%04x\n",
                                  (UINT)dest_tid, msg );
+            nspa_send_diag_bump( SEND_REJ_NO_OWN_SHM );
             return FALSE;
         }
         own_reply_ring = &((nspa_queue_bypass_shm_t *)own_bypass)->nspa_reply_ring;
@@ -938,6 +1326,7 @@ BOOL nspa_try_send_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
         {
             TRACE_(nspa_bypass)( "send skip reply-ring-full dest=%04x msg=%04x\n",
                                  (UINT)dest_tid, msg );
+            nspa_send_diag_bump( SEND_REJ_REPLY_RING_FULL );
             return FALSE;
         }
         own_sync = nspa_get_own_server_queue_handle();
@@ -947,6 +1336,7 @@ BOOL nspa_try_send_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
                               NSPA_REPLY_STATE_FREE, __ATOMIC_RELEASE );
             TRACE_(nspa_bypass)( "send skip no-own-sync dest=%04x msg=%04x\n",
                                  (UINT)dest_tid, msg );
+            nspa_send_diag_bump( SEND_REJ_NO_OWN_SYNC );
             return FALSE;
         }
         reply_slot = &own_reply_ring->slots[reply_idx];
@@ -966,6 +1356,7 @@ BOOL nspa_try_send_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
             __atomic_store_n( &reply_slot->state, NSPA_REPLY_STATE_FREE, __ATOMIC_RELEASE );
         TRACE_(nspa_bypass)( "send skip ring-full dest=%04x msg=%04x\n",
                              (UINT)dest_tid, msg );
+        nspa_send_diag_bump( SEND_REJ_DEST_RING_FULL );
         return FALSE;
     }
 
@@ -1003,7 +1394,11 @@ BOOL nspa_try_send_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
     TRACE_(nspa_bypass)( "send posted tid=%04x dest=%04x type=%u msg=%04x slot=%u reply=%u\n",
                          own_tid, (UINT)dest_tid, type_enum, msg, msg_idx, reply_idx );
 
-    if (is_notify) return TRUE;
+    if (is_notify)
+    {
+        nspa_send_diag_bump( SEND_ACCEPT_NOTIFY );
+        return TRUE;
+    }
 
     /* Wait for reply.  queue->sync is manual-reset and shared with ordinary
      * pump traffic, so we poll the reply state with a short timeout rather
@@ -1026,6 +1421,7 @@ BOOL nspa_try_send_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
             TRACE_(nspa_bypass)( "send timeout dest=%04x msg=%04x slot=%u\n",
                                  (UINT)dest_tid, msg, reply_idx );
             __atomic_store_n( &reply_slot->state, NSPA_REPLY_STATE_FREE, __ATOMIC_RELEASE );
+            nspa_send_diag_bump( SEND_REJ_REPLY_TIMEOUT );
             return FALSE;
         }
         /* Drain inbound SEND messages before waiting so a peer that has
@@ -1044,5 +1440,6 @@ BOOL nspa_try_send_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
 
     TRACE_(nspa_bypass)( "send got-reply dest=%04x msg=%04x result=%lx waits=%d\n",
                          (UINT)dest_tid, msg, (unsigned long)*result_out, waits );
+    nspa_send_diag_bump( SEND_ACCEPT_SYNC );
     return TRUE;
 }

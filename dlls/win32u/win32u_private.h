@@ -44,6 +44,11 @@ extern BOOL nspa_try_send_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
                                 LRESULT *result_out );
 extern BOOL nspa_write_ring_reply( DWORD sender_tid, UINT reply_slot_idx,
                                    LRESULT result, const void *data, UINT data_size );
+/* T1 diagnostic: caller-side SEH-swallowed fault counter.  Called from
+ * send_inter_thread_message's __EXCEPT block so we can distinguish a
+ * fault-during-bypass from the ordinary reject exits.  No-op when the
+ * NSPA_SEND_DIAG gate is off. */
+extern void nspa_send_diag_fault_bump( void );
 /* Memfd-era replacement for the old queue_shm_t.nspa_bypass_locator
  * resolution.  Returns current thread's own bypass ring mmap (bootstrapping
  * via server request on first call), or NULL if bypass is off / server

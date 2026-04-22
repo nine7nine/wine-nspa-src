@@ -230,24 +230,43 @@ void nspa_inode_publish_slot( unsigned long long device, unsigned long long inod
     /* Seqlock begin — odd = mutating. */
     __atomic_store_n( &bucket->seq, seq + 1, __ATOMIC_RELEASE );
 
+    /* Server publishes into subentry[0] only — subentries[1..N-1] are
+     * client processes' views, written by clients in Phase 1A.2.c.  We
+     * never overwrite client subentries here; we only update the server's
+     * subentry and clear/initialise the slot key fields if first/last
+     * subentry comes/goes. */
     if (refcount == 0)
     {
-        slot->device                = 0;
-        slot->inode                 = 0;
-        slot->refcount              = 0;
-        slot->agg_existing_access   = 0;
-        slot->agg_existing_sharing  = 0;
-        slot->flags                 = 0;
-        if (bucket->slot_count > 0) bucket->slot_count--;
+        /* Server has no opens for this inode anymore.  Clear server's
+         * subentry.  If no client subentries are present either, the
+         * slot becomes fully empty (device = 0). */
+        unsigned int i;
+        int any_client = 0;
+        slot->sub_refcount[0] = 0;
+        slot->sub_access[0]   = 0;
+        slot->sub_sharing[0]  = 0;
+        for (i = 1; i < NSPA_INODE_SUBENTRIES; i++)
+            if (slot->pids[i] != 0) { any_client = 1; break; }
+        if (!any_client)
+        {
+            unsigned int j;
+            slot->device = 0;
+            slot->inode  = 0;
+            slot->flags  = 0;
+            for (j = 0; j < NSPA_INODE_SUBENTRIES; j++) slot->pids[j] = 0;
+            if (bucket->slot_count > 0) bucket->slot_count--;
+        }
     }
     else
     {
         if (slot->device == 0) bucket->slot_count++;
-        slot->device                = device;
-        slot->inode                 = inode_no;
-        slot->refcount              = refcount;
-        slot->agg_existing_access   = agg_existing_access;
-        slot->agg_existing_sharing  = agg_existing_sharing;
+        slot->device          = device;
+        slot->inode           = inode_no;
+        slot->sub_refcount[0] = refcount;
+        slot->sub_access[0]   = agg_existing_access;
+        slot->sub_sharing[0]  = agg_existing_sharing;
+        /* pids[0] always 0 — server's subentry is implicit by index 0. */
+        slot->pids[0]         = 0;
         /* flags reserved for FILE_MAPPING_* tracking — Phase 3. */
     }
 

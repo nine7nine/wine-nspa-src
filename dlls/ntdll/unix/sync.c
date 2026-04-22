@@ -3643,6 +3643,34 @@ NTSTATUS WINAPI NtCreateSection( HANDLE *handle, ACCESS_MASK access, const OBJEC
 
     if ((ret = alloc_object_attributes( attr, &objattr, &len ))) return ret;
 
+    /* NSPA local-file Phase 1A.3: if the file handle is a local-range
+     * handle (opened via the bypass in NtCreateFile), promote it to
+     * a server-side mapping by sending the unix fd via inflight + a
+     * dedicated RPC.  Server allocates an inode-tracked struct file
+     * from the unix fd and creates the section against it. */
+    if (file && nspa_local_file_is_local_handle( file ))
+    {
+        int unix_fd = nspa_local_file_table_lookup_unix_fd( file );
+        if (unix_fd >= 0)
+        {
+            wine_server_send_fd( unix_fd );
+            SERVER_START_REQ( nspa_create_mapping_from_unix_fd )
+            {
+                req->fd          = unix_fd;
+                req->access      = access;
+                req->flags       = sec_flags;
+                req->file_access = file_access;
+                req->size        = size ? size->QuadPart : 0;
+                wine_server_add_data( req, objattr, len );
+                ret = wine_server_call( req );
+                *handle = wine_server_ptr_handle( reply->handle );
+            }
+            SERVER_END_REQ;
+            free( objattr );
+            return ret;
+        }
+    }
+
     SERVER_START_REQ( create_mapping )
     {
         req->access      = access;

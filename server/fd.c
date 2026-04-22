@@ -2259,6 +2259,83 @@ error:
     return NULL;
 }
 
+/* NSPA local-file Phase 1A.3: build an inode-tracked fd from a unix
+ * fd that the client already opened.  Mirrors the post-open() portion
+ * of open_fd: fstat → get_inode → list_add → check_sharing → publish.
+ *
+ * MVP scope: regular files only (S_ISREG).  Special files / directories
+ * fail with STATUS_INVALID_PARAMETER; clients fall back to server's
+ * full create_file path for those.
+ *
+ * Takes ownership of unix_fd: closes it on any failure (including
+ * sharing violation), so the caller never needs to clean up. */
+struct fd *create_inode_fd_from_unix_fd( int unix_fd, unsigned int access,
+                                         unsigned int sharing, unsigned int options,
+                                         struct unicode_str nt_name )
+{
+    struct stat st;
+    struct closed_fd *closed_fd;
+    struct fd *fd;
+    struct inode *inode;
+    unsigned int err;
+
+    if (fstat( unix_fd, &st ) == -1)
+    {
+        file_set_error();
+        close( unix_fd );
+        return NULL;
+    }
+    if (!S_ISREG( st.st_mode ))
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        close( unix_fd );
+        return NULL;
+    }
+
+    if (!(fd = alloc_fd_object()))
+    {
+        close( unix_fd );
+        return NULL;
+    }
+    fd->options = options;
+
+    if (!(closed_fd = mem_alloc( sizeof(*closed_fd) )))
+    {
+        close( unix_fd );
+        release_object( fd );
+        return NULL;
+    }
+
+    fd->unix_fd   = unix_fd;
+    fd->nt_name   = dup_nt_name( NULL, nt_name, &fd->nt_namelen );
+    fd->unix_name = NULL;
+
+    inode = get_inode( st.st_dev, st.st_ino, fd->unix_fd );
+    if (!inode)
+    {
+        free( closed_fd );
+        release_object( fd );
+        return NULL;
+    }
+
+    closed_fd->unix_fd    = fd->unix_fd;
+    closed_fd->unix_name  = fd->unix_name;
+    closed_fd->disp_flags = 0;
+    fd->inode             = inode;
+    fd->closed            = closed_fd;
+    fd->cacheable         = !inode->device->removable;
+    list_add_head( &inode->open, &fd->inode_entry );
+    nspa_publish_inode_state( inode );
+
+    if ((err = check_sharing( fd, access, sharing, 0, options )))
+    {
+        set_error( err );
+        release_object( fd );
+        return NULL;
+    }
+    return fd;
+}
+
 /* create an fd for an anonymous file */
 /* if the function fails the unix fd is closed */
 struct fd *create_anonymous_fd( const struct fd_ops *fd_user_ops, int unix_fd, struct object *user,

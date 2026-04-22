@@ -315,6 +315,7 @@ DECL_HANDLER(d3dkmt_mutex_acquire);
 DECL_HANDLER(d3dkmt_mutex_release);
 DECL_HANDLER(nspa_get_thread_queue);
 DECL_HANDLER(nspa_ensure_own_bypass);
+DECL_HANDLER(nspa_create_mapping_from_unix_fd);
 DECL_HANDLER(nspa_get_inode_table);
 
 typedef void (*req_handler)( const void *req, void *reply );
@@ -628,6 +629,7 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_d3dkmt_mutex_release,
     (req_handler)req_nspa_get_thread_queue,
     (req_handler)req_nspa_ensure_own_bypass,
+    (req_handler)req_nspa_create_mapping_from_unix_fd,
     (req_handler)req_nspa_get_inode_table,
 };
 
@@ -2395,6 +2397,14 @@ C_ASSERT( sizeof(struct nspa_get_thread_queue_reply) == 48 );
 C_ASSERT( sizeof(struct nspa_ensure_own_bypass_request) == 16 );
 C_ASSERT( offsetof(struct nspa_ensure_own_bypass_reply, fd_sent) == 8 );
 C_ASSERT( sizeof(struct nspa_ensure_own_bypass_reply) == 16 );
+C_ASSERT( offsetof(struct nspa_create_mapping_from_unix_fd_request, fd) == 12 );
+C_ASSERT( offsetof(struct nspa_create_mapping_from_unix_fd_request, access) == 16 );
+C_ASSERT( offsetof(struct nspa_create_mapping_from_unix_fd_request, flags) == 20 );
+C_ASSERT( offsetof(struct nspa_create_mapping_from_unix_fd_request, file_access) == 24 );
+C_ASSERT( offsetof(struct nspa_create_mapping_from_unix_fd_request, size) == 32 );
+C_ASSERT( sizeof(struct nspa_create_mapping_from_unix_fd_request) == 40 );
+C_ASSERT( offsetof(struct nspa_create_mapping_from_unix_fd_reply, handle) == 8 );
+C_ASSERT( sizeof(struct nspa_create_mapping_from_unix_fd_reply) == 16 );
 C_ASSERT( sizeof(struct nspa_get_inode_table_request) == 16 );
 C_ASSERT( offsetof(struct nspa_get_inode_table_reply, fd_sent) == 8 );
 C_ASSERT( offsetof(struct nspa_get_inode_table_reply, bucket_count) == 12 );

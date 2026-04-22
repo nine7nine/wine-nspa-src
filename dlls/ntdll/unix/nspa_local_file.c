@@ -237,14 +237,13 @@ int nspa_local_file_table_lookup( unsigned long long device, unsigned long long 
  * implications the bypass would mishandle are listed; advisory hints
  * (RANDOM_ACCESS, SEQUENTIAL_ONLY) are intentionally NOT here.
  *
- * FILE_NON_DIRECTORY_FILE is the loader-specific signal — DLL loads
- * will subsequently NtCreateSection on the handle, which requires the
- * server to know about it.  Local handles cannot be section-mapped, so
- * exclude this option from MVP eligibility. */
+ * FILE_NON_DIRECTORY_FILE re-allowed in 1A.3: NtCreateSection now
+ * promotes local handles to server-mediated sections via the
+ * nspa_create_mapping_from_unix_fd handler. */
 #define NSPA_LF_DISQUALIFYING_OPTIONS \
     (FILE_NO_INTERMEDIATE_BUFFERING | FILE_WRITE_THROUGH | \
      FILE_OPEN_FOR_BACKUP_INTENT | FILE_RESERVE_OPFILTER | \
-     FILE_COMPLETE_IF_OPLOCKED | FILE_NON_DIRECTORY_FILE)
+     FILE_COMPLETE_IF_OPLOCKED)
 
 /* Forward decl — implementation appears later in the file (Slice 1A.1.c). */
 static void nspa_lf_table_open_lazy( void );

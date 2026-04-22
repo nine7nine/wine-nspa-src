@@ -4500,6 +4500,25 @@ enum inproc_sync_type
 @END
 
 
+/* NSPA local-file Phase 1A.3: create a section/mapping from a unix fd
+ * the client already opened locally via the bypass.  Used by NtCreateSection
+ * when promotion is needed (caller has a local-range file handle).  Server
+ * receives the inflight fd, builds an inode-tracked struct file, then runs
+ * the same mapping creation path as the regular create_mapping handler.
+ *
+ * Same shape as create_mapping but file_handle is replaced by inflight fd. */
+@REQ(nspa_create_mapping_from_unix_fd)
+    int             fd;          /* inflight unix fd id (client-assigned) */
+    unsigned int    access;      /* mapping access */
+    unsigned int    flags;       /* SEC_* flags */
+    unsigned int    file_access; /* file access rights */
+    mem_size_t      size;        /* mapping size */
+    VARARG(objattr,object_attributes); /* object attributes */
+@REPLY
+    obj_handle_t    handle;
+@END
+
+
 /* NSPA: fetch the process-global shared inode table memfd for the
  * local-file bypass (Phase 1A.1).  Server lazily allocates a shmem region
  * on first call and returns the same fd to every caller via send_client_fd.

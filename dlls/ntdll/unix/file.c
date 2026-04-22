@@ -4707,10 +4707,12 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
          * a real conflict (propagate), or STATUS_NOT_SUPPORTED to fall
          * back to the existing server path.  Eligibility filter mirrors
          * nspa_local_file_diag_categorize. */
+        /* FILE_NON_DIRECTORY_FILE re-allowed: NtCreateSection now
+         * promotes local handles to server-mediated sections via the
+         * nspa_create_mapping_from_unix_fd handler (Phase 1A.3). */
         if (!attr->RootDirectory && !attr->SecurityDescriptor &&
             disposition == FILE_OPEN &&
-            !(options & (FILE_OPEN_BY_FILE_ID | FILE_DIRECTORY_FILE | FILE_DELETE_ON_CLOSE |
-                         FILE_NON_DIRECTORY_FILE)) &&
+            !(options & (FILE_OPEN_BY_FILE_ID | FILE_DIRECTORY_FILE | FILE_DELETE_ON_CLOSE)) &&
             !(access & ~(FILE_READ_DATA | FILE_READ_ATTRIBUTES | FILE_READ_EA |
                          READ_CONTROL | SYNCHRONIZE | GENERIC_READ)))
         {

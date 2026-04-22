@@ -1217,9 +1217,14 @@ static unsigned int get_mapping_flags( obj_handle_t handle, unsigned int flags )
 }
 
 
+/* NSPA local-file Phase 1A.3: refactored to accept either a server
+ * handle (existing path) or a struct file directly (used by the
+ * nspa_create_mapping_from_unix_fd handler when promoting a local
+ * file handle).  Pass either `handle` or `file_obj`; not both. */
 static struct mapping *create_mapping( struct object *root, const struct unicode_str *name,
                                        unsigned int attr, mem_size_t size, unsigned int flags,
-                                       obj_handle_t handle, unsigned int file_access,
+                                       obj_handle_t handle, struct file *file_obj,
+                                       unsigned int file_access,
                                        const struct security_descriptor *sd )
 {
     struct mapping *mapping;
@@ -1227,6 +1232,8 @@ static struct mapping *create_mapping( struct object *root, const struct unicode
     struct fd *fd;
     int unix_fd;
     struct stat st;
+    int has_file = (handle != 0 || file_obj != NULL);
+    int file_obj_owned = 0;
 
     if (!(mapping = create_named_object( root, &mapping_ops, name, attr, sd )))
         return NULL;
@@ -1243,14 +1250,24 @@ static struct mapping *create_mapping( struct object *root, const struct unicode
     mapping->exp_len     = 0;
     mapping->ver_len     = 0;
 
-    if (!(mapping->flags = get_mapping_flags( handle, flags ))) goto error;
+    /* get_mapping_flags only checks file-or-not; pass any non-zero value
+     * when we have a file_obj. */
+    if (!(mapping->flags = get_mapping_flags( has_file ? 1 : 0, flags ))) goto error;
 
-    if (handle)
+    if (has_file)
     {
         const unsigned int sharing = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
         unsigned int mapping_access = FILE_MAPPING_ACCESS;
 
-        if (!(file = get_file_obj( current->process, handle, file_access ))) goto error;
+        if (file_obj)
+        {
+            file = file_obj;        /* caller-owned; do not release */
+        }
+        else
+        {
+            if (!(file = get_file_obj( current->process, handle, file_access ))) goto error;
+            file_obj_owned = 1;
+        }
         fd = get_obj_fd( (struct object *)file );
 
         /* file sharing rules for mappings are different so we use magic the access rights */
@@ -1262,7 +1279,7 @@ static struct mapping *create_mapping( struct object *root, const struct unicode
             mapping->fd = dup_fd_object( fd, mapping_access, sharing, FILE_SYNCHRONOUS_IO_NONALERT );
             if (mapping->fd) set_fd_user( mapping->fd, &mapping_fd_ops, NULL );
         }
-        release_object( file );
+        if (file_obj_owned) release_object( file );
         release_object( fd );
         if (!mapping->fd) goto error;
 
@@ -1538,7 +1555,7 @@ struct mapping *create_session_mapping( struct object *root, const struct unicod
     size_t size = max( sizeof(*shared_session) + sizeof(object_shm_t) * 512, 0x10000 );
 
     size = round_size( size, host_page_mask );
-    return create_mapping( root, name, attr, size, SEC_COMMIT, 0, access, sd );
+    return create_mapping( root, name, attr, size, SEC_COMMIT, 0, NULL, access, sd );
 }
 
 void set_session_mapping( struct mapping *mapping )
@@ -1780,7 +1797,7 @@ struct object *create_user_data_mapping( struct object *root, const struct unico
     struct mapping *mapping;
 
     if (!(mapping = create_mapping( root, name, attr, sizeof(KUSER_SHARED_DATA),
-                                    SEC_COMMIT, 0, FILE_READ_DATA | FILE_WRITE_DATA, sd ))) return NULL;
+                                    SEC_COMMIT, 0, NULL, FILE_READ_DATA | FILE_WRITE_DATA, sd ))) return NULL;
     ptr = mmap( NULL, mapping->size, PROT_WRITE, MAP_SHARED, get_unix_fd( mapping->fd ), 0 );
     if (ptr != MAP_FAILED)
     {
@@ -1882,7 +1899,7 @@ DECL_HANDLER(create_mapping)
     }
 
     if ((mapping = create_mapping( root, &name, objattr->attributes, req->size, req->flags,
-                                   req->file_handle, req->file_access, sd )))
+                                   req->file_handle, NULL, req->file_access, sd )))
     {
         if (get_error() == STATUS_OBJECT_NAME_EXISTS)
             reply->handle = alloc_handle( current->process, &mapping->obj, req->access, objattr->attributes );
@@ -1892,6 +1909,68 @@ DECL_HANDLER(create_mapping)
         release_object( mapping );
     }
 
+    if (root) release_object( root );
+}
+
+/* NSPA local-file Phase 1A.3: section creation from a client-passed
+ * unix fd.  Used by NtCreateSection when promoting a local-range file
+ * handle to allow section mapping.  Server receives the inflight unix
+ * fd, builds an inode-tracked struct fd, wraps it in a struct file,
+ * then uses the same create_mapping path as the regular handler. */
+DECL_HANDLER(nspa_create_mapping_from_unix_fd)
+{
+    struct object *root;
+    struct mapping *mapping;
+    struct file *file;
+    struct fd *new_fd;
+    struct unicode_str name;
+    const struct security_descriptor *sd;
+    const struct object_attributes *objattr = get_req_object_attributes( &sd, &name, &root );
+    int unix_fd;
+    struct unicode_str empty_nt = { NULL, 0 };
+
+    reply->handle = 0;
+    if (!objattr) return;
+
+    if ((unix_fd = thread_get_inflight_fd( current, req->fd )) == -1)
+    {
+        if (root) release_object( root );
+        set_error( STATUS_INVALID_HANDLE );
+        return;
+    }
+
+    /* Build inode-tracked fd from the inflight unix fd.  Takes
+     * ownership of unix_fd: on any failure path it closes it. */
+    new_fd = create_inode_fd_from_unix_fd( unix_fd, req->file_access,
+                                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                           0, empty_nt );
+    if (!new_fd)
+    {
+        if (root) release_object( root );
+        return;
+    }
+
+    /* Wrap fd in struct file.  create_file_for_fd_obj duplicates the
+     * fd object (acceptable here — only happens once per local→server
+     * promotion, not on every open). */
+    if (!(file = create_file_for_fd_obj( new_fd, req->file_access,
+                                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE )))
+    {
+        release_object( new_fd );
+        if (root) release_object( root );
+        return;
+    }
+
+    if ((mapping = create_mapping( root, &name, objattr->attributes, req->size, req->flags,
+                                   0, file, req->file_access, sd )))
+    {
+        reply->handle = alloc_handle_no_access_check( current->process, &mapping->obj,
+                                                      req->access, objattr->attributes );
+        release_object( mapping );
+    }
+
+    release_object( file );
+    release_object( new_fd );
     if (root) release_object( root );
 }
 

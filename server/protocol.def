@@ -1135,6 +1135,43 @@ typedef volatile struct
     nspa_timer_ring_t    nspa_timer_ring;  /* WM_TIMER expiries from local dispatcher */
 } nspa_queue_bypass_shm_t;
 
+/* NSPA local-file bypass — Phase 1A.1 shared inode aggregation table.
+ * Server is the sole writer (under server-internal lock); clients read
+ * lock-free via per-bucket seqlock.  Each slot holds the aggregated
+ * sharing/access state for one (device, inode) currently open in any
+ * Wine process — same algorithm as server/fd.c's check_sharing.  Slot
+ * with device == 0 is empty.  Bucket size and count are fixed; clients
+ * must be prepared for "entry not present, fall back to server". */
+#define NSPA_INODE_BUCKETS               1024
+#define NSPA_INODE_SLOTS_PER_BUCKET      4
+#define NSPA_INODE_TABLE_MAGIC           0x4E5350414C49464Dull   /* "NSPALIFM" */
+#define NSPA_INODE_TABLE_VERSION         1
+
+typedef volatile struct
+{
+    unsigned __int64     device;                /* 0 = empty slot */
+    unsigned __int64     inode;
+    unsigned int         refcount;              /* number of open fds tracked here */
+    unsigned int         agg_existing_access;   /* OR of fd->access across opens */
+    unsigned int         agg_existing_sharing;  /* AND of fd->sharing across opens with access != 0 */
+    unsigned int         flags;                 /* FILE_MAPPING_IMAGE|WRITE|ACCESS counts (low 24 bits each, packed) */
+} nspa_inode_slot_t;
+
+typedef volatile struct
+{
+    unsigned int         seq;                   /* seqlock — even = stable, odd = mutating */
+    unsigned int         slot_count;            /* number of non-empty slots in this bucket */
+    nspa_inode_slot_t    slots[NSPA_INODE_SLOTS_PER_BUCKET];
+} nspa_inode_bucket_t;
+
+typedef volatile struct
+{
+    unsigned __int64     magic;                 /* NSPA_INODE_TABLE_MAGIC */
+    unsigned int         version;               /* NSPA_INODE_TABLE_VERSION */
+    unsigned int         bucket_count;          /* NSPA_INODE_BUCKETS */
+    nspa_inode_bucket_t  buckets[NSPA_INODE_BUCKETS];
+} nspa_inode_table_shm_t;
+
 typedef volatile struct
 {
     timeout_t            access_time;      /* last time the queue was accessed */
@@ -4428,4 +4465,19 @@ enum inproc_sync_type
 @REQ(nspa_ensure_own_bypass)
 @REPLY
     int             fd_sent;     /* 1 = fd follows on socket, 0 = no fd */
+@END
+
+
+/* NSPA: fetch the process-global shared inode table memfd for the
+ * local-file bypass (Phase 1A.1).  Server lazily allocates a shmem region
+ * on first call and returns the same fd to every caller via send_client_fd.
+ * Clients mmap it READ-ONLY and use seqlock to read aggregated per-inode
+ * sharing/access state without taking any blocking lock.  reply->fd_sent
+ * is 1 when the fd follows on the socket, 0 if the server is unable to
+ * provide one (memfd_create unavailable etc) — clients must fall back. */
+@REQ(nspa_get_inode_table)
+@REPLY
+    int             fd_sent;     /* 1 = fd follows on socket, 0 = no fd */
+    unsigned int    bucket_count;/* echo of NSPA_INODE_BUCKETS for client sanity */
+    unsigned int    table_size;  /* size of the shmem region in bytes */
 @END

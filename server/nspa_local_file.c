@@ -36,9 +36,26 @@
 #include "process.h"
 #include "request.h"
 
+#include <rtpi.h>
+
 #ifdef HAVE_SYS_MEMFD_H
 # include <sys/memfd.h>
 #endif
+
+/* Compile-time check: our shmem-allocated lock storage must be at least
+ * as big as a pi_mutex_t.  pi_mutex_t is 64 bytes (cacheline-isolated);
+ * nspa_pi_mutex_t.storage is also 64 bytes. */
+typedef char nspa_pi_mutex_storage_check[
+    (sizeof(((nspa_pi_mutex_t *)0)->storage) >= sizeof(pi_mutex_t)) ? 1 : -1 ];
+
+/* Cast from shmem storage to live pi_mutex_t.  Both are 64-byte aligned
+ * by virtue of the bucket layout (slots end on 8-byte boundary, pi_mutex_t
+ * is at the start of the bucket).  Lock state lives in the first 12
+ * bytes of the storage; the rest is cacheline pad. */
+static inline pi_mutex_t *nspa_lock_of( nspa_inode_bucket_t *bucket )
+{
+    return (pi_mutex_t *)bucket->lock.storage;
+}
 
 /* Lazy-allocated singleton.  fd is -1 until the first request creates it
  * (or memfd_create fails permanently).  Once allocated, fd stays open
@@ -85,9 +102,16 @@ static int nspa_inode_table_ensure( void )
     memset( map, 0, size );
     {
         nspa_inode_table_shm_t *t = map;
+        unsigned int b;
         t->magic        = NSPA_INODE_TABLE_MAGIC;
         t->version      = NSPA_INODE_TABLE_VERSION;
         t->bucket_count = NSPA_INODE_BUCKETS;
+        /* Initialise per-bucket PI mutexes with PSHARED so they work
+         * across processes.  pi_mutex_init memsets 64 bytes and sets
+         * flags; our storage is exactly 64 bytes so this is in-bounds. */
+        for (b = 0; b < NSPA_INODE_BUCKETS; b++)
+            pi_mutex_init( nspa_lock_of( (nspa_inode_bucket_t *)&t->buckets[b] ),
+                           RTPI_MUTEX_PSHARED );
     }
 
     nspa_inode_table_fd   = fd;
@@ -195,6 +219,13 @@ void nspa_inode_publish_slot( unsigned long long device, unsigned long long inod
     if (slot_idx < 0) slot_idx = empty_idx;
     slot = (nspa_inode_slot_t *)&bucket->slots[slot_idx];
 
+    /* Cross-process write critical section: take the bucket's PI mutex
+     * before mutating slot data + bumping seq.  Pairs with client-side
+     * publishes from slice (b).  Server is single-threaded so this is
+     * uncontended within wineserver, but contention with client writers
+     * (1A.2.b+) requires the lock to be honoured. */
+    pi_mutex_lock( nspa_lock_of( bucket ) );
+
     seq = bucket->seq;
     /* Seqlock begin — odd = mutating. */
     __atomic_store_n( &bucket->seq, seq + 1, __ATOMIC_RELEASE );
@@ -222,6 +253,8 @@ void nspa_inode_publish_slot( unsigned long long device, unsigned long long inod
 
     /* Seqlock end — even = stable.  Pairs with client ACQUIRE-load. */
     __atomic_store_n( &bucket->seq, seq + 2, __ATOMIC_RELEASE );
+
+    pi_mutex_unlock( nspa_lock_of( bucket ) );
 }
 
 DECL_HANDLER(nspa_get_inode_table)

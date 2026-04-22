@@ -1141,8 +1141,19 @@ typedef volatile struct
     unsigned int         flags;
 } nspa_inode_slot_t;
 
+/* 64-byte storage for a librtpi pi_mutex_t.  pi_mutex_t itself is a
+ * union { struct { futex/flags/nspa_recursion }; pad[64]; } aligned 64
+ * — we provide the storage in shmem and cast to pi_mutex_t * at use
+ * sites.  The first 12 bytes are the live state (futex, flags,
+ * nspa_recursion); the remaining 52 are cacheline-isolation pad. */
 typedef volatile struct
 {
+    unsigned __int64     storage[8];
+} nspa_pi_mutex_t;
+
+typedef volatile struct
+{
+    nspa_pi_mutex_t      lock;
     unsigned int         seq;
     unsigned int         slot_count;
     nspa_inode_slot_t    slots[NSPA_INODE_SLOTS_PER_BUCKET];
@@ -7329,6 +7340,6 @@ union generic_reply
     struct nspa_get_inode_table_reply nspa_get_inode_table_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 938
+#define SERVER_PROTOCOL_VERSION 939
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

@@ -307,6 +307,11 @@ extern int      nspa_local_file_table_remove( HANDLE handle, int *unix_fd_out,
 extern int      nspa_local_file_table_lookup_unix_fd( HANDLE handle );
 extern NTSTATUS nspa_local_file_check_sharing( unsigned long long device, unsigned long long inode,
                                                unsigned int my_access, unsigned int my_sharing );
+extern NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
+                                            ACCESS_MASK access, ULONG sharing,
+                                            ULONG options, IO_STATUS_BLOCK *io );
+extern int      nspa_local_file_is_local_handle( HANDLE h );
+extern int      nspa_local_file_close( HANDLE handle );
 extern void *create_startup_info( const UNICODE_STRING *nt_image, ULONG process_flags,
                                   const RTL_USER_PROCESS_PARAMETERS *params,
                                   const struct pe_image_info *pe_info, DWORD *info_size );

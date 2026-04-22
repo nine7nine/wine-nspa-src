@@ -3065,6 +3065,33 @@ static int peek_message( MSG *msg, const struct peek_message_filter *filter )
                     popped     = TRUE;
                 }
             }
+            /* NSPA Phase 4.7: client-side POST-class pop.  Only fires when
+             * server has no equal-or-higher-priority work — see arbitration
+             * comment in nspa_try_pop_own_ring_post.  Saves the wineserver
+             * get_message RTT for ring-routed POSTs (the dominant remaining
+             * server cost in audio playback workloads). */
+            if (!popped && (signal_bits & (QS_POSTMESSAGE | QS_ALLPOSTMESSAGE)))
+            {
+                HWND   pst_hwnd;
+                UINT   pst_msg;
+                WPARAM pst_wp;
+                LPARAM pst_lp;
+                DWORD  pst_time;
+                if (nspa_try_pop_own_ring_post( hwnd, first, last,
+                                                &pst_msg, &pst_wp, &pst_lp,
+                                                &pst_time, &pst_hwnd ))
+                {
+                    pop_type   = MSG_POSTED;
+                    pop_msg    = pst_msg;
+                    pop_win    = pst_hwnd;
+                    pop_wp     = pst_wp;
+                    pop_lp     = pst_lp;
+                    pop_time   = pst_time;
+                    pop_sender = 0;
+                    pop_slot   = 0;
+                    popped     = TRUE;
+                }
+            }
             if (popped)
             {
                 res                   = STATUS_SUCCESS;

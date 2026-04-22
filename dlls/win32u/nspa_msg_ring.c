@@ -23,6 +23,8 @@
 #pragma makedep unix
 #endif
 
+#include <errno.h>
+#include <linux/futex.h>
 #include <pthread.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -30,8 +32,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
+
+#ifndef FUTEX_WAIT_PRIVATE
+#define FUTEX_WAIT_PRIVATE (FUTEX_WAIT | FUTEX_PRIVATE_FLAG)
+#endif
+#ifndef FUTEX_WAKE_PRIVATE
+#define FUTEX_WAKE_PRIVATE (FUTEX_WAKE | FUTEX_PRIVATE_FLAG)
+#endif
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -1197,6 +1207,14 @@ BOOL nspa_write_ring_reply( DWORD sender_tid, UINT reply_slot_idx,
 
     __atomic_store_n( &slot->state, NSPA_REPLY_STATE_READY, __ATOMIC_RELEASE );
 
+    /* Wake the sender's targeted futex on slot->state.  Sender's wait loop
+     * uses futex_wait directly on the reply slot value so it sees this
+     * exact transition with no false wakes from unrelated queue traffic. */
+    syscall( SYS_futex, (void *)&slot->state, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0 );
+
+    /* Also kick the queue->sync ntsync event for any waiter that came in
+     * via the legacy queue-wide path (e.g. wait_message_reply on a server-
+     * routed send).  Cheap; no-op if no waiter. */
     status = wine_server_signal_internal_sync( entry->sync_handle );
     if (status) status = NtSetEvent( entry->sync_handle, NULL );
     if (status)
@@ -1408,23 +1426,30 @@ BOOL nspa_try_send_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
         return TRUE;
     }
 
-    /* Wait for reply.  queue->sync is manual-reset and shared with ordinary
-     * pump traffic, so we poll the reply state with a short timeout rather
-     * than blocking indefinitely on the event.  5 s total cap before giving
-     * up and returning FALSE (caller falls back to server).
+    /* Wait for reply via futex on the reply slot's state field.  This is
+     * targeted: only wakes when the receiver writes the reply (which calls
+     * FUTEX_WAKE_PRIVATE on the same address).  No false wakes from
+     * unrelated queue traffic — the previous NtWaitForSingleObject on
+     * queue->sync was woken by every incoming message, causing waits++ to
+     * advance much faster than the nominal 10 ms tick and the "5 s timeout"
+     * to fire in milliseconds under busy-queue conditions.
      *
-     * Cross-send deadlock protection: if the peer's winproc SendMessages
-     * back to us while we are waiting, we must pump those incoming SEND
-     * messages.  Otherwise peer blocks on its own reply waiting for us to
-     * dispatch, and we block on our reply waiting for peer — classic
-     * deadlock.  Mirror wait_message_reply's QS_SENDMESSAGE drain. */
+     * Cross-send deadlock protection retained: if the peer's winproc
+     * SendMessages back to us while we are waiting, we drain incoming
+     * SENDs before each futex_wait so the peer can make forward progress.
+     *
+     * Total cap: 2 s (200 iterations × 10 ms futex timeout).  Lower than
+     * the legacy 5 s because the futex actually waits the full 10 ms when
+     * no real signal is pending; under genuine receiver outage the cap is
+     * the floor for falling back to the server send_message path. */
     for (;;)
     {
         unsigned int state = __atomic_load_n( &reply_slot->state, __ATOMIC_ACQUIRE );
-        LARGE_INTEGER timeout;
+        struct timespec rel;
+        long ret;
 
         if (state == NSPA_REPLY_STATE_READY) break;
-        if (waits > 500)  /* 500 * 10 ms = 5 s */
+        if (waits > 200)  /* 200 * 10 ms = 2 s */
         {
             TRACE_(nspa_bypass)( "send timeout dest=%04x msg=%04x slot=%u\n",
                                  (UINT)dest_tid, msg, reply_idx );
@@ -1438,10 +1463,18 @@ BOOL nspa_try_send_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
         /* Re-check state after the drain — peer may have replied during it. */
         state = __atomic_load_n( &reply_slot->state, __ATOMIC_ACQUIRE );
         if (state == NSPA_REPLY_STATE_READY) break;
-        timeout.QuadPart = -100000LL;  /* 10 ms */
-        NtWaitForSingleObject( own_sync, FALSE, &timeout );
+        /* futex_wait returns immediately with EAGAIN if state has already
+         * changed from PENDING (the receiver beat us to the wait), so no
+         * lost-wake race vs. the WAKE on the receiver side. */
+        rel.tv_sec  = 0;
+        rel.tv_nsec = 10 * 1000 * 1000;  /* 10 ms */
+        ret = syscall( SYS_futex, (void *)&reply_slot->state,
+                       FUTEX_WAIT_PRIVATE, NSPA_REPLY_STATE_PENDING,
+                       &rel, NULL, 0 );
+        (void)ret;  /* EAGAIN / ETIMEDOUT / 0 / EINTR all loop back to recheck */
         waits++;
     }
+    (void)own_sync;  /* legacy fallback path no longer needed; see receiver-side futex_wake */
 
     *result_out = reply_slot->result;
     __atomic_store_n( &reply_slot->state, NSPA_REPLY_STATE_FREE, __ATOMIC_RELEASE );

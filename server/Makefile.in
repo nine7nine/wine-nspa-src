@@ -25,6 +25,7 @@ SOURCES = \
 	mutex.c \
 	named_pipe.c \
 	nspa_local_file.c \
+	nspa_local_file.h \
 	nspa_profile.c \
 	object.c \
 	process.c \

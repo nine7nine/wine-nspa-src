@@ -295,6 +295,18 @@ extern NTSTATUS nspa_local_timer_register_duplicate( HANDLE source_handle, HANDL
 extern void     nspa_local_file_diag_categorize( const OBJECT_ATTRIBUTES *attr, ACCESS_MASK access,
                                                  ULONG sharing, ULONG disposition, ULONG options );
 extern void     nspa_local_file_diag_lazy_start( void );
+extern NTSTATUS nspa_local_file_publish_open( unsigned long long device, unsigned long long inode,
+                                              unsigned int access, unsigned int sharing );
+extern void     nspa_local_file_publish_close( unsigned long long device, unsigned long long inode );
+extern NTSTATUS nspa_local_file_table_add( HANDLE handle, int unix_fd,
+                                           unsigned long long device, unsigned long long inode,
+                                           unsigned int access, unsigned int sharing );
+extern int      nspa_local_file_table_remove( HANDLE handle, int *unix_fd_out,
+                                              unsigned long long *device_out,
+                                              unsigned long long *inode_out );
+extern int      nspa_local_file_table_lookup_unix_fd( HANDLE handle );
+extern NTSTATUS nspa_local_file_check_sharing( unsigned long long device, unsigned long long inode,
+                                               unsigned int my_access, unsigned int my_sharing );
 extern void *create_startup_info( const UNICODE_STRING *nt_image, ULONG process_flags,
                                   const RTL_USER_PROCESS_PARAMETERS *params,
                                   const struct pe_image_info *pe_info, DWORD *info_size );

@@ -24,6 +24,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -31,9 +32,11 @@
 #define WIN32_NO_STATUS
 #include "windef.h"
 #include "winternl.h"
+#include "wine/list.h"
 #include "wine/server.h"
 #include "wine/debug.h"
 #include "unix_private.h"
+#include <rtpi.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(nspa_lfile);
 
@@ -73,7 +76,7 @@ static time_t nspa_lf_diag_start_epoch;
  * 1A.2 wires in the bypass dispatch. */
 
 static pthread_once_t           nspa_lf_table_once  = PTHREAD_ONCE_INIT;
-static const nspa_inode_table_shm_t *nspa_lf_table  = NULL;   /* mmap, READ-ONLY */
+static nspa_inode_table_shm_t  *nspa_lf_table       = NULL;   /* mmap RW (clients write own subentry under PI lock) */
 static size_t                   nspa_lf_table_size  = 0;
 static int                      nspa_lf_table_state = 0;      /* 0=untried, 1=ok, -1=failed */
 /* Counters for the diag dump — show that the lookup path is exercised. */
@@ -114,7 +117,10 @@ static void nspa_lf_table_open_once_fn( void )
         return;
     }
 
-    map = mmap( NULL, table_size, PROT_READ, MAP_SHARED, fd, 0 );
+    /* PROT_READ | PROT_WRITE: clients write their own subentry slots
+     * (Phase 1A.2.c+) under the shmem-resident per-bucket PI mutex.
+     * Reads remain seqlock-protected. */
+    map = mmap( NULL, table_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0 );
     close( fd );  /* mmap holds the page mapping; the fd is no longer needed */
     if (map == MAP_FAILED)
     {
@@ -134,7 +140,7 @@ static void nspa_lf_table_open_once_fn( void )
         }
     }
 
-    nspa_lf_table       = (const nspa_inode_table_shm_t *)map;
+    nspa_lf_table       = (nspa_inode_table_shm_t *)map;
     nspa_lf_table_size  = table_size;
     nspa_lf_table_state = 1;
     TRACE( "NSPA local-file table: mmap ok, %u buckets × %u slots = %zu bytes\n",
@@ -426,4 +432,402 @@ static void nspa_lf_diag_start_once_fn( void )
 void nspa_local_file_diag_lazy_start( void )
 {
     pthread_once( &nspa_lf_diag_start_once, nspa_lf_diag_start_once_fn );
+}
+
+/* ---------------------------------------------------------------------
+ * Phase 1A.2.c — client-side publish API + per-process file table.
+ *
+ * Per-process file table tracks every file that THIS Wine process has
+ * opened locally via the bypass.  Required because publish_close needs
+ * to recompute this process's contribution from its remaining opens
+ * (sharing aggregation cannot be undone by simple subtraction).
+ *
+ * Cross-process write coordination: the per-bucket PI mutex landed in
+ * 1A.2.a is acquired before any slot mutation.  The seqlock around
+ * the slot still bumps on writes so lock-free readers see consistent
+ * snapshots.  Server publishes to subentry[0] (its view); each client
+ * gets one subentry[1..N-1] keyed by its own pid. */
+
+struct nspa_local_open
+{
+    struct list       entry;
+    HANDLE            handle;
+    int               unix_fd;
+    unsigned long long device;
+    unsigned long long inode;
+    unsigned int      access;
+    unsigned int      sharing;
+};
+
+static struct list      nspa_lf_opens          = LIST_INIT(nspa_lf_opens);
+static pthread_mutex_t  nspa_lf_opens_mutex    = PTHREAD_MUTEX_INITIALIZER;
+
+/* Linux-only TID-cached pid via getpid().  pid is process-wide so we
+ * cache it in a static after first call. */
+static unsigned int nspa_lf_self_pid( void )
+{
+    static unsigned int cached;
+    if (!cached) cached = (unsigned int)getpid();
+    return cached;
+}
+
+/* Cast shmem-resident pi_mutex_t storage to a usable pi_mutex_t.
+ * Storage is 64 bytes inline in the bucket; pi_mutex_t is also 64
+ * bytes (cacheline-isolated).  See server/nspa_local_file.c for the
+ * matching server-side cast. */
+static inline pi_mutex_t *nspa_lf_lock_of( nspa_inode_bucket_t *bucket )
+{
+    return (pi_mutex_t *)bucket->lock.storage;
+}
+
+/* Find a writable bucket pointer for (device, inode).  Returns NULL if
+ * the table isn't mapped. */
+static nspa_inode_bucket_t *nspa_lf_bucket_for( unsigned long long device,
+                                                unsigned long long inode )
+{
+    if (nspa_lf_table_state != 1 || !nspa_lf_table) return NULL;
+    return (nspa_inode_bucket_t *)&nspa_lf_table->buckets[
+        nspa_lf_bucket_index( device, inode ) ];
+}
+
+/* Walk this process's file table to recompute the aggregated contribution
+ * for one (device, inode).  Caller holds nspa_lf_opens_mutex.  Output
+ * parameters: *refcount, *agg_access, *agg_sharing. */
+static void nspa_lf_recompute_local_aggregate( unsigned long long device,
+                                               unsigned long long inode,
+                                               unsigned int *refcount,
+                                               unsigned int *agg_access,
+                                               unsigned int *agg_sharing )
+{
+    const unsigned int read_access  = FILE_READ_DATA | FILE_EXECUTE;
+    const unsigned int write_access = FILE_WRITE_DATA | FILE_APPEND_DATA;
+    const unsigned int all_access   = read_access | write_access | DELETE;
+    struct nspa_local_open *o;
+    unsigned int rc = 0, ax = 0, sh = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+
+    LIST_FOR_EACH_ENTRY( o, &nspa_lf_opens, struct nspa_local_open, entry )
+    {
+        if (o->device != device || o->inode != inode) continue;
+        rc++;
+        if (o->access & all_access) sh &= o->sharing;
+        ax |= o->access;
+    }
+
+    *refcount    = rc;
+    *agg_access  = ax;
+    *agg_sharing = sh;
+}
+
+/* Publish that this process has just opened a new fd for (device, inode)
+ * with the given access/sharing.  Does NOT add the fd to the per-process
+ * file table — caller is responsible for that ordering (publish first
+ * so other processes see the new state, then bump local table).  In
+ * Phase 1A.2.d the NtCreateFile bypass dispatch will sequence both. */
+NTSTATUS nspa_local_file_publish_open( unsigned long long device, unsigned long long inode,
+                                       unsigned int access, unsigned int sharing )
+{
+    nspa_inode_bucket_t *bucket;
+    int slot_idx = -1;
+    int empty_slot_idx = -1;
+    int sub_idx = -1;
+    int empty_sub_idx = -1;
+    unsigned int i, seq;
+    unsigned int my_pid;
+    nspa_inode_slot_t *slot;
+    const unsigned int all_access = FILE_READ_DATA | FILE_EXECUTE
+                                  | FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE;
+
+    if (!(bucket = nspa_lf_bucket_for( device, inode ))) return STATUS_NOT_SUPPORTED;
+    my_pid = nspa_lf_self_pid();
+
+    pi_mutex_lock( nspa_lf_lock_of( bucket ) );
+
+    /* Find slot for (device, inode) or note empty. */
+    for (i = 0; i < NSPA_INODE_SLOTS_PER_BUCKET; i++)
+    {
+        if (bucket->slots[i].device == device && bucket->slots[i].inode == inode)
+        {
+            slot_idx = (int)i;
+            break;
+        }
+        if (bucket->slots[i].device == 0 && empty_slot_idx < 0)
+            empty_slot_idx = (int)i;
+    }
+    if (slot_idx < 0)
+    {
+        if (empty_slot_idx < 0)
+        {
+            /* Bucket overflow — caller falls back to server. */
+            pi_mutex_unlock( nspa_lf_lock_of( bucket ) );
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        slot_idx = empty_slot_idx;
+    }
+    slot = (nspa_inode_slot_t *)&bucket->slots[slot_idx];
+
+    /* Find my subentry (pids[i] == my_pid) or an empty client subentry
+     * (pids[i] == 0 in indices 1..N-1; index 0 is the server slot). */
+    for (i = 1; i < NSPA_INODE_SUBENTRIES; i++)
+    {
+        if (slot->pids[i] == my_pid)
+        {
+            sub_idx = (int)i;
+            break;
+        }
+        if (slot->pids[i] == 0 && empty_sub_idx < 0)
+            empty_sub_idx = (int)i;
+    }
+    if (sub_idx < 0)
+    {
+        if (empty_sub_idx < 0)
+        {
+            /* Subentry overflow — too many client procs hold this inode.
+             * Caller falls back to server. */
+            pi_mutex_unlock( nspa_lf_lock_of( bucket ) );
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        sub_idx = empty_sub_idx;
+    }
+
+    seq = bucket->seq;
+    __atomic_store_n( &bucket->seq, seq + 1, __ATOMIC_RELEASE );
+
+    if (slot->device == 0)
+    {
+        /* New slot — initialise key fields. */
+        slot->device = device;
+        slot->inode  = inode;
+        slot->flags  = 0;
+        bucket->slot_count++;
+    }
+
+    if (slot->pids[sub_idx] != my_pid)
+    {
+        /* New subentry for our pid. */
+        slot->pids[sub_idx]         = my_pid;
+        slot->sub_refcount[sub_idx] = 1;
+        slot->sub_access[sub_idx]   = access;
+        slot->sub_sharing[sub_idx]  = (access & all_access) ? sharing
+                                      : (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+    }
+    else
+    {
+        /* Adding another open in the same subentry — OR access, AND
+         * sharing (for opens with access != 0).  Approximate but safe;
+         * publish_close recomputes from the local file table for
+         * accuracy. */
+        slot->sub_refcount[sub_idx]++;
+        slot->sub_access[sub_idx]  |= access;
+        if (access & all_access)
+            slot->sub_sharing[sub_idx] &= sharing;
+    }
+
+    __atomic_store_n( &bucket->seq, seq + 2, __ATOMIC_RELEASE );
+    pi_mutex_unlock( nspa_lf_lock_of( bucket ) );
+    return STATUS_SUCCESS;
+}
+
+/* Publish that this process has closed an fd for (device, inode).
+ * Recomputes our subentry's aggregate from our remaining local opens
+ * (caller has already removed this open from the local table).  If our
+ * subentry refcount drops to 0 the subentry is cleared; if no
+ * subentries remain in use the slot is cleared. */
+void nspa_local_file_publish_close( unsigned long long device, unsigned long long inode )
+{
+    nspa_inode_bucket_t *bucket;
+    int slot_idx = -1;
+    int sub_idx = -1;
+    unsigned int i, seq;
+    unsigned int my_pid;
+    unsigned int new_refcount = 0, new_access = 0, new_sharing = 0;
+    nspa_inode_slot_t *slot;
+
+    if (!(bucket = nspa_lf_bucket_for( device, inode ))) return;
+    my_pid = nspa_lf_self_pid();
+
+    /* Recompute outside the bucket lock — accesses our local table only. */
+    pthread_mutex_lock( &nspa_lf_opens_mutex );
+    nspa_lf_recompute_local_aggregate( device, inode, &new_refcount, &new_access, &new_sharing );
+    pthread_mutex_unlock( &nspa_lf_opens_mutex );
+
+    pi_mutex_lock( nspa_lf_lock_of( bucket ) );
+
+    for (i = 0; i < NSPA_INODE_SLOTS_PER_BUCKET; i++)
+    {
+        if (bucket->slots[i].device == device && bucket->slots[i].inode == inode)
+        {
+            slot_idx = (int)i;
+            break;
+        }
+    }
+    if (slot_idx < 0)
+    {
+        pi_mutex_unlock( nspa_lf_lock_of( bucket ) );
+        return;
+    }
+    slot = (nspa_inode_slot_t *)&bucket->slots[slot_idx];
+
+    for (i = 1; i < NSPA_INODE_SUBENTRIES; i++)
+    {
+        if (slot->pids[i] == my_pid) { sub_idx = (int)i; break; }
+    }
+    if (sub_idx < 0)
+    {
+        pi_mutex_unlock( nspa_lf_lock_of( bucket ) );
+        return;
+    }
+
+    seq = bucket->seq;
+    __atomic_store_n( &bucket->seq, seq + 1, __ATOMIC_RELEASE );
+
+    if (new_refcount == 0)
+    {
+        /* This process has no more local opens for this inode — clear
+         * our subentry. */
+        slot->pids[sub_idx]         = 0;
+        slot->sub_refcount[sub_idx] = 0;
+        slot->sub_access[sub_idx]   = 0;
+        slot->sub_sharing[sub_idx]  = 0;
+
+        /* If the slot is fully empty (no server opens, no client opens),
+         * clear it. */
+        {
+            int any = 0;
+            unsigned int j;
+            if (slot->sub_refcount[0] > 0) any = 1;
+            for (j = 1; !any && j < NSPA_INODE_SUBENTRIES; j++)
+                if (slot->pids[j] != 0) any = 1;
+            if (!any)
+            {
+                slot->device = 0;
+                slot->inode  = 0;
+                slot->flags  = 0;
+                if (bucket->slot_count > 0) bucket->slot_count--;
+            }
+        }
+    }
+    else
+    {
+        slot->sub_refcount[sub_idx] = new_refcount;
+        slot->sub_access[sub_idx]   = new_access;
+        slot->sub_sharing[sub_idx]  = new_sharing;
+    }
+
+    __atomic_store_n( &bucket->seq, seq + 2, __ATOMIC_RELEASE );
+    pi_mutex_unlock( nspa_lf_lock_of( bucket ) );
+}
+
+/* Add an open to the per-process file table.  Used by NtCreateFile
+ * bypass dispatch in Phase 1A.2.d after a successful publish_open. */
+NTSTATUS nspa_local_file_table_add( HANDLE handle, int unix_fd,
+                                    unsigned long long device, unsigned long long inode,
+                                    unsigned int access, unsigned int sharing )
+{
+    struct nspa_local_open *o = malloc( sizeof(*o) );
+    if (!o) return STATUS_NO_MEMORY;
+    o->handle  = handle;
+    o->unix_fd = unix_fd;
+    o->device  = device;
+    o->inode   = inode;
+    o->access  = access;
+    o->sharing = sharing;
+    pthread_mutex_lock( &nspa_lf_opens_mutex );
+    list_add_head( &nspa_lf_opens, &o->entry );
+    pthread_mutex_unlock( &nspa_lf_opens_mutex );
+    return STATUS_SUCCESS;
+}
+
+/* Remove an open from the per-process file table.  Returns 1 + fills
+ * out-params if the handle was tracked locally; 0 otherwise.  Used by
+ * NtClose dispatch — caller invokes publish_close after this returns
+ * 1 to update the shared subentry. */
+int nspa_local_file_table_remove( HANDLE handle, int *unix_fd_out,
+                                  unsigned long long *device_out,
+                                  unsigned long long *inode_out )
+{
+    struct nspa_local_open *o, *next;
+    int found = 0;
+
+    pthread_mutex_lock( &nspa_lf_opens_mutex );
+    LIST_FOR_EACH_ENTRY_SAFE( o, next, &nspa_lf_opens, struct nspa_local_open, entry )
+    {
+        if (o->handle == handle)
+        {
+            *unix_fd_out = o->unix_fd;
+            *device_out  = o->device;
+            *inode_out   = o->inode;
+            list_remove( &o->entry );
+            free( o );
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock( &nspa_lf_opens_mutex );
+    return found;
+}
+
+/* Look up a tracked handle's unix fd without removing it.  Returns -1
+ * if not in the local table.  Used by NtReadFile/NtWriteFile dispatch
+ * in Phase 1A.2.e. */
+int nspa_local_file_table_lookup_unix_fd( HANDLE handle )
+{
+    struct nspa_local_open *o;
+    int fd = -1;
+    pthread_mutex_lock( &nspa_lf_opens_mutex );
+    LIST_FOR_EACH_ENTRY( o, &nspa_lf_opens, struct nspa_local_open, entry )
+    {
+        if (o->handle == handle) { fd = o->unix_fd; break; }
+    }
+    pthread_mutex_unlock( &nspa_lf_opens_mutex );
+    return fd;
+}
+
+/* Replicates server/fd.c:check_sharing using slot subentries.  Called
+ * by NtCreateFile bypass dispatch (Phase 1A.2.d) before opening locally.
+ * Returns STATUS_SUCCESS if the new open with `my_access`/`my_sharing`
+ * would not violate any existing open's sharing mode, or
+ * STATUS_SHARING_VIOLATION otherwise. */
+NTSTATUS nspa_local_file_check_sharing( unsigned long long device, unsigned long long inode,
+                                        unsigned int my_access, unsigned int my_sharing )
+{
+    const unsigned int read_access  = FILE_READ_DATA | FILE_EXECUTE;
+    const unsigned int write_access = FILE_WRITE_DATA | FILE_APPEND_DATA;
+    const unsigned int all_access   = read_access | write_access | DELETE;
+    nspa_inode_slot_t snapshot;
+    unsigned int agg_access = 0;
+    unsigned int agg_sharing = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    unsigned int i;
+
+    if (!nspa_local_file_table_lookup( device, inode, &snapshot ))
+    {
+        /* No existing opens — nothing to conflict with. */
+        return STATUS_SUCCESS;
+    }
+
+    /* Walk subentries and merge in-use ones into the running aggregate. */
+    for (i = 0; i < NSPA_INODE_SUBENTRIES; i++)
+    {
+        unsigned int in_use = (i == 0) ? (snapshot.sub_refcount[0] > 0)
+                                       : (snapshot.pids[i] != 0);
+        if (!in_use) continue;
+        if (snapshot.sub_access[i] & all_access)
+            agg_sharing &= snapshot.sub_sharing[i];
+        agg_access |= snapshot.sub_access[i];
+    }
+
+    /* Now run the same algorithm as server/fd.c:check_sharing. */
+    if (((my_access & read_access)  && !(agg_sharing & FILE_SHARE_READ)) ||
+        ((my_access & write_access) && !(agg_sharing & FILE_SHARE_WRITE)) ||
+        ((my_access & DELETE)       && !(agg_sharing & FILE_SHARE_DELETE)))
+        return STATUS_SHARING_VIOLATION;
+
+    if (!(my_access & all_access))
+        return STATUS_SUCCESS;   /* zero-access opens ignore sharing */
+
+    if (((agg_access & read_access)  && !(my_sharing & FILE_SHARE_READ)) ||
+        ((agg_access & write_access) && !(my_sharing & FILE_SHARE_WRITE)) ||
+        ((agg_access & DELETE)       && !(my_sharing & FILE_SHARE_DELETE)))
+        return STATUS_SHARING_VIOLATION;
+
+    return STATUS_SUCCESS;
 }

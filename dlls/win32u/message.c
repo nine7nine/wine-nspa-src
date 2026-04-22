@@ -2933,6 +2933,24 @@ static BOOL check_queue_bits( UINT wake_mask, UINT changed_mask, UINT signal_bit
             __atomic_load_n( &queue_bypass->nspa_msg_ring.change_ack_seq, __ATOMIC_ACQUIRE ))
             ring_changed |= QS_POSTMESSAGE | QS_ALLPOSTMESSAGE;
         if (ring_send) ring_changed |= QS_SENDMESSAGE;
+        /* NSPA Phase B: synthesise QS_TIMER from the local-dispatcher timer
+         * ring so the peek_message drain at line 3035 actually runs.  Without
+         * this, check_queue_bits returns "skip=TRUE" whenever the queue's
+         * server-side wake bits are unchanged — and the local dispatcher
+         * never sets server-side bits — so locally-published WM_TIMERs are
+         * silently invisible to PeekMessage in tight pump loops.  Phase B's
+         * "wake-bit synth deferred" note was wrong: tight polling reaches
+         * check_queue_bits before access_time times out, never the drain. */
+        if (queue_bypass)
+        {
+            UINT thead = __atomic_load_n( &queue_bypass->nspa_timer_ring.head, __ATOMIC_ACQUIRE );
+            UINT ttail = __atomic_load_n( &queue_bypass->nspa_timer_ring.tail, __ATOMIC_ACQUIRE );
+            if (thead != ttail)
+            {
+                ring_bits    |= QS_TIMER;
+                ring_changed |= QS_TIMER;
+            }
+        }
         wake = queue_shm->wake_bits | ring_bits;
         changed = queue_shm->changed_bits | ring_changed;
 
@@ -3404,6 +3422,16 @@ static BOOL is_queue_signaled(void)
             __atomic_load_n( &queue_bypass->nspa_msg_ring.change_ack_seq, __ATOMIC_ACQUIRE ))
             ring_changed |= QS_POSTMESSAGE | QS_ALLPOSTMESSAGE;
         if (ring_send) ring_changed |= QS_SENDMESSAGE;
+        if (queue_bypass)
+        {
+            UINT thead = __atomic_load_n( &queue_bypass->nspa_timer_ring.head, __ATOMIC_ACQUIRE );
+            UINT ttail = __atomic_load_n( &queue_bypass->nspa_timer_ring.tail, __ATOMIC_ACQUIRE );
+            if (thead != ttail)
+            {
+                ring_bits    |= QS_TIMER;
+                ring_changed |= QS_TIMER;
+            }
+        }
         signaled = ((queue_shm->wake_bits | ring_bits) & queue_shm->wake_mask) ||
                    ((queue_shm->changed_bits | ring_changed) & queue_shm->changed_mask);
     }

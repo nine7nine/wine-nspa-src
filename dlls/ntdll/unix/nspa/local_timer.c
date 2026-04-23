@@ -80,7 +80,7 @@
 #include "winternl.h"
 #include "wine/debug.h"
 #include "wine/list.h"
-#include "unix_private.h"
+#include "../unix_private.h"
 #include <rtpi.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(timer);

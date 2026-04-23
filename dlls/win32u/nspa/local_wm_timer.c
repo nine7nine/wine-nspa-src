@@ -68,7 +68,7 @@
 
 #include <ntstatus.h>
 #define WIN32_NO_STATUS
-#include "win32u_private.h"
+#include "../win32u_private.h"
 #include "wine/debug.h"
 #include "wine/list.h"
 #include "wine/server_protocol.h"

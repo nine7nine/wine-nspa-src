@@ -36,7 +36,7 @@
 #include "wine/list.h"
 #include "wine/server.h"
 #include "wine/debug.h"
-#include "unix_private.h"
+#include "../unix_private.h"
 #include <rtpi.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(nspa_lfile);

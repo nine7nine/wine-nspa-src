@@ -676,7 +676,17 @@ static NTSTATUS alloc_handle_list( const PS_ATTRIBUTE *handles_attr, obj_handle_
 
     src = handles_attr->ValuePtr;
     for (i = 0; i < count; ++i)
-        (*handles)[i] = wine_server_obj_handle( src[i] );
+    {
+        HANDLE h = src[i];
+        /* NSPA local-file: the server has no record of local-range handles,
+         * so promote each before sending the handle array into new_process. */
+        if (nspa_local_file_is_local_handle( h ))
+        {
+            HANDLE promoted = nspa_local_file_get_or_promote_server_handle( h );
+            if (promoted) h = promoted;
+        }
+        (*handles)[i] = wine_server_obj_handle( h );
+    }
 
     *handles_len = count * sizeof(**handles);
 
@@ -821,6 +831,14 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
 #endif
 
     wine_server_send_fd( socketfd[1] );
+
+    /* NSPA local-file: if the server is going to auto-inherit handles
+     * from our handle table, make sure every OBJ_INHERIT-flagged local-
+     * range file handle is already server-visible.  The server walks
+     * its own handle table for inheritable entries; client-only local-
+     * range handles wouldn't otherwise be seen. */
+    if (process_flags & PROCESS_CREATE_FLAGS_INHERIT_HANDLES)
+        nspa_local_file_promote_inheritable();
 
     /* create the process on the server side */
 

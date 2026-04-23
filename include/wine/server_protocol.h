@@ -1117,6 +1117,7 @@ typedef volatile struct
     nspa_msg_ring_t      nspa_msg_ring;
     nspa_reply_ring_t    nspa_reply_ring;
     nspa_timer_ring_t    nspa_timer_ring;
+    int                  nspa_hook_walk_counts[NB_HOOKS];
 } nspa_queue_bypass_shm_t;
 
 /* NSPA local-file bypass — Phase 1A.2 shared inode aggregation table
@@ -4651,7 +4652,7 @@ struct start_hook_chain_reply
     thread_id_t    tid;
     int            unicode;
     int            has_next;
-    char __pad_28[4];
+    int            has_global;
     client_ptr_t   proc;
     /* VARARG(module,unicode_str); */
 };
@@ -7420,6 +7421,6 @@ union generic_reply
     struct nspa_get_inode_table_reply nspa_get_inode_table_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 944
+#define SERVER_PROTOCOL_VERSION 945
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

@@ -85,6 +85,13 @@ static unsigned long long       nspa_lf_lookup_attempt;
 static unsigned long long       nspa_lf_lookup_hit;
 static unsigned long long       nspa_lf_lookup_miss;
 static unsigned long long       nspa_lf_lookup_seq_retry;
+/* Phase 1A.3 audit counters — track where local handles flow */
+static unsigned long long       nspa_lf_bypass_minted;        /* NtCreateFile minted local handle */
+static unsigned long long       nspa_lf_close_intercepts;     /* NtClose on local handle */
+static unsigned long long       nspa_lf_section_intercepts;   /* NtCreateSection on local handle */
+static unsigned long long       nspa_lf_section_promote_ok;   /* nspa_create_mapping_from_unix_fd succeeded */
+static unsigned long long       nspa_lf_section_promote_fail; /* nspa_create_mapping_from_unix_fd returned !=SUCCESS */
+static unsigned long long       nspa_lf_get_unix_fd_intercepts; /* server_get_unix_fd routed to local table */
 
 static void nspa_lf_table_open_once_fn( void )
 {
@@ -404,6 +411,21 @@ static void nspa_lf_diag_dump( void )
         fprintf(f, "  lookup_hit                      %llu\n", lh);
         fprintf(f, "  lookup_miss                     %llu\n", lm);
         fprintf(f, "  lookup_seq_retry                %llu\n", ls);
+
+        /* Phase 1A.3 audit — show client intercept activity. */
+        {
+            unsigned long long bm = __atomic_load_n( &nspa_lf_bypass_minted,          __ATOMIC_RELAXED );
+            unsigned long long ci = __atomic_load_n( &nspa_lf_close_intercepts,       __ATOMIC_RELAXED );
+            unsigned long long si = __atomic_load_n( &nspa_lf_section_intercepts,     __ATOMIC_RELAXED );
+            unsigned long long sok= __atomic_load_n( &nspa_lf_section_promote_ok,     __ATOMIC_RELAXED );
+            unsigned long long sf = __atomic_load_n( &nspa_lf_section_promote_fail,   __ATOMIC_RELAXED );
+            unsigned long long uf = __atomic_load_n( &nspa_lf_get_unix_fd_intercepts, __ATOMIC_RELAXED );
+            fprintf(f, "\n[client intercepts]\n");
+            fprintf(f, "  NtCreateFile_minted             %llu\n", bm);
+            fprintf(f, "  NtClose_local                   %llu\n", ci);
+            fprintf(f, "  NtCreateSection_promote         %llu (ok=%llu fail=%llu)\n", si, sok, sf);
+            fprintf(f, "  server_get_unix_fd_local        %llu\n", uf);
+        }
     }
 
     fclose(f);
@@ -1037,6 +1059,21 @@ static void nspa_lf_free_handle( HANDLE h )
     pthread_mutex_unlock( &nspa_lf_handle_mutex );
 }
 
+/* Phase 1A.3 audit: counter bump helpers (separate functions so call
+ * sites in file.c/sync.c/server.c don't need to touch our static
+ * counters directly).  cause: 0=enter, 1=success, 2=fail. */
+void nspa_local_file_section_intercept_bump( int cause )
+{
+    if (cause == 0) __atomic_fetch_add( &nspa_lf_section_intercepts, 1, __ATOMIC_RELAXED );
+    else if (cause == 1) __atomic_fetch_add( &nspa_lf_section_promote_ok, 1, __ATOMIC_RELAXED );
+    else __atomic_fetch_add( &nspa_lf_section_promote_fail, 1, __ATOMIC_RELAXED );
+}
+
+void nspa_local_file_get_unix_fd_intercept_bump( void )
+{
+    __atomic_fetch_add( &nspa_lf_get_unix_fd_intercepts, 1, __ATOMIC_RELAXED );
+}
+
 int nspa_local_file_is_local_handle( HANDLE h )
 {
     unsigned int v = (unsigned int)(ULONG_PTR)h;
@@ -1139,6 +1176,7 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
 
     *handle = h;
     if (io) io->Information = FILE_OPENED;
+    __atomic_fetch_add( &nspa_lf_bypass_minted, 1, __ATOMIC_RELAXED );
     return STATUS_SUCCESS;
 }
 
@@ -1151,6 +1189,7 @@ int nspa_local_file_close( HANDLE handle )
     unsigned long long dev = 0, ino = 0;
 
     if (!nspa_local_file_is_local_handle( handle )) return 0;
+    __atomic_fetch_add( &nspa_lf_close_intercepts, 1, __ATOMIC_RELAXED );
 
     if (!nspa_local_file_table_remove( handle, &unix_fd, &dev, &ino ))
     {

@@ -360,8 +360,6 @@ static struct msg_queue *create_msg_queue( struct thread *thread, struct thread_
             shared->changed_mask = 0;
             shared->changed_bits = 0;
             shared->internal_bits = 0;
-            /* Lazy: locator starts zero.  nspa_ensure_shared() sets it later. */
-            memset( (void *)&shared->nspa_bypass_locator, 0, sizeof(shared->nspa_bypass_locator) );
         }
         SHARED_WRITE_END;
 
@@ -1116,11 +1114,10 @@ static inline int nspa_ring_wake_syn_disabled(void)
 }
 
 /* NSPA_MSG_BYPASS_SERVER_NO_ALLOC: skip per-queue nspa_shared allocation
- * entirely so queue_shared_t.nspa_bypass_locator stays zero and the bypass
- * infrastructure is effectively absent at runtime.  Used to isolate whether
- * the library-panel regression is caused by the structural plumbing
- * (allocation + locator propagation) rather than the ring arbitration or
- * wake-bit synthesis subsystems. */
+ * entirely so the bypass infrastructure is effectively absent at runtime.
+ * Used to isolate whether the library-panel regression is caused by the
+ * structural plumbing (allocation + ring publish) rather than the ring
+ * arbitration or wake-bit synthesis subsystems. */
 static inline int nspa_ring_alloc_disabled(void)
 {
     if (nspa_server_alloc_off == -1)
@@ -1314,10 +1311,8 @@ static int nspa_ensure_shared( struct msg_queue *queue )
     }
 
     /* Ring is zeroed + active flag set inside nspa_alloc_bypass_shm.
-     * queue_shm_t.nspa_bypass_locator is not touched — the locator field
-     * is retired by the memfd redesign (Phase 2 removes it from the
-     * protocol).  Clients discover the ring via send_client_fd() from
-     * the nspa_get_thread_queue handler. */
+     * Clients discover the ring via send_client_fd() from the
+     * nspa_get_thread_queue handler; reply->fd_sent signals delivery. */
     return 1;
 }
 
@@ -3679,13 +3674,7 @@ DECL_HANDLER(nspa_get_thread_queue)
     if (queue)
     {
         reply->locator = get_shared_object_locator( queue->shared );
-
-        /* Locator field is retired by the memfd redesign — its .id doubles
-         * as a "bypass fd follows this reply" sentinel during Phase 1.
-         * Client checks reply->bypass_locator.id != 0 → call
-         * wine_server_receive_fd().  Phase 2 replaces this with a proper
-         * protocol field. */
-        memset( &reply->bypass_locator, 0, sizeof(reply->bypass_locator) );
+        reply->fd_sent = 0;
         /* EVENT_MODIFY_STATE lets the peer call NtSetEvent; SYNCHRONIZE for completeness */
         reply->sync_handle = alloc_handle( current->process, queue->sync,
                                            EVENT_MODIFY_STATE | SYNCHRONIZE, 0 );
@@ -3693,17 +3682,13 @@ DECL_HANDLER(nspa_get_thread_queue)
         /* NSPA: deliver the peer's bypass memfd unconditionally.  Queues are
          * eager-allocated at create_msg_queue time, so the ring is always
          * present here (modulo the NSPA_MSG_BYPASS_SERVER_NO_ALLOC kill
-         * switch which makes nspa_ensure_shared a no-op).  The historical
-         * caller_ready gate that made delivery contingent on the *caller*
-         * having its own ring was a workaround for a session-shmem alloc
-         * side effect retired by the memfd redesign; with eager-allocate
-         * in place there is no remaining chicken-and-egg between caller
-         * readiness and peer ring availability. */
+         * switch which makes nspa_ensure_shared a no-op).  reply->fd_sent
+         * tells the client whether the fd followed on the socket. */
         if (reply->sync_handle && nspa_ensure_shared( queue ) &&
             queue->nspa_bypass_fd != -1 &&
             send_client_fd( current->process, queue->nspa_bypass_fd, reply->sync_handle ) == 0)
         {
-            reply->bypass_locator.id = 1;  /* Phase-1 sentinel: fd was sent */
+            reply->fd_sent = 1;
         }
     }
     release_object( thread );

@@ -1198,7 +1198,6 @@ typedef volatile struct
     unsigned int         changed_bits;
     unsigned int         internal_bits;
     int                  hooks_count[NB_HOOKS];
-    struct obj_locator   nspa_bypass_locator;
 } queue_shm_t;
 
 typedef volatile struct
@@ -6376,9 +6375,8 @@ struct nspa_get_thread_queue_reply
 {
     struct reply_header __header;
     struct obj_locator locator;
-    struct obj_locator bypass_locator;
+    int             fd_sent;
     obj_handle_t    sync_handle;
-    char __pad_44[4];
 };
 
 
@@ -7423,6 +7421,6 @@ union generic_reply
     struct nspa_get_inode_table_reply nspa_get_inode_table_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 946
+#define SERVER_PROTOCOL_VERSION 947
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

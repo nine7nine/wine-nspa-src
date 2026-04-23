@@ -62,13 +62,11 @@ extern void nspa_send_diag_fault_bump( void );
 extern BOOL nspa_try_pop_own_ring_post( HWND filter_hwnd, UINT first, UINT last,
                                         UINT *msg_out, WPARAM *wp_out, LPARAM *lp_out,
                                         DWORD *time_out, HWND *win_out );
-/* Memfd-era replacement for the old queue_shm_t.nspa_bypass_locator
- * resolution.  Returns current thread's own bypass ring mmap (bootstrapping
- * via server request on first call), or NULL if bypass is off / server
- * couldn't provide a ring.  Exposed so get_queue_bypass_shm() and
- * check_queue_bits() can include ring-synthesised wake bits in the local
- * shmem check, avoiding the server round-trip to learn of pending ring
- * SENDs. */
+/* Returns current thread's own bypass ring mmap (bootstrapping via server
+ * request on first call), or NULL if bypass is off / server couldn't
+ * provide a ring.  Exposed so get_queue_bypass_shm() and check_queue_bits()
+ * can include ring-synthesised wake bits in the local shmem check, avoiding
+ * the server round-trip to learn of pending ring SENDs. */
 extern const nspa_queue_bypass_shm_t *nspa_get_own_bypass_shm_public( void );
 
 /* Phase 4.6: pop a ring SEND from own ring client-side, eliminating the

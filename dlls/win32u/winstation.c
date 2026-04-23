@@ -271,13 +271,13 @@ NTSTATUS get_shared_queue( struct object_lock *lock, const queue_shm_t **queue_s
 
 const nspa_queue_bypass_shm_t *get_queue_bypass_shm( const queue_shm_t *queue_shm )
 {
-    static int ignore_locator = -1;
+    static int bypass_shm_disabled = -1;
 
     (void)queue_shm;  /* own ring is resolved via the TLS cache. */
 
-    if (ignore_locator == -1)
-        ignore_locator = (getenv("NSPA_CLIENT_IGNORE_LOCATOR") != NULL);
-    if (ignore_locator) return NULL;
+    if (bypass_shm_disabled == -1)
+        bypass_shm_disabled = (getenv("NSPA_NO_CLIENT_BYPASS_SHM") != NULL);
+    if (bypass_shm_disabled) return NULL;
 
     /* Delegate to the memfd-era TLS-cached own-bypass lookup.  Callers
      * (check_queue_bits, get_shared_queue_bits) always pass the current

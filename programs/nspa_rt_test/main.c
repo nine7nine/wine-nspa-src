@@ -29,9 +29,10 @@
  *   nt-timer       NSPA NT timer Phase A validation. Exercises CreateWaitableTimer /
  *                  SetWaitableTimer / CancelWaitableTimer / WaitForSingleObject
  *                  through the NSPA local-timer dispatcher.  Run twice, once
- *                  with NSPA_LOCAL_TIMERS=1 (local path) and once unset
- *                  (server path); both must report PASS (NT semantics must
- *                  not diverge between paths).
+ *                  with NSPA_DISABLE_LOCAL_TIMERS unset (local path, default)
+ *                  and once with NSPA_DISABLE_LOCAL_TIMERS=1 (server path);
+ *                  both must report PASS (NT semantics must not diverge
+ *                  between paths).
  *   signal-recursion Multi-threaded PAGE_GUARD / VirtualAlloc fault stress
  *                  that validates virtual_mutex and Wine's segv_handler
  *                  fault-dispatch path. Catches regressions in the
@@ -4185,13 +4186,13 @@ static int cmd_condvar_pi(int argc, char **argv)
  *
  *   Exercises the CreateWaitableTimer / SetWaitableTimer / NtWaitForSingleObject
  *   / CancelWaitableTimer / CloseHandle paths through the NSPA local-timer
- *   dispatcher (dlls/ntdll/unix/nspa_local_timer.c).  Same tests must PASS
- *   whether NSPA_LOCAL_TIMERS is set or not — the dispatcher is an
+ *   dispatcher (dlls/ntdll/unix/nspa/local_timer.c).  Same tests must PASS
+ *   whether NSPA_DISABLE_LOCAL_TIMERS is set or not — the dispatcher is an
  *   optimisation, NT semantics must be identical.
  *
  *   Runner convention:
- *       NSPA_RT_PRIO=80                       ./wine ...exe nt-timer   (server path)
- *       NSPA_RT_PRIO=80 NSPA_LOCAL_TIMERS=1   ./wine ...exe nt-timer   (local path)
+ *       NSPA_RT_PRIO=80                              ./wine ...exe nt-timer   (local, default)
+ *       NSPA_RT_PRIO=80 NSPA_DISABLE_LOCAL_TIMERS=1  ./wine ...exe nt-timer   (server path)
  *
  *   Thread scheduling (deliberate, to avoid FIFO busyloops per
  *   feedback_never_fifo_busyloops):
@@ -4473,13 +4474,13 @@ static int nt_timer_sub_absolute( void )
 
 static int cmd_nt_timer( int argc, char **argv )
 {
-    const char *gate = getenv( "NSPA_LOCAL_TIMERS" );
+    int server_path = (getenv( "NSPA_DISABLE_LOCAL_TIMERS" ) != NULL);
     int pass = 0, total = 7;
 
     (void)argc; (void)argv;
     print_banner( "nt-timer", "NSPA NT timer Phase A (NtCreate/Set/Cancel/Query/Wait)" );
 
-    print_kv( "path",           "%s", (gate && gate[0] == '1') ? "NSPA LOCAL DISPATCHER" : "wineserver (gate off)" );
+    print_kv( "path",           "%s", server_path ? "wineserver (NSPA_DISABLE_LOCAL_TIMERS set)" : "NSPA LOCAL DISPATCHER" );
     print_kv( "expected",       "all %d sub-tests PASS regardless of path (NT-semantics invariant)", total );
 
     enter_realtime_class();
@@ -4508,10 +4509,10 @@ static int cmd_nt_timer( int argc, char **argv )
  *   Subcommand: wm-timer  (NSPA WM_TIMER Phase B validation)
  *
  *   Exercises user32::SetTimer / KillTimer / WM_TIMER delivery through
- *   the NSPA local WM_TIMER dispatcher (dlls/win32u/nspa_local_wm_timer.c).
- *   Same tests must PASS on both server path (NSPA_LOCAL_WM_TIMERS unset)
- *   and local path (NSPA_LOCAL_WM_TIMERS=1) — Phase B is an optimisation,
- *   NT semantics must not diverge.
+ *   the NSPA local WM_TIMER dispatcher (dlls/win32u/nspa/local_wm_timer.c).
+ *   Same tests must PASS on both local path (NSPA_DISABLE_LOCAL_WM_TIMERS
+ *   unset, default) and server path (NSPA_DISABLE_LOCAL_WM_TIMERS=1) —
+ *   Phase B is an optimisation, NT semantics must not diverge.
  *
  *   Critical NT semantic covered: WM_TIMER coalescing.  If the message
  *   pump stalls across N periods, the app sees ONE WM_TIMER, not N.
@@ -4701,13 +4702,13 @@ static int wm_timer_sub_id_zero_fallthrough( HWND hwnd )
 
 static int cmd_wm_timer( int argc, char **argv )
 {
-    const char *gate = getenv( "NSPA_LOCAL_WM_TIMERS" );
+    int server_path = (getenv( "NSPA_DISABLE_LOCAL_WM_TIMERS" ) != NULL);
     HWND hwnd;
     int pass = 0, total = 5;
 
     (void)argc; (void)argv;
     print_banner( "wm-timer", "NSPA WM_TIMER Phase B (SetTimer/KillTimer/WM_TIMER)" );
-    print_kv( "path",     "%s", (gate && gate[0] == '1') ? "NSPA LOCAL DISPATCHER" : "wineserver (gate off)" );
+    print_kv( "path",     "%s", server_path ? "wineserver (NSPA_DISABLE_LOCAL_WM_TIMERS set)" : "NSPA LOCAL DISPATCHER" );
     print_kv( "expected", "all %d sub-tests PASS regardless of path", total );
 
     if (!(hwnd = wm_timer_create_window()))

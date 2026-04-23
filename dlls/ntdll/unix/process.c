@@ -676,17 +676,7 @@ static NTSTATUS alloc_handle_list( const PS_ATTRIBUTE *handles_attr, obj_handle_
 
     src = handles_attr->ValuePtr;
     for (i = 0; i < count; ++i)
-    {
-        HANDLE h = src[i];
-        /* NSPA local-file: the server has no record of local-range handles,
-         * so promote each before sending the handle array into new_process. */
-        if (nspa_local_file_is_local_handle( h ))
-        {
-            HANDLE promoted = nspa_local_file_get_or_promote_server_handle( h );
-            if (promoted) h = promoted;
-        }
-        (*handles)[i] = wine_server_obj_handle( h );
-    }
+        (*handles)[i] = wine_server_obj_handle( src[i] );
 
     *handles_len = count * sizeof(**handles);
 

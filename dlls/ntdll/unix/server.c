@@ -2223,6 +2223,7 @@ NTSTATUS WINAPI NtDuplicateObject( HANDLE source_process, HANDLE source, HANDLE 
     sigset_t sigset;
     unsigned int ret;
     int fd = -1;
+    HANDLE original_local = 0;
 
     if (dest) *dest = 0;
 
@@ -2253,11 +2254,20 @@ NTSTATUS WINAPI NtDuplicateObject( HANDLE source_process, HANDLE source, HANDLE 
      * operates on something it knows about.  Returns a server-range
      * handle in *dest — correct since the dup is consumed by non-NSPA
      * code paths (e.g. CreateFileMapping, Ableton's .als decompress
-     * stream) that need server-visible handles. */
+     * stream) that need server-visible handles.
+     *
+     * Preserve the original so that a DUPLICATE_CLOSE_SOURCE dup can
+     * clean up the LF entry after the server-side dup+close runs on
+     * the promoted handle — otherwise we'd leak the unix fd + the
+     * stale LF table entry for the original local-range handle. */
     if (source_process == NtCurrentProcess() && nspa_local_file_is_local_handle( source ))
     {
         HANDLE promoted = nspa_local_file_get_or_promote_server_handle( source );
-        if (promoted) source = promoted;
+        if (promoted)
+        {
+            original_local = source;
+            source = promoted;
+        }
     }
 
     /* hold fd_cache_mutex to prevent the fd from being added again between the
@@ -2290,6 +2300,15 @@ NTSTATUS WINAPI NtDuplicateObject( HANDLE source_process, HANDLE source, HANDLE 
     server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
 
     if (fd != -1) close( fd );
+
+    /* LF cleanup for DUPLICATE_CLOSE_SOURCE on a promoted local-range
+     * source: the server just closed the promoted server handle as part
+     * of the dup, but our LF table entry for `original_local` still
+     * points to a live unix fd and a now-stale server_handle.  Drop the
+     * entry so the unix fd is closed and the handle slot is freed. */
+    if (!ret && original_local && (options & DUPLICATE_CLOSE_SOURCE))
+        nspa_local_file_close( original_local );
+
     return ret;
 }
 
@@ -2300,6 +2319,20 @@ NTSTATUS WINAPI NtDuplicateObject( HANDLE source_process, HANDLE source, HANDLE 
 NTSTATUS WINAPI NtCompareObjects( HANDLE first, HANDLE second )
 {
     unsigned int status;
+
+    /* NSPA local-file: either handle may be a local-range file handle
+     * the server has no record of.  Promote both before the RPC so the
+     * server compares real server objects. */
+    if (nspa_local_file_is_local_handle( first ))
+    {
+        HANDLE promoted = nspa_local_file_get_or_promote_server_handle( first );
+        if (promoted) first = promoted;
+    }
+    if (nspa_local_file_is_local_handle( second ))
+    {
+        HANDLE promoted = nspa_local_file_get_or_promote_server_handle( second );
+        if (promoted) second = promoted;
+    }
 
     SERVER_START_REQ( compare_objects )
     {

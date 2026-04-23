@@ -4686,25 +4686,31 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
          * a real conflict (propagate), or STATUS_NOT_SUPPORTED to fall
          * back to the existing server path.  Eligibility filter mirrors
          * nspa_local_file_diag_categorize. */
-        /* Phase 1A.5 attempt: tried excluding loader-pattern opens
-         * (.dll/.drv/.sys/.exe) to dodge the unresolved per-Nt*File
-         * coverage gap.  GUI bringup works with that, but Ableton's
-         * data-file opens (.als and similar) still fail — even further
-         * Nt*File ops we haven't hooked are hit by data-file workflows.
-         *
-         * Conservative eligibility (FILE_NON_DIRECTORY_FILE excluded)
-         * is the proven safe ship state; expansion requires the
-         * comprehensive Nt*File audit documented in
-         * plan_local_file_bypass.md (Phase 1A.5+). */
-        if (!attr->RootDirectory && !attr->SecurityDescriptor &&
+        /* Phase 1A.6 debug: broader eligibility re-enabled with stderr
+         * trace to find the unhooked op that breaks .als loads. */
+        BOOL loader_open = FALSE;
+        if (attr->ObjectName && attr->ObjectName->Length >= 4 * sizeof(WCHAR))
+        {
+            const WCHAR *buf = attr->ObjectName->Buffer;
+            ULONG ofs = attr->ObjectName->Length / sizeof(WCHAR) - 4;
+            WCHAR e1 = buf[ofs] | 0x20, e2 = buf[ofs+1] | 0x20,
+                  e3 = buf[ofs+2] | 0x20, e4 = buf[ofs+3] | 0x20;
+            if (e1 == '.' && ((e2=='d' && e3=='l' && e4=='l') ||
+                              (e2=='d' && e3=='r' && e4=='v') ||
+                              (e2=='s' && e3=='y' && e4=='s') ||
+                              (e2=='e' && e3=='x' && e4=='e')))
+                loader_open = TRUE;
+        }
+
+        if (!loader_open &&
+            !attr->RootDirectory && !attr->SecurityDescriptor &&
             disposition == FILE_OPEN &&
-            !(options & (FILE_OPEN_BY_FILE_ID | FILE_DIRECTORY_FILE | FILE_DELETE_ON_CLOSE |
-                         FILE_NON_DIRECTORY_FILE)) &&
+            !(options & (FILE_OPEN_BY_FILE_ID | FILE_DIRECTORY_FILE | FILE_DELETE_ON_CLOSE)) &&
             !(access & ~(FILE_READ_DATA | FILE_READ_ATTRIBUTES | FILE_READ_EA |
                          READ_CONTROL | SYNCHRONIZE | GENERIC_READ)))
         {
-            NTSTATUS bypass = nspa_local_file_try_bypass( handle, unix_name, access,
-                                                          sharing, options, io );
+            NTSTATUS bypass = nspa_local_file_try_bypass( handle, unix_name, attr->ObjectName,
+                                                          access, sharing, options, io );
             if (bypass == STATUS_SUCCESS)
             {
                 free( unix_name );
@@ -5059,6 +5065,9 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
     {
         HANDLE promoted = nspa_local_file_get_or_promote_server_handle( handle );
         if (promoted) srv_handle = promoted;
+        if (getenv("NSPA_LF_TRACE"))
+            fprintf( stderr, "NSPA-LF QIF h=%p class=%u srv=%p\n",
+                     handle, class, srv_handle );
     }
 
     if (class == WineFileUnixNameInformation)

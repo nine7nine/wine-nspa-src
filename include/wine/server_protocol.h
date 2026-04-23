@@ -6437,6 +6437,7 @@ struct nspa_create_file_from_unix_fd_request
     unsigned int    sharing;
     unsigned int    options;
     unsigned int    attributes;
+    /* VARARG(filename,unicode_str); */
 };
 struct nspa_create_file_from_unix_fd_reply
 {
@@ -7417,6 +7418,6 @@ union generic_reply
     struct nspa_get_inode_table_reply nspa_get_inode_table_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 942
+#define SERVER_PROTOCOL_VERSION 943
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

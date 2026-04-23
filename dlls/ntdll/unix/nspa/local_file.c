@@ -37,6 +37,7 @@
 #include "wine/server.h"
 #include "wine/debug.h"
 #include "../unix_private.h"
+#include "debug.h"
 #include <rtpi.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(nspa_lfile);
@@ -1276,8 +1277,7 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
     /* Phase 1A.6 debug: log mint with path so we can correlate with
      * subsequent operations on this handle.  Filtered: only log if
      * NSPA_LF_TRACE=1 to avoid spam. */
-    if (getenv("NSPA_LF_TRACE"))
-        fprintf( stderr, "NSPA-LF mint h=%p fd=%d access=%x sharing=%x options=%x path=%s\n",
+    NSPA_TRACE( LF_TRACE, "NSPA-LF mint h=%p fd=%d access=%x sharing=%x options=%x path=%s\n",
                  h, unix_fd, (unsigned)access, (unsigned)sharing, (unsigned)options, unix_name );
     return STATUS_SUCCESS;
 }
@@ -1292,12 +1292,63 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
  * need a server-recognised handle (NtFsControlFile, NtQueryInformationFile,
  * NtSetInformationFile, etc.) to handle local-range handles transparently. */
 
+/* Local-file fast path for server_get_unix_fd.  For a local-range
+ * handle, fills the fd + type + options from the private table and
+ * returns STATUS_SUCCESS (or STATUS_INVALID_HANDLE when the handle is
+ * in range but not registered).  Returns STATUS_NOT_SUPPORTED for non-
+ * local-range handles so the caller falls through to the normal
+ * server path.  Keeps the LF fast-path out of upstream server.c — the
+ * caller sees one guarded return, all local-file logic lives here. */
+int nspa_local_file_try_get_unix_fd( HANDLE handle, unsigned int wanted_access,
+                                     int *unix_fd, int *needs_close,
+                                     enum server_fd_type *type, unsigned int *options )
+{
+    int local_fd = -1;
+    unsigned int local_options = 0;
+
+    if (!nspa_local_file_is_local_handle( handle )) return STATUS_NOT_SUPPORTED;
+
+    if (!nspa_local_file_table_lookup_full( handle, &local_fd, &local_options ) || local_fd < 0)
+    {
+        NSPA_TRACE( LF_TRACE, "NSPA-LF get_unix_fd h=%p NOT-FOUND-IN-TABLE\n", handle );
+        return STATUS_INVALID_HANDLE;
+    }
+
+    *unix_fd = local_fd;
+    *needs_close = 0;
+    if (type) *type = FD_TYPE_FILE;
+    if (options) *options = local_options;
+    nspa_local_file_get_unix_fd_intercept_bump();
+    NSPA_TRACE( LF_TRACE, "NSPA-LF get_unix_fd h=%p fd=%d wanted=%x\n",
+                handle, local_fd, wanted_access );
+    return STATUS_SUCCESS;
+}
+
 /* Convenience wrapper: if `h` is a local-range handle, promote it and
  * return the server handle; otherwise return `h` unchanged.  Collapses
  * the repeated 4-line `is_local_handle + get_or_promote` idiom that
  * appeared at every NT-API intercept site down to one-liner call sites
  * and keeps upstream Wine files close to vanilla for rebase
  * friendliness. */
+/* Traced variant — same as nspa_promote_if_local but emits a tagged
+ * stderr line on a real promotion.  Used by NtQueryInformationFile /
+ * NtQueryObject etc. so the trace emission lives here rather than
+ * sprinkled through upstream file.c. */
+HANDLE nspa_promote_if_local_traced( HANDLE h, const char *tag, unsigned int info )
+{
+    if (nspa_local_file_is_local_handle( h ))
+    {
+        HANDLE promoted = nspa_local_file_get_or_promote_server_handle( h );
+        if (promoted)
+        {
+            NSPA_TRACE( LF_TRACE, "NSPA-LF %s h=%p class=%u srv=%p\n",
+                        tag, h, info, promoted );
+            return promoted;
+        }
+    }
+    return h;
+}
+
 HANDLE nspa_promote_if_local( HANDLE h )
 {
     if (nspa_local_file_is_local_handle( h ))
@@ -1320,8 +1371,7 @@ HANDLE nspa_local_file_get_or_promote_server_handle( HANDLE local_handle )
 
     if (!nspa_local_file_is_local_handle( local_handle )) return 0;
     __atomic_fetch_add( &nspa_lf_promote_calls, 1, __ATOMIC_RELAXED );
-    if (getenv("NSPA_LF_TRACE"))
-        fprintf( stderr, "NSPA-LF promote-call h=%p\n", local_handle );
+    NSPA_TRACE( LF_TRACE, "NSPA-LF promote-call h=%p\n", local_handle );
 
     pi_mutex_lock( &nspa_lf_opens_mutex );
     LIST_FOR_EACH_ENTRY( o, &nspa_lf_opens, struct nspa_local_open, entry )
@@ -1477,8 +1527,7 @@ int nspa_local_file_close( HANDLE handle )
 
     if (!nspa_local_file_is_local_handle( handle )) return 0;
     __atomic_fetch_add( &nspa_lf_close_intercepts, 1, __ATOMIC_RELAXED );
-    if (getenv("NSPA_LF_TRACE"))
-        fprintf( stderr, "NSPA-LF close h=%p\n", handle );
+    NSPA_TRACE( LF_TRACE, "NSPA-LF close h=%p\n", handle );
 
     /* Inline-extended remove that also captures server_handle for
      * 1A.4 lazy-promotion cleanup. */

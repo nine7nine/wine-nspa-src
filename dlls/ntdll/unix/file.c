@@ -5067,10 +5067,7 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
     /* NSPA local-file: lazy-promote before any server_get_file_info
      * call.  server_get_unix_fd below stays on the original (local)
      * handle for the local-fd fast path. */
-    srv_handle = nspa_promote_if_local( handle );
-    if (handle != srv_handle && getenv("NSPA_LF_TRACE"))
-        fprintf( stderr, "NSPA-LF QIF h=%p class=%u srv=%p\n",
-                 handle, class, srv_handle );
+    srv_handle = nspa_promote_if_local_traced( handle, "QIF", class );
 
     if (class == WineFileUnixNameInformation)
         return server_get_file_info( srv_handle, io, ptr, len, class );
@@ -7835,13 +7832,7 @@ NTSTATUS WINAPI NtQueryObject( HANDLE handle, OBJECT_INFORMATION_CLASS info_clas
     if (used_len) *used_len = 0;
 
     /* NSPA local-file: promote before NtQueryObject server call. */
-    {
-        HANDLE orig = handle;
-        handle = nspa_promote_if_local( handle );
-        if (handle != orig && getenv("NSPA_LF_TRACE"))
-            fprintf( stderr, "NSPA-LF QObj h=%p class=%u srv=%p\n",
-                     orig, info_class, handle );
-    }
+    handle = nspa_promote_if_local_traced( handle, "QObj", info_class );
 
     switch (info_class)
     {

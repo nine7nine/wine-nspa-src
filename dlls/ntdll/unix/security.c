@@ -997,11 +997,7 @@ NTSTATUS WINAPI NtQuerySecurityObject( HANDLE handle, SECURITY_INFORMATION info,
     TRACE( "(%p,0x%08x,%p,0x%08x,%p)\n", handle, info, descr, length, retlen );
 
     /* NSPA local-file: promote so the server sees something it knows. */
-    if (nspa_local_file_is_local_handle( handle ))
-    {
-        HANDLE promoted = nspa_local_file_get_or_promote_server_handle( handle );
-        if (promoted) handle = promoted;
-    }
+    handle = nspa_promote_if_local( handle );
 
     for (;;)
     {
@@ -1066,11 +1062,7 @@ NTSTATUS WINAPI NtSetSecurityObject( HANDLE handle, SECURITY_INFORMATION info, P
     if (!descr) return STATUS_ACCESS_VIOLATION;
 
     /* NSPA local-file: promote so the server sees something it knows. */
-    if (nspa_local_file_is_local_handle( handle ))
-    {
-        HANDLE promoted = nspa_local_file_get_or_promote_server_handle( handle );
-        if (promoted) handle = promoted;
-    }
+    handle = nspa_promote_if_local( handle );
 
     /* reuse the object attribute SD marshalling */
     InitializeObjectAttributes( &attr, NULL, 0, 0, descr );

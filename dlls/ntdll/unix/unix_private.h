@@ -292,8 +292,22 @@ extern void init_startup_info(void);
 /* NSPA RT v1.2: exposed so other ntdll/unix files can access the
  * HANDLE→unix_tid map and cached process priority class. All live in
  * dlls/ntdll/unix/thread.c. */
+/* NSPA RT constants (shared between thread.c intercept sites and nspa/rt.c). */
+#ifndef NSPA_RT_TIME_CRITICAL
+# define NSPA_RT_TIME_CRITICAL 15  /* THREAD_PRIORITY_TIME_CRITICAL from winnt.h */
+#endif
+#ifndef NSPA_THREAD_PRIORITY_IDLE
+# define NSPA_THREAD_PRIORITY_IDLE (-15)
+#endif
 extern void nspa_rt_set_cached_priocls( int cls );
 extern void nspa_rt_map_remove( HANDLE handle );
+extern void nspa_rt_map_add( HANDLE handle, int tid );
+extern int  nspa_rt_map_lookup( HANDLE handle );
+extern void nspa_rt_probe( void );
+extern int  nspa_rt_apply_tid( int tid, int nt_band );
+extern int  nspa_resolve_nt_band( int base_priority );
+extern int  nspa_rt_prio_base;
+extern int  nspa_rt_policy_v;
 
 /* NSPA local NT timer dispatcher (dlls/ntdll/unix/nspa_local_timer.c).
  * Each entry point returns STATUS_NOT_IMPLEMENTED when the feature gate is

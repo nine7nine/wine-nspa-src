@@ -117,6 +117,8 @@ extern void free_msg_queue( struct thread *thread );
 extern struct hook_table *get_queue_hooks( struct thread *thread );
 extern void set_queue_hooks( struct thread *thread, struct hook_table *hooks );
 extern void add_queue_hook_count( struct thread *thread, unsigned int index, int count );
+extern int  nspa_queue_hook_tier1_active( struct thread *thread );
+extern int  nspa_queue_hook_chain_busy_tier1( struct thread *thread, int index );
 extern void inc_queue_paint_count( struct thread *thread, int incr );
 extern void queue_cleanup_window( struct thread *thread, user_handle_t win );
 extern int init_thread_queue( struct thread *thread );

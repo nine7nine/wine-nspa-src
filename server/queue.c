@@ -750,6 +750,46 @@ void add_queue_hook_count( struct thread *thread, unsigned int index, int count 
     assert( thread->queue->shared->hooks_count[index] >= 0 );
 }
 
+/* NSPA Tier 1: single-source-of-truth gate for whether the client-owned
+ * shmem refcount (nspa_queue_bypass_shm_t::nspa_hook_walk_counts[]) is
+ * being used for this queue's hook-chain pinning.  True iff NSPA_HOOK_TIER1
+ * env is set (server-side) AND the memfd-backed bypass shm has been
+ * allocated for this queue.  The server publishes this per-RPC in
+ * start_hook_chain reply->tier1_active so the client matches without
+ * reading env independently. */
+static int nspa_hook_tier1_env_enabled( void )
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *v = getenv( "NSPA_HOOK_TIER1" );
+        cached = (v && *v && *v != '0');
+    }
+    return cached;
+}
+
+int nspa_queue_hook_tier1_active( struct thread *thread )
+{
+    if (!nspa_hook_tier1_env_enabled()) return 0;
+    if (!thread || !thread->queue) return 0;
+    return thread->queue->nspa_shared != NULL;
+}
+
+/* NSPA Tier 1: is a walker currently pinning the queue-local hook chain at
+ * `index`?  Read via the memfd-backed bypass shm, written by the client's
+ * ACQ_REL ++/-- around its walk.  SEQ_CST load on the server pairs with
+ * the client's ACQ_REL store so any write ordered before the decrement is
+ * observed here before the caller decides to free a proc=0-marked hook. */
+int nspa_queue_hook_chain_busy_tier1( struct thread *thread, int index )
+{
+    nspa_queue_bypass_shm_t *shared;
+
+    if (index < 0 || index >= NB_HOOKS) return 0;
+    if (!thread || !thread->queue) return 0;
+    if (!(shared = thread->queue->nspa_shared)) return 0;
+    return __atomic_load_n( &shared->nspa_hook_walk_counts[index], __ATOMIC_SEQ_CST ) > 0;
+}
+
 /* check the queue status */
 static inline int get_queue_status( struct msg_queue *queue )
 {

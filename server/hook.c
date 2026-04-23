@@ -303,11 +303,30 @@ static void hook_table_destroy( struct object *obj )
             free_hook( hook );
 }
 
+/* NSPA Tier 1: sweep proc=0-marked hooks out of a queue-local chain
+ * when no walker is currently pinning it.  The walk refcount lives in
+ * the client's memfd-backed bypass shm (nspa_hook_walk_counts[]); if
+ * count > 0, a walker holds pointers into the chain and we must defer
+ * free.  Safe to call opportunistically from any hook-API handler —
+ * if busy, this is a no-op. */
+static void nspa_queue_hook_chain_sweep( struct thread *thread, int index )
+{
+    struct hook_table *table;
+    struct hook *hook, *next;
+
+    if (index < 0 || index >= NB_HOOKS) return;
+    if (!(table = get_queue_hooks( thread ))) return;
+    if (nspa_queue_hook_chain_busy_tier1( thread, index )) return;
+    LIST_FOR_EACH_ENTRY_SAFE( hook, next, &table->hooks[index], struct hook, chain )
+        if (!hook->proc) free_hook( hook );
+}
+
 /* remove a hook, freeing it if the chain is not in use */
 static void remove_hook( struct hook *hook )
 {
     struct desktop *desktop = hook->desktop;
     int global = hook->table == desktop->global_hooks;
+    int busy;
     struct thread *thread;
 
     if (!global)
@@ -318,7 +337,18 @@ static void remove_hook( struct hook *hook )
         add_queue_hook_count( thread, hook->index, -1 );
     }
 
-    if (hook->table->counts[hook->index])
+    /* NSPA Tier 1: queue-local hook chains use the client-shmem refcount
+     * when tier1 is active for this thread's queue.  Global hooks always
+     * stay on the legacy counts[] path (desktop-level shmem would be
+     * needed to migrate them).  Outside of tier1, queue-local hooks also
+     * stay on counts[] — so the only branch that differs is tier1-on
+     * queue-local, which reads the memfd bypass shm. */
+    if (global || !nspa_queue_hook_tier1_active( hook->thread ))
+        busy = hook->table->counts[hook->index] > 0;
+    else
+        busy = nspa_queue_hook_chain_busy_tier1( hook->thread, hook->index );
+
+    if (busy)
         hook->proc = 0; /* chain is in use, just mark it and return */
     else
         free_hook( hook );
@@ -458,6 +488,13 @@ DECL_HANDLER(set_hook)
                           req->flags, req->proc, req->unicode, module, module_size )))
     {
         reply->handle = hook->handle;
+        /* NSPA Tier 1: opportunistic sweep of pending-free hooks on the
+         * same (queue, idx).  In tier1 mode we can't rely on
+         * finish_hook_chain to trigger this — the client skips that RPC
+         * for the queue-local path.  set_hook is an obvious natural
+         * moment: a state-changing hook API call for this queue. */
+        if (!global && nspa_queue_hook_tier1_active( hook->thread ))
+            nspa_queue_hook_chain_sweep( hook->thread, hook->index );
     }
     else free( module );
 
@@ -472,6 +509,8 @@ done:
 DECL_HANDLER(remove_hook)
 {
     struct hook *hook;
+    struct thread *sweep_thread = NULL;
+    int sweep_index = -1;
 
     if (req->handle)
     {
@@ -494,6 +533,22 @@ DECL_HANDLER(remove_hook)
             return;
         }
     }
+
+    /* NSPA Tier 1: capture the queue-local chain to sweep.  Global hooks
+     * skip the sweep — their refcount still lives in counts[].  Must do
+     * the sweep BEFORE remove_hook() because remove_hook can free the
+     * hook, which release_object()s hook->thread and could leave the
+     * captured pointer dangling.  The sweep only touches hooks with
+     * proc=0; the hook being removed still has proc!=0 at this point,
+     * so sweep does not interfere with the impending remove. */
+    if (hook->table != hook->desktop->global_hooks
+        && nspa_queue_hook_tier1_active( hook->thread ))
+    {
+        sweep_thread = hook->thread;
+        sweep_index  = hook->index;
+    }
+
+    if (sweep_thread) nspa_queue_hook_chain_sweep( sweep_thread, sweep_index );
 
     remove_hook( hook );
 }
@@ -542,12 +597,14 @@ DECL_HANDLER(start_hook_chain)
      * second during menu activity). */
     reply->has_next = get_next_hook( current, hook, req->event, req->window,
                                      req->object_id, req->child_id ) ? 1 : 0;
-    /* NSPA Tier 1 step 2: publish whether a desktop-global hook table was
-     * pinned.  Still bump both counts[] as before — client not yet reading
-     * has_global in this commit; the gated refcount migration happens in a
-     * follow-up. */
-    reply->has_global = global_table ? 1 : 0;
-    if (table) table->counts[hook->index]++;
+    /* NSPA Tier 1: publish whether a desktop-global hook table was pinned
+     * (client still needs finish_hook_chain for that part), and whether
+     * we're running in tier1 mode for THIS queue (client-shmem refcount
+     * instead of counts[]).  Server is the single source of truth so
+     * client doesn't risk drifting on a divergent env. */
+    reply->has_global   = global_table ? 1 : 0;
+    reply->tier1_active = nspa_queue_hook_tier1_active( current ) ? 1 : 0;
+    if (table && !reply->tier1_active) table->counts[hook->index]++;
     if (global_table) global_table->counts[hook->index]++;
     if (hook->module) set_reply_data( hook->module, hook->module_size );
 }
@@ -559,14 +616,22 @@ DECL_HANDLER(finish_hook_chain)
     struct hook_table *table = get_queue_hooks( current );
     struct hook_table *global_hooks = get_global_hooks( current );
     int index = req->id - WH_MINHOOK;
+    int tier1 = nspa_queue_hook_tier1_active( current );
 
     if (req->id < WH_MINHOOK || req->id > WH_WINEVENT)
     {
         set_error( STATUS_INVALID_PARAMETER );
         return;
     }
-    if (table) release_hook_chain( table, index );
+    /* NSPA Tier 1: queue-local release is client-driven when tier1 is on;
+     * otherwise keep the legacy counts[]-- path.  Still always release
+     * global_hooks via counts[] — we didn't migrate those. */
+    if (table && !tier1) release_hook_chain( table, index );
     if (global_hooks) release_hook_chain( global_hooks, index );
+    /* Opportunistic sweep for the tier1 path: the client's dec may have
+     * just dropped the walk refcount to zero, and this is our only
+     * signal to reap pending-free hooks for this queue+idx. */
+    if (tier1) nspa_queue_hook_chain_sweep( current, index );
 }
 
 

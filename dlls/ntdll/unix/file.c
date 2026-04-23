@@ -4686,19 +4686,16 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
          * a real conflict (propagate), or STATUS_NOT_SUPPORTED to fall
          * back to the existing server path.  Eligibility filter mirrors
          * nspa_local_file_diag_categorize. */
-        /* Phase 1A.4 partial: NtFsControlFile (b), NtQueryInformationFile
-         * (c), NtSetInformationFile (d), NtLockFile/NtUnlockFile (e)
-         * all route local-range handles through lazy server-handle
-         * promotion.  However live testing under Ableton shows there
-         * is still ≥1 Wine path using a handle-passing operation we
-         * haven't identified — broader eligibility breaks GUI driver
-         * bringup the same way as before.  Eligibility kept
-         * conservative pending continued audit (NtDeviceIoControlFile,
-         * NtCancelIoFile, NtNotifyChangeDirectoryFile,
-         * NtQueryVolumeInformationFile, NtQueryEaFile, NtQueryDirectoryFile,
-         * server_get_unix_name and other server_*_file helpers).
-         * Promotion infrastructure remains live for the few cases it
-         * does cover. */
+        /* Phase 1A.5 attempt: tried excluding loader-pattern opens
+         * (.dll/.drv/.sys/.exe) to dodge the unresolved per-Nt*File
+         * coverage gap.  GUI bringup works with that, but Ableton's
+         * data-file opens (.als and similar) still fail — even further
+         * Nt*File ops we haven't hooked are hit by data-file workflows.
+         *
+         * Conservative eligibility (FILE_NON_DIRECTORY_FILE excluded)
+         * is the proven safe ship state; expansion requires the
+         * comprehensive Nt*File audit documented in
+         * plan_local_file_bypass.md (Phase 1A.5+). */
         if (!attr->RootDirectory && !attr->SecurityDescriptor &&
             disposition == FILE_OPEN &&
             !(options & (FILE_OPEN_BY_FILE_ID | FILE_DIRECTORY_FILE | FILE_DELETE_ON_CLOSE |

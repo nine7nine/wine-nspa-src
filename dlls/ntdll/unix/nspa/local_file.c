@@ -1291,6 +1291,23 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
  * isn't in our table or RPC failed.  Used by Nt*File interceptors that
  * need a server-recognised handle (NtFsControlFile, NtQueryInformationFile,
  * NtSetInformationFile, etc.) to handle local-range handles transparently. */
+
+/* Convenience wrapper: if `h` is a local-range handle, promote it and
+ * return the server handle; otherwise return `h` unchanged.  Collapses
+ * the repeated 4-line `is_local_handle + get_or_promote` idiom that
+ * appeared at every NT-API intercept site down to one-liner call sites
+ * and keeps upstream Wine files close to vanilla for rebase
+ * friendliness. */
+HANDLE nspa_promote_if_local( HANDLE h )
+{
+    if (nspa_local_file_is_local_handle( h ))
+    {
+        HANDLE promoted = nspa_local_file_get_or_promote_server_handle( h );
+        if (promoted) return promoted;
+    }
+    return h;
+}
+
 HANDLE nspa_local_file_get_or_promote_server_handle( HANDLE local_handle )
 {
     struct nspa_local_open *o;

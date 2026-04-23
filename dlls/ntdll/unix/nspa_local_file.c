@@ -478,7 +478,8 @@ void nspa_local_file_diag_lazy_start( void )
 struct nspa_local_open
 {
     struct list       entry;
-    HANDLE            handle;
+    HANDLE            handle;            /* local-range handle returned to app */
+    HANDLE            server_handle;     /* lazy-promoted server handle, 0 if not yet promoted (1A.4) */
     int               unix_fd;
     unsigned long long device;
     unsigned long long inode;
@@ -487,7 +488,10 @@ struct nspa_local_open
 };
 
 static struct list      nspa_lf_opens          = LIST_INIT(nspa_lf_opens);
-static pthread_mutex_t  nspa_lf_opens_mutex    = PTHREAD_MUTEX_INITIALIZER;
+/* PI mutex — per-process file table accessed from any thread including
+ * RT-promoted ones (audio threads occasionally open/close files at
+ * init / library scan).  PSHARED flag NOT set — process-local. */
+static DEFINE_PI_MUTEX(nspa_lf_opens_mutex, 0);
 
 /* Linux-only TID-cached pid via getpid().  pid is process-wide so we
  * cache it in a static after first call. */
@@ -673,9 +677,9 @@ void nspa_local_file_publish_close( unsigned long long device, unsigned long lon
     my_pid = nspa_lf_self_pid();
 
     /* Recompute outside the bucket lock — accesses our local table only. */
-    pthread_mutex_lock( &nspa_lf_opens_mutex );
+    pi_mutex_lock( &nspa_lf_opens_mutex );
     nspa_lf_recompute_local_aggregate( device, inode, &new_refcount, &new_access, &new_sharing );
-    pthread_mutex_unlock( &nspa_lf_opens_mutex );
+    pi_mutex_unlock( &nspa_lf_opens_mutex );
 
     pi_mutex_lock( nspa_lf_lock_of( bucket ) );
 
@@ -752,15 +756,16 @@ NTSTATUS nspa_local_file_table_add( HANDLE handle, int unix_fd,
 {
     struct nspa_local_open *o = malloc( sizeof(*o) );
     if (!o) return STATUS_NO_MEMORY;
-    o->handle  = handle;
-    o->unix_fd = unix_fd;
-    o->device  = device;
-    o->inode   = inode;
-    o->access  = access;
-    o->sharing = sharing;
-    pthread_mutex_lock( &nspa_lf_opens_mutex );
+    o->handle        = handle;
+    o->server_handle = 0;          /* lazy-promoted on first server-needing op */
+    o->unix_fd       = unix_fd;
+    o->device        = device;
+    o->inode         = inode;
+    o->access        = access;
+    o->sharing       = sharing;
+    pi_mutex_lock( &nspa_lf_opens_mutex );
     list_add_head( &nspa_lf_opens, &o->entry );
-    pthread_mutex_unlock( &nspa_lf_opens_mutex );
+    pi_mutex_unlock( &nspa_lf_opens_mutex );
     return STATUS_SUCCESS;
 }
 
@@ -775,7 +780,7 @@ int nspa_local_file_table_remove( HANDLE handle, int *unix_fd_out,
     struct nspa_local_open *o, *next;
     int found = 0;
 
-    pthread_mutex_lock( &nspa_lf_opens_mutex );
+    pi_mutex_lock( &nspa_lf_opens_mutex );
     LIST_FOR_EACH_ENTRY_SAFE( o, next, &nspa_lf_opens, struct nspa_local_open, entry )
     {
         if (o->handle == handle)
@@ -789,7 +794,7 @@ int nspa_local_file_table_remove( HANDLE handle, int *unix_fd_out,
             break;
         }
     }
-    pthread_mutex_unlock( &nspa_lf_opens_mutex );
+    pi_mutex_unlock( &nspa_lf_opens_mutex );
     return found;
 }
 
@@ -800,12 +805,12 @@ int nspa_local_file_table_lookup_unix_fd( HANDLE handle )
 {
     struct nspa_local_open *o;
     int fd = -1;
-    pthread_mutex_lock( &nspa_lf_opens_mutex );
+    pi_mutex_lock( &nspa_lf_opens_mutex );
     LIST_FOR_EACH_ENTRY( o, &nspa_lf_opens, struct nspa_local_open, entry )
     {
         if (o->handle == handle) { fd = o->unix_fd; break; }
     }
-    pthread_mutex_unlock( &nspa_lf_opens_mutex );
+    pi_mutex_unlock( &nspa_lf_opens_mutex );
     return fd;
 }
 
@@ -1008,7 +1013,8 @@ static NTSTATUS nspa_local_file_check_and_publish_open( unsigned long long devic
 static unsigned int nspa_lf_handle_base;
 static int          nspa_lf_handles_in_use[NSPA_LF_HANDLE_CAP];   /* 1 if allocated */
 static unsigned int nspa_lf_handle_next;
-static pthread_mutex_t nspa_lf_handle_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* PI mutex — handle allocator can be hit from RT threads. */
+static DEFINE_PI_MUTEX(nspa_lf_handle_mutex, 0);
 
 static void nspa_lf_handle_init_once_fn( void )
 {
@@ -1028,7 +1034,7 @@ static HANDLE nspa_lf_alloc_handle( void )
 
     pthread_once( &nspa_lf_handle_once, nspa_lf_handle_init_once_fn );
 
-    pthread_mutex_lock( &nspa_lf_handle_mutex );
+    pi_mutex_lock( &nspa_lf_handle_mutex );
     for (i = 0; i < NSPA_LF_HANDLE_CAP; i++)
     {
         slot = (nspa_lf_handle_next + i) % NSPA_LF_HANDLE_CAP;
@@ -1042,7 +1048,7 @@ static HANDLE nspa_lf_alloc_handle( void )
             break;
         }
     }
-    pthread_mutex_unlock( &nspa_lf_handle_mutex );
+    pi_mutex_unlock( &nspa_lf_handle_mutex );
     return result;
 }
 
@@ -1054,9 +1060,9 @@ static void nspa_lf_free_handle( HANDLE h )
     if (v < nspa_lf_handle_base) return;
     slot = (v - nspa_lf_handle_base) / 4;
     if (slot >= NSPA_LF_HANDLE_CAP) return;
-    pthread_mutex_lock( &nspa_lf_handle_mutex );
+    pi_mutex_lock( &nspa_lf_handle_mutex );
     nspa_lf_handles_in_use[slot] = 0;
-    pthread_mutex_unlock( &nspa_lf_handle_mutex );
+    pi_mutex_unlock( &nspa_lf_handle_mutex );
 }
 
 /* Phase 1A.3 audit: counter bump helpers (separate functions so call
@@ -1183,15 +1189,123 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
 /* NtClose routing.  Called from NtClose before the existing close path.
  * Returns 1 if the handle was a local-file handle and was fully cleaned
  * up; 0 if not (caller continues with normal close). */
+/* Phase 1A.4: lazy server-handle promotion.  Returns the cached
+ * server handle for `local_handle`, allocating one on first call via
+ * the new nspa_create_file_from_unix_fd RPC.  Returns 0 if local_handle
+ * isn't in our table or RPC failed.  Used by Nt*File interceptors that
+ * need a server-recognised handle (NtFsControlFile, NtQueryInformationFile,
+ * NtSetInformationFile, etc.) to handle local-range handles transparently. */
+HANDLE nspa_local_file_get_or_promote_server_handle( HANDLE local_handle )
+{
+    struct nspa_local_open *o;
+    int need_promote = 0;
+    int unix_fd = -1;
+    unsigned int access = 0, sharing = 0;
+    HANDLE result = 0;
+
+    if (!nspa_local_file_is_local_handle( local_handle )) return 0;
+
+    pi_mutex_lock( &nspa_lf_opens_mutex );
+    LIST_FOR_EACH_ENTRY( o, &nspa_lf_opens, struct nspa_local_open, entry )
+    {
+        if (o->handle == local_handle)
+        {
+            if (o->server_handle) result = o->server_handle;
+            else
+            {
+                need_promote = 1;
+                unix_fd = o->unix_fd;
+                access  = o->access;
+                sharing = o->sharing;
+            }
+            break;
+        }
+    }
+    pi_mutex_unlock( &nspa_lf_opens_mutex );
+
+    if (result || !need_promote) return result;
+
+    /* RPC outside the table lock — server call can block, mustn't
+     * hold the per-process file-table mutex during it. */
+    {
+        HANDLE promoted = 0;
+        unsigned int ret;
+        wine_server_send_fd( unix_fd );
+        SERVER_START_REQ( nspa_create_file_from_unix_fd )
+        {
+            req->fd         = unix_fd;
+            req->access     = access;
+            req->sharing    = sharing;
+            req->options    = 0;
+            req->attributes = 0;
+            ret = wine_server_call( req );
+            if (!ret) promoted = wine_server_ptr_handle( reply->handle );
+        }
+        SERVER_END_REQ;
+        if (!promoted) return 0;
+
+        /* Store back, racing safely with another concurrent promotion
+         * (we keep whichever lands first; close our own if loser). */
+        pi_mutex_lock( &nspa_lf_opens_mutex );
+        LIST_FOR_EACH_ENTRY( o, &nspa_lf_opens, struct nspa_local_open, entry )
+        {
+            if (o->handle == local_handle)
+            {
+                if (o->server_handle)
+                {
+                    /* Lost race — keep existing, drop ours. */
+                    pi_mutex_unlock( &nspa_lf_opens_mutex );
+                    {
+                        SERVER_START_REQ( close_handle )
+                        {
+                            req->handle = wine_server_obj_handle( promoted );
+                            wine_server_call( req );
+                        }
+                        SERVER_END_REQ;
+                    }
+                    return o->server_handle;
+                }
+                o->server_handle = promoted;
+                result = promoted;
+                break;
+            }
+        }
+        pi_mutex_unlock( &nspa_lf_opens_mutex );
+    }
+    return result;
+}
+
 int nspa_local_file_close( HANDLE handle )
 {
     int unix_fd = -1;
     unsigned long long dev = 0, ino = 0;
+    HANDLE server_handle = 0;
+    struct nspa_local_open *o, *next;
+    int found = 0;
 
     if (!nspa_local_file_is_local_handle( handle )) return 0;
     __atomic_fetch_add( &nspa_lf_close_intercepts, 1, __ATOMIC_RELAXED );
 
-    if (!nspa_local_file_table_remove( handle, &unix_fd, &dev, &ino ))
+    /* Inline-extended remove that also captures server_handle for
+     * 1A.4 lazy-promotion cleanup. */
+    pi_mutex_lock( &nspa_lf_opens_mutex );
+    LIST_FOR_EACH_ENTRY_SAFE( o, next, &nspa_lf_opens, struct nspa_local_open, entry )
+    {
+        if (o->handle == handle)
+        {
+            unix_fd       = o->unix_fd;
+            dev           = o->device;
+            ino           = o->inode;
+            server_handle = o->server_handle;
+            list_remove( &o->entry );
+            free( o );
+            found = 1;
+            break;
+        }
+    }
+    pi_mutex_unlock( &nspa_lf_opens_mutex );
+
+    if (!found)
     {
         /* Handle is in our range but not in our table — already closed
          * or never tracked.  Treat as closed (best-effort). */
@@ -1201,6 +1315,18 @@ int nspa_local_file_close( HANDLE handle )
 
     nspa_local_file_publish_close( dev, ino );
     if (unix_fd >= 0) close( unix_fd );
+
+    /* If we lazily promoted to a server handle, close that too. */
+    if (server_handle)
+    {
+        SERVER_START_REQ( close_handle )
+        {
+            req->handle = wine_server_obj_handle( server_handle );
+            wine_server_call( req );
+        }
+        SERVER_END_REQ;
+    }
+
     nspa_lf_free_handle( handle );
     return 1;
 }

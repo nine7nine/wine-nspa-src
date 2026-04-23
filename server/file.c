@@ -672,6 +672,43 @@ DECL_HANDLER(create_file)
     if (root_fd) release_object( root_fd );
 }
 
+/* NSPA local-file Phase 1A.4: lazy server-handle promotion.  When an
+ * Nt*File operation that needs server-side state is invoked on a
+ * local-range file handle, the client calls this RPC to mint a
+ * server-side file handle backed by the inflight unix fd.  Subsequent
+ * Nt*File ops route through the server handle while reads/writes
+ * continue to use the local unix fd via server_get_unix_fd. */
+DECL_HANDLER(nspa_create_file_from_unix_fd)
+{
+    struct object *file_obj;
+    struct fd *fd;
+    struct unicode_str empty_nt = { NULL, 0 };
+    int unix_fd;
+
+    reply->handle = 0;
+
+    if ((unix_fd = thread_get_inflight_fd( current, req->fd )) == -1)
+    {
+        set_error( STATUS_INVALID_HANDLE );
+        return;
+    }
+
+    /* Build inode-tracked fd from the inflight unix fd.  Takes
+     * ownership of unix_fd: closes on failure. */
+    fd = create_inode_fd_from_unix_fd( unix_fd, req->access, req->sharing,
+                                       req->options, empty_nt );
+    if (!fd) return;
+
+    /* Wrap fd in struct file via create_file_obj (mode 0 — gets
+     * set after if needed; section path doesn't read it). */
+    if ((file_obj = create_file_obj( fd, req->access, 0 )))
+    {
+        reply->handle = alloc_handle( current->process, file_obj, req->access, req->attributes );
+        release_object( file_obj );
+    }
+    release_object( fd );
+}
+
 /* allocate a file handle for a Unix fd */
 DECL_HANDLER(alloc_file_handle)
 {

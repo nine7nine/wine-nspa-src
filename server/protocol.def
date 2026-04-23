@@ -4519,6 +4519,24 @@ enum inproc_sync_type
 @END
 
 
+/* NSPA local-file Phase 1A.4: build a regular FILE handle from a
+ * client-opened unix fd, used for lazy server-handle promotion.  When
+ * an Nt*File operation that needs server-side state is called on a
+ * local-range handle, the client lazily allocates a server handle via
+ * this RPC, caches it in the per-process file table, and routes the
+ * operation through the server handle.  Read/write keep using the
+ * local fd via the existing server_get_unix_fd intercept. */
+@REQ(nspa_create_file_from_unix_fd)
+    int             fd;          /* inflight unix fd id (client-assigned) */
+    unsigned int    access;      /* file access */
+    unsigned int    sharing;     /* sharing mode */
+    unsigned int    options;     /* FILE_OPEN options */
+    unsigned int    attributes;  /* OBJECT_ATTRIBUTES->Attributes */
+@REPLY
+    obj_handle_t    handle;
+@END
+
+
 /* NSPA: fetch the process-global shared inode table memfd for the
  * local-file bypass (Phase 1A.1).  Server lazily allocates a shmem region
  * on first call and returns the same fd to every caller via send_client_fd.

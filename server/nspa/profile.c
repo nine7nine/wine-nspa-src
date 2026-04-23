@@ -18,7 +18,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "request.h"
+#include "../request.h"
 
 #define NSPA_PROFILE_MAX_THREADS 128
 

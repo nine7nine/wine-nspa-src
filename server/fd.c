@@ -100,7 +100,7 @@
 #include "handle.h"
 #include "process.h"
 #include "request.h"
-#include "nspa_local_file.h"
+#include "nspa/local_file.h"
 
 #include "winternl.h"
 #include "winioctl.h"

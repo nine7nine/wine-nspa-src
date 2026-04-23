@@ -3528,7 +3528,7 @@ static void dump_nspa_get_thread_queue_request( const struct nspa_get_thread_que
 static void dump_nspa_get_thread_queue_reply( const struct nspa_get_thread_queue_reply *req )
 {
     dump_obj_locator( " locator=", &req->locator );
-    dump_obj_locator( ", bypass_locator=", &req->bypass_locator );
+    fprintf( stderr, ", fd_sent=%d", req->fd_sent );
     fprintf( stderr, ", sync_handle=%04x", req->sync_handle );
 }
 

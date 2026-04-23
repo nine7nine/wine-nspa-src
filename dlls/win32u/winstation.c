@@ -273,8 +273,7 @@ const nspa_queue_bypass_shm_t *get_queue_bypass_shm( const queue_shm_t *queue_sh
 {
     static int ignore_locator = -1;
 
-    (void)queue_shm;  /* memfd redesign: own ring is resolved via TLS, not
-                       * queue_shm->nspa_bypass_locator. */
+    (void)queue_shm;  /* own ring is resolved via the TLS cache. */
 
     if (ignore_locator == -1)
         ignore_locator = (getenv("NSPA_CLIENT_IGNORE_LOCATOR") != NULL);

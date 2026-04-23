@@ -1214,7 +1214,6 @@ typedef volatile struct
     unsigned int         changed_bits;     /* changed wakeup bits */
     unsigned int         internal_bits;    /* internal queue bits */
     int                  hooks_count[NB_HOOKS];  /* active hooks count */
-    struct obj_locator   nspa_bypass_locator;  /* external shared object for bypass rings */
 } queue_shm_t;
 
 typedef volatile struct
@@ -4487,7 +4486,7 @@ enum inproc_sync_type
     thread_id_t     tid;          /* target thread id */
 @REPLY
     struct obj_locator locator;          /* shared session object locator for target queue */
-    struct obj_locator bypass_locator;   /* Phase-1 sentinel: .id != 0 means fd follows via SCM_RIGHTS */
+    int             fd_sent;             /* 1 = peer bypass memfd follows via SCM_RIGHTS, 0 = no fd */
     obj_handle_t    sync_handle;         /* handle to the queue's sync object (ntsync event) */
 @END
 

@@ -5064,17 +5064,13 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
 
     io->Information = 0;
 
-    /* NSPA local-file Phase 1A.4.c: lazy-promote local handles before
-     * any server_get_file_info call.  server_get_unix_fd below stays
-     * on the original (local) handle for the local-fd fast path. */
-    if (nspa_local_file_is_local_handle( handle ))
-    {
-        HANDLE promoted = nspa_local_file_get_or_promote_server_handle( handle );
-        if (promoted) srv_handle = promoted;
-        if (getenv("NSPA_LF_TRACE"))
-            fprintf( stderr, "NSPA-LF QIF h=%p class=%u srv=%p\n",
-                     handle, class, srv_handle );
-    }
+    /* NSPA local-file: lazy-promote before any server_get_file_info
+     * call.  server_get_unix_fd below stays on the original (local)
+     * handle for the local-fd fast path. */
+    srv_handle = nspa_promote_if_local( handle );
+    if (handle != srv_handle && getenv("NSPA_LF_TRACE"))
+        fprintf( stderr, "NSPA-LF QIF h=%p class=%u srv=%p\n",
+                 handle, class, srv_handle );
 
     if (class == WineFileUnixNameInformation)
         return server_get_file_info( srv_handle, io, ptr, len, class );
@@ -5253,11 +5249,7 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
     /* NSPA local-file Phase 1A.4.d: lazy-promote local handles before
      * any SERVER_START_REQ.  server_get_unix_fd below stays on the
      * original (local) handle for the local-fd fast path. */
-    if (nspa_local_file_is_local_handle( handle ))
-    {
-        HANDLE promoted = nspa_local_file_get_or_promote_server_handle( handle );
-        if (promoted) srv_handle = promoted;
-    }
+    srv_handle = nspa_promote_if_local( handle );
 
     switch (class)
     {
@@ -6737,11 +6729,7 @@ NTSTATUS WINAPI NtDeviceIoControlFile( HANDLE handle, HANDLE event, PIO_APC_ROUT
      * sends the handle to the server (server_ioctl_file fallback +
      * each sub-driver's *DeviceIoControl uses the handle).  Promote
      * once at the top and use srv_handle for all dispatches. */
-    if (nspa_local_file_is_local_handle( handle ))
-    {
-        HANDLE promoted = nspa_local_file_get_or_promote_server_handle( handle );
-        if (promoted) srv_handle = promoted;
-    }
+    srv_handle = nspa_promote_if_local( handle );
 
     switch (device)
     {
@@ -6833,11 +6821,7 @@ NTSTATUS WINAPI NtFsControlFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE ap
      * any server_ioctl_file call.  server_get_unix_fd below stays on
      * the original (local) handle so it routes through the per-process
      * file table without a server RTT. */
-    if (nspa_local_file_is_local_handle( handle ))
-    {
-        HANDLE promoted = nspa_local_file_get_or_promote_server_handle( handle );
-        if (promoted) srv_handle = promoted;
-    }
+    srv_handle = nspa_promote_if_local( handle );
 
     status = server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, &options );
     if (status && status != STATUS_BAD_DEVICE_TYPE)
@@ -6954,11 +6938,7 @@ NTSTATUS WINAPI NtFlushBuffersFileEx( HANDLE handle, ULONG flags, void *params, 
 
     /* NSPA local-file Phase 1A.5+: server_async + flush RPC use the
      * handle.  fsync path uses local fd via server_get_unix_fd. */
-    if (nspa_local_file_is_local_handle( handle ))
-    {
-        HANDLE promoted = nspa_local_file_get_or_promote_server_handle( handle );
-        if (promoted) srv_handle = promoted;
-    }
+    srv_handle = nspa_promote_if_local( handle );
 
     ret = server_get_unix_fd( handle, FILE_WRITE_DATA, &fd, &needs_close, &type, NULL );
     if (ret == STATUS_ACCESS_DENIED)
@@ -7016,11 +6996,7 @@ static NTSTATUS cancel_io( HANDLE handle, IO_STATUS_BLOCK *io, IO_STATUS_BLOCK *
     /* NSPA local-file Phase 1A.5+: lazy-promote local-range handles
      * before cancel_async server RPC.  Covers NtCancelIoFile +
      * NtCancelIoFileEx (both call this helper). */
-    if (nspa_local_file_is_local_handle( handle ))
-    {
-        HANDLE promoted = nspa_local_file_get_or_promote_server_handle( handle );
-        if (promoted) srv_handle = promoted;
-    }
+    srv_handle = nspa_promote_if_local( handle );
 
     SERVER_START_REQ( cancel_async )
     {
@@ -7082,11 +7058,7 @@ NTSTATUS WINAPI NtCancelSynchronousIoFile( HANDLE handle, IO_STATUS_BLOCK *io, I
     TRACE( "(%p %p %p)\n", handle, io, io_status );
 
     /* NSPA local-file Phase 1A.5+ */
-    if (nspa_local_file_is_local_handle( handle ))
-    {
-        HANDLE promoted = nspa_local_file_get_or_promote_server_handle( handle );
-        if (promoted) srv_handle = promoted;
-    }
+    srv_handle = nspa_promote_if_local( handle );
 
     SERVER_START_REQ( cancel_sync )
     {
@@ -7123,11 +7095,7 @@ NTSTATUS WINAPI NtLockFile( HANDLE file, HANDLE event, PIO_APC_ROUTINE apc, void
 
     /* NSPA local-file Phase 1A.4.e: lock_file is server-mediated;
      * promote local-range handles before the RPC. */
-    if (nspa_local_file_is_local_handle( file ))
-    {
-        HANDLE promoted = nspa_local_file_get_or_promote_server_handle( file );
-        if (promoted) srv_file = promoted;
-    }
+    srv_file = nspa_promote_if_local( file );
 
     for (;;)
     {
@@ -7189,11 +7157,7 @@ NTSTATUS WINAPI NtUnlockFile( HANDLE handle, IO_STATUS_BLOCK *io_status, LARGE_I
     }
 
     /* NSPA local-file Phase 1A.4.e: unlock_file is server-mediated. */
-    if (nspa_local_file_is_local_handle( handle ))
-    {
-        HANDLE promoted = nspa_local_file_get_or_promote_server_handle( handle );
-        if (promoted) srv_handle = promoted;
-    }
+    srv_handle = nspa_promote_if_local( handle );
 
     SERVER_START_REQ( unlock_file )
     {
@@ -7548,11 +7512,7 @@ NTSTATUS WINAPI NtQueryVolumeInformationFile( HANDLE handle, IO_STATUS_BLOCK *io
     HANDLE srv_handle = handle;
 
     /* NSPA local-file Phase 1A.5+ */
-    if (nspa_local_file_is_local_handle( handle ))
-    {
-        HANDLE promoted = nspa_local_file_get_or_promote_server_handle( handle );
-        if (promoted) srv_handle = promoted;
-    }
+    srv_handle = nspa_promote_if_local( handle );
 
     status = server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, NULL );
     if (status == STATUS_BAD_DEVICE_TYPE)
@@ -7874,18 +7834,13 @@ NTSTATUS WINAPI NtQueryObject( HANDLE handle, OBJECT_INFORMATION_CLASS info_clas
 
     if (used_len) *used_len = 0;
 
-    /* NSPA local-file Phase 1A.6: promote local-range handles before any
-     * NtQueryObject server call.  GetFinalPathNameByHandle and apps that
-     * introspect handles via ObjectName/Basic/Type information classes
-     * would otherwise get STATUS_INVALID_HANDLE because local handles
-     * aren't in the server's process handle table. */
-    if (nspa_local_file_is_local_handle( handle ))
+    /* NSPA local-file: promote before NtQueryObject server call. */
     {
-        HANDLE promoted = nspa_local_file_get_or_promote_server_handle( handle );
-        if (promoted) handle = promoted;
-        if (getenv("NSPA_LF_TRACE"))
+        HANDLE orig = handle;
+        handle = nspa_promote_if_local( handle );
+        if (handle != orig && getenv("NSPA_LF_TRACE"))
             fprintf( stderr, "NSPA-LF QObj h=%p class=%u srv=%p\n",
-                     handle, info_class, promoted );
+                     orig, info_class, handle );
     }
 
     switch (info_class)
@@ -8061,11 +8016,7 @@ NTSTATUS WINAPI NtSetInformationObject( HANDLE handle, OBJECT_INFORMATION_CLASS 
     /* NSPA local-file Phase 1A.6: promote local handles before
      * set_handle_info — apps that mark inheritance / protect-from-close
      * on a file handle would otherwise hit STATUS_INVALID_HANDLE. */
-    if (nspa_local_file_is_local_handle( handle ))
-    {
-        HANDLE promoted = nspa_local_file_get_or_promote_server_handle( handle );
-        if (promoted) handle = promoted;
-    }
+    handle = nspa_promote_if_local( handle );
 
     switch (info_class)
     {

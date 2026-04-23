@@ -2651,11 +2651,7 @@ NTSTATUS WINAPI NtMakePermanentObject( HANDLE handle )
     TRACE("%p\n", handle);
 
     /* NSPA local-file: promote so the server sees something it knows. */
-    if (nspa_local_file_is_local_handle( handle ))
-    {
-        HANDLE promoted = nspa_local_file_get_or_promote_server_handle( handle );
-        if (promoted) handle = promoted;
-    }
+    handle = nspa_promote_if_local( handle );
 
     SERVER_START_REQ( set_object_permanence )
     {
@@ -2678,11 +2674,7 @@ NTSTATUS WINAPI NtMakeTemporaryObject( HANDLE handle )
     TRACE("%p\n", handle);
 
     /* NSPA local-file: promote so the server sees something it knows. */
-    if (nspa_local_file_is_local_handle( handle ))
-    {
-        HANDLE promoted = nspa_local_file_get_or_promote_server_handle( handle );
-        if (promoted) handle = promoted;
-    }
+    handle = nspa_promote_if_local( handle );
 
     SERVER_START_REQ( set_object_permanence )
     {

@@ -2940,8 +2940,20 @@ static BOOL check_queue_bits( UINT wake_mask, UINT changed_mask, UINT signal_bit
          * never sets server-side bits — so locally-published WM_TIMERs are
          * silently invisible to PeekMessage in tight pump loops.  Phase B's
          * "wake-bit synth deferred" note was wrong: tight polling reaches
-         * check_queue_bits before access_time times out, never the drain. */
-        if (queue_bypass)
+         * check_queue_bits before access_time times out, never the drain.
+         *
+         * Gate on signal_bits & QS_TIMER so we only raise the local-timer
+         * wake when the caller actually accepts QS_TIMER.  Without this
+         * gate, a pump called with e.g. QS_POSTMESSAGE|QS_PAINT gets
+         * QS_TIMER folded into clear_bits (by the POSTMESSAGE→TIMER
+         * coupling in peek_message), our synth lights ring_changed,
+         * check_queue_bits returns skip=FALSE, and peek_message can't
+         * pop the timer (its inner branch also checks signal_bits) —
+         * producing a spurious server RTT and a one-pump-iteration
+         * delay in delivering whatever the caller DID want.  Menu popup
+         * pumps hit this hard; the visible symptom is a one-frame black
+         * flash before the menu contents draw. */
+        if (queue_bypass && (signal_bits & QS_TIMER))
         {
             UINT thead = __atomic_load_n( &queue_bypass->nspa_timer_ring.head, __ATOMIC_ACQUIRE );
             UINT ttail = __atomic_load_n( &queue_bypass->nspa_timer_ring.tail, __ATOMIC_ACQUIRE );
@@ -3449,7 +3461,13 @@ static BOOL is_queue_signaled(void)
             __atomic_load_n( &queue_bypass->nspa_msg_ring.change_ack_seq, __ATOMIC_ACQUIRE ))
             ring_changed |= QS_POSTMESSAGE | QS_ALLPOSTMESSAGE;
         if (ring_send) ring_changed |= QS_SENDMESSAGE;
-        if (queue_bypass)
+        /* Mirror the QS_TIMER synth in check_queue_bits, but gated on
+         * the queue's own wake_mask/changed_mask.  If the current app
+         * isn't asking to be notified on timers (neither mask has
+         * QS_TIMER), lighting ring_bits|ring_changed here produces a
+         * spurious "queue is signaled" wake that no pump iteration can
+         * drain — same root cause as the check_queue_bits case. */
+        if (queue_bypass && ((queue_shm->wake_mask | queue_shm->changed_mask) & QS_TIMER))
         {
             UINT thead = __atomic_load_n( &queue_bypass->nspa_timer_ring.head, __ATOMIC_ACQUIRE );
             UINT ttail = __atomic_load_n( &queue_bypass->nspa_timer_ring.tail, __ATOMIC_ACQUIRE );

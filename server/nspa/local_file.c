@@ -35,6 +35,7 @@
 #include "../file.h"
 #include "../process.h"
 #include "../request.h"
+#include "debug.h"
 
 #include <rtpi.h>
 
@@ -286,4 +287,14 @@ DECL_HANDLER(nspa_get_inode_table)
 
     if (send_client_fd( current->process, nspa_inode_table_fd, 0 ) == 0)
         reply->fd_sent = 1;
+}
+
+/* Server-side promote trace — called from server/file.c's
+ * nspa_create_file_from_unix_fd handler so upstream file.c carries a
+ * single-line hook, not a conditional fprintf block. */
+void nspa_lf_trace_promote( unsigned int nt_name_len, unsigned int data_size )
+{
+    NSPA_TRACE( LF_TRACE_SRV,
+                "NSPA-LF-SRV nspa_create_file_from_unix_fd: nt_name.len=%u (data_size=%u)\n",
+                nt_name_len, data_size );
 }

@@ -501,6 +501,12 @@ struct nspa_local_open
     unsigned int      access;
     unsigned int      sharing;
     unsigned int      options;           /* FILE_OPEN options the app passed (FILE_SYNCHRONOUS_IO_NONALERT etc) */
+    /* Original NT path captured at try_bypass time.  Sent to the server
+     * on lazy promotion so the promoted struct fd carries fd->nt_name —
+     * required by GetFinalPathNameByHandle / FileNameInformation queries
+     * apps run on the handle (e.g. Ableton .als loader). */
+    WCHAR            *nt_name;           /* malloc'd; NULL if no name captured */
+    USHORT            nt_name_len;       /* in bytes (matches UNICODE_STRING.Length) */
 };
 
 static struct list      nspa_lf_opens          = LIST_INIT(nspa_lf_opens);
@@ -769,7 +775,8 @@ void nspa_local_file_publish_close( unsigned long long device, unsigned long lon
 NTSTATUS nspa_local_file_table_add( HANDLE handle, int unix_fd,
                                     unsigned long long device, unsigned long long inode,
                                     unsigned int access, unsigned int sharing,
-                                    unsigned int options )
+                                    unsigned int options,
+                                    const UNICODE_STRING *nt_name )
 {
     struct nspa_local_open *o = malloc( sizeof(*o) );
     if (!o) return STATUS_NO_MEMORY;
@@ -781,6 +788,20 @@ NTSTATUS nspa_local_file_table_add( HANDLE handle, int unix_fd,
     o->access        = access;
     o->sharing       = sharing;
     o->options       = options;
+    o->nt_name       = NULL;
+    o->nt_name_len   = 0;
+    if (nt_name && nt_name->Buffer && nt_name->Length)
+    {
+        o->nt_name = malloc( nt_name->Length );
+        if (o->nt_name)
+        {
+            memcpy( o->nt_name, nt_name->Buffer, nt_name->Length );
+            o->nt_name_len = nt_name->Length;
+        }
+        /* malloc failure leaves nt_name NULL — promotion still works,
+         * just without populated FileNameInformation.  Don't fail the
+         * whole add. */
+    }
     pi_mutex_lock( &nspa_lf_opens_mutex );
     list_add_head( &nspa_lf_opens, &o->entry );
     pi_mutex_unlock( &nspa_lf_opens_mutex );
@@ -807,6 +828,7 @@ int nspa_local_file_table_remove( HANDLE handle, int *unix_fd_out,
             *device_out  = o->device;
             *inode_out   = o->inode;
             list_remove( &o->entry );
+            free( o->nt_name );
             free( o );
             found = 1;
             break;
@@ -1158,6 +1180,7 @@ static int nspa_local_file_enabled( void )
  * status for genuine open failures (sharing violation, no such file,
  * permission denied) — caller propagates to the app. */
 NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
+                                     const UNICODE_STRING *nt_name,
                                      ACCESS_MASK access, ULONG sharing,
                                      ULONG options, IO_STATUS_BLOCK *io )
 {
@@ -1169,6 +1192,27 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
 
     if (!nspa_local_file_enabled()) return STATUS_NOT_SUPPORTED;
     if (nspa_lf_table_state != 1)   return STATUS_NOT_SUPPORTED;
+
+    /* Expand GENERIC_* into specific bits before any sharing arbitration
+     * or storage — server's create_file does the same with map_access().
+     * Without this expansion, an open with GENERIC_READ has zero
+     * FILE_READ_DATA bits, which makes our sharing check skip the
+     * read-vs-share-read arbitration AND makes the promoted server fd
+     * lack the access needed for subsequent reads. */
+    {
+        const ACCESS_MASK gr = FILE_READ_DATA | FILE_READ_ATTRIBUTES |
+                               FILE_READ_EA | READ_CONTROL | SYNCHRONIZE;
+        const ACCESS_MASK gw = FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES |
+                               FILE_WRITE_EA | READ_CONTROL | SYNCHRONIZE;
+        const ACCESS_MASK ge = FILE_EXECUTE | FILE_READ_ATTRIBUTES |
+                               READ_CONTROL | SYNCHRONIZE;
+        const ACCESS_MASK ga = STANDARD_RIGHTS_ALL | FILE_ALL_ACCESS;
+        if (access & GENERIC_READ)    access |= gr;
+        if (access & GENERIC_WRITE)   access |= gw;
+        if (access & GENERIC_EXECUTE) access |= ge;
+        if (access & GENERIC_ALL)     access |= ga;
+        access &= ~(GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | GENERIC_ALL);
+    }
 
     /* stat the unix path to derive (dev, inode) for the table lookup. */
     if (stat( unix_name, &st ) != 0)
@@ -1212,7 +1256,7 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
     status = nspa_local_file_table_add( h, unix_fd,
                                         (unsigned long long)st.st_dev,
                                         (unsigned long long)st.st_ino,
-                                        access, sharing, options );
+                                        access, sharing, options, nt_name );
     if (status != STATUS_SUCCESS)
     {
         nspa_lf_free_handle( h );
@@ -1225,6 +1269,12 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
     *handle = h;
     if (io) io->Information = FILE_OPENED;
     __atomic_fetch_add( &nspa_lf_bypass_minted, 1, __ATOMIC_RELAXED );
+    /* Phase 1A.6 debug: log mint with path so we can correlate with
+     * subsequent operations on this handle.  Filtered: only log if
+     * NSPA_LF_TRACE=1 to avoid spam. */
+    if (getenv("NSPA_LF_TRACE"))
+        fprintf( stderr, "NSPA-LF mint h=%p fd=%d access=%x sharing=%x options=%x path=%s\n",
+                 h, unix_fd, (unsigned)access, (unsigned)sharing, (unsigned)options, unix_name );
     return STATUS_SUCCESS;
 }
 
@@ -1243,10 +1293,14 @@ HANDLE nspa_local_file_get_or_promote_server_handle( HANDLE local_handle )
     int need_promote = 0;
     int unix_fd = -1;
     unsigned int access = 0, sharing = 0, options = 0;
+    WCHAR *nt_name_copy = NULL;
+    USHORT nt_name_len = 0;
     HANDLE result = 0;
 
     if (!nspa_local_file_is_local_handle( local_handle )) return 0;
     __atomic_fetch_add( &nspa_lf_promote_calls, 1, __ATOMIC_RELAXED );
+    if (getenv("NSPA_LF_TRACE"))
+        fprintf( stderr, "NSPA-LF promote-call h=%p\n", local_handle );
 
     pi_mutex_lock( &nspa_lf_opens_mutex );
     LIST_FOR_EACH_ENTRY( o, &nspa_lf_opens, struct nspa_local_open, entry )
@@ -1261,6 +1315,17 @@ HANDLE nspa_local_file_get_or_promote_server_handle( HANDLE local_handle )
                 access  = o->access;
                 sharing = o->sharing;
                 options = o->options;
+                /* Snapshot NT path so we can send it after dropping the
+                 * lock — wine_server_call can block. */
+                if (o->nt_name && o->nt_name_len)
+                {
+                    nt_name_copy = malloc( o->nt_name_len );
+                    if (nt_name_copy)
+                    {
+                        memcpy( nt_name_copy, o->nt_name, o->nt_name_len );
+                        nt_name_len = o->nt_name_len;
+                    }
+                }
             }
             break;
         }
@@ -1272,7 +1337,7 @@ HANDLE nspa_local_file_get_or_promote_server_handle( HANDLE local_handle )
         __atomic_fetch_add( &nspa_lf_promote_cached_hit, 1, __ATOMIC_RELAXED );
         return result;
     }
-    if (!need_promote) return result;
+    if (!need_promote) { free( nt_name_copy ); return result; }
 
     /* RPC outside the table lock — server call can block, mustn't
      * hold the per-process file-table mutex during it. */
@@ -1290,10 +1355,18 @@ HANDLE nspa_local_file_get_or_promote_server_handle( HANDLE local_handle )
              * sync/async/buffering semantics as the original open. */
             req->options    = options;
             req->attributes = 0;
+            /* Phase 1A.6: pass NT path so server-side struct fd carries
+             * fd->nt_name — required by FileNameInformation queries
+             * (GetFinalPathNameByHandle).  Apps like Ableton bail with
+             * "could not be opened" when the queried path is empty. */
+            if (nt_name_copy && nt_name_len)
+                wine_server_add_data( req, nt_name_copy, nt_name_len );
             ret = wine_server_call( req );
             if (!ret) promoted = wine_server_ptr_handle( reply->handle );
         }
         SERVER_END_REQ;
+        free( nt_name_copy );
+        nt_name_copy = NULL;
         if (!promoted)
         {
             __atomic_fetch_add( &nspa_lf_promote_fail, 1, __ATOMIC_RELAXED );
@@ -1342,6 +1415,8 @@ int nspa_local_file_close( HANDLE handle )
 
     if (!nspa_local_file_is_local_handle( handle )) return 0;
     __atomic_fetch_add( &nspa_lf_close_intercepts, 1, __ATOMIC_RELAXED );
+    if (getenv("NSPA_LF_TRACE"))
+        fprintf( stderr, "NSPA-LF close h=%p\n", handle );
 
     /* Inline-extended remove that also captures server_handle for
      * 1A.4 lazy-promotion cleanup. */
@@ -1355,6 +1430,7 @@ int nspa_local_file_close( HANDLE handle )
             ino           = o->inode;
             server_handle = o->server_handle;
             list_remove( &o->entry );
+            free( o->nt_name );
             free( o );
             found = 1;
             break;

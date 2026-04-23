@@ -4532,6 +4532,7 @@ enum inproc_sync_type
     unsigned int    sharing;     /* sharing mode */
     unsigned int    options;     /* FILE_OPEN options */
     unsigned int    attributes;  /* OBJECT_ATTRIBUTES->Attributes */
+    VARARG(filename,unicode_str); /* original NT path — needed so server-side fd has correct fd->nt_name for FileNameInformation queries */
 @REPLY
     obj_handle_t    handle;
 @END

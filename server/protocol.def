@@ -1133,6 +1133,7 @@ typedef volatile struct
     nspa_msg_ring_t      nspa_msg_ring;    /* incoming messages (senders -> me) */
     nspa_reply_ring_t    nspa_reply_ring;  /* replies to my SendMessage calls (receivers -> me) */
     nspa_timer_ring_t    nspa_timer_ring;  /* WM_TIMER expiries from local dispatcher */
+    int                  nspa_hook_walk_counts[NB_HOOKS]; /* Tier 1: client-owned walk refcount for queue-local hook chains (see server/hook.c + dlls/win32u/hook.c) */
 } nspa_queue_bypass_shm_t;
 
 /* NSPA local-file bypass — Phase 1A.2 shared inode aggregation table
@@ -3432,6 +3433,7 @@ enum caret_state
     thread_id_t    tid;            /* thread id for low-level keyboard/mouse hooks */
     int            unicode;        /* is it a unicode hook? */
     int            has_next;       /* NSPA: 1 if another hook follows, 0 if this is the last */
+    int            has_global;     /* NSPA: 1 if a desktop-global hook table was pinned and still needs a finish_hook_chain RPC */
     client_ptr_t   proc;           /* hook procedure */
     VARARG(module,unicode_str);    /* module name */
 @END

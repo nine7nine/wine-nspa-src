@@ -6707,6 +6707,7 @@ NTSTATUS WINAPI NtDeviceIoControlFile( HANDLE handle, HANDLE event, PIO_APC_ROUT
 {
     ULONG device = (code >> 16);
     NTSTATUS status = STATUS_NOT_SUPPORTED;
+    HANDLE srv_handle = handle;
 
     TRACE( "(%p,%p,%p,%p,%p,0x%08x,%p,0x%08x,%p,0x%08x)\n",
            handle, event, apc, apc_context, io, code,
@@ -6717,32 +6718,42 @@ NTSTATUS WINAPI NtDeviceIoControlFile( HANDLE handle, HANDLE event, PIO_APC_ROUT
     if (HandleToLong( handle ) == ~0)
         return STATUS_INVALID_HANDLE;
 
+    /* NSPA local-file Phase 1A.5+: every dispatch path here ultimately
+     * sends the handle to the server (server_ioctl_file fallback +
+     * each sub-driver's *DeviceIoControl uses the handle).  Promote
+     * once at the top and use srv_handle for all dispatches. */
+    if (nspa_local_file_is_local_handle( handle ))
+    {
+        HANDLE promoted = nspa_local_file_get_or_promote_server_handle( handle );
+        if (promoted) srv_handle = promoted;
+    }
+
     switch (device)
     {
     case FILE_DEVICE_BEEP:
     case FILE_DEVICE_NETWORK:
-        status = sock_ioctl( handle, event, apc, apc_context, io, code, in_buffer, in_size, out_buffer, out_size );
+        status = sock_ioctl( srv_handle, event, apc, apc_context, io, code, in_buffer, in_size, out_buffer, out_size );
         break;
     case FILE_DEVICE_DISK:
     case FILE_DEVICE_CD_ROM:
     case FILE_DEVICE_DVD:
     case FILE_DEVICE_CONTROLLER:
     case FILE_DEVICE_MASS_STORAGE:
-        status = cdrom_DeviceIoControl( handle, event, apc, apc_context, io, code,
+        status = cdrom_DeviceIoControl( srv_handle, event, apc, apc_context, io, code,
                                         in_buffer, in_size, out_buffer, out_size );
         break;
     case FILE_DEVICE_SERIAL_PORT:
-        status = serial_DeviceIoControl( handle, event, apc, apc_context, io, code,
+        status = serial_DeviceIoControl( srv_handle, event, apc, apc_context, io, code,
                                          in_buffer, in_size, out_buffer, out_size );
         break;
     case FILE_DEVICE_TAPE:
-        status = tape_DeviceIoControl( handle, event, apc, apc_context, io, code,
+        status = tape_DeviceIoControl( srv_handle, event, apc, apc_context, io, code,
                                        in_buffer, in_size, out_buffer, out_size );
         break;
     }
 
     if (status == STATUS_NOT_SUPPORTED || status == STATUS_BAD_DEVICE_TYPE)
-        return server_ioctl_file( handle, event, apc, apc_context, io, code,
+        return server_ioctl_file( srv_handle, event, apc, apc_context, io, code,
                                   in_buffer, in_size, out_buffer, out_size );
     return status;
 }
@@ -6917,6 +6928,7 @@ NTSTATUS WINAPI NtFlushBuffersFileEx( HANDLE handle, ULONG flags, void *params, 
     HANDLE wait_handle;
     enum server_fd_type type;
     int fd, needs_close;
+    HANDLE srv_handle = handle;
 
     TRACE( "(%p,0x%08x,%p,0x%08x,%p)\n", handle, flags, params, size, io );
 
@@ -6924,6 +6936,14 @@ NTSTATUS WINAPI NtFlushBuffersFileEx( HANDLE handle, ULONG flags, void *params, 
     if (params || size) FIXME( "params %p/0x%08x ignored\n", params, size );
 
     if (!io || !virtual_check_buffer_for_write( io, sizeof(*io) )) return STATUS_ACCESS_VIOLATION;
+
+    /* NSPA local-file Phase 1A.5+: server_async + flush RPC use the
+     * handle.  fsync path uses local fd via server_get_unix_fd. */
+    if (nspa_local_file_is_local_handle( handle ))
+    {
+        HANDLE promoted = nspa_local_file_get_or_promote_server_handle( handle );
+        if (promoted) srv_handle = promoted;
+    }
 
     ret = server_get_unix_fd( handle, FILE_WRITE_DATA, &fd, &needs_close, &type, NULL );
     if (ret == STATUS_ACCESS_DENIED)
@@ -6943,14 +6963,14 @@ NTSTATUS WINAPI NtFlushBuffersFileEx( HANDLE handle, ULONG flags, void *params, 
     {
         struct async_irp *async;
 
-        if (!(async = (struct async_irp *)alloc_fileio( sizeof(*async), irp_completion, handle )))
+        if (!(async = (struct async_irp *)alloc_fileio( sizeof(*async), irp_completion, srv_handle )))
             return STATUS_NO_MEMORY;
         async->buffer  = NULL;
         async->size    = 0;
 
         SERVER_START_REQ( flush )
         {
-            req->async = server_async( handle, &async->io, NULL, NULL, NULL, iosb_client_ptr(io) );
+            req->async = server_async( srv_handle, &async->io, NULL, NULL, NULL, iosb_client_ptr(io) );
             ret = wine_server_call( req );
             wait_handle = wine_server_ptr_handle( reply->event );
             if (wait_handle && ret != STATUS_PENDING)
@@ -6976,10 +6996,20 @@ static NTSTATUS cancel_io( HANDLE handle, IO_STATUS_BLOCK *io, IO_STATUS_BLOCK *
 {
     HANDLE cancel_handle;
     unsigned int status;
+    HANDLE srv_handle = handle;
+
+    /* NSPA local-file Phase 1A.5+: lazy-promote local-range handles
+     * before cancel_async server RPC.  Covers NtCancelIoFile +
+     * NtCancelIoFileEx (both call this helper). */
+    if (nspa_local_file_is_local_handle( handle ))
+    {
+        HANDLE promoted = nspa_local_file_get_or_promote_server_handle( handle );
+        if (promoted) srv_handle = promoted;
+    }
 
     SERVER_START_REQ( cancel_async )
     {
-        req->handle      = wine_server_obj_handle( handle );
+        req->handle      = wine_server_obj_handle( srv_handle );
         req->iosb        = wine_server_client_ptr( io );
         req->only_thread = only_thread;
         if (!(status = wine_server_call( req )))
@@ -7032,12 +7062,20 @@ NTSTATUS WINAPI NtCancelIoFileEx( HANDLE handle, IO_STATUS_BLOCK *io, IO_STATUS_
 NTSTATUS WINAPI NtCancelSynchronousIoFile( HANDLE handle, IO_STATUS_BLOCK *io, IO_STATUS_BLOCK *io_status )
 {
     unsigned int status;
+    HANDLE srv_handle = handle;
 
     TRACE( "(%p %p %p)\n", handle, io, io_status );
 
+    /* NSPA local-file Phase 1A.5+ */
+    if (nspa_local_file_is_local_handle( handle ))
+    {
+        HANDLE promoted = nspa_local_file_get_or_promote_server_handle( handle );
+        if (promoted) srv_handle = promoted;
+    }
+
     SERVER_START_REQ( cancel_sync )
     {
-        req->handle = wine_server_obj_handle( handle );
+        req->handle = wine_server_obj_handle( srv_handle );
         req->iosb   = wine_server_client_ptr( io );
         status = wine_server_call( req );
     }
@@ -7492,6 +7530,14 @@ NTSTATUS WINAPI NtQueryVolumeInformationFile( HANDLE handle, IO_STATUS_BLOCK *io
 {
     int fd, needs_close;
     unsigned int status;
+    HANDLE srv_handle = handle;
+
+    /* NSPA local-file Phase 1A.5+ */
+    if (nspa_local_file_is_local_handle( handle ))
+    {
+        HANDLE promoted = nspa_local_file_get_or_promote_server_handle( handle );
+        if (promoted) srv_handle = promoted;
+    }
 
     status = server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, NULL );
     if (status == STATUS_BAD_DEVICE_TYPE)
@@ -7499,15 +7545,15 @@ NTSTATUS WINAPI NtQueryVolumeInformationFile( HANDLE handle, IO_STATUS_BLOCK *io
         struct async_irp *async;
         HANDLE wait_handle;
 
-        if (!(async = (struct async_irp *)alloc_fileio( sizeof(*async), irp_completion, handle )))
+        if (!(async = (struct async_irp *)alloc_fileio( sizeof(*async), irp_completion, srv_handle )))
             return STATUS_NO_MEMORY;
         async->buffer  = buffer;
         async->size    = length;
 
         SERVER_START_REQ( get_volume_info )
         {
-            req->async = server_async( handle, &async->io, NULL, NULL, NULL, iosb_client_ptr(io) );
-            req->handle = wine_server_obj_handle( handle );
+            req->async = server_async( srv_handle, &async->io, NULL, NULL, NULL, iosb_client_ptr(io) );
+            req->handle = wine_server_obj_handle( srv_handle );
             req->info_class = info_class;
             wine_server_set_reply( req, buffer, length );
             status = wine_server_call( req );

@@ -46,8 +46,8 @@
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
 #include "winternl.h"
-#include "win32u_private.h"
-#include "ntuser_private.h"
+#include "../win32u_private.h"
+#include "../ntuser_private.h"
 #include "dde.h"
 #include "wine/debug.h"
 

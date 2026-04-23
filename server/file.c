@@ -47,6 +47,7 @@
 #include "request.h"
 #include "process.h"
 #include "security.h"
+#include "nspa/local_file.h"
 
 static const WCHAR file_name[] = {'F','i','l','e'};
 
@@ -699,9 +700,7 @@ DECL_HANDLER(nspa_create_file_from_unix_fd)
      * GetFinalPathNameByHandle queries that apps run on the handle. */
     nt_name.str = get_req_data();
     nt_name.len = (get_req_data_size() / sizeof(WCHAR)) * sizeof(WCHAR);
-    if (getenv("NSPA_LF_TRACE_SRV"))
-        fprintf( stderr, "NSPA-LF-SRV nspa_create_file_from_unix_fd: nt_name.len=%u (data_size=%u)\n",
-                 (unsigned)nt_name.len, (unsigned)get_req_data_size() );
+    nspa_lf_trace_promote( (unsigned)nt_name.len, (unsigned)get_req_data_size() );
 
     /* Expand GENERIC_* access bits the same way server's create_file does
      * before storing on the handle.  Without this, a handle opened with

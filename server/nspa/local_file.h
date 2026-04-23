@@ -32,4 +32,9 @@ extern void nspa_inode_publish_slot( unsigned long long device, unsigned long lo
  * publish overhead before any client has opted in. */
 extern int nspa_inode_table_is_active( void );
 
+/* Trace helper: emits the server-side promote trace line if the
+ * NSPA_LF_TRACE_SRV env is set.  Lives here so upstream server/file.c
+ * carries a single-line hook, not a conditional fprintf block. */
+extern void nspa_lf_trace_promote( unsigned int nt_name_len, unsigned int data_size );
+
 #endif /* __WINE_SERVER_NSPA_LOCAL_FILE_H */

@@ -97,6 +97,14 @@ BOOL is_hooked( INT id )
 static unsigned long long nspa_hook_top_calls;        /* every call_message_hooks invocation */
 static unsigned long long nspa_hook_skipped_no_hooks; /* is_hooked() returned FALSE */
 static unsigned long long nspa_hook_server_dispatch;  /* reached start_hook_chain RTT */
+/* NSPA Tier 1 diag counters: track the client-shmem refcount path's actual
+ * engagement vs fallback so we can verify the optimisation is taking effect
+ * when NSPA_HOOK_TIER1 is on.  Matched pairs (inc==dec) confirm the ++/--
+ * is balanced; skipped vs forced finish counts prove the RPC saving. */
+static unsigned long long nspa_hook_tier1_shmem_inc;
+static unsigned long long nspa_hook_tier1_shmem_dec;
+static unsigned long long nspa_hook_tier1_finish_skipped;
+static unsigned long long nspa_hook_tier1_finish_forced;
 /* Category counters — sampled at server-dispatch time on the conditions
  * a future safe-bypass would care about.  Together they tell us, for
  * a given workload, how big the safely-bypassable subset would be:
@@ -163,6 +171,19 @@ static void nspa_hook_diag_dump( void )
     fprintf(f, "  >>> SAFE_BYPASS_SUBSET %llu  (%.1f%% of dispatch, %.1f%% of top_calls)\n", safe,
             disp ? 100.0 * (double)safe / (double)disp : 0.0,
             top  ? 100.0 * (double)safe / (double)top  : 0.0);
+    {
+        unsigned long long t1inc  = __atomic_load_n( &nspa_hook_tier1_shmem_inc,       __ATOMIC_RELAXED );
+        unsigned long long t1dec  = __atomic_load_n( &nspa_hook_tier1_shmem_dec,       __ATOMIC_RELAXED );
+        unsigned long long t1skip = __atomic_load_n( &nspa_hook_tier1_finish_skipped,  __ATOMIC_RELAXED );
+        unsigned long long t1keep = __atomic_load_n( &nspa_hook_tier1_finish_forced,   __ATOMIC_RELAXED );
+        fprintf(f, "\n[Tier 1 refcount]\n");
+        fprintf(f, "  shmem_inc              %llu\n", t1inc);
+        fprintf(f, "  shmem_dec              %llu  (balanced: %s)\n",
+                t1dec, (t1inc == t1dec) ? "yes" : "NO — refcount leak");
+        fprintf(f, "  finish_skipped         %llu  (%.1f%% of forced+skipped)\n",
+                t1skip, (t1skip + t1keep) ? 100.0 * (double)t1skip / (double)(t1skip + t1keep) : 0.0);
+        fprintf(f, "  finish_forced          %llu  (global-path or tier1 inactive)\n", t1keep);
+    }
     fclose(f);
     rename(tmp, path);
 }
@@ -588,7 +609,11 @@ LRESULT call_message_hooks( INT id, INT code, WPARAM wparam, LPARAM lparam, size
 {
     struct win_hook_params info;
     WCHAR module[MAX_PATH];
-    DWORD_PTR ret;
+    DWORD_PTR ret = 0;
+    int idx = id - WH_MINHOOK;
+    int has_global = 0;
+    int tier1_active = 0;
+    nspa_queue_bypass_shm_t *bypass = NULL;
 
     user_check_not_lock();
 
@@ -610,6 +635,22 @@ LRESULT call_message_hooks( INT id, INT code, WPARAM wparam, LPARAM lparam, size
     info.prev_unicode = TRUE;
     info.id = id;
 
+    /* NSPA Tier 1: pin the queue-local chain against deferred-free via
+     * the memfd-backed bypass shm BEFORE sending start_hook_chain.  Must
+     * happen pre-RPC: a remove_hook arriving at the server from another
+     * thread before our start_hook_chain is processed needs to see count>0.
+     * The atomic store is published before the RPC's send(2), which is a
+     * global fence.  If bypass shm isn't mapped yet (bootstrap failed or
+     * msg-bypass off), fall back to the legacy path — server matches by
+     * setting reply->tier1_active=0 for this queue. */
+    if (idx >= 0 && idx < NB_HOOKS)
+        bypass = (nspa_queue_bypass_shm_t *)nspa_get_own_bypass_shm_public();
+    if (bypass)
+    {
+        __atomic_fetch_add( &bypass->nspa_hook_walk_counts[idx], 1, __ATOMIC_ACQ_REL );
+        __atomic_fetch_add( &nspa_hook_tier1_shmem_inc, 1, __ATOMIC_RELAXED );
+    }
+
     SERVER_START_REQ( start_hook_chain )
     {
         unsigned int module_size = 0;
@@ -625,38 +666,59 @@ LRESULT call_message_hooks( INT id, INT code, WPARAM wparam, LPARAM lparam, size
             info.tid          = reply->tid;
             info.proc         = wine_server_get_ptr( reply->proc );
             info.next_unicode = reply->unicode;
+            has_global        = reply->has_global;
+            tier1_active      = reply->tier1_active;
             /* NSPA diag: read chain length from shmem to categorize this
              * dispatch on the conditions a future safe-bypass cares about. */
+            if (idx >= 0 && idx < NB_HOOKS)
             {
                 struct object_lock lock = OBJECT_LOCK_INIT;
                 const queue_shm_t *queue_shm;
                 int chain_len = 0;
                 UINT status;
-                int idx = id - WH_MINHOOK;
-                if (idx >= 0 && idx < NB_HOOKS)
-                {
-                    while ((status = get_shared_queue( &lock, &queue_shm )) == STATUS_PENDING)
-                        chain_len = queue_shm->hooks_count[idx];
-                    if (!status)
-                        nspa_hook_diag_categorize( &info, chain_len, module_size );
-                }
+                while ((status = get_shared_queue( &lock, &queue_shm )) == STATUS_PENDING)
+                    chain_len = queue_shm->hooks_count[idx];
+                if (!status)
+                    nspa_hook_diag_categorize( &info, chain_len, module_size );
             }
         }
     }
     SERVER_END_REQ;
-    if (!info.tid && !info.proc) return 0;
 
-    info.code   = code;
-    info.wparam = wparam;
-    info.lparam = lparam;
-    ret = call_hook( &info, module, lparam_size, message_size, ansi );
-
-    SERVER_START_REQ( finish_hook_chain )
+    /* Walk the chain.  Same as before — just one hook at this level; any
+     * CallNextHookEx the hook proc makes re-enters via get_hook_info. */
+    if (info.tid || info.proc)
     {
-        req->id = id;
-        wine_server_call( req );
+        info.code   = code;
+        info.wparam = wparam;
+        info.lparam = lparam;
+        ret = call_hook( &info, module, lparam_size, message_size, ansi );
     }
-    SERVER_END_REQ;
+
+    /* Release the queue-local refcount we took pre-RPC.  Always runs when
+     * the inc ran; the server's deferred-free sweep is triggered lazily
+     * from the next set_hook/remove_hook/finish_hook_chain on this idx. */
+    if (bypass)
+    {
+        __atomic_fetch_sub( &bypass->nspa_hook_walk_counts[idx], 1, __ATOMIC_ACQ_REL );
+        __atomic_fetch_add( &nspa_hook_tier1_shmem_dec, 1, __ATOMIC_RELAXED );
+    }
+
+    /* Send finish_hook_chain iff the server is still counting queue-local
+     * via counts[] (tier1_active=0) OR a desktop-global chain was pinned.
+     * In the tier1-queue-only common case, this RPC is eliminated. */
+    if (!tier1_active || has_global)
+    {
+        SERVER_START_REQ( finish_hook_chain )
+        {
+            req->id = id;
+            wine_server_call( req );
+        }
+        SERVER_END_REQ;
+        __atomic_fetch_add( &nspa_hook_tier1_finish_forced, 1, __ATOMIC_RELAXED );
+    }
+    else __atomic_fetch_add( &nspa_hook_tier1_finish_skipped, 1, __ATOMIC_RELAXED );
+
     return ret;
 }
 
@@ -743,6 +805,10 @@ void WINAPI NtUserNotifyWinEvent( DWORD event, HWND hwnd, LONG object_id, LONG c
     ULONG ret_len;
     BOOL ret;
     int has_next = 0;
+    int has_global = 0;
+    int tier1_active = 0;
+    const int idx = WH_WINEVENT - WH_MINHOOK;
+    nspa_queue_bypass_shm_t *bypass = NULL;
 
     TRACE( "%04x, %p, %d, %d\n", event, hwnd, object_id, child_id );
 
@@ -766,6 +832,15 @@ void WINAPI NtUserNotifyWinEvent( DWORD event, HWND hwnd, LONG object_id, LONG c
     info.child_id  = child_id;
     info.tid       = GetCurrentThreadId();
 
+    /* NSPA Tier 1: pin queue-local walk refcount in bypass shm before
+     * start_hook_chain.  See call_message_hooks() for the rationale. */
+    bypass = (nspa_queue_bypass_shm_t *)nspa_get_own_bypass_shm_public();
+    if (bypass)
+    {
+        __atomic_fetch_add( &bypass->nspa_hook_walk_counts[idx], 1, __ATOMIC_ACQ_REL );
+        __atomic_fetch_add( &nspa_hook_tier1_shmem_inc, 1, __ATOMIC_RELAXED );
+    }
+
     SERVER_START_REQ( start_hook_chain )
     {
         req->id        = WH_WINEVENT;
@@ -778,15 +853,19 @@ void WINAPI NtUserNotifyWinEvent( DWORD event, HWND hwnd, LONG object_id, LONG c
         if (ret)
         {
             info.module[wine_server_reply_size(req) / sizeof(WCHAR)] = 0;
-            info.handle = wine_server_ptr_handle( reply->handle );
-            info.proc   = wine_server_get_ptr( reply->proc );
-            has_next    = reply->has_next;
+            info.handle  = wine_server_ptr_handle( reply->handle );
+            info.proc    = wine_server_get_ptr( reply->proc );
+            has_next     = reply->has_next;
         }
+        /* has_global / tier1_active are valid whether or not a hook
+         * matched (server may have pinned tables anyway via counts[] in
+         * the !tier1 branch). */
+        has_global   = reply->has_global;
+        tier1_active = reply->tier1_active;
     }
     SERVER_END_REQ;
-    if (!ret) return;
 
-    do
+    if (ret) do
     {
         TRACE( "calling WH_WINEVENT hook %p event %x hwnd %p %x %x module %s\n",
                info.proc, event, hwnd, object_id, child_id, debugstr_w(info.module) );
@@ -825,10 +904,22 @@ void WINAPI NtUserNotifyWinEvent( DWORD event, HWND hwnd, LONG object_id, LONG c
     }
     while (ret);
 
-    SERVER_START_REQ( finish_hook_chain )
+    /* Must balance the inc whether or not the walk actually started. */
+    if (bypass)
     {
-        req->id = WH_WINEVENT;
-        wine_server_call( req );
+        __atomic_fetch_sub( &bypass->nspa_hook_walk_counts[idx], 1, __ATOMIC_ACQ_REL );
+        __atomic_fetch_add( &nspa_hook_tier1_shmem_dec, 1, __ATOMIC_RELAXED );
     }
-    SERVER_END_REQ;
+
+    if (!tier1_active || has_global)
+    {
+        SERVER_START_REQ( finish_hook_chain )
+        {
+            req->id = WH_WINEVENT;
+            wine_server_call( req );
+        }
+        SERVER_END_REQ;
+        __atomic_fetch_add( &nspa_hook_tier1_finish_forced, 1, __ATOMIC_RELAXED );
+    }
+    else __atomic_fetch_add( &nspa_hook_tier1_finish_skipped, 1, __ATOMIC_RELAXED );
 }

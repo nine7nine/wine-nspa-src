@@ -1163,16 +1163,13 @@ int nspa_local_file_is_local_handle( HANDLE h )
     return slot < NSPA_LF_HANDLE_CAP;
 }
 
-/* Read the NSPA_LOCAL_FILES env gate once.  Default off until proven
- * across multiple workloads.  Set to 1 to enable the bypass dispatch. */
-static int nspa_local_file_enabled( void )
+/* Bypass dispatch is on by default.  Set NSPA_DISABLE_LOCAL_FILES=1 to
+ * fall back to the regular server create_file RPC (bisection aid). */
+static int nspa_local_file_disabled( void )
 {
     static int cached = -1;
     if (cached < 0)
-    {
-        const char *v = getenv( "NSPA_LOCAL_FILES" );
-        cached = (v && *v && *v != '0') ? 1 : 0;
-    }
+        cached = (getenv( "NSPA_DISABLE_LOCAL_FILES" ) != NULL);
     return cached;
 }
 
@@ -1195,7 +1192,7 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
     NTSTATUS status;
     HANDLE h;
 
-    if (!nspa_local_file_enabled()) return STATUS_NOT_SUPPORTED;
+    if (nspa_local_file_disabled()) return STATUS_NOT_SUPPORTED;
     if (nspa_lf_table_state != 1)   return STATUS_NOT_SUPPORTED;
 
     /* Expand GENERIC_* into specific bits before any sharing arbitration

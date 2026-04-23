@@ -682,8 +682,9 @@ DECL_HANDLER(nspa_create_file_from_unix_fd)
 {
     struct object *file_obj;
     struct fd *fd;
-    struct unicode_str empty_nt = { NULL, 0 };
+    struct unicode_str nt_name;
     int unix_fd;
+    unsigned int access;
 
     reply->handle = 0;
 
@@ -693,17 +694,33 @@ DECL_HANDLER(nspa_create_file_from_unix_fd)
         return;
     }
 
+    /* NT path travels as VARARG so server-side struct fd carries the
+     * original name — required by FileNameInformation /
+     * GetFinalPathNameByHandle queries that apps run on the handle. */
+    nt_name.str = get_req_data();
+    nt_name.len = (get_req_data_size() / sizeof(WCHAR)) * sizeof(WCHAR);
+    if (getenv("NSPA_LF_TRACE_SRV"))
+        fprintf( stderr, "NSPA-LF-SRV nspa_create_file_from_unix_fd: nt_name.len=%u (data_size=%u)\n",
+                 (unsigned)nt_name.len, (unsigned)get_req_data_size() );
+
+    /* Expand GENERIC_* access bits the same way server's create_file does
+     * before storing on the handle.  Without this, a handle opened with
+     * GENERIC_READ has neither FILE_READ_DATA nor FILE_READ_ATTRIBUTES,
+     * so any subsequent get_handle_fd with wanted=FILE_READ_DATA fails
+     * with STATUS_ACCESS_DENIED. */
+    access = map_access( req->access, &file_type.mapping );
+
     /* Build inode-tracked fd from the inflight unix fd.  Takes
      * ownership of unix_fd: closes on failure. */
-    fd = create_inode_fd_from_unix_fd( unix_fd, req->access, req->sharing,
-                                       req->options, empty_nt );
+    fd = create_inode_fd_from_unix_fd( unix_fd, access, req->sharing,
+                                       req->options, nt_name );
     if (!fd) return;
 
     /* Wrap fd in struct file via create_file_obj (mode 0 — gets
      * set after if needed; section path doesn't read it). */
-    if ((file_obj = create_file_obj( fd, req->access, 0 )))
+    if ((file_obj = create_file_obj( fd, access, 0 )))
     {
-        reply->handle = alloc_handle( current->process, file_obj, req->access, req->attributes );
+        reply->handle = alloc_handle( current->process, file_obj, access, req->attributes );
         release_object( file_obj );
     }
     release_object( fd );

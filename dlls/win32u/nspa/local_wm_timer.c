@@ -43,7 +43,8 @@
  *   drains it.  Dispatcher's coalescing can never re-publish a killed
  *   entry because it's gone from the table.
  *
- * Feature gate: NSPA_LOCAL_WM_TIMERS=1 in the environment, default off.
+ * Feature gate: on by default.  Set NSPA_DISABLE_LOCAL_WM_TIMERS=1 to
+ * fall back to wineserver WM_TIMER dispatch (bisection aid).
  */
 
 #if 0
@@ -131,10 +132,9 @@ static pthread_once_t   table_once = PTHREAD_ONCE_INIT;
 
 static void init_feature_gate(void)
 {
-    const char *env = getenv( "NSPA_LOCAL_WM_TIMERS" );
-    nspa_wm_timers_enabled = (env && env[0] == '1') ? 1 : 0;
-    if (nspa_wm_timers_enabled)
-        TRACE( "NSPA local WM_TIMER dispatch: ENABLED\n" );
+    nspa_wm_timers_enabled = (getenv( "NSPA_DISABLE_LOCAL_WM_TIMERS" ) == NULL);
+    if (!nspa_wm_timers_enabled)
+        TRACE( "NSPA local WM_TIMER dispatch: DISABLED (NSPA_DISABLE_LOCAL_WM_TIMERS set)\n" );
 }
 
 static void init_table_buckets(void)

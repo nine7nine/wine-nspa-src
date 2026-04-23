@@ -6422,6 +6422,30 @@ struct nspa_create_mapping_from_unix_fd_reply
 };
 
 
+/* NSPA local-file Phase 1A.4: build a regular FILE handle from a
+ * client-opened unix fd, used for lazy server-handle promotion.  When
+ * an Nt*File operation that needs server-side state is called on a
+ * local-range handle, the client lazily allocates a server handle via
+ * this RPC, caches it in the per-process file table, and routes the
+ * operation through the server handle.  Read/write keep using the
+ * local fd via the existing server_get_unix_fd intercept. */
+struct nspa_create_file_from_unix_fd_request
+{
+    struct request_header __header;
+    int             fd;
+    unsigned int    access;
+    unsigned int    sharing;
+    unsigned int    options;
+    unsigned int    attributes;
+};
+struct nspa_create_file_from_unix_fd_reply
+{
+    struct reply_header __header;
+    obj_handle_t    handle;
+    char __pad_12[4];
+};
+
+
 /* NSPA: fetch the process-global shared inode table memfd for the
  * local-file bypass (Phase 1A.1).  Server lazily allocates a shmem region
  * on first call and returns the same fd to every caller via send_client_fd.
@@ -6755,6 +6779,7 @@ enum request
     REQ_nspa_get_thread_queue,
     REQ_nspa_ensure_own_bypass,
     REQ_nspa_create_mapping_from_unix_fd,
+    REQ_nspa_create_file_from_unix_fd,
     REQ_nspa_get_inode_table,
     REQ_NB_REQUESTS
 };
@@ -7072,6 +7097,7 @@ union generic_request
     struct nspa_get_thread_queue_request nspa_get_thread_queue_request;
     struct nspa_ensure_own_bypass_request nspa_ensure_own_bypass_request;
     struct nspa_create_mapping_from_unix_fd_request nspa_create_mapping_from_unix_fd_request;
+    struct nspa_create_file_from_unix_fd_request nspa_create_file_from_unix_fd_request;
     struct nspa_get_inode_table_request nspa_get_inode_table_request;
 };
 union generic_reply
@@ -7387,9 +7413,10 @@ union generic_reply
     struct nspa_get_thread_queue_reply nspa_get_thread_queue_reply;
     struct nspa_ensure_own_bypass_reply nspa_ensure_own_bypass_reply;
     struct nspa_create_mapping_from_unix_fd_reply nspa_create_mapping_from_unix_fd_reply;
+    struct nspa_create_file_from_unix_fd_reply nspa_create_file_from_unix_fd_reply;
     struct nspa_get_inode_table_reply nspa_get_inode_table_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 941
+#define SERVER_PROTOCOL_VERSION 942
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

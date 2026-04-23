@@ -3560,6 +3560,7 @@ static void dump_nspa_create_file_from_unix_fd_request( const struct nspa_create
     fprintf( stderr, ", sharing=%08x", req->sharing );
     fprintf( stderr, ", options=%08x", req->options );
     fprintf( stderr, ", attributes=%08x", req->attributes );
+    dump_varargs_unicode_str( ", filename=", cur_size );
 }
 
 static void dump_nspa_create_file_from_unix_fd_reply( const struct nspa_create_file_from_unix_fd_reply *req )

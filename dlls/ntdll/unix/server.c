@@ -1433,8 +1433,13 @@ int server_get_unix_fd( HANDLE handle, unsigned int wanted_access, int *unix_fd,
              * behaviour, and the loader opens DLLs with that flag. */
             if (options) *options = local_options;
             nspa_local_file_get_unix_fd_intercept_bump();
+            if (getenv("NSPA_LF_TRACE"))
+                fprintf( stderr, "NSPA-LF get_unix_fd h=%p fd=%d wanted=%x\n",
+                         handle, local_fd, wanted_access );
             return STATUS_SUCCESS;
         }
+        if (getenv("NSPA_LF_TRACE"))
+            fprintf( stderr, "NSPA-LF get_unix_fd h=%p NOT-FOUND-IN-TABLE\n", handle );
         return STATUS_INVALID_HANDLE;
     }
 

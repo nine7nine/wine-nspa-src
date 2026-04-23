@@ -1834,6 +1834,7 @@ C_ASSERT( offsetof(struct start_hook_chain_reply, pid) == 12 );
 C_ASSERT( offsetof(struct start_hook_chain_reply, tid) == 16 );
 C_ASSERT( offsetof(struct start_hook_chain_reply, unicode) == 20 );
 C_ASSERT( offsetof(struct start_hook_chain_reply, has_next) == 24 );
+C_ASSERT( offsetof(struct start_hook_chain_reply, has_global) == 28 );
 C_ASSERT( offsetof(struct start_hook_chain_reply, proc) == 32 );
 C_ASSERT( sizeof(struct start_hook_chain_reply) == 40 );
 C_ASSERT( offsetof(struct finish_hook_chain_request, id) == 12 );

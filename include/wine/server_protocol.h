@@ -1187,7 +1187,7 @@ typedef volatile struct
     unsigned int         version;
     unsigned int         bucket_count;
     nspa_inode_bucket_t  buckets[NSPA_INODE_BUCKETS];
-} nspa_inode_table_shm_t;
+} nspa_inode_table_t;
 
 typedef volatile struct
 {
@@ -7421,6 +7421,6 @@ union generic_reply
     struct nspa_get_inode_table_reply nspa_get_inode_table_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 947
+#define SERVER_PROTOCOL_VERSION 948
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

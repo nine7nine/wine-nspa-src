@@ -78,7 +78,7 @@ static time_t nspa_lf_diag_start_epoch;
  * 1A.2 wires in the bypass dispatch. */
 
 static pthread_once_t           nspa_lf_table_once  = PTHREAD_ONCE_INIT;
-static nspa_inode_table_shm_t  *nspa_lf_table       = NULL;   /* mmap RW (clients write own subentry under PI lock) */
+static nspa_inode_table_t  *nspa_lf_table       = NULL;   /* mmap RW (clients write own subentry under PI lock) */
 static size_t                   nspa_lf_table_size  = 0;
 static int                      nspa_lf_table_state = 0;      /* 0=untried, 1=ok, -1=failed */
 /* Counters for the diag dump — show that the lookup path is exercised. */
@@ -152,7 +152,7 @@ static void nspa_lf_table_open_once_fn( void )
     }
 
     {
-        const nspa_inode_table_shm_t *t = map;
+        const nspa_inode_table_t *t = map;
         if (t->magic != NSPA_INODE_TABLE_MAGIC ||
             t->version != NSPA_INODE_TABLE_VERSION ||
             t->bucket_count != NSPA_INODE_BUCKETS)
@@ -163,7 +163,7 @@ static void nspa_lf_table_open_once_fn( void )
         }
     }
 
-    nspa_lf_table       = (nspa_inode_table_shm_t *)map;
+    nspa_lf_table       = (nspa_inode_table_t *)map;
     nspa_lf_table_size  = table_size;
     nspa_lf_table_state = 1;
     TRACE( "NSPA local-file table: mmap ok, %u buckets × %u slots = %zu bytes\n",

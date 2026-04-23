@@ -1203,7 +1203,7 @@ typedef volatile struct
     unsigned int         version;               /* NSPA_INODE_TABLE_VERSION */
     unsigned int         bucket_count;          /* NSPA_INODE_BUCKETS */
     nspa_inode_bucket_t  buckets[NSPA_INODE_BUCKETS];
-} nspa_inode_table_shm_t;
+} nspa_inode_table_t;
 
 typedef volatile struct
 {

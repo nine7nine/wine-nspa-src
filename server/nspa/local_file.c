@@ -64,7 +64,7 @@ static inline pi_mutex_t *nspa_lock_of( nspa_inode_bucket_t *bucket )
  * client that calls nspa_get_inode_table. */
 static int                       nspa_inode_table_fd   = -1;
 static size_t                    nspa_inode_table_size = 0;
-static nspa_inode_table_shm_t   *nspa_inode_table_map  = NULL;
+static nspa_inode_table_t   *nspa_inode_table_map  = NULL;
 
 /* Ensure the shmem region exists.  Returns 1 on success, 0 on permanent
  * failure (memfd_create unsupported, ftruncate failure, mmap failure).
@@ -75,7 +75,7 @@ static int nspa_inode_table_ensure( void )
 #ifdef HAVE_MEMFD_CREATE
     int fd;
     void *map;
-    const size_t size = sizeof(nspa_inode_table_shm_t);
+    const size_t size = sizeof(nspa_inode_table_t);
 
     if (nspa_inode_table_fd >= 0)  return 1;
     if (nspa_inode_table_fd == -2) return 0;   /* sticky-failure marker */
@@ -102,7 +102,7 @@ static int nspa_inode_table_ensure( void )
      * reject the table. */
     memset( map, 0, size );
     {
-        nspa_inode_table_shm_t *t = map;
+        nspa_inode_table_t *t = map;
         unsigned int b;
         t->magic        = NSPA_INODE_TABLE_MAGIC;
         t->version      = NSPA_INODE_TABLE_VERSION;
@@ -281,7 +281,7 @@ DECL_HANDLER(nspa_get_inode_table)
 {
     reply->fd_sent      = 0;
     reply->bucket_count = NSPA_INODE_BUCKETS;
-    reply->table_size   = (unsigned int)sizeof(nspa_inode_table_shm_t);
+    reply->table_size   = (unsigned int)sizeof(nspa_inode_table_t);
 
     if (!nspa_inode_table_ensure()) return;
 

@@ -3431,6 +3431,7 @@ enum caret_state
     process_id_t   pid;            /* process id for low-level keyboard/mouse hooks */
     thread_id_t    tid;            /* thread id for low-level keyboard/mouse hooks */
     int            unicode;        /* is it a unicode hook? */
+    int            has_next;       /* NSPA: 1 if another hook follows, 0 if this is the last */
     client_ptr_t   proc;           /* hook procedure */
     VARARG(module,unicode_str);    /* module name */
 @END

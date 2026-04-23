@@ -742,6 +742,7 @@ void WINAPI NtUserNotifyWinEvent( DWORD event, HWND hwnd, LONG object_id, LONG c
     void *ret_ptr;
     ULONG ret_len;
     BOOL ret;
+    int has_next = 0;
 
     TRACE( "%04x, %p, %d, %d\n", event, hwnd, object_id, child_id );
 
@@ -779,6 +780,7 @@ void WINAPI NtUserNotifyWinEvent( DWORD event, HWND hwnd, LONG object_id, LONG c
             info.module[wine_server_reply_size(req) / sizeof(WCHAR)] = 0;
             info.handle = wine_server_ptr_handle( reply->handle );
             info.proc   = wine_server_get_ptr( reply->proc );
+            has_next    = reply->has_next;
         }
     }
     SERVER_END_REQ;
@@ -793,6 +795,11 @@ void WINAPI NtUserNotifyWinEvent( DWORD event, HWND hwnd, LONG object_id, LONG c
         KeUserModeCallback( NtUserCallWinEventHook, &info,
                             FIELD_OFFSET( struct win_event_hook_params, module[lstrlenW(info.module) + 1] ),
                             &ret_ptr, &ret_len );
+
+        /* NSPA: skip the next-hook server RPC when start_hook_chain
+         * already told us there isn't one.  Saves one RTT per
+         * chain-length-1 invocation (the common case). */
+        if (!has_next) break;
 
         SERVER_START_REQ( get_hook_info )
         {
@@ -809,6 +816,9 @@ void WINAPI NtUserNotifyWinEvent( DWORD event, HWND hwnd, LONG object_id, LONG c
                 info.module[wine_server_reply_size(req) / sizeof(WCHAR)] = 0;
                 info.handle = wine_server_ptr_handle( reply->handle );
                 info.proc   = wine_server_get_ptr( reply->proc );
+                /* get_hook_info doesn't carry has_next; treat each
+                 * continuation as potentially chain-continuing and
+                 * let the next iteration's server call tell us. */
             }
         }
         SERVER_END_REQ;

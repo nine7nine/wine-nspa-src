@@ -590,10 +590,7 @@ static BOOL nspa_populate_cache_entry( DWORD tid, struct nspa_cache_entry *entry
         if (!(status = wine_server_call( req )))
         {
             sync_handle   = wine_server_ptr_handle( reply->sync_handle );
-            /* Phase-1 sentinel: bypass_locator.id != 0 means server sent an
-             * fd via SCM_RIGHTS on this reply.  Phase 2 replaces the
-             * sentinel with a proper protocol field. */
-            has_bypass_fd = (unsigned int)reply->bypass_locator.id;
+            has_bypass_fd = reply->fd_sent;
         }
     }
     SERVER_END_REQ;
@@ -1011,8 +1008,7 @@ static unsigned int nspa_reply_ring_reserve( volatile nspa_reply_ring_t *ring )
 }
 
 /* Public wrapper so winstation.c and input.c's wake-bit synthesis can
- * resolve the current thread's own bypass ring via the memfd-era TLS
- * cache instead of the retired queue_shm_t.nspa_bypass_locator. */
+ * resolve the current thread's own bypass ring via the TLS cache. */
 const nspa_queue_bypass_shm_t *nspa_get_own_bypass_shm_public( void )
 {
     return nspa_get_own_bypass_shm();

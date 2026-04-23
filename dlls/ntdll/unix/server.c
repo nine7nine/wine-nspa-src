@@ -1409,37 +1409,14 @@ int server_get_unix_fd( HANDLE handle, unsigned int wanted_access, int *unix_fd,
     *needs_close = 0;
     wanted_access &= FILE_READ_DATA | FILE_WRITE_DATA | FILE_APPEND_DATA;
 
-    /* NSPA local-file: if this is a local-file handle, return the
-     * cached unix_fd from our per-process file table without any
-     * server contact.  needs_close=0 because our table owns the fd
-     * lifetime; type=FD_TYPE_FILE because Phase 1A.2 only bypasses
-     * regular files; options=0 because MVP is FILE_OPEN read-only.
-     * Routes NtReadFile/NtWriteFile (and the rest of Wine's I/O paths
-     * that go through server_get_unix_fd) onto the local fd. */
-    if (nspa_local_file_is_local_handle( handle ))
-    {
-        int local_fd = -1;
-        unsigned int local_options = 0;
-        if (nspa_local_file_table_lookup_full( handle, &local_fd, &local_options ) && local_fd >= 0)
-        {
-            *unix_fd = local_fd;
-            *needs_close = 0;
-            if (type) *type = FD_TYPE_FILE;
-            /* Phase 1A.4 fix: return the actual options the file was
-             * opened with — NtReadFile/NtWriteFile branch on
-             * FILE_SYNCHRONOUS_IO_NONALERT to choose async vs sync
-             * behaviour, and the loader opens DLLs with that flag. */
-            if (options) *options = local_options;
-            nspa_local_file_get_unix_fd_intercept_bump();
-            if (getenv("NSPA_LF_TRACE"))
-                fprintf( stderr, "NSPA-LF get_unix_fd h=%p fd=%d wanted=%x\n",
-                         handle, local_fd, wanted_access );
-            return STATUS_SUCCESS;
-        }
-        if (getenv("NSPA_LF_TRACE"))
-            fprintf( stderr, "NSPA-LF get_unix_fd h=%p NOT-FOUND-IN-TABLE\n", handle );
-        return STATUS_INVALID_HANDLE;
-    }
+    /* NSPA local-file: local-range handles have their fd in a client-
+     * private table — no server contact.  Helper returns STATUS_SUCCESS
+     * (populated fd + type + options), STATUS_INVALID_HANDLE (in-range
+     * but not registered), or STATUS_NOT_SUPPORTED (not an LF handle,
+     * fall through to the normal server path). */
+    ret = nspa_local_file_try_get_unix_fd( handle, wanted_access,
+                                            unix_fd, needs_close, type, options );
+    if (ret != STATUS_NOT_SUPPORTED) return ret;
 
     ret = get_cached_fd( handle, &fd, type, &access, options );
     if (ret != STATUS_INVALID_HANDLE) goto done;

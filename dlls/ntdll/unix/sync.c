@@ -3653,6 +3653,7 @@ NTSTATUS WINAPI NtCreateSection( HANDLE *handle, ACCESS_MASK access, const OBJEC
         int unix_fd = nspa_local_file_table_lookup_unix_fd( file );
         if (unix_fd >= 0)
         {
+            nspa_local_file_section_intercept_bump( 0 );
             wine_server_send_fd( unix_fd );
             SERVER_START_REQ( nspa_create_mapping_from_unix_fd )
             {
@@ -3666,6 +3667,7 @@ NTSTATUS WINAPI NtCreateSection( HANDLE *handle, ACCESS_MASK access, const OBJEC
                 *handle = wine_server_ptr_handle( reply->handle );
             }
             SERVER_END_REQ;
+            nspa_local_file_section_intercept_bump( ret == STATUS_SUCCESS ? 1 : 2 );
             free( objattr );
             return ret;
         }

@@ -342,6 +342,10 @@ extern void     nspa_local_file_section_intercept_bump( int cause );
 extern void     nspa_local_file_get_unix_fd_intercept_bump( void );
 extern HANDLE   nspa_local_file_get_or_promote_server_handle( HANDLE local_handle );
 extern HANDLE   nspa_promote_if_local( HANDLE h );
+extern HANDLE   nspa_promote_if_local_traced( HANDLE h, const char *tag, unsigned int info );
+extern int      nspa_local_file_try_get_unix_fd( HANDLE handle, unsigned int wanted_access,
+                                                 int *unix_fd, int *needs_close,
+                                                 enum server_fd_type *type, unsigned int *options );
 extern void *create_startup_info( const UNICODE_STRING *nt_image, ULONG process_flags,
                                   const RTL_USER_PROCESS_PARAMETERS *params,
                                   const struct pe_image_info *pe_info, DWORD *info_size );

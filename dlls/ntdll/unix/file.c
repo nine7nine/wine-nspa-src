@@ -7868,6 +7868,20 @@ NTSTATUS WINAPI NtQueryObject( HANDLE handle, OBJECT_INFORMATION_CLASS info_clas
 
     if (used_len) *used_len = 0;
 
+    /* NSPA local-file Phase 1A.6: promote local-range handles before any
+     * NtQueryObject server call.  GetFinalPathNameByHandle and apps that
+     * introspect handles via ObjectName/Basic/Type information classes
+     * would otherwise get STATUS_INVALID_HANDLE because local handles
+     * aren't in the server's process handle table. */
+    if (nspa_local_file_is_local_handle( handle ))
+    {
+        HANDLE promoted = nspa_local_file_get_or_promote_server_handle( handle );
+        if (promoted) handle = promoted;
+        if (getenv("NSPA_LF_TRACE"))
+            fprintf( stderr, "NSPA-LF QObj h=%p class=%u srv=%p\n",
+                     handle, info_class, promoted );
+    }
+
     switch (info_class)
     {
     case ObjectBasicInformation:
@@ -8037,6 +8051,15 @@ NTSTATUS WINAPI NtSetInformationObject( HANDLE handle, OBJECT_INFORMATION_CLASS 
     unsigned int status;
 
     TRACE("(%p,0x%08x,%p,0x%08x)\n", handle, info_class, ptr, len);
+
+    /* NSPA local-file Phase 1A.6: promote local handles before
+     * set_handle_info — apps that mark inheritance / protect-from-close
+     * on a file handle would otherwise hit STATUS_INVALID_HANDLE. */
+    if (nspa_local_file_is_local_handle( handle ))
+    {
+        HANDLE promoted = nspa_local_file_get_or_promote_server_handle( handle );
+        if (promoted) handle = promoted;
+    }
 
     switch (info_class)
     {

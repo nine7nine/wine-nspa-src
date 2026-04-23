@@ -92,6 +92,11 @@ static unsigned long long       nspa_lf_section_intercepts;   /* NtCreateSection
 static unsigned long long       nspa_lf_section_promote_ok;   /* nspa_create_mapping_from_unix_fd succeeded */
 static unsigned long long       nspa_lf_section_promote_fail; /* nspa_create_mapping_from_unix_fd returned !=SUCCESS */
 static unsigned long long       nspa_lf_get_unix_fd_intercepts; /* server_get_unix_fd routed to local table */
+/* Phase 1A.4 audit counters — lazy server-handle promotion */
+static unsigned long long       nspa_lf_promote_calls;        /* nspa_local_file_get_or_promote_server_handle invoked */
+static unsigned long long       nspa_lf_promote_cached_hit;   /* server_handle already cached, returned immediately */
+static unsigned long long       nspa_lf_promote_minted;       /* server_handle minted via RPC (lazy) */
+static unsigned long long       nspa_lf_promote_fail;         /* RPC returned 0 handle */
 
 static void nspa_lf_table_open_once_fn( void )
 {
@@ -425,6 +430,16 @@ static void nspa_lf_diag_dump( void )
             fprintf(f, "  NtClose_local                   %llu\n", ci);
             fprintf(f, "  NtCreateSection_promote         %llu (ok=%llu fail=%llu)\n", si, sok, sf);
             fprintf(f, "  server_get_unix_fd_local        %llu\n", uf);
+
+            /* 1A.4 lazy server-handle promotion counters */
+            {
+                unsigned long long pc  = __atomic_load_n( &nspa_lf_promote_calls,      __ATOMIC_RELAXED );
+                unsigned long long pch = __atomic_load_n( &nspa_lf_promote_cached_hit, __ATOMIC_RELAXED );
+                unsigned long long pm  = __atomic_load_n( &nspa_lf_promote_minted,     __ATOMIC_RELAXED );
+                unsigned long long pf  = __atomic_load_n( &nspa_lf_promote_fail,       __ATOMIC_RELAXED );
+                fprintf(f, "  get_or_promote_server_handle    %llu (cached_hit=%llu minted=%llu fail=%llu)\n",
+                        pc, pch, pm, pf);
+            }
         }
     }
 
@@ -485,6 +500,7 @@ struct nspa_local_open
     unsigned long long inode;
     unsigned int      access;
     unsigned int      sharing;
+    unsigned int      options;           /* FILE_OPEN options the app passed (FILE_SYNCHRONOUS_IO_NONALERT etc) */
 };
 
 static struct list      nspa_lf_opens          = LIST_INIT(nspa_lf_opens);
@@ -752,7 +768,8 @@ void nspa_local_file_publish_close( unsigned long long device, unsigned long lon
  * bypass dispatch in Phase 1A.2.d after a successful publish_open. */
 NTSTATUS nspa_local_file_table_add( HANDLE handle, int unix_fd,
                                     unsigned long long device, unsigned long long inode,
-                                    unsigned int access, unsigned int sharing )
+                                    unsigned int access, unsigned int sharing,
+                                    unsigned int options )
 {
     struct nspa_local_open *o = malloc( sizeof(*o) );
     if (!o) return STATUS_NO_MEMORY;
@@ -763,6 +780,7 @@ NTSTATUS nspa_local_file_table_add( HANDLE handle, int unix_fd,
     o->inode         = inode;
     o->access        = access;
     o->sharing       = sharing;
+    o->options       = options;
     pi_mutex_lock( &nspa_lf_opens_mutex );
     list_add_head( &nspa_lf_opens, &o->entry );
     pi_mutex_unlock( &nspa_lf_opens_mutex );
@@ -812,6 +830,30 @@ int nspa_local_file_table_lookup_unix_fd( HANDLE handle )
     }
     pi_mutex_unlock( &nspa_lf_opens_mutex );
     return fd;
+}
+
+/* Phase 1A.4 fix: also return the options the file was opened with so
+ * server_get_unix_fd can return them to NtReadFile/NtWriteFile.  Without
+ * this, options=0 makes those functions treat sync handles (FILE_
+ * SYNCHRONOUS_IO_NONALERT — set by the loader and most apps) as async,
+ * breaking downstream callers that expect synchronous semantics. */
+int nspa_local_file_table_lookup_full( HANDLE handle, int *unix_fd_out, unsigned int *options_out )
+{
+    struct nspa_local_open *o;
+    int found = 0;
+    pi_mutex_lock( &nspa_lf_opens_mutex );
+    LIST_FOR_EACH_ENTRY( o, &nspa_lf_opens, struct nspa_local_open, entry )
+    {
+        if (o->handle == handle)
+        {
+            if (unix_fd_out) *unix_fd_out = o->unix_fd;
+            if (options_out) *options_out = o->options;
+            found = 1;
+            break;
+        }
+    }
+    pi_mutex_unlock( &nspa_lf_opens_mutex );
+    return found;
 }
 
 /* Compute aggregate from a slot snapshot.  Helper for the standalone
@@ -1170,7 +1212,7 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
     status = nspa_local_file_table_add( h, unix_fd,
                                         (unsigned long long)st.st_dev,
                                         (unsigned long long)st.st_ino,
-                                        access, sharing );
+                                        access, sharing, options );
     if (status != STATUS_SUCCESS)
     {
         nspa_lf_free_handle( h );
@@ -1200,10 +1242,11 @@ HANDLE nspa_local_file_get_or_promote_server_handle( HANDLE local_handle )
     struct nspa_local_open *o;
     int need_promote = 0;
     int unix_fd = -1;
-    unsigned int access = 0, sharing = 0;
+    unsigned int access = 0, sharing = 0, options = 0;
     HANDLE result = 0;
 
     if (!nspa_local_file_is_local_handle( local_handle )) return 0;
+    __atomic_fetch_add( &nspa_lf_promote_calls, 1, __ATOMIC_RELAXED );
 
     pi_mutex_lock( &nspa_lf_opens_mutex );
     LIST_FOR_EACH_ENTRY( o, &nspa_lf_opens, struct nspa_local_open, entry )
@@ -1217,13 +1260,19 @@ HANDLE nspa_local_file_get_or_promote_server_handle( HANDLE local_handle )
                 unix_fd = o->unix_fd;
                 access  = o->access;
                 sharing = o->sharing;
+                options = o->options;
             }
             break;
         }
     }
     pi_mutex_unlock( &nspa_lf_opens_mutex );
 
-    if (result || !need_promote) return result;
+    if (result)
+    {
+        __atomic_fetch_add( &nspa_lf_promote_cached_hit, 1, __ATOMIC_RELAXED );
+        return result;
+    }
+    if (!need_promote) return result;
 
     /* RPC outside the table lock — server call can block, mustn't
      * hold the per-process file-table mutex during it. */
@@ -1236,13 +1285,21 @@ HANDLE nspa_local_file_get_or_promote_server_handle( HANDLE local_handle )
             req->fd         = unix_fd;
             req->access     = access;
             req->sharing    = sharing;
-            req->options    = 0;
+            /* Phase 1A.4 fix: pass through the actual options the file
+             * was opened with so the server's struct fd has the same
+             * sync/async/buffering semantics as the original open. */
+            req->options    = options;
             req->attributes = 0;
             ret = wine_server_call( req );
             if (!ret) promoted = wine_server_ptr_handle( reply->handle );
         }
         SERVER_END_REQ;
-        if (!promoted) return 0;
+        if (!promoted)
+        {
+            __atomic_fetch_add( &nspa_lf_promote_fail, 1, __ATOMIC_RELAXED );
+            return 0;
+        }
+        __atomic_fetch_add( &nspa_lf_promote_minted, 1, __ATOMIC_RELAXED );
 
         /* Store back, racing safely with another concurrent promotion
          * (we keep whichever lands first; close our own if loser). */

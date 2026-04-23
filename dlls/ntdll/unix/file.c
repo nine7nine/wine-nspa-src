@@ -4707,12 +4707,22 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
          * a real conflict (propagate), or STATUS_NOT_SUPPORTED to fall
          * back to the existing server path.  Eligibility filter mirrors
          * nspa_local_file_diag_categorize. */
-        /* FILE_NON_DIRECTORY_FILE re-allowed: NtCreateSection now
-         * promotes local handles to server-mediated sections via the
-         * nspa_create_mapping_from_unix_fd handler (Phase 1A.3). */
+        /* Phase 1A.3 status: section-handle promotion infrastructure
+         * is in place (nspa_create_mapping_from_unix_fd RPC), but
+         * empirical testing showed many other Nt*File operations
+         * (NtFsControlFile, NtQueryInformationFile, NtMapViewOfSection
+         * paths beyond NtCreateSection, etc.) don't yet handle
+         * local-range handles — apps like winex11.drv loaders break.
+         *
+         * Conservative MVP eligibility (FILE_NON_DIRECTORY_FILE
+         * excluded) keeps the bypass correct on all workloads while
+         * future work extends per-Nt*File local-handle awareness.
+         * Each new Nt*File path that gains the intercept can have its
+         * relevant option re-allowed here. */
         if (!attr->RootDirectory && !attr->SecurityDescriptor &&
             disposition == FILE_OPEN &&
-            !(options & (FILE_OPEN_BY_FILE_ID | FILE_DIRECTORY_FILE | FILE_DELETE_ON_CLOSE)) &&
+            !(options & (FILE_OPEN_BY_FILE_ID | FILE_DIRECTORY_FILE | FILE_DELETE_ON_CLOSE |
+                         FILE_NON_DIRECTORY_FILE)) &&
             !(access & ~(FILE_READ_DATA | FILE_READ_ATTRIBUTES | FILE_READ_EA |
                          READ_CONTROL | SYNCHRONIZE | GENERIC_READ)))
         {

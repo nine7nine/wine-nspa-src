@@ -1042,6 +1042,11 @@ int nspa_local_file_is_local_handle( HANDLE h )
     unsigned int v = (unsigned int)(ULONG_PTR)h;
     unsigned int slot;
     pthread_once( &nspa_lf_handle_once, nspa_lf_handle_init_once_fn );
+    /* Exclude pseudo-handles the kernel reserves.  The CURRENT_PROCESS
+     * pseudo-handle 0x7FFFFFFF lands inside our range otherwise (range
+     * is [0x7FFFC000, 0x80000000)), which would route NtClose for it
+     * through our local cleanup and similar misroutes. */
+    if (v == 0x7FFFFFFFu || v >= 0xFFFFFFFAu) return 0;
     if (v < nspa_lf_handle_base) return 0;
     slot = (v - nspa_lf_handle_base) / 4;
     return slot < NSPA_LF_HANDLE_CAP;

@@ -38,8 +38,8 @@ SOURCES = \
 	mapping.c \
 	menu.c \
 	message.c \
-	nspa_local_wm_timer.c \
-	nspa_msg_ring.c \
+	nspa/local_wm_timer.c \
+	nspa/msg_ring.c \
 	opengl.c \
 	opentype.c \
 	painting.c \

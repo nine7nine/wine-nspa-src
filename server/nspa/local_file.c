@@ -32,9 +32,9 @@
 #include "windef.h"
 #include "winternl.h"
 
-#include "file.h"
-#include "process.h"
-#include "request.h"
+#include "../file.h"
+#include "../process.h"
+#include "../request.h"
 
 #include <rtpi.h>
 

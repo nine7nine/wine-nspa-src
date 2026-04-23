@@ -2326,16 +2326,8 @@ NTSTATUS WINAPI NtCompareObjects( HANDLE first, HANDLE second )
     /* NSPA local-file: either handle may be a local-range file handle
      * the server has no record of.  Promote both before the RPC so the
      * server compares real server objects. */
-    if (nspa_local_file_is_local_handle( first ))
-    {
-        HANDLE promoted = nspa_local_file_get_or_promote_server_handle( first );
-        if (promoted) first = promoted;
-    }
-    if (nspa_local_file_is_local_handle( second ))
-    {
-        HANDLE promoted = nspa_local_file_get_or_promote_server_handle( second );
-        if (promoted) second = promoted;
-    }
+    first = nspa_promote_if_local( first );
+    second = nspa_promote_if_local( second );
 
     SERVER_START_REQ( compare_objects )
     {

@@ -1425,6 +1425,7 @@ int server_get_unix_fd( HANDLE handle, unsigned int wanted_access, int *unix_fd,
             *needs_close = 0;
             if (type) *type = FD_TYPE_FILE;
             if (options) *options = 0;
+            nspa_local_file_get_unix_fd_intercept_bump();
             return STATUS_SUCCESS;
         }
         return STATUS_INVALID_HANDLE;

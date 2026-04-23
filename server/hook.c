@@ -542,6 +542,11 @@ DECL_HANDLER(start_hook_chain)
      * second during menu activity). */
     reply->has_next = get_next_hook( current, hook, req->event, req->window,
                                      req->object_id, req->child_id ) ? 1 : 0;
+    /* NSPA Tier 1 step 2: publish whether a desktop-global hook table was
+     * pinned.  Still bump both counts[] as before — client not yet reading
+     * has_global in this commit; the gated refcount migration happens in a
+     * follow-up. */
+    reply->has_global = global_table ? 1 : 0;
     if (table) table->counts[hook->index]++;
     if (global_table) global_table->counts[hook->index]++;
     if (hook->module) set_reply_data( hook->module, hook->module_size );

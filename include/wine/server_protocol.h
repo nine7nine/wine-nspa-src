@@ -4653,6 +4653,8 @@ struct start_hook_chain_reply
     int            unicode;
     int            has_next;
     int            has_global;
+    int            tier1_active;
+    char __pad_36[4];
     client_ptr_t   proc;
     /* VARARG(module,unicode_str); */
 };
@@ -7421,6 +7423,6 @@ union generic_reply
     struct nspa_get_inode_table_reply nspa_get_inode_table_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 945
+#define SERVER_PROTOCOL_VERSION 946
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

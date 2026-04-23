@@ -1077,29 +1077,31 @@ static NTSTATUS nspa_local_file_check_and_publish_open( unsigned long long devic
  * CLIENT_HANDLE_BASE but high enough to never collide with server-
  * allocated handles.  The exact value isn't load-bearing — the
  * is_local_file_handle check uses our own range table. */
-static unsigned int nspa_lf_handle_base;
+/* Use a high fixed base.  Server handles start at 0x4 and grow; the
+ * NTSync client range starts near INPROC_SYNC_CACHE_TOTAL.  Pick a
+ * range disjoint from both: fixed bottom at 0x80000000 - cap*4.
+ *
+ * Initialised at declaration (constant expression) — previously lazy-
+ * inited via pthread_once inside nspa_lf_alloc_handle, but that left
+ * nspa_lf_handle_base = 0 until the first mint.  is_local_handle uses
+ * `v < base` as its lower-bound check: with base=0 that's always false
+ * for any positive handle, so any server handle < NSPA_LF_HANDLE_CAP*4
+ * (16384) got classified as local-range before any LF mint happened.
+ * Small server handles like stdio (0x14/0x18) fall in that range, and
+ * e.g. the alloc_handle_list promotion path would then fire the LF
+ * table lookup + lock on every PS_ATTRIBUTE_HANDLE_LIST entry — a
+ * no-op but with enough contention to show as a visible menu flash on
+ * CreateProcess-adjacent paths. */
+static unsigned int nspa_lf_handle_base = 0x80000000u - NSPA_LF_HANDLE_CAP * 4;
 static int          nspa_lf_handles_in_use[NSPA_LF_HANDLE_CAP];   /* 1 if allocated */
 static unsigned int nspa_lf_handle_next;
 /* PI mutex — handle allocator can be hit from RT threads. */
 static DEFINE_PI_MUTEX(nspa_lf_handle_mutex, 0);
 
-static void nspa_lf_handle_init_once_fn( void )
-{
-    /* Use a high fixed base.  Server handles start at 0x4 and grow; the
-     * NTSync client range starts near INPROC_SYNC_CACHE_TOTAL.  Pick a
-     * range disjoint from both: fixed bottom at 0x80000000 - cap*4. */
-    nspa_lf_handle_base = 0x80000000u - NSPA_LF_HANDLE_CAP * 4;
-    nspa_lf_handle_next = 0;
-}
-
-static pthread_once_t nspa_lf_handle_once = PTHREAD_ONCE_INIT;
-
 static HANDLE nspa_lf_alloc_handle( void )
 {
     unsigned int i, slot;
     HANDLE result = NULL;
-
-    pthread_once( &nspa_lf_handle_once, nspa_lf_handle_init_once_fn );
 
     pi_mutex_lock( &nspa_lf_handle_mutex );
     for (i = 0; i < NSPA_LF_HANDLE_CAP; i++)
@@ -1123,7 +1125,6 @@ static void nspa_lf_free_handle( HANDLE h )
 {
     unsigned int v = (unsigned int)(ULONG_PTR)h;
     unsigned int slot;
-    pthread_once( &nspa_lf_handle_once, nspa_lf_handle_init_once_fn );
     if (v < nspa_lf_handle_base) return;
     slot = (v - nspa_lf_handle_base) / 4;
     if (slot >= NSPA_LF_HANDLE_CAP) return;
@@ -1151,7 +1152,6 @@ int nspa_local_file_is_local_handle( HANDLE h )
 {
     unsigned int v = (unsigned int)(ULONG_PTR)h;
     unsigned int slot;
-    pthread_once( &nspa_lf_handle_once, nspa_lf_handle_init_once_fn );
     /* Exclude pseudo-handles the kernel reserves.  The CURRENT_PROCESS
      * pseudo-handle 0x7FFFFFFF lands inside our range otherwise (range
      * is [0x7FFFC000, 0x80000000)), which would route NtClose for it

@@ -2364,6 +2364,7 @@ static void dump_start_hook_chain_reply( const struct start_hook_chain_reply *re
     fprintf( stderr, ", pid=%04x", req->pid );
     fprintf( stderr, ", tid=%04x", req->tid );
     fprintf( stderr, ", unicode=%d", req->unicode );
+    fprintf( stderr, ", has_next=%d", req->has_next );
     dump_uint64( ", proc=", &req->proc );
     dump_varargs_unicode_str( ", module=", cur_size );
 }

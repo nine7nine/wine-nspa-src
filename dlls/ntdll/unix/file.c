@@ -4725,13 +4725,19 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
 
         if (!loader_open &&
             !attr->RootDirectory && !attr->SecurityDescriptor &&
-            disposition == FILE_OPEN &&
+            (disposition == FILE_OPEN || disposition == FILE_OPEN_IF) &&
             !(options & (FILE_OPEN_BY_FILE_ID | FILE_DIRECTORY_FILE | FILE_DELETE_ON_CLOSE)) &&
+            /* Only synchronous opens — async (OVERLAPPED) reads route through
+             * register_async_file_read which sends the handle to the server;
+             * local-range handles can't ride that path.  Non-audio-hot, let
+             * the server path handle them. */
+            (options & (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT)) &&
             !(access & ~(FILE_READ_DATA | FILE_READ_ATTRIBUTES | FILE_READ_EA |
                          READ_CONTROL | SYNCHRONIZE | GENERIC_READ)))
         {
             NTSTATUS bypass = nspa_local_file_try_bypass( handle, unix_name, attr->ObjectName,
-                                                          access, sharing, options, io );
+                                                          access, sharing, options,
+                                                          attr->Attributes, io );
             if (bypass == STATUS_SUCCESS)
             {
                 free( unix_name );

@@ -321,6 +321,7 @@ extern NTSTATUS nspa_local_file_table_add( HANDLE handle, int unix_fd,
                                            unsigned long long device, unsigned long long inode,
                                            unsigned int access, unsigned int sharing,
                                            unsigned int options,
+                                           unsigned int attributes,
                                            const UNICODE_STRING *nt_name );
 extern int      nspa_local_file_table_remove( HANDLE handle, int *unix_fd_out,
                                               unsigned long long *device_out,
@@ -332,7 +333,9 @@ extern NTSTATUS nspa_local_file_check_sharing( unsigned long long device, unsign
 extern NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
                                             const UNICODE_STRING *nt_name,
                                             ACCESS_MASK access, ULONG sharing,
-                                            ULONG options, IO_STATUS_BLOCK *io );
+                                            ULONG options, ULONG attributes,
+                                            IO_STATUS_BLOCK *io );
+extern void     nspa_local_file_promote_inheritable( void );
 extern int      nspa_local_file_is_local_handle( HANDLE h );
 extern int      nspa_local_file_close( HANDLE handle );
 extern void     nspa_local_file_section_intercept_bump( int cause );

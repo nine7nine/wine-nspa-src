@@ -501,6 +501,7 @@ struct nspa_local_open
     unsigned int      access;
     unsigned int      sharing;
     unsigned int      options;           /* FILE_OPEN options the app passed (FILE_SYNCHRONOUS_IO_NONALERT etc) */
+    unsigned int      attributes;        /* ObjectAttributes->Attributes (OBJ_INHERIT etc) — forwarded on lazy promote */
     /* Original NT path captured at try_bypass time.  Sent to the server
      * on lazy promotion so the promoted struct fd carries fd->nt_name —
      * required by GetFinalPathNameByHandle / FileNameInformation queries
@@ -776,6 +777,7 @@ NTSTATUS nspa_local_file_table_add( HANDLE handle, int unix_fd,
                                     unsigned long long device, unsigned long long inode,
                                     unsigned int access, unsigned int sharing,
                                     unsigned int options,
+                                    unsigned int attributes,
                                     const UNICODE_STRING *nt_name )
 {
     struct nspa_local_open *o = malloc( sizeof(*o) );
@@ -788,6 +790,7 @@ NTSTATUS nspa_local_file_table_add( HANDLE handle, int unix_fd,
     o->access        = access;
     o->sharing       = sharing;
     o->options       = options;
+    o->attributes    = attributes;
     o->nt_name       = NULL;
     o->nt_name_len   = 0;
     if (nt_name && nt_name->Buffer && nt_name->Length)
@@ -1182,7 +1185,8 @@ static int nspa_local_file_enabled( void )
 NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
                                      const UNICODE_STRING *nt_name,
                                      ACCESS_MASK access, ULONG sharing,
-                                     ULONG options, IO_STATUS_BLOCK *io )
+                                     ULONG options, ULONG attributes,
+                                     IO_STATUS_BLOCK *io )
 {
     struct stat st;
     int unix_fd;
@@ -1256,7 +1260,7 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
     status = nspa_local_file_table_add( h, unix_fd,
                                         (unsigned long long)st.st_dev,
                                         (unsigned long long)st.st_ino,
-                                        access, sharing, options, nt_name );
+                                        access, sharing, options, attributes, nt_name );
     if (status != STATUS_SUCCESS)
     {
         nspa_lf_free_handle( h );
@@ -1292,7 +1296,7 @@ HANDLE nspa_local_file_get_or_promote_server_handle( HANDLE local_handle )
     struct nspa_local_open *o;
     int need_promote = 0;
     int unix_fd = -1;
-    unsigned int access = 0, sharing = 0, options = 0;
+    unsigned int access = 0, sharing = 0, options = 0, attributes = 0;
     WCHAR *nt_name_copy = NULL;
     USHORT nt_name_len = 0;
     HANDLE result = 0;
@@ -1311,10 +1315,11 @@ HANDLE nspa_local_file_get_or_promote_server_handle( HANDLE local_handle )
             else
             {
                 need_promote = 1;
-                unix_fd = o->unix_fd;
-                access  = o->access;
-                sharing = o->sharing;
-                options = o->options;
+                unix_fd    = o->unix_fd;
+                access     = o->access;
+                sharing    = o->sharing;
+                options    = o->options;
+                attributes = o->attributes;
                 /* Snapshot NT path so we can send it after dropping the
                  * lock — wine_server_call can block. */
                 if (o->nt_name && o->nt_name_len)
@@ -1354,7 +1359,10 @@ HANDLE nspa_local_file_get_or_promote_server_handle( HANDLE local_handle )
              * was opened with so the server's struct fd has the same
              * sync/async/buffering semantics as the original open. */
             req->options    = options;
-            req->attributes = 0;
+            /* Forward ObjectAttributes->Attributes (esp. OBJ_INHERIT) so
+             * the promoted server handle is a faithful replica of the
+             * original open — required for CreateProcess inheritance. */
+            req->attributes = attributes;
             /* Phase 1A.6: pass NT path so server-side struct fd carries
              * fd->nt_name — required by FileNameInformation queries
              * (GetFinalPathNameByHandle).  Apps like Ableton bail with
@@ -1403,6 +1411,43 @@ HANDLE nspa_local_file_get_or_promote_server_handle( HANDLE local_handle )
         pi_mutex_unlock( &nspa_lf_opens_mutex );
     }
     return result;
+}
+
+/* Walk the per-process LF table and eagerly promote every entry whose
+ * ObjectAttributes->Attributes carries OBJ_INHERIT.  Called from
+ * NtCreateUserProcess before the new_process RPC when the parent asks
+ * the server to inherit handles: the server's auto-inherit scan walks
+ * *its* handle table, so an OBJ_INHERIT-flagged local-range handle
+ * must already be server-visible or the child won't get it.
+ *
+ * Collects handle values under the table lock, then promotes outside
+ * the lock since get_or_promote_server_handle itself does an RPC. */
+void nspa_local_file_promote_inheritable( void )
+{
+    HANDLE *to_promote = NULL;
+    size_t count = 0, cap = 0;
+    struct nspa_local_open *o;
+
+    pi_mutex_lock( &nspa_lf_opens_mutex );
+    LIST_FOR_EACH_ENTRY( o, &nspa_lf_opens, struct nspa_local_open, entry )
+    {
+        if (!(o->attributes & OBJ_INHERIT)) continue;
+        if (o->server_handle) continue;                   /* already promoted */
+        if (count == cap)
+        {
+            size_t new_cap = cap ? cap * 2 : 16;
+            HANDLE *resized = realloc( to_promote, new_cap * sizeof(HANDLE) );
+            if (!resized) { pi_mutex_unlock( &nspa_lf_opens_mutex ); free( to_promote ); return; }
+            to_promote = resized;
+            cap = new_cap;
+        }
+        to_promote[count++] = o->handle;
+    }
+    pi_mutex_unlock( &nspa_lf_opens_mutex );
+
+    for (size_t i = 0; i < count; i++)
+        nspa_local_file_get_or_promote_server_handle( to_promote[i] );
+    free( to_promote );
 }
 
 int nspa_local_file_close( HANDLE handle )

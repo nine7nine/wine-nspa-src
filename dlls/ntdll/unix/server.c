@@ -2250,6 +2250,19 @@ NTSTATUS WINAPI NtDuplicateObject( HANDLE source_process, HANDLE source, HANDLE 
         return result.dup_handle.status;
     }
 
+    /* NSPA local-file: the server has no record of local-range handles,
+     * so a dup on one would fail with STATUS_INVALID_HANDLE.  Promote
+     * the local handle to a server handle first so the server-side dup
+     * operates on something it knows about.  Returns a server-range
+     * handle in *dest — correct since the dup is consumed by non-NSPA
+     * code paths (e.g. CreateFileMapping, Ableton's .als decompress
+     * stream) that need server-visible handles. */
+    if (source_process == NtCurrentProcess() && nspa_local_file_is_local_handle( source ))
+    {
+        HANDLE promoted = nspa_local_file_get_or_promote_server_handle( source );
+        if (promoted) source = promoted;
+    }
+
     /* hold fd_cache_mutex to prevent the fd from being added again between the
      * call to remove_fd_from_cache and close_handle */
     server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );

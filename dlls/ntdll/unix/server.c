@@ -1418,13 +1418,18 @@ int server_get_unix_fd( HANDLE handle, unsigned int wanted_access, int *unix_fd,
      * that go through server_get_unix_fd) onto the local fd. */
     if (nspa_local_file_is_local_handle( handle ))
     {
-        int local_fd = nspa_local_file_table_lookup_unix_fd( handle );
-        if (local_fd >= 0)
+        int local_fd = -1;
+        unsigned int local_options = 0;
+        if (nspa_local_file_table_lookup_full( handle, &local_fd, &local_options ) && local_fd >= 0)
         {
             *unix_fd = local_fd;
             *needs_close = 0;
             if (type) *type = FD_TYPE_FILE;
-            if (options) *options = 0;
+            /* Phase 1A.4 fix: return the actual options the file was
+             * opened with — NtReadFile/NtWriteFile branch on
+             * FILE_SYNCHRONOUS_IO_NONALERT to choose async vs sync
+             * behaviour, and the loader opens DLLs with that flag. */
+            if (options) *options = local_options;
             nspa_local_file_get_unix_fd_intercept_bump();
             return STATUS_SUCCESS;
         }

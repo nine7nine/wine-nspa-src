@@ -300,11 +300,13 @@ extern NTSTATUS nspa_local_file_publish_open( unsigned long long device, unsigne
 extern void     nspa_local_file_publish_close( unsigned long long device, unsigned long long inode );
 extern NTSTATUS nspa_local_file_table_add( HANDLE handle, int unix_fd,
                                            unsigned long long device, unsigned long long inode,
-                                           unsigned int access, unsigned int sharing );
+                                           unsigned int access, unsigned int sharing,
+                                           unsigned int options );
 extern int      nspa_local_file_table_remove( HANDLE handle, int *unix_fd_out,
                                               unsigned long long *device_out,
                                               unsigned long long *inode_out );
 extern int      nspa_local_file_table_lookup_unix_fd( HANDLE handle );
+extern int      nspa_local_file_table_lookup_full( HANDLE handle, int *unix_fd_out, unsigned int *options_out );
 extern NTSTATUS nspa_local_file_check_sharing( unsigned long long device, unsigned long long inode,
                                                unsigned int my_access, unsigned int my_sharing );
 extern NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,

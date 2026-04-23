@@ -86,6 +86,15 @@ static unsigned long long       nspa_lf_lookup_attempt;
 static unsigned long long       nspa_lf_lookup_hit;
 static unsigned long long       nspa_lf_lookup_miss;
 static unsigned long long       nspa_lf_lookup_seq_retry;
+/* Silent-fallback counters — baseline visibility for LF memfd migration.
+ * bucket_overflow:    bucket has no free slot for a new (device, inode).
+ * subentry_overflow:  slot found but >N-1 client procs already hold it.
+ * seq_exhausted:      seqlock-read retry loop gave up (writer pinned bucket).
+ * Distinct sizing knobs — keep separate so dumps show which dimension
+ * is the bottleneck. */
+static unsigned long long       nspa_lf_bucket_overflow;
+static unsigned long long       nspa_lf_subentry_overflow;
+static unsigned long long       nspa_lf_seq_exhausted;
 /* Phase 1A.3 audit counters — track where local handles flow */
 static unsigned long long       nspa_lf_bypass_minted;        /* NtCreateFile minted local handle */
 static unsigned long long       nspa_lf_close_intercepts;     /* NtClose on local handle */
@@ -233,8 +242,11 @@ int nspa_local_file_table_lookup( unsigned long long device, unsigned long long 
 
     /* Retry exhaustion — extremely rare (would require a writer
      * pinning the bucket faster than we can read).  Treat as miss;
-     * caller falls back to server. */
-    __atomic_fetch_add( &nspa_lf_lookup_miss, 1, __ATOMIC_RELAXED );
+     * caller falls back to server.  lookup_miss also bumped for
+     * continuity with existing dump consumers; seq_exhausted is the
+     * specific signal that the retry loop gave up. */
+    __atomic_fetch_add( &nspa_lf_lookup_miss,   1, __ATOMIC_RELAXED );
+    __atomic_fetch_add( &nspa_lf_seq_exhausted, 1, __ATOMIC_RELAXED );
     return 0;
 }
 
@@ -375,10 +387,13 @@ static void nspa_lf_diag_dump( void )
      * client's view.  Counts populated slots so we can confirm server
      * publish reaches us.  No bypass dispatch is wired yet (1A.2). */
     {
-        unsigned long long la = __atomic_load_n( &nspa_lf_lookup_attempt,   __ATOMIC_RELAXED );
-        unsigned long long lh = __atomic_load_n( &nspa_lf_lookup_hit,       __ATOMIC_RELAXED );
-        unsigned long long lm = __atomic_load_n( &nspa_lf_lookup_miss,      __ATOMIC_RELAXED );
-        unsigned long long ls = __atomic_load_n( &nspa_lf_lookup_seq_retry, __ATOMIC_RELAXED );
+        unsigned long long la = __atomic_load_n( &nspa_lf_lookup_attempt,    __ATOMIC_RELAXED );
+        unsigned long long lh = __atomic_load_n( &nspa_lf_lookup_hit,        __ATOMIC_RELAXED );
+        unsigned long long lm = __atomic_load_n( &nspa_lf_lookup_miss,       __ATOMIC_RELAXED );
+        unsigned long long ls = __atomic_load_n( &nspa_lf_lookup_seq_retry,  __ATOMIC_RELAXED );
+        unsigned long long bo = __atomic_load_n( &nspa_lf_bucket_overflow,   __ATOMIC_RELAXED );
+        unsigned long long so = __atomic_load_n( &nspa_lf_subentry_overflow, __ATOMIC_RELAXED );
+        unsigned long long se = __atomic_load_n( &nspa_lf_seq_exhausted,     __ATOMIC_RELAXED );
         unsigned int populated_buckets = 0;
         unsigned int populated_slots   = 0;
 
@@ -417,6 +432,9 @@ static void nspa_lf_diag_dump( void )
         fprintf(f, "  lookup_hit                      %llu\n", lh);
         fprintf(f, "  lookup_miss                     %llu\n", lm);
         fprintf(f, "  lookup_seq_retry                %llu\n", ls);
+        fprintf(f, "  bucket_overflow                 %llu\n", bo);
+        fprintf(f, "  subentry_overflow               %llu\n", so);
+        fprintf(f, "  seq_exhausted                   %llu\n", se);
 
         /* Phase 1A.3 audit — show client intercept activity. */
         {
@@ -613,6 +631,7 @@ NTSTATUS nspa_local_file_publish_open( unsigned long long device, unsigned long 
         if (empty_slot_idx < 0)
         {
             /* Bucket overflow — caller falls back to server. */
+            __atomic_fetch_add( &nspa_lf_bucket_overflow, 1, __ATOMIC_RELAXED );
             pi_mutex_unlock( nspa_lf_lock_of( bucket ) );
             return STATUS_INSUFFICIENT_RESOURCES;
         }
@@ -638,6 +657,7 @@ NTSTATUS nspa_local_file_publish_open( unsigned long long device, unsigned long 
         {
             /* Subentry overflow — too many client procs hold this inode.
              * Caller falls back to server. */
+            __atomic_fetch_add( &nspa_lf_subentry_overflow, 1, __ATOMIC_RELAXED );
             pi_mutex_unlock( nspa_lf_lock_of( bucket ) );
             return STATUS_INSUFFICIENT_RESOURCES;
         }

@@ -3434,6 +3434,7 @@ enum caret_state
     int            unicode;        /* is it a unicode hook? */
     int            has_next;       /* NSPA: 1 if another hook follows, 0 if this is the last */
     int            has_global;     /* NSPA: 1 if a desktop-global hook table was pinned and still needs a finish_hook_chain RPC */
+    int            tier1_active;   /* NSPA: 1 if server is using the client-shmem refcount for queue-local pinning on this queue; client must match */
     client_ptr_t   proc;           /* hook procedure */
     VARARG(module,unicode_str);    /* module name */
 @END

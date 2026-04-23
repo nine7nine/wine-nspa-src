@@ -4686,20 +4686,19 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
          * a real conflict (propagate), or STATUS_NOT_SUPPORTED to fall
          * back to the existing server path.  Eligibility filter mirrors
          * nspa_local_file_diag_categorize. */
-        /* Phase 1A.3 audit (2026-04-22) result: re-allowing
-         * FILE_NON_DIRECTORY_FILE engages the section-promotion path
-         * cleanly (zero section_promote failures across all wineboot
-         * processes), but Ableton still fails because OTHER Nt*File
-         * operations (NtFsControlFile, NtQueryInformationFile,
-         * NtSetInformationFile) send the local-range handle to the
-         * server, which doesn't know it.
-         *
-         * Conservative MVP eligibility kept until per-Nt*File local-
-         * handle interception work is done (Phase 1A.4: audit each
-         * Nt*File function in unix/file.c, intercept where local
-         * handles flow, route to local fd or fall back to STATUS_NOT_
-         * SUPPORTED with caller-side promotion).  See plan_local_file_
-         * bypass.md for the next slice. */
+        /* Phase 1A.4 partial: NtFsControlFile (b), NtQueryInformationFile
+         * (c), NtSetInformationFile (d), NtLockFile/NtUnlockFile (e)
+         * all route local-range handles through lazy server-handle
+         * promotion.  However live testing under Ableton shows there
+         * is still ≥1 Wine path using a handle-passing operation we
+         * haven't identified — broader eligibility breaks GUI driver
+         * bringup the same way as before.  Eligibility kept
+         * conservative pending continued audit (NtDeviceIoControlFile,
+         * NtCancelIoFile, NtNotifyChangeDirectoryFile,
+         * NtQueryVolumeInformationFile, NtQueryEaFile, NtQueryDirectoryFile,
+         * server_get_unix_name and other server_*_file helpers).
+         * Promotion infrastructure remains live for the few cases it
+         * does cover. */
         if (!attr->RootDirectory && !attr->SecurityDescriptor &&
             disposition == FILE_OPEN &&
             !(options & (FILE_OPEN_BY_FILE_ID | FILE_DIRECTORY_FILE | FILE_DELETE_ON_CLOSE |
@@ -5050,24 +5049,34 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
     unsigned int reparse_tag;
     unsigned int options;
     unsigned int status;
+    HANDLE srv_handle = handle;
 
     TRACE( "(%p,%p,%p,0x%08x,0x%08x)\n", handle, io, ptr, len, class);
 
     io->Information = 0;
 
+    /* NSPA local-file Phase 1A.4.c: lazy-promote local handles before
+     * any server_get_file_info call.  server_get_unix_fd below stays
+     * on the original (local) handle for the local-fd fast path. */
+    if (nspa_local_file_is_local_handle( handle ))
+    {
+        HANDLE promoted = nspa_local_file_get_or_promote_server_handle( handle );
+        if (promoted) srv_handle = promoted;
+    }
+
     if (class == WineFileUnixNameInformation)
-        return server_get_file_info( handle, io, ptr, len, class );
+        return server_get_file_info( srv_handle, io, ptr, len, class );
     if (class <= 0 || class >= FileMaximumInformation)
         return io->Status = STATUS_INVALID_INFO_CLASS;
     if (!info_sizes[class])
-        return server_get_file_info( handle, io, ptr, len, class );
+        return server_get_file_info( srv_handle, io, ptr, len, class );
     if (len < info_sizes[class])
         return io->Status = STATUS_INFO_LENGTH_MISMATCH;
 
     if ((status = server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, &options )))
     {
         if (status != STATUS_BAD_DEVICE_TYPE) return io->Status = status;
-        return server_get_file_info( handle, io, ptr, len, class );
+        return server_get_file_info( srv_handle, io, ptr, len, class );
     }
 
     switch (class)
@@ -5225,8 +5234,18 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
 {
     int fd, needs_close;
     unsigned int status = STATUS_SUCCESS;
+    HANDLE srv_handle = handle;
 
     TRACE( "(%p,%p,%p,0x%08x,0x%08x)\n", handle, io, ptr, len, class );
+
+    /* NSPA local-file Phase 1A.4.d: lazy-promote local handles before
+     * any SERVER_START_REQ.  server_get_unix_fd below stays on the
+     * original (local) handle for the local-fd fast path. */
+    if (nspa_local_file_is_local_handle( handle ))
+    {
+        HANDLE promoted = nspa_local_file_get_or_promote_server_handle( handle );
+        if (promoted) srv_handle = promoted;
+    }
 
     switch (class)
     {
@@ -5240,7 +5259,7 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
             if ((status = server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, NULL )))
                 return io->Status = status;
 
-            if (server_get_unix_name( handle, &unix_name )) unix_name = NULL;
+            if (server_get_unix_name( srv_handle, &unix_name )) unix_name = NULL;
 
             mtime.QuadPart = info->LastWriteTime.QuadPart == -1 ? 0 : info->LastWriteTime.QuadPart;
             atime.QuadPart = info->LastAccessTime.QuadPart == -1 ? 0 : info->LastAccessTime.QuadPart;
@@ -5281,7 +5300,7 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
 
             SERVER_START_REQ( set_fd_eof_info )
             {
-                req->handle   = wine_server_obj_handle( handle );
+                req->handle   = wine_server_obj_handle( srv_handle );
                 req->eof      = info->EndOfFile.QuadPart;
                 status = wine_server_call( req );
             }
@@ -5303,7 +5322,7 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
 
             SERVER_START_REQ( set_named_pipe_info )
             {
-                req->handle = wine_server_obj_handle( handle );
+                req->handle = wine_server_obj_handle( srv_handle );
                 req->flags  = (info->CompletionMode ? NAMED_PIPE_NONBLOCKING_MODE    : 0) |
                               (info->ReadMode       ? NAMED_PIPE_MESSAGE_STREAM_READ : 0);
                 status = wine_server_call( req );
@@ -5319,7 +5338,7 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
 
             SERVER_START_REQ( set_mailslot_info )
             {
-                req->handle = wine_server_obj_handle( handle );
+                req->handle = wine_server_obj_handle( srv_handle );
                 req->flags = MAILSLOT_SET_READ_TIMEOUT;
                 req->read_timeout = info->ReadTimeout.QuadPart;
                 status = wine_server_call( req );
@@ -5335,7 +5354,7 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
 
             SERVER_START_REQ( set_completion_info )
             {
-                req->handle   = wine_server_obj_handle( handle );
+                req->handle   = wine_server_obj_handle( srv_handle );
                 req->chandle  = wine_server_obj_handle( info->CompletionPort );
                 req->ckey     = info->CompletionKey;
                 status = wine_server_call( req );
@@ -5355,7 +5374,7 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
 
             SERVER_START_REQ( set_fd_completion_mode )
             {
-                req->handle   = wine_server_obj_handle( handle );
+                req->handle   = wine_server_obj_handle( srv_handle );
                 req->flags    = info->Flags;
                 status = wine_server_call( req );
             }
@@ -5417,7 +5436,7 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
 
             SERVER_START_REQ( set_fd_disp_info )
             {
-                req->handle   = wine_server_obj_handle( handle );
+                req->handle   = wine_server_obj_handle( srv_handle );
                 req->flags    = info->DoDeleteFile ? FILE_DISPOSITION_DELETE : FILE_DISPOSITION_DO_NOT_DELETE;
                 status = wine_server_call( req );
             }
@@ -5436,7 +5455,7 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
 
             SERVER_START_REQ( set_fd_disp_info )
             {
-                req->handle   = wine_server_obj_handle( handle );
+                req->handle   = wine_server_obj_handle( srv_handle );
                 req->flags    = info->Flags;
                 status = wine_server_call( req );
             }
@@ -5472,7 +5491,7 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
             {
                 SERVER_START_REQ( set_fd_name_info )
                 {
-                    req->handle   = wine_server_obj_handle( handle );
+                    req->handle   = wine_server_obj_handle( srv_handle );
                     req->rootdir  = wine_server_obj_handle( attr.RootDirectory );
                     req->namelen  = attr.ObjectName->Length;
                     req->link     = FALSE;
@@ -5517,7 +5536,7 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
             {
                 SERVER_START_REQ( set_fd_name_info )
                 {
-                    req->handle   = wine_server_obj_handle( handle );
+                    req->handle   = wine_server_obj_handle( srv_handle );
                     req->rootdir  = wine_server_obj_handle( attr.RootDirectory );
                     req->namelen  = attr.ObjectName->Length;
                     req->link     = TRUE;
@@ -6779,12 +6798,23 @@ NTSTATUS WINAPI NtFsControlFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE ap
     int fd, needs_close;
     ULONG_PTR size = 0;
     NTSTATUS status;
+    HANDLE srv_handle = handle;
 
     TRACE( "(%p,%p,%p,%p,%p,0x%08x,%p,0x%08x,%p,0x%08x)\n",
            handle, event, apc, apc_context, io, code,
            in_buffer, in_size, out_buffer, out_size );
 
     if (!io) return STATUS_INVALID_PARAMETER;
+
+    /* NSPA local-file Phase 1A.4.b: lazy-promote local handles before
+     * any server_ioctl_file call.  server_get_unix_fd below stays on
+     * the original (local) handle so it routes through the per-process
+     * file table without a server RTT. */
+    if (nspa_local_file_is_local_handle( handle ))
+    {
+        HANDLE promoted = nspa_local_file_get_or_promote_server_handle( handle );
+        if (promoted) srv_handle = promoted;
+    }
 
     status = server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, &options );
     if (status && status != STATUS_BAD_DEVICE_TYPE)
@@ -6796,14 +6826,14 @@ NTSTATUS WINAPI NtFsControlFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE ap
     switch (code)
     {
     case FSCTL_DISMOUNT_VOLUME:
-        status = server_ioctl_file( handle, event, apc, apc_context, io, code,
+        status = server_ioctl_file( srv_handle, event, apc, apc_context, io, code,
                                     in_buffer, in_size, out_buffer, out_size );
-        if (!status) status = unmount_device( handle );
+        if (!status) status = unmount_device( srv_handle );
         return status;
 
     case FSCTL_PIPE_IMPERSONATE:
         FIXME("FSCTL_PIPE_IMPERSONATE: impersonating self\n");
-        return server_ioctl_file( handle, event, apc, apc_context, io, code,
+        return server_ioctl_file( srv_handle, event, apc, apc_context, io, code,
                                   in_buffer, in_size, out_buffer, out_size );
 
     case FSCTL_IS_VOLUME_MOUNTED:
@@ -6862,12 +6892,12 @@ NTSTATUS WINAPI NtFsControlFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE ap
         status = STATUS_SUCCESS;
         break;
     default:
-        return server_ioctl_file( handle, event, apc, apc_context, io, code,
+        return server_ioctl_file( srv_handle, event, apc, apc_context, io, code,
                                   in_buffer, in_size, out_buffer, out_size );
     }
 
     if (!NT_ERROR(status) && status != STATUS_PENDING)
-        file_complete_async( handle, options, event, apc, apc_context, io, status, size );
+        file_complete_async( srv_handle, options, event, apc, apc_context, io, status, size );
     return status;
 }
 
@@ -7032,6 +7062,7 @@ NTSTATUS WINAPI NtLockFile( HANDLE file, HANDLE event, PIO_APC_ROUTINE apc, void
     unsigned int ret;
     HANDLE handle;
     BOOLEAN async;
+    HANDLE srv_file = file;
 
     if (apc || io_status || key)
     {
@@ -7040,11 +7071,19 @@ NTSTATUS WINAPI NtLockFile( HANDLE file, HANDLE event, PIO_APC_ROUTINE apc, void
     }
     if (apc_user && !warn++) FIXME("I/O completion on lock not implemented yet\n");
 
+    /* NSPA local-file Phase 1A.4.e: lock_file is server-mediated;
+     * promote local-range handles before the RPC. */
+    if (nspa_local_file_is_local_handle( file ))
+    {
+        HANDLE promoted = nspa_local_file_get_or_promote_server_handle( file );
+        if (promoted) srv_file = promoted;
+    }
+
     for (;;)
     {
         SERVER_START_REQ( lock_file )
         {
-            req->handle      = wine_server_obj_handle( file );
+            req->handle      = wine_server_obj_handle( srv_file );
             req->offset      = offset->QuadPart;
             req->count       = count->QuadPart;
             req->shared      = !exclusive;
@@ -7087,6 +7126,7 @@ NTSTATUS WINAPI NtUnlockFile( HANDLE handle, IO_STATUS_BLOCK *io_status, LARGE_I
                               LARGE_INTEGER *count, ULONG *key )
 {
     unsigned int status;
+    HANDLE srv_handle = handle;
 
     TRACE( "%p %p %s %s\n",
            handle, io_status, wine_dbgstr_longlong(offset->QuadPart), wine_dbgstr_longlong(count->QuadPart) );
@@ -7098,9 +7138,16 @@ NTSTATUS WINAPI NtUnlockFile( HANDLE handle, IO_STATUS_BLOCK *io_status, LARGE_I
         return (io_status->Status = STATUS_NOT_IMPLEMENTED);
     }
 
+    /* NSPA local-file Phase 1A.4.e: unlock_file is server-mediated. */
+    if (nspa_local_file_is_local_handle( handle ))
+    {
+        HANDLE promoted = nspa_local_file_get_or_promote_server_handle( handle );
+        if (promoted) srv_handle = promoted;
+    }
+
     SERVER_START_REQ( unlock_file )
     {
-        req->handle = wine_server_obj_handle( handle );
+        req->handle = wine_server_obj_handle( srv_handle );
         req->offset = offset->QuadPart;
         req->count  = count->QuadPart;
         status = wine_server_call( req );

@@ -314,6 +314,7 @@ extern int      nspa_local_file_is_local_handle( HANDLE h );
 extern int      nspa_local_file_close( HANDLE handle );
 extern void     nspa_local_file_section_intercept_bump( int cause );
 extern void     nspa_local_file_get_unix_fd_intercept_bump( void );
+extern HANDLE   nspa_local_file_get_or_promote_server_handle( HANDLE local_handle );
 extern void *create_startup_info( const UNICODE_STRING *nt_image, ULONG process_flags,
                                   const RTL_USER_PROCESS_PARAMETERS *params,
                                   const struct pe_image_info *pe_info, DWORD *info_size );

@@ -534,6 +534,14 @@ DECL_HANDLER(start_hook_chain)
     reply->proc    = hook->proc;
     reply->handle  = hook->handle;
     reply->unicode = hook->unicode;
+    /* NSPA: peek at the next hook while we're already walking the chain.
+     * Lets the client skip the get_hook_info(get_next=1) RPC when the
+     * current hook is the only/last one in the chain — 33% RTT saving
+     * on chain-length-1 invocations (the common case for Ableton's
+     * single WH_WINEVENT hook dispatched thousands of times per
+     * second during menu activity). */
+    reply->has_next = get_next_hook( current, hook, req->event, req->window,
+                                     req->object_id, req->child_id ) ? 1 : 0;
     if (table) table->counts[hook->index]++;
     if (global_table) global_table->counts[hook->index]++;
     if (hook->module) set_reply_data( hook->module, hook->module_size );

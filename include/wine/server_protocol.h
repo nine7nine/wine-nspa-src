@@ -4650,6 +4650,8 @@ struct start_hook_chain_reply
     process_id_t   pid;
     thread_id_t    tid;
     int            unicode;
+    int            has_next;
+    char __pad_28[4];
     client_ptr_t   proc;
     /* VARARG(module,unicode_str); */
 };
@@ -7418,6 +7420,6 @@ union generic_reply
     struct nspa_get_inode_table_reply nspa_get_inode_table_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 943
+#define SERVER_PROTOCOL_VERSION 944
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

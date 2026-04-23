@@ -25,9 +25,10 @@
  *   - Cross-process NtDuplicateObject of a managed timer: rejected with
  *     STATUS_ACCESS_DENIED.  Matches timer audit §H.
  *
- * Feature gate: NSPA_LOCAL_TIMERS=1 in the environment.  Default off until
- * validated on Ableton + the broader app set, consistent with the NSPA
- * invariant "local dispatch is optimisation, never a behaviour change".
+ * Feature gate: local dispatch is on by default.  Set
+ * NSPA_DISABLE_LOCAL_TIMERS=1 to fall back to wineserver; useful for
+ * bisecting regressions, per the NSPA invariant "local dispatch is
+ * optimisation, never a behaviour change".
  *
  * Clock semantics: the dispatcher's internal deadline, queue ordering, and
  * pi_cond_timedwait all run on CLOCK_MONOTONIC.  This is the RT-correct
@@ -135,10 +136,9 @@ static pthread_once_t table_once = PTHREAD_ONCE_INIT;
 
 static void init_feature_gate(void)
 {
-    const char *env = getenv( "NSPA_LOCAL_TIMERS" );
-    nspa_local_timers_enabled = (env && env[0] == '1') ? 1 : 0;
-    if (nspa_local_timers_enabled)
-        TRACE( "NSPA local NT timer dispatch: ENABLED\n" );
+    nspa_local_timers_enabled = (getenv( "NSPA_DISABLE_LOCAL_TIMERS" ) == NULL);
+    if (!nspa_local_timers_enabled)
+        TRACE( "NSPA local NT timer dispatch: DISABLED (NSPA_DISABLE_LOCAL_TIMERS set)\n" );
 }
 
 static void init_table_buckets(void)

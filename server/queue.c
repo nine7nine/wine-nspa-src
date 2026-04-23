@@ -1092,8 +1092,8 @@ static void free_message( struct message *msg )
  *     the legacy `shared->wake_bits`.
  *
  * Both are evaluated at wineserver start and cached.  Independent of
- * client-side NSPA_ENABLE_MSG_BYPASS so the plumbing can be A/B tested
- * with bypass on.  See docs/send-message-bypass-design.md §15.10. */
+ * the client-side bypass gate so the plumbing can be A/B tested with
+ * bypass on.  See docs/send-message-bypass-design.md §15.10. */
 static int nspa_server_ring_arb_off = -1;
 static int nspa_server_wake_syn_off = -1;
 static int nspa_server_alloc_off    = -1;

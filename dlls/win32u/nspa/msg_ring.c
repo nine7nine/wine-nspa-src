@@ -143,13 +143,7 @@ static BOOL nspa_bypass_disabled( void )
     static int cached = -1;
 
     if (cached == -1)
-    {
-        /* Opt-in: off by default while the feature is being stabilised.
-         * Legacy NSPA_DISABLE_MSG_BYPASS=1 still forces off. */
-        if (getenv( "NSPA_DISABLE_MSG_BYPASS" )) cached = 1;
-        else if (getenv( "NSPA_ENABLE_MSG_BYPASS" )) cached = 0;
-        else cached = 1;
-    }
+        cached = (getenv( "NSPA_DISABLE_MSG_BYPASS" ) != NULL);
     return cached;
 }
 
@@ -906,14 +900,11 @@ static void nspa_own_tls_init_once( void )
     pthread_key_create( &nspa_own_tls_key, nspa_own_tls_destructor );
 }
 
-static int nspa_own_bootstrap_enabled( void )
+static int nspa_own_bootstrap_disabled( void )
 {
     static int cached = -1;
     if (cached < 0)
-    {
-        const char *v = getenv( "NSPA_ENABLE_OWN_BOOTSTRAP" );
-        cached = (v && *v && *v != '0');
-    }
+        cached = (getenv( "NSPA_DISABLE_OWN_BOOTSTRAP" ) != NULL);
     return cached;
 }
 
@@ -933,9 +924,7 @@ static const nspa_queue_bypass_shm_t *nspa_get_own_bypass_shm( void )
      *    local shmem check — without it, check_queue_bits returns
      *    "nothing to do" for ring-pending SENDs and the thread never
      *    wakes the dispatcher until some other trigger fires.
-     * 2. Reply slot reservation for SEND-class bypass (gated opt-in via
-     *    NSPA_ENABLE_OWN_BOOTSTRAP in nspa_try_send_ring — that's the
-     *    dispatch-latency-sensitive path).
+     * 2. Reply slot reservation for SEND-class bypass (nspa_try_send_ring).
      */
     if (nspa_bypass_disabled()) return NULL;
 
@@ -1025,20 +1014,16 @@ const nspa_queue_bypass_shm_t *nspa_get_peer_bypass_shm_public( DWORD peer_tid )
     return entry ? nspa_get_cached_bypass_shm( entry ) : NULL;
 }
 
-/* Opt-in: NSPA_ENABLE_CLIENT_RING_DISPATCH=1 makes peek_message scan the
- * own ring for SEND-class msgs BEFORE issuing the wineserver get_message
- * request.  This is the Phase 4.6 dispatch-latency fix: removes the
- * server RTT from the hot SEND dispatch path so MainThread can consume
- * ring SENDs within microseconds instead of tens of milliseconds.
- * Default off until validated. */
-static int nspa_client_ring_dispatch_enabled( void )
+/* peek_message scans the own ring for SEND-class msgs BEFORE issuing the
+ * wineserver get_message request.  This is the Phase 4.6 dispatch-latency
+ * fix: removes the server RTT from the hot SEND dispatch path so MainThread
+ * can consume ring SENDs within microseconds instead of tens of milliseconds.
+ * Set NSPA_DISABLE_CLIENT_RING_DISPATCH=1 to fall back to server-scan. */
+static int nspa_client_ring_dispatch_disabled( void )
 {
     static int cached = -1;
     if (cached < 0)
-    {
-        const char *v = getenv( "NSPA_ENABLE_CLIENT_RING_DISPATCH" );
-        cached = (v && *v && *v != '0');
-    }
+        cached = (getenv( "NSPA_DISABLE_CLIENT_RING_DISPATCH" ) != NULL);
     return cached;
 }
 
@@ -1083,7 +1068,7 @@ BOOL nspa_try_pop_own_ring_send( HWND filter_hwnd, UINT first, UINT last,
     volatile nspa_msg_ring_t *ring;
     unsigned int head, tail, cursor;
 
-    if (!nspa_client_ring_dispatch_enabled()) return FALSE;
+    if (nspa_client_ring_dispatch_disabled()) return FALSE;
     if (!own) return FALSE;
 
     /* Only the "any window" case can be handled correctly client-side.
@@ -1184,7 +1169,7 @@ BOOL nspa_try_pop_own_ring_post( HWND filter_hwnd, UINT first, UINT last,
 
     /* Same opt-in gate as Phase 4.6 — single env var for all client-side
      * ring dispatch behaviour. */
-    if (!nspa_client_ring_dispatch_enabled()) return FALSE;
+    if (nspa_client_ring_dispatch_disabled()) return FALSE;
 
     /* Specific-window filter requires server's window tree to evaluate
      * is_child_window correctly.  Fall back to server.  Same constraint
@@ -1425,12 +1410,11 @@ BOOL nspa_try_send_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
     /* Sync sends need our own reply ring + sync handle. */
     if (!is_notify)
     {
-        /* SEND bypass remains opt-in via NSPA_ENABLE_OWN_BOOTSTRAP until
-         * the dispatch-latency fix (Phase 4.5 client-side ring-SEND pump)
-         * lands.  Own ring is still bootstrapped for wake-bit synthesis
-         * (nspa_get_own_bypass_shm is called elsewhere); only using the
-         * reply ring for synchronous SEND is gated. */
-        if (!nspa_own_bootstrap_enabled())
+        /* SEND bypass uses the caller's own reply ring + sync handle.
+         * Can be disabled for bisection via NSPA_DISABLE_OWN_BOOTSTRAP;
+         * the own ring is still bootstrapped for wake-bit synthesis
+         * (nspa_get_own_bypass_shm is called elsewhere). */
+        if (nspa_own_bootstrap_disabled())
         {
             TRACE_(nspa_bypass)( "send skip send-opt-in-disabled dest=%04x msg=%04x\n",
                                  (UINT)dest_tid, msg );

@@ -37,7 +37,6 @@
 #ifdef HAVE_PWD_H
 # include <pwd.h>
 #endif
-#include <sched.h>  /* NSPA v2.4: sched_{get,set}scheduler for shmem-IPC PI boost */
 #include <signal.h>
 #include <sys/ioctl.h>  /* NSPA Shape A: ioctl() for NTSYNC_IOC_EVENT_SET_PI */
 #ifdef HAVE_LINUX_NTSYNC_H

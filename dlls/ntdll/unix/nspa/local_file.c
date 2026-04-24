@@ -1119,6 +1119,36 @@ static unsigned int nspa_lf_handle_next;
 /* PI mutex — handle allocator can be hit from RT threads. */
 static DEFINE_PI_MUTEX(nspa_lf_handle_mutex, 0);
 
+/* ABA properties (audited 2026-04-24, Item 6 of bypass-hardening-notes.md):
+ *
+ * Encoded HANDLE is nspa_lf_handle_base + slot*4 — no generation bits.
+ * HANDLE values are reused when a slot is freed and later re-allocated.
+ * This matches Win32 PEB HANDLE semantics (the NT kernel also reuses
+ * handle values after NtClose), so consumers who cache a HANDLE across
+ * a close boundary are already in undefined territory per the platform
+ * contract.  No generation counter is added.
+ *
+ * Concurrent close+alloc race is prevented by the close-path ordering
+ * invariant in nspa_local_file_close():
+ *   1. lock nspa_lf_opens_mutex
+ *   2. remove the entry from nspa_lf_opens (list is now clean for this HANDLE)
+ *   3. unlock nspa_lf_opens_mutex
+ *   4. publish_close / close(unix_fd) / close server_handle
+ *   5. nspa_lf_free_handle(handle)  ← slot flipped to free LAST
+ *
+ * A concurrent nspa_lf_alloc_handle() call during steps 1-4 sees the
+ * slot as in_use and picks a different one.  Only after step 5 can the
+ * slot be reused, at which point every LF-side reference to the old
+ * HANDLE is gone.
+ *
+ * LF is fully synchronous — no async completion paths can deliver a
+ * stale HANDLE value to a caller after close.
+ *
+ * Do not reorder steps 4 and 5 in nspa_local_file_close().  Freeing
+ * the slot before the list is fully cleared would allow a concurrent
+ * alloc to mint a duplicate HANDLE that collides with the in-flight
+ * close's list entry. */
+
 static HANDLE nspa_lf_alloc_handle( void )
 {
     unsigned int i, slot;
@@ -1588,6 +1618,8 @@ int nspa_local_file_close( HANDLE handle )
         SERVER_END_REQ;
     }
 
+    /* Free the slot LAST — ordering invariant for ABA-safety.  See the
+     * comment block above nspa_lf_alloc_handle (search "ABA properties"). */
     nspa_lf_free_handle( handle );
     return 1;
 }

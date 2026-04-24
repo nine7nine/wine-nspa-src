@@ -44,12 +44,6 @@ extern BOOL nspa_try_send_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
                                 LRESULT *result_out );
 extern BOOL nspa_write_ring_reply( DWORD sender_tid, UINT reply_slot_idx,
                                    LRESULT result, const void *data, UINT data_size );
-/* T1 diagnostic: caller-side SEH-swallowed fault counter.  Called from
- * send_inter_thread_message's __EXCEPT block so we can distinguish a
- * fault-during-bypass from the ordinary reject exits.  No-op when the
- * NSPA_SEND_DIAG gate is off. */
-extern void nspa_send_diag_fault_bump( void );
-
 /* Phase 4.7: client-side POST-class pop from own ring.  Returns TRUE if
  * a MSG_POSTED slot was claimed (READY → CONSUMED) and fields populated.
  * Arbitration check: bails when queue_shm->wake_bits indicates server has

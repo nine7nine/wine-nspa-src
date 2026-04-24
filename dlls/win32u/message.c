@@ -4043,33 +4043,16 @@ static LRESULT send_inter_thread_message( const struct send_message_info *info, 
      * MSG_NOTIFY via the shmem ring + reply ring.  On success the reply has
      * already been received and *res_ptr is filled.
      *
-     * SEH guard: some PE-created threads (Ableton DWM-Sync observed) fault
-     * inside the ring path for reasons still under investigation.  Rather
-     * than let the fault trigger an unwind-and-retry loop that chews 100 %
-     * CPU with no diagnostic, catch it here, log, and fall through to the
-     * server path. */
+     * The SEH wrap that used to protect this call (for a fault observed
+     * with the pre-memfd session-shmem plumbing) was retired on
+     * 2026-04-24 after an Ableton session with NSPA_SEND_DIAG=1 showed
+     * rej_faulted_seh=0 across 18,070 sends / 12 processes.  See Item 1
+     * in nspa/docs/bypass-hardening-notes.md. */
+    if (nspa_try_send_ring( info->dest_tid, info->type, info->hwnd, info->msg,
+                            info->wparam, info->lparam, &ring_result ))
     {
-        BOOL bypass_ret = FALSE;
-        __TRY
-        {
-            bypass_ret = nspa_try_send_ring( info->dest_tid, info->type, info->hwnd, info->msg,
-                                             info->wparam, info->lparam, &ring_result );
-        }
-        __EXCEPT
-        {
-            WARN_(nspa_bypass)( "nspa_try_send_ring faulted for dest=%04x type=%u hwnd=%p msg=%04x — falling back to server\n",
-                                (UINT)info->dest_tid, info->type, info->hwnd, info->msg );
-            nspa_send_diag_fault_bump();
-            bypass_ret = FALSE;
-        }
-        __ENDTRY
-        TRACE_(nspa_bypass)( "PROBE post-bypass ret=%d dest=%04x type=%u\n",
-                             bypass_ret, (UINT)info->dest_tid, info->type );
-        if (bypass_ret)
-        {
-            if (res_ptr) *res_ptr = ring_result;
-            return 1;
-        }
+        if (res_ptr) *res_ptr = ring_result;
+        return 1;
     }
 
     if (!put_message_in_queue( info, &reply_size )) return 0;

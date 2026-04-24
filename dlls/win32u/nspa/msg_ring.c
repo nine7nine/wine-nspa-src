@@ -187,7 +187,6 @@ enum nspa_send_reason
     SEND_REJ_NO_OWN_SYNC,
     SEND_REJ_DEST_RING_FULL,
     SEND_REJ_REPLY_TIMEOUT,
-    SEND_REJ_FAULTED_SEH,
     SEND_REASON_NB
 };
 
@@ -227,7 +226,6 @@ static const char *const nspa_send_reason_name[SEND_REASON_NB] = {
     "rej_no_own_sync",
     "rej_dest_ring_full",
     "rej_reply_timeout",
-    "rej_faulted_seh",
 };
 
 static const char *const nspa_post_reason_name[POST_REASON_NB] = {
@@ -365,14 +363,6 @@ static void nspa_post_diag_bump( enum nspa_post_reason r )
     if (!nspa_send_diag_enabled()) return;
     __atomic_fetch_add( &nspa_diag_post[r], 1, __ATOMIC_RELAXED );
     nspa_diag_tid_bump_post( HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ), r );
-    nspa_diag_lazy_start();
-}
-
-/* External-facing bumper for send_inter_thread_message's __EXCEPT block. */
-void nspa_send_diag_fault_bump( void )
-{
-    if (!nspa_send_diag_enabled()) return;
-    __atomic_fetch_add( &nspa_diag_send[SEND_REJ_FAULTED_SEH], 1, __ATOMIC_RELAXED );
     nspa_diag_lazy_start();
 }
 

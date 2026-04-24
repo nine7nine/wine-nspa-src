@@ -45,6 +45,10 @@
 #ifdef HAVE_SYS_RESOURCE_H
 #include <sys/resource.h>
 #endif
+#include <sys/ioctl.h>        /* NSPA Shape A: for NTSYNC_IOC_CREATE_EVENT ioctl */
+#ifdef HAVE_LINUX_NTSYNC_H
+# include <linux/ntsync.h>    /* NSPA Shape A: ntsync_event_args */
+#endif
 #ifdef __APPLE__
 #include <mach/mach_init.h>
 #include <mach/mach_time.h>
@@ -549,11 +553,13 @@ static struct context *create_thread_context( struct thread *thread )
 /* create a new thread */
 #ifdef __linux__
 
-/* NSPA v1.5 shmem IPC: helpers for the per-client dispatcher pthread.
- * See server/file.h for global_lock / poll_generation semantics. */
-
-#define NSPA_FUTEX_WAIT 0
-#define NSPA_FUTEX_WAKE 1
+/* NSPA Shape A shmem IPC: helpers for the per-client dispatcher pthread.
+ * Signalling is via a per-thread ntsync event fd; PI is kernel-atomic via
+ * NTSYNC_IOC_EVENT_SET_PI. The dispatcher blocks in NTSYNC_IOC_WAIT_ANY
+ * on its event fd and wakes up already boosted when an RT client signals.
+ * Reply direction still uses a plain futex (request_shm->reply_futex)
+ * since no PI is needed server→client. See server/file.h for
+ * global_lock / poll_generation semantics. */
 
 static void nspa_handle_shm_request( struct thread *thread, struct request_shm *request_shm )
 {
@@ -561,79 +567,64 @@ static void nspa_handle_shm_request( struct thread *thread, struct request_shm *
     read_request_shm( thread, request_shm );
 }
 
-/* Dispatcher pthread: one per client thread. Sits in FUTEX_WAIT on the
- * client's request_shm->futex. When the client wakes it (futex 0->1),
- * it grabs global_lock, dispatches the request via the existing
- * req_handlers[] table, writes the reply into shared memory, transitions
- * the futex back to 0, FUTEX_WAKEs the client, and loops.
+/* Dispatcher pthread: one per client thread. Blocks in NTSYNC_IOC_WAIT_ANY
+ * on thread->request_event_fd. When the client signals with
+ * NTSYNC_IOC_EVENT_SET_PI, the kernel atomically wakes this pthread AND
+ * boosts its task to the caller's RT priority. After dispatching one
+ * request and writing the reply, we FUTEX_WAKE the client on reply_futex
+ * and loop back to WAIT. Re-entering WAIT auto-releases any PI boost.
  *
- * On teardown (futex set to -1 by cleanup_thread), it releases its hold on
- * the shm mapping and exits. */
+ * Teardown: server closes request_event_fd in cleanup_thread. The WAIT
+ * ioctl returns with EBADF (fd closed under us) and we exit the loop. */
 static void *nspa_request_shm_thread( void *param )
 {
     struct thread *thread = param;
     int request_shm_fd;
+    int event_fd;
+    int device_fd = get_inproc_device_fd();
     volatile struct request_shm *request_shm;
     unsigned long generation = 0;
 
     pi_mutex_lock( &global_lock );
     request_shm_fd = thread->request_shm_fd;
     request_shm = thread->request_shm;
+    event_fd = thread->request_event_fd;
     pi_mutex_unlock( &global_lock );
 
-    /* NSPA v2.4: publish our Linux TID to the shm so the client can boost
-     * us via sched_setscheduler when it's blocked on a reply at a higher
-     * RT priority than our own. Release ordering pairs with the client's
-     * acquire load in nspa_shm_pi_boost. Written once per dispatch thread
-     * lifetime — we never clear it, which is fine because the client only
-     * reads it while this thread is still servicing the shm. */
-    if (request_shm)
-        __atomic_store_n( &request_shm->server_dispatch_tid,
-                          (int)syscall( __NR_gettid ),
-                          __ATOMIC_RELEASE );
+    if (device_fd < 0 || event_fd < 0 || !request_shm) goto done;
 
     for (;;)
     {
-        int val;
+        struct ntsync_wait_args wait_args = {
+            .timeout = ~(__u64)0,
+            .objs    = (uintptr_t)&event_fd,
+            .count   = 1,
+            .owner   = 0,       /* events don't use owner; mutex-only field */
+            .index   = ~0u,
+            .alert   = 0,
+        };
+        int ret;
 
-        while ((val = request_shm->futex) != 1)
-        {
-            if (val == -1) goto done;
-            if (val != 0)
-                fatal_protocol_error( thread, "nspa shmem: unknown futex state %d\n", val );
-            syscall( __NR_futex, &request_shm->futex, NSPA_FUTEX_WAIT, val, NULL, NULL, 0 );
-        }
+        do { ret = ioctl( device_fd, NTSYNC_IOC_WAIT_ANY, &wait_args ); }
+        while (ret < 0 && errno == EINTR);
+        if (ret < 0) goto done;  /* EBADF on fd close → teardown */
 
         pi_mutex_lock( &global_lock );
         generation = poll_generation;
-
-        val = request_shm->futex;
-        if (val != 1)
-        {
-            if (val != -1)
-                fatal_protocol_error( thread, "nspa shmem: unknown futex state %d (locked)\n", val );
-            goto done_locked;
-        }
-
-        /* aarch64-correct memory barriers: compiler fences alone are
-         * insufficient on weakly-ordered architectures. Ensure all writes
-         * made by the client before FUTEX_WAKE are visible to us before
-         * we dispatch, and all our writes are visible before we transition
-         * the futex back to 0. */
-        __atomic_thread_fence( __ATOMIC_SEQ_CST );
-        nspa_handle_shm_request( thread, (struct request_shm *)request_shm );
-        __atomic_thread_fence( __ATOMIC_SEQ_CST );
 
         request_shm_fd = thread->request_shm_fd;
         request_shm = thread->request_shm;
         if (request_shm_fd == -1 || !request_shm) goto done_locked;
 
-        val = __sync_val_compare_and_swap( &request_shm->futex, 1, 0 );
-        if (val != 1 && val != -1)
-            fatal_protocol_error( thread, "nspa shmem: unknown futex state %d (post)\n", val );
+        nspa_handle_shm_request( thread, (struct request_shm *)request_shm );
+
+        /* Publish reply: set reply_futex and wake the client. Single-writer
+         * on reply_futex from this side; client resets to 0 after reading. */
+        request_shm->reply_futex = 1;
 
         pi_mutex_unlock( &global_lock );
-        syscall( __NR_futex, &request_shm->futex, NSPA_FUTEX_WAKE, 1, NULL, NULL, 0 );
+        syscall( __NR_futex, &request_shm->reply_futex, 1 /* FUTEX_WAKE */,
+                 1, NULL, NULL, 0 );
 
         if (poll_generation != generation)
             force_exit_poll();
@@ -757,34 +748,66 @@ struct thread *create_thread( int fd, struct process *process, const struct secu
         pthread_attr_t attr;
         pthread_attr_t *pattr = NULL;
         int created;
+        int event_fd = -1;
 
-        if (nspa_srv_rt_prio > 0)
+#ifdef HAVE_LINUX_NTSYNC_H
+        /* NSPA Shape A: create a per-thread ntsync event fd. The client
+         * signals this via NTSYNC_IOC_EVENT_SET_PI to wake the dispatcher
+         * and atomically boost its priority. manual=0 + signaled=0 →
+         * auto-reset, initially clear (1-producer-1-consumer fits
+         * one-request-per-wake). All-or-nothing with the shm: if the
+         * event fd fails, drop the shm too and fall back to socket IPC. */
+        if (get_inproc_device_fd() >= 0)
         {
-            struct sched_param shm_param = { .sched_priority = nspa_srv_rt_prio };
-            pthread_attr_init( &attr );
-            pthread_attr_setinheritsched( &attr, PTHREAD_EXPLICIT_SCHED );
-            pthread_attr_setschedpolicy( &attr, nspa_srv_rt_policy );
-            pthread_attr_setschedparam( &attr, &shm_param );
-            pthread_attr_setscope( &attr, PTHREAD_SCOPE_SYSTEM );
-            pattr = &attr;
+            struct ntsync_event_args ev_args = { .signaled = 0, .manual = 0 };
+            event_fd = ioctl( get_inproc_device_fd(), NTSYNC_IOC_CREATE_EVENT, &ev_args );
         }
+#endif
 
-        grab_object( thread );  /* hold for the dispatcher pthread */
-        created = pthread_create( &pthread, pattr, nspa_request_shm_thread, thread );
-        if (pattr) pthread_attr_destroy( &attr );
-
-        if (created == 0)
+        if (event_fd == -1)
         {
-            pthread_detach( pthread );
-            thread->request_shm_thread_running = 1;
-        }
-        else
-        {
-            release_object( thread );
+            /* Either no ntsync support or event creation failed. Drop the
+             * shm — we want the signal primitive and the payload together,
+             * not in half-state. Falls back to socket IPC. */
             close( thread->request_shm_fd );
             munmap( (void *)thread->request_shm, REQUEST_SHM_SIZE );
             thread->request_shm_fd = -1;
             thread->request_shm = NULL;
+        }
+        else
+        {
+            thread->request_event_fd = event_fd;
+
+            if (nspa_srv_rt_prio > 0)
+            {
+                struct sched_param shm_param = { .sched_priority = nspa_srv_rt_prio };
+                pthread_attr_init( &attr );
+                pthread_attr_setinheritsched( &attr, PTHREAD_EXPLICIT_SCHED );
+                pthread_attr_setschedpolicy( &attr, nspa_srv_rt_policy );
+                pthread_attr_setschedparam( &attr, &shm_param );
+                pthread_attr_setscope( &attr, PTHREAD_SCOPE_SYSTEM );
+                pattr = &attr;
+            }
+
+            grab_object( thread );  /* hold for the dispatcher pthread */
+            created = pthread_create( &pthread, pattr, nspa_request_shm_thread, thread );
+            if (pattr) pthread_attr_destroy( &attr );
+
+            if (created == 0)
+            {
+                pthread_detach( pthread );
+                thread->request_shm_thread_running = 1;
+            }
+            else
+            {
+                release_object( thread );
+                close( thread->request_shm_fd );
+                munmap( (void *)thread->request_shm, REQUEST_SHM_SIZE );
+                thread->request_shm_fd = -1;
+                thread->request_shm = NULL;
+                close( thread->request_event_fd );
+                thread->request_event_fd = -1;
+            }
         }
     }
     else
@@ -860,13 +883,14 @@ static void cleanup_thread( struct thread *thread )
     if (thread->reply_fd) release_object( thread->reply_fd );
     if (thread->wait_fd) release_object( thread->wait_fd );
 #ifdef __linux__
-    /* NSPA v1.5: signal the dispatcher pthread to exit by transitioning the
-     * futex to -1 and waking it. The pthread owns the fd+mmap cleanup in its
-     * exit path; we only clean them up here if the pthread never started. */
-    if (thread->request_shm)
+    /* NSPA Shape A: close the per-thread ntsync event fd. This is the
+     * teardown signal — the dispatcher pthread's NTSYNC_IOC_WAIT_ANY
+     * returns with EBADF and the pthread owns fd+mmap cleanup in its
+     * exit path. If the pthread never started, we clean up here. */
+    if (thread->request_event_fd != -1)
     {
-        __atomic_exchange_n( &thread->request_shm->futex, -1, __ATOMIC_SEQ_CST );
-        syscall( __NR_futex, &thread->request_shm->futex, NSPA_FUTEX_WAKE, 1, NULL, NULL, 0 );
+        close( thread->request_event_fd );
+        thread->request_event_fd = -1;
     }
     if (!thread->request_shm_thread_running)
     {
@@ -2047,11 +2071,14 @@ DECL_HANDLER(init_first_thread)
 #ifdef __linux__
     /* NSPA v1.5 shmem IPC: pass per-thread shmem fd to the client.
      * Ordering: inproc_device (above) is sent first if present, then
-     * request_shm. Client-side server_init_process receives in the same
-     * order. The fd handle token is reply->tid to disambiguate from
-     * inproc_device's token. */
+     * request_shm, then (NSPA Shape A) request_event. Client-side
+     * server_init_process receives in the same order. Handle tokens
+     * disambiguate — reply->tid for request_shm, reply->tid | 0x80000000u for
+     * request_event. */
     if ((reply->has_request_shm = current->request_shm_fd != -1))
         send_client_fd( current->process, current->request_shm_fd, reply->tid );
+    if ((reply->has_request_event = current->request_event_fd != -1))
+        send_client_fd( current->process, current->request_event_fd, reply->tid | 0x80000000u );
 
     /* NSPA E2: use the tail of the first thread's request_shm as the
      * client-poll bitmap.  No separate shmem or protocol field needed. */
@@ -2085,9 +2112,12 @@ DECL_HANDLER(init_thread)
     reply->suspend = (is_thread_suspended( current ) || current->context != NULL);
 
 #ifdef __linux__
-    /* NSPA v1.5: pass per-thread shmem fd (fd handle token = current's tid). */
+    /* NSPA v1.5: pass per-thread shmem fd (fd handle token = current's tid).
+     * NSPA Shape A: then the ntsync event fd (tid | 2 disambiguates). */
     if ((reply->has_request_shm = current->request_shm_fd != -1))
         send_client_fd( current->process, current->request_shm_fd, get_thread_id( current ) );
+    if ((reply->has_request_event = current->request_event_fd != -1))
+        send_client_fd( current->process, current->request_event_fd, get_thread_id( current ) | 0x80000000u );
 #endif
 }
 

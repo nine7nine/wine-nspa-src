@@ -39,6 +39,22 @@
 #endif
 #include <sched.h>  /* NSPA v2.4: sched_{get,set}scheduler for shmem-IPC PI boost */
 #include <signal.h>
+#include <sys/ioctl.h>  /* NSPA Shape A: ioctl() for NTSYNC_IOC_EVENT_SET_PI */
+#ifdef HAVE_LINUX_NTSYNC_H
+# include <linux/ntsync.h>  /* NSPA Shape A */
+/* NSPA Shape A: compat shim matching dlls/ntdll/unix/sync.c for headers
+ * that ship without EVENT_SET_PI yet.  Keep in sync with sync.c. */
+# ifndef NTSYNC_IOC_EVENT_SET_PI
+struct ntsync_event_set_pi_args
+{
+    __u32 flags;
+    __u32 policy;
+    __u32 prio;
+    __u32 __pad;
+};
+#  define NTSYNC_IOC_EVENT_SET_PI _IOW('N', 0x8e, struct ntsync_event_set_pi_args)
+# endif
+#endif
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -306,135 +322,30 @@ static inline unsigned int wait_reply( struct __server_request_info *req )
 
 #ifdef __linux__
 
-/* NSPA v1.5 shmem IPC: futex-based fast path for small wineserver requests.
+/* NSPA Shape A: shmem IPC with ntsync signalling and kernel-atomic PI.
  * See server/thread.c:nspa_request_shm_thread for the server side.
  *
- * State machine on request_shm->futex:
- *   0 (idle)    → 1 (request pending): client wrote request, woke dispatcher
- *   1 (pending) → 0 (reply ready):    dispatcher wrote reply, woke client
- *   anything    → -1 (terminated):    teardown, either side should exit
+ * Protocol:
+ *   Client writes request body into request_shm, then sends
+ *   NTSYNC_IOC_EVENT_SET_PI (RT) or NTSYNC_IOC_EVENT_SET (non-RT) on its
+ *   per-thread request_event_fd. Kernel atomically wakes the dispatcher
+ *   pthread AND boosts its task to the caller's RT policy+prio. Client
+ *   then sleeps on request_shm->reply_futex until dispatcher writes the
+ *   reply and futex_wakes it.
  *
- * NSPA v2.4 layered on top of v1.5: manual priority inheritance for the
- * dispatch thread. When a high-priority (SCHED_FIFO/SCHED_RR) client is
- * blocked on a reply, we boost the wineserver dispatch thread to match
- * our policy+priority for the duration of the wait, then restore. This
- * prevents priority inversion where an intermediate-priority RT thread
- * would otherwise preempt the dispatch thread while the client waits.
+ * Teardown:
+ *   Server closes request_event_fd → dispatcher's NTSYNC_IOC_WAIT_ANY
+ *   returns with an error → dispatcher exits. No -1 sentinel needed.
  *
- * Same pattern as NSPA RT v2.3 CS-PI (manual boost via sched_setscheduler),
- * just applied to the shmem IPC dispatch thread instead of a CRITICAL_SECTION
- * holder. The dispatch thread's Linux TID is published in
- * request_shm->server_dispatch_tid by nspa_request_shm_thread() at startup.
- */
-#define NSPA_FUTEX_WAIT 0
-#define NSPA_FUTEX_WAKE 1
-
-/* Saved scheduling state for restore after an shm-ipc wait. */
-struct nspa_shm_boost_state
-{
-    int tid;     /* server dispatch TID (0 = no boost happened) */
-    int policy;  /* original scheduling class */
-    int prio;    /* original rt_priority */
-};
-
-/* Per-thread cache of the wineserver dispatch thread's base scheduling
- * state (before any boost). Populated once on the first PI boost via
- * sched_getscheduler/sched_getparam, then reused for all subsequent
- * unboosts. This avoids querying the server's state on every request. */
-static __thread int nspa_srv_base_policy = -1;  /* -1 = not yet cached */
-static __thread int nspa_srv_base_prio;
-
-/* NSPA v2.5: simplified PI boost using cached RT state.
- *
- * Boost the wineserver dispatch thread to match our own RT priority.
- *
- * Our own state: uses per-thread cached policy+prio when available
- * (populated by nspa_rt_apply_tid on self-promotion). Falls back to
- * sched_getscheduler(0) + sched_getparam(0) on cache miss (e.g.
- * cross-thread promotion or Tier 2), then populates the cache.
- *
- * Server's base state: queried once (first boost) and cached in TLS.
- *
- * Steady-state cost for RT threads: 1 boost + 1 unboost = 2 syscalls.
- * Non-RT threads: 1 syscall (sched_getscheduler) then fast-out.
- * Previous cost: 4 query + 1 boost + 1 unboost = 6 syscalls. */
-static void nspa_shm_pi_boost( volatile struct request_shm *shm,
-                                struct nspa_shm_boost_state *saved )
-{
-    struct ntdll_thread_data *data = ntdll_get_thread_data();
-    struct sched_param param;
-    int my_policy, my_prio, srv_tid;
-
-    saved->tid = 0;
-
-    /* Check our RT state. The cache (nspa_rt_cached_prio) is populated by
-     * nspa_rt_apply_tid(0, ...) for Tier 1 self-promotion. If the cache is
-     * empty (prio == 0), fall back to the syscall — covers cross-thread
-     * promotion and Tier 2 server-side scheduling. */
-    my_prio = data->nspa_rt_cached_prio;
-    my_policy = data->nspa_rt_cached_policy;
-
-    if (my_prio <= 0)
-    {
-        /* Cache miss — query the kernel and populate. */
-        my_policy = sched_getscheduler( 0 );
-        if (my_policy != SCHED_FIFO && my_policy != SCHED_RR)
-            return;
-        if (sched_getparam( 0, &param ) < 0 || param.sched_priority <= 0)
-            return;
-        my_prio = param.sched_priority;
-        /* Populate cache so subsequent requests skip the syscalls. */
-        data->nspa_rt_cached_policy = my_policy;
-        data->nspa_rt_cached_prio   = my_prio;
-    }
-
-    /* Acquire pairs with the dispatch thread's release store. */
-    srv_tid = __atomic_load_n( &shm->server_dispatch_tid, __ATOMIC_ACQUIRE );
-    if (srv_tid <= 0)
-        return;
-
-    /* Cache the server dispatch thread's base scheduling state on first
-     * boost. This is stable — the server sets it once at startup and never
-     * changes it (only we boost/unboost it transiently). */
-    if (nspa_srv_base_policy < 0)
-    {
-        struct sched_param srv_param;
-        nspa_srv_base_policy = sched_getscheduler( srv_tid );
-        if (nspa_srv_base_policy < 0)
-            nspa_srv_base_policy = SCHED_FIFO;
-        if (sched_getparam( srv_tid, &srv_param ) == 0)
-            nspa_srv_base_prio = srv_param.sched_priority;
-        else
-            nspa_srv_base_prio = 1;
-    }
-
-    /* Skip if server is already at or above our priority. */
-    if ((nspa_srv_base_policy == SCHED_FIFO || nspa_srv_base_policy == SCHED_RR) &&
-        nspa_srv_base_prio >= my_prio)
-        return;
-
-    saved->tid    = srv_tid;
-    saved->policy = nspa_srv_base_policy;
-    saved->prio   = nspa_srv_base_prio;
-
-    param.sched_priority = my_prio;
-    if (sched_setscheduler( srv_tid, my_policy, &param ) < 0)
-    {
-        saved->tid = 0;
-    }
-}
-
-static void nspa_shm_pi_unboost( struct nspa_shm_boost_state *saved )
-{
-    struct sched_param param;
-    if (saved->tid == 0) return;
-    param.sched_priority = saved->prio;
-    sched_setscheduler( saved->tid, saved->policy, &param );
-}
+ * Supersedes NSPA v2.4/v2.5 manual sched_setscheduler PI boost:
+ *   - No TID read/publish race window
+ *   - Kernel autoreleases boost on dispatcher's next WAIT entry
+ *   - 1 ioctl vs 2 sched_setscheduler syscalls per RT request */
 
 static unsigned int nspa_send_request_shm( const struct __server_request_info *req )
 {
-    volatile struct request_shm *request_shm = ntdll_get_thread_data()->request_shm;
+    struct ntdll_thread_data *data = ntdll_get_thread_data();
+    volatile struct request_shm *request_shm = data->request_shm;
     unsigned int i;
 
     /* Copy fixed header + variable-size data into the shmem region. */
@@ -449,13 +360,25 @@ static unsigned int nspa_send_request_shm( const struct __server_request_info *r
         }
     }
 
-    /* Publish: transition futex 0 -> 1 and wake the dispatcher. The fence
-     * ensures all writes above are visible to the dispatcher before it sees
-     * the state change (required on aarch64; no-op on x86). */
-    __atomic_thread_fence( __ATOMIC_SEQ_CST );
-    while (__sync_val_compare_and_swap( &request_shm->futex, 0, 1 ) != 0)
-        sched_yield();
-    syscall( __NR_futex, &request_shm->futex, NSPA_FUTEX_WAKE, 1, NULL, NULL, 0 );
+    /* Signal the dispatcher. Kernel atomically wakes it AND boosts its
+     * task to our RT priority if we're RT. On x86_64 the ioctl syscall
+     * is a full memory barrier, so prior writes to request_shm are
+     * visible to the dispatcher when it wakes. */
+    if (data->nspa_rt_cached_prio > 0)
+    {
+        struct ntsync_event_set_pi_args args = {
+            .flags  = 0,
+            .policy = data->nspa_rt_cached_policy,
+            .prio   = data->nspa_rt_cached_prio,
+            .__pad  = 0,
+        };
+        ioctl( data->request_event_fd, NTSYNC_IOC_EVENT_SET_PI, &args );
+    }
+    else
+    {
+        __u32 prev;
+        ioctl( data->request_event_fd, NTSYNC_IOC_EVENT_SET, &prev );
+    }
     return STATUS_SUCCESS;
 }
 
@@ -464,30 +387,19 @@ static inline unsigned int nspa_wait_reply_shm( struct __server_request_info *re
     volatile struct request_shm *request_shm = ntdll_get_thread_data()->request_shm;
     char *data_ptr = (char *)(request_shm + 1) + req->u.req.request_header.request_size;
     unsigned int copy_limit = (char *)request_shm + NSPA_REQUEST_SHM_SIZE - data_ptr;
-    struct nspa_shm_boost_state boost;
     int val;
 
-    /* NSPA v2.4: boost the dispatch thread for priority inheritance while
-     * we're blocked. No-op if we're not RT or the server is already at/
-     * above our priority. Paired with nspa_shm_pi_unboost after the wait. */
-    nspa_shm_pi_boost( request_shm, &boost );
-
-    /* Wait for dispatcher to transition futex 1 -> 0. */
-    while ((val = request_shm->futex) != 0)
+    /* Wait for dispatcher to set reply_futex 0 → 1. No PI boost on the
+     * reply path — we're already at our own priority; server is already
+     * boosted from the EVENT_SET_PI we issued. */
+    while ((val = request_shm->reply_futex) == 0)
     {
-        if (val == -1)
-        {
-            nspa_shm_pi_unboost( &boost );
-            abort_thread( 0 );  /* teardown */
-        }
-        syscall( __NR_futex, &request_shm->futex, NSPA_FUTEX_WAIT, val, NULL, NULL, 0 );
+        syscall( __NR_futex, &request_shm->reply_futex, 0 /* FUTEX_WAIT */,
+                 val, NULL, NULL, 0 );
     }
-
-    nspa_shm_pi_unboost( &boost );
-
-    /* aarch64-correct memory barrier: ensure we observe all of the
-     * dispatcher's writes (reply data) before we read the reply body. */
-    __atomic_thread_fence( __ATOMIC_SEQ_CST );
+    /* Reset for the next round. The shmem page is owned by this thread
+     * only — single-writer on this word. */
+    request_shm->reply_futex = 0;
 
     memcpy( &req->u.reply, (void *)&request_shm->u.reply, sizeof(req->u.reply) );
     if (req->u.reply.reply_header.reply_size)
@@ -1917,6 +1829,7 @@ size_t server_init_process(void)
     {
         sigset_t sigset;
         int shm_fd_local = -1;
+        int event_fd_local = -1;
         BOOL received_shm = FALSE;
 
         /* NSPA v1.5: wrap in fd_cache_mutex to match Torge's original patch
@@ -1953,6 +1866,14 @@ size_t server_init_process(void)
                     assert( handle == tid );
                     received_shm = TRUE;
                 }
+                /* NSPA Shape A: ntsync event fd for request signaling.
+                 * Always sent AFTER has_request_shm's fd. Handle token is
+                 * tid | 0x80000000u — disambiguation sanity check only. */
+                if (reply->has_request_event)
+                {
+                    event_fd_local = wine_server_receive_fd( &handle );
+                    assert( handle == (tid | 0x80000000u) );
+                }
                 /* NSPA E2: client_poll_bitmap is in the tail of request_shm.
                  * Set up the pointer after mmap below. */
             }
@@ -1972,6 +1893,7 @@ size_t server_init_process(void)
                 close( shm_fd_local );
                 data->request_shm_fd = -1;
                 data->request_shm = NULL;
+                if (event_fd_local >= 0) { close( event_fd_local ); event_fd_local = -1; }
             }
             else if (!client_poll_bitmap)
             {
@@ -1980,6 +1902,7 @@ size_t server_init_process(void)
                                      + NSPA_REQUEST_SHM_SIZE - CLIENT_POLL_BITMAP_SIZE;
             }
         }
+        data->request_event_fd = event_fd_local;
     }
 #else
     SERVER_START_REQ( init_first_thread )
@@ -2101,6 +2024,7 @@ void server_init_thread( void *entry_point, BOOL *suspend )
 #ifdef __linux__
     sigset_t sigset;
     int shm_fd_local = -1;
+    int event_fd_local = -1;
     BOOL received_shm = FALSE;
 #endif
 
@@ -2136,6 +2060,14 @@ void server_init_thread( void *entry_point, BOOL *suspend )
             shm_fd_local = wine_server_receive_fd( &handle );
             received_shm = TRUE;
         }
+        /* NSPA Shape A: ntsync event fd for request signaling.  Sent AFTER
+         * request_shm fd.  Handle token is (tid | 0x80000000u). */
+        if (reply->has_request_event)
+        {
+            obj_handle_t handle;
+            event_fd_local = wine_server_receive_fd( &handle );
+            assert( handle == (GetCurrentThreadId() | 0x80000000u) );
+        }
 #else
         wine_server_call( req );
         *suspend = reply->suspend;
@@ -2157,8 +2089,10 @@ void server_init_thread( void *entry_point, BOOL *suspend )
             close( shm_fd_local );
             data->request_shm_fd = -1;
             data->request_shm = NULL;
+            if (event_fd_local >= 0) { close( event_fd_local ); event_fd_local = -1; }
         }
     }
+    data->request_event_fd = event_fd_local;
 #endif
 
     close( reply_pipe );

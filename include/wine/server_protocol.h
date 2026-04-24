@@ -1378,8 +1378,10 @@ struct init_first_thread_reply
     unsigned int session_id;
     obj_handle_t inproc_device;
     int          has_request_shm;
+    int          has_request_event;
     data_size_t  info_size;
     /* VARARG(machines,ushorts); */
+    char __pad_44[4];
 };
 
 
@@ -1398,6 +1400,8 @@ struct init_thread_reply
     struct reply_header __header;
     int          suspend;
     int          has_request_shm;
+    int          has_request_event;
+    char __pad_20[4];
 };
 
 
@@ -7421,6 +7425,6 @@ union generic_reply
     struct nspa_get_inode_table_reply nspa_get_inode_table_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 948
+#define SERVER_PROTOCOL_VERSION 949
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

@@ -155,6 +155,18 @@ struct ntdll_thread_data
                                                            * nspa_rt_apply_tid on self (tid==0). */
     int                           nspa_rt_cached_prio;    /* NSPA v2.5: cached sched_priority.
                                                            * 0 = not RT / uninitialized. */
+#ifdef __linux__
+    int                           request_event_fd; /* NSPA Shape A: ntsync event fd received
+                                                      * from wineserver via SCM_RIGHTS. Client
+                                                      * signals a pending request with
+                                                      * NTSYNC_IOC_EVENT_SET_PI (RT) or
+                                                      * NTSYNC_IOC_EVENT_SET (non-RT). Replaces
+                                                      * the raw CAS+FUTEX_WAKE path in
+                                                      * nspa_send_request_shm. -1 = not set up.
+                                                      * Placed after nspa_unix_tid so that
+                                                      * offset (asm-referenced via
+                                                      * NSPA_UNIX_TID_OFFSET) stays stable. */
+#endif
 };
 
 C_ASSERT( sizeof(struct ntdll_thread_data) <= sizeof(((TEB *)0)->GdiTebBatch) );

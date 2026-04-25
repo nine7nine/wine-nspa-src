@@ -48,6 +48,7 @@
 #include "rpc_assoc.h"
 #include "rpc_message.h"
 #include "rpc_server.h"
+#include "nspa/timeouts.h"
 #include "epm_towers.h"
 
 #define DEFAULT_NCACN_HTTP_TIMEOUT (60 * 1000)
@@ -387,14 +388,25 @@ static int rpcrt4_conn_np_read(RpcConnection *conn, void *buffer, unsigned int c
         status = NtReadFile(connection->pipe, event, NULL, NULL, &connection->io_status, buffer, count, NULL, NULL);
     if (status == STATUS_PENDING)
     {
+        DWORD wait_res;
         /* check read_closed again before waiting to avoid a race */
         if (connection->read_closed)
         {
             IO_STATUS_BLOCK io_status;
             NtCancelIoFileEx(connection->pipe, &connection->io_status, &io_status);
         }
-        WaitForSingleObject(event, INFINITE);
-        status = connection->io_status.Status;
+        wait_res = WaitForSingleObject(event, nspa_rpc_io_timeout_ms());
+        if (wait_res == WAIT_TIMEOUT)
+        {
+            /* NSPA Phase 2.B: cancel the in-flight read before declaring
+             * timeout, then drain the cancellation completion so the
+             * io_status block reaches a stable state. */
+            IO_STATUS_BLOCK io_status;
+            NtCancelIoFileEx(connection->pipe, &connection->io_status, &io_status);
+            WaitForSingleObject(event, INFINITE);
+            status = STATUS_IO_TIMEOUT;
+        }
+        else status = connection->io_status.Status;
     }
     release_np_event(connection, event);
     return status && status != STATUS_BUFFER_OVERFLOW ? -1 : connection->io_status.Information;
@@ -414,8 +426,16 @@ static int rpcrt4_conn_np_write(RpcConnection *conn, const void *buffer, unsigne
     status = NtWriteFile(connection->pipe, event, NULL, NULL, &io_status, buffer, count, NULL, NULL);
     if (status == STATUS_PENDING)
     {
-        WaitForSingleObject(event, INFINITE);
-        status = io_status.Status;
+        DWORD wait_res = WaitForSingleObject(event, nspa_rpc_io_timeout_ms());
+        if (wait_res == WAIT_TIMEOUT)
+        {
+            /* NSPA Phase 2.B: cancel + drain on timeout. */
+            IO_STATUS_BLOCK cancel_status;
+            NtCancelIoFileEx(connection->pipe, &io_status, &cancel_status);
+            WaitForSingleObject(event, INFINITE);
+            status = STATUS_IO_TIMEOUT;
+        }
+        else status = io_status.Status;
     }
     release_np_event(connection, event);
     if (status)
@@ -1098,11 +1118,14 @@ static BOOL rpcrt4_sock_wait_for_send(RpcConnection_tcp *tcpc)
     ERR("WSAEventSelect() failed with error %d\n", WSAGetLastError());
     return FALSE;
   }
-  res = WaitForSingleObject(tcpc->sock_event, INFINITE);
+  res = WaitForSingleObject(tcpc->sock_event, nspa_rpc_io_timeout_ms());
   switch (res)
   {
   case WAIT_OBJECT_0:
     return TRUE;
+  case WAIT_TIMEOUT:
+    /* NSPA Phase 2.B: peer never accepted, treat as send failure. */
+    return FALSE;
   default:
     ERR("WaitForMultipleObjects() failed with error %ld\n", GetLastError());
     return FALSE;

@@ -20,6 +20,8 @@ SOURCES = \
 	ndr_stubless.c \
 	ndr_typelib.c \
 	ndr_types.idl \
+	nspa/timeouts.c \
+	nspa/timeouts.h \
 	rpc_assoc.c \
 	rpc_async.c \
 	rpc_binding.c \

@@ -4556,3 +4556,48 @@ enum inproc_sync_type
     unsigned int    bucket_count;/* echo of NSPA_INODE_BUCKETS for client sanity */
     unsigned int    table_size;  /* size of the shmem region in bytes */
 @END
+
+
+/* nspa rpc — relocate rpcss state into wineserver
+ *
+ * Phase 1.A: irpcss (COM class-factory registry).  Replaces the four
+ * irpcss_* RPC calls in dlls/combase/rpc.c with direct wineserver
+ * requests.  Server-side state lives in server/nspa/rpc_state.c and is
+ * keyed on the registering process; cleanup is hooked into the existing
+ * process_destroy chain (matches the RPC [context_handle] ownership
+ * model rpcss uses today).
+ *
+ * Gated client-side by NSPA_RPC_BYPASS bitmask (bit 0 = irpcss).  When
+ * the gate is off, dlls/combase/rpc.c falls through to the legacy
+ * ncalrpc path unchanged.
+ *
+ * See nspa/docs/rpc-fast-and-solid-plan.md.  Plan 1.B (irot) and 1.C
+ * (epm) will append further requests below. */
+
+@REQ(nspa_register_class_factory)
+    unsigned __int64 clsid_lo;   /* CLSID low 8 bytes (memcpy from GUID) */
+    unsigned __int64 clsid_hi;   /* CLSID high 8 bytes */
+    unsigned int    flags;       /* REGCLS_* flags from CoRegisterClassObject */
+    VARARG(object,bytes);        /* MInterfacePointer blob (ulCntData + abData) */
+@REPLY
+    unsigned int    cookie;      /* registration cookie (monotonic) */
+@END
+
+
+@REQ(nspa_revoke_class_factory)
+    unsigned int    cookie;      /* cookie returned by nspa_register_class_factory */
+@END
+
+
+@REQ(nspa_get_class_factory)
+    unsigned __int64 clsid_lo;   /* CLSID low 8 bytes */
+    unsigned __int64 clsid_hi;   /* CLSID high 8 bytes */
+@REPLY
+    VARARG(object,bytes);        /* MInterfacePointer blob, empty if not found */
+@END
+
+
+@REQ(nspa_alloc_thread_seq_id)
+@REPLY
+    unsigned int    seq_id;      /* monotonic thread sequence id */
+@END

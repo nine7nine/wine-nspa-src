@@ -318,6 +318,10 @@ DECL_HANDLER(nspa_ensure_own_bypass);
 DECL_HANDLER(nspa_create_mapping_from_unix_fd);
 DECL_HANDLER(nspa_create_file_from_unix_fd);
 DECL_HANDLER(nspa_get_inode_table);
+DECL_HANDLER(nspa_register_class_factory);
+DECL_HANDLER(nspa_revoke_class_factory);
+DECL_HANDLER(nspa_get_class_factory);
+DECL_HANDLER(nspa_alloc_thread_seq_id);
 
 typedef void (*req_handler)( const void *req, void *reply );
 static const req_handler req_handlers[REQ_NB_REQUESTS] =
@@ -633,6 +637,10 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_nspa_create_mapping_from_unix_fd,
     (req_handler)req_nspa_create_file_from_unix_fd,
     (req_handler)req_nspa_get_inode_table,
+    (req_handler)req_nspa_register_class_factory,
+    (req_handler)req_nspa_revoke_class_factory,
+    (req_handler)req_nspa_get_class_factory,
+    (req_handler)req_nspa_alloc_thread_seq_id,
 };
 
 C_ASSERT( sizeof(abstime_t) == 8 );
@@ -2425,3 +2433,18 @@ C_ASSERT( offsetof(struct nspa_get_inode_table_reply, fd_sent) == 8 );
 C_ASSERT( offsetof(struct nspa_get_inode_table_reply, bucket_count) == 12 );
 C_ASSERT( offsetof(struct nspa_get_inode_table_reply, table_size) == 16 );
 C_ASSERT( sizeof(struct nspa_get_inode_table_reply) == 24 );
+C_ASSERT( offsetof(struct nspa_register_class_factory_request, clsid_lo) == 16 );
+C_ASSERT( offsetof(struct nspa_register_class_factory_request, clsid_hi) == 24 );
+C_ASSERT( offsetof(struct nspa_register_class_factory_request, flags) == 32 );
+C_ASSERT( sizeof(struct nspa_register_class_factory_request) == 40 );
+C_ASSERT( offsetof(struct nspa_register_class_factory_reply, cookie) == 8 );
+C_ASSERT( sizeof(struct nspa_register_class_factory_reply) == 16 );
+C_ASSERT( offsetof(struct nspa_revoke_class_factory_request, cookie) == 12 );
+C_ASSERT( sizeof(struct nspa_revoke_class_factory_request) == 16 );
+C_ASSERT( offsetof(struct nspa_get_class_factory_request, clsid_lo) == 16 );
+C_ASSERT( offsetof(struct nspa_get_class_factory_request, clsid_hi) == 24 );
+C_ASSERT( sizeof(struct nspa_get_class_factory_request) == 32 );
+C_ASSERT( sizeof(struct nspa_get_class_factory_reply) == 8 );
+C_ASSERT( sizeof(struct nspa_alloc_thread_seq_id_request) == 16 );
+C_ASSERT( offsetof(struct nspa_alloc_thread_seq_id_reply, seq_id) == 8 );
+C_ASSERT( sizeof(struct nspa_alloc_thread_seq_id_reply) == 16 );

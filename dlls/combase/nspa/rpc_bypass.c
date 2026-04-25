@@ -77,6 +77,9 @@ HRESULT nspa_irpcss_register_class_factory( REFCLSID clsid, DWORD flags,
     unsigned int status;
     SIZE_T blob_size = 0;
 
+    TRACE( "nspa-bypass register %s flags %#lx obj %p\n",
+           debugstr_guid(clsid), flags, object );
+
     if (object) blob_size = FIELD_OFFSET( MInterfacePointer, abData[object->ulCntData] );
 
     SERVER_START_REQ( nspa_register_class_factory )
@@ -96,6 +99,8 @@ HRESULT nspa_irpcss_register_class_factory( REFCLSID clsid, DWORD flags,
 HRESULT nspa_irpcss_revoke_class_factory( unsigned int cookie )
 {
     unsigned int status;
+
+    TRACE( "nspa-bypass revoke cookie %u\n", cookie );
 
     SERVER_START_REQ( nspa_revoke_class_factory )
     {
@@ -119,6 +124,8 @@ HRESULT nspa_irpcss_get_class_factory( REFCLSID clsid, PMInterfacePointer *objec
     PMInterfacePointer buf;
     unsigned int status;
     data_size_t reply_size = 0;
+
+    TRACE( "nspa-bypass get %s\n", debugstr_guid(clsid) );
 
     *object = NULL;
 
@@ -157,6 +164,8 @@ HRESULT nspa_irpcss_get_class_factory( REFCLSID clsid, PMInterfacePointer *objec
 HRESULT nspa_irpcss_alloc_thread_seq_id( DWORD *id )
 {
     unsigned int status;
+
+    TRACE( "nspa-bypass alloc_thread_seq_id\n" );
 
     SERVER_START_REQ( nspa_alloc_thread_seq_id )
     {

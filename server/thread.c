@@ -460,7 +460,6 @@ static inline void init_thread_structure( struct thread *thread )
     thread->request_shm_fd  = -1;
     thread->request_shm     = NULL;
     thread->request_shm_thread_running = 0;
-    thread->request_event_fd = -1;
 #endif
     thread->state           = RUNNING;
     thread->exit_code       = 0;
@@ -896,7 +895,6 @@ static void cleanup_thread( struct thread *thread )
     thread->request_shm_fd = -1;
     thread->request_shm = NULL;
     thread->request_shm_thread_running = 0;
-    thread->request_event_fd = -1;
 #endif
     thread->desktop = 0;
     thread->desc = NULL;

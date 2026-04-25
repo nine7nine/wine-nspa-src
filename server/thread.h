@@ -115,14 +115,6 @@ struct thread
     int                    request_shm_fd;    /* NSPA v1.5: shared memory fd */
     volatile struct request_shm *request_shm; /* NSPA v1.5: shared memory mapping */
     int                    request_shm_thread_running; /* NSPA v1.5: shm dispatcher pthread status */
-    int                    request_event_fd;  /* NSPA Shape A: per-thread ntsync event fd
-                                                * (created via NTSYNC_IOC_CREATE_EVENT on
-                                                * inproc_device_fd, sent to client via
-                                                * SCM_RIGHTS, signaled by client with
-                                                * NTSYNC_IOC_EVENT_SET_PI). Dispatcher pthread
-                                                * blocks on ioctl(inproc_device_fd,
-                                                * NTSYNC_IOC_WAIT_ANY, { .objs = &this_fd }).
-                                                * -1 = not created (fallback to socket IPC). */
 #endif
     enum run_state         state;         /* running state */
     int                    exit_code;     /* thread exit code */

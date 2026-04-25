@@ -511,12 +511,76 @@ static inline unsigned int nspa_wait_reply_shm( struct __server_request_info *re
 
 
 /***********************************************************************
+ *  NSPA wineserver request profiler.
+ *
+ *  Activated by NSPA_PROFILE=<path>. When enabled, every request that
+ *  passes through server_call_unlocked is counted by request id; on
+ *  process exit the histogram is dumped to <path>.<pid> as a TSV.
+ *
+ *  Throwaway instrumentation: drives the drain-candidate ranking for
+ *  the shm-IPC redesign. Default-off, atomic-RELAXED counter, no impact
+ *  when the env var is unset.
+ *
+ *  To map ids to names after capture:
+ *    paste <(grep -oE 'REQ_[a-z_]+' include/wine/server_protocol.h \
+ *              | sed 's/REQ_//' | nl -v0 -ba) <profile>
+ */
+static unsigned long nspa_profile_counts[REQ_NB_REQUESTS];
+static char          nspa_profile_path[512];
+static int           nspa_profile_enabled;
+
+static void nspa_profile_dump(void)
+{
+    int fd, i;
+    char buf[128];
+    int len;
+
+    fd = open( nspa_profile_path, O_WRONLY | O_CREAT | O_TRUNC, 0644 );
+    if (fd < 0) return;
+
+    len = snprintf( buf, sizeof(buf),
+                    "# NSPA wineserver request histogram (pid %d)\n"
+                    "# req_id\tcount\n", (int)getpid() );
+    write( fd, buf, len );
+
+    for (i = 0; i < REQ_NB_REQUESTS; i++)
+    {
+        unsigned long c = __atomic_load_n( &nspa_profile_counts[i], __ATOMIC_RELAXED );
+        if (!c) continue;
+        len = snprintf( buf, sizeof(buf), "%d\t%lu\n", i, c );
+        write( fd, buf, len );
+    }
+    close( fd );
+}
+
+static void __attribute__((constructor)) nspa_profile_init(void)
+{
+    const char *env = getenv( "NSPA_PROFILE" );
+    if (!env || !env[0]) return;
+
+    /* Append pid so multi-process Wine workloads don't collide on one file. */
+    snprintf( nspa_profile_path, sizeof(nspa_profile_path), "%s.%d", env, (int)getpid() );
+    atexit( nspa_profile_dump );
+    __atomic_store_n( &nspa_profile_enabled, 1, __ATOMIC_RELEASE );
+}
+
+static inline void nspa_profile_count( unsigned int req )
+{
+    if (!__atomic_load_n( &nspa_profile_enabled, __ATOMIC_ACQUIRE )) return;
+    if (req < REQ_NB_REQUESTS)
+        __atomic_fetch_add( &nspa_profile_counts[req], 1, __ATOMIC_RELAXED );
+}
+
+
+/***********************************************************************
  *           server_call_unlocked
  */
 unsigned int server_call_unlocked( void *req_ptr )
 {
     struct __server_request_info * const req = req_ptr;
     unsigned int ret;
+
+    nspa_profile_count( req->u.req.request_header.req );
 
 #ifdef __linux__
     /* NSPA v1.5: use shmem fast path if set up AND request fits. */

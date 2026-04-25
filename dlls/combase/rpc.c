@@ -33,6 +33,7 @@
 #include "combase_private.h"
 
 #include "irpcss.h"
+#include "nspa/rpc_bypass.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(ole);
 
@@ -303,6 +304,8 @@ static RPC_BINDING_HANDLE get_irot_handle(void)
 
 HRESULT rpcss_get_next_seqid(DWORD *id)
 {
+    if (nspa_rpc_bypass_irpcss())
+        return nspa_irpcss_alloc_thread_seq_id( id );
     RPCSS_CALL_START
     hr = irpcss_get_thread_seq_id(get_irpcss_handle(), id);
     RPCSS_CALL_END
@@ -363,6 +366,8 @@ HRESULT WINAPI InternalIrotRevoke(IrotCookie cookie, IrotContextHandle *ctxt_han
 
 static HRESULT rpcss_server_register(REFCLSID clsid, DWORD flags, MInterfacePointer *obj, unsigned int *cookie)
 {
+    if (nspa_rpc_bypass_irpcss())
+        return nspa_irpcss_register_class_factory( clsid, flags, obj, cookie );
     RPCSS_CALL_START
     hr = irpcss_server_register(get_irpcss_handle(), clsid, flags, obj, cookie);
     RPCSS_CALL_END
@@ -370,6 +375,8 @@ static HRESULT rpcss_server_register(REFCLSID clsid, DWORD flags, MInterfacePoin
 
 HRESULT rpc_revoke_local_server(unsigned int cookie)
 {
+    if (nspa_rpc_bypass_irpcss())
+        return nspa_irpcss_revoke_class_factory( cookie );
     RPCSS_CALL_START
     hr = irpcss_server_revoke(get_irpcss_handle(), cookie);
     RPCSS_CALL_END
@@ -377,6 +384,8 @@ HRESULT rpc_revoke_local_server(unsigned int cookie)
 
 static HRESULT rpcss_get_class_object(REFCLSID rclsid, PMInterfacePointer *objref)
 {
+    if (nspa_rpc_bypass_irpcss())
+        return nspa_irpcss_get_class_factory( rclsid, objref );
     RPCSS_CALL_START
     hr = irpcss_get_class_object(get_irpcss_handle(), rclsid, objref);
     RPCSS_CALL_END

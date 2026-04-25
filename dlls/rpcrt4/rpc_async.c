@@ -35,6 +35,16 @@ WINE_DEFAULT_DEBUG_CHANNEL(rpc);
 
 #define RPC_ASYNC_SIGNATURE 0x43595341
 
+/* Async call state machine, encoded in the (otherwise unused) Lock field
+ * of RPC_ASYNC_STATE.  Wine's RpcAsyncInitializeHandle initialises Lock
+ * to 0, and the upstream MSDN-documented contract for that field is
+ * "private, set to 0 by RpcAsyncInitializeHandle" — so it is the right
+ * place for our terminal-status word.  Updated only via Interlocked*
+ * primitives so RpcAsyncGetCallStatus is wait-free. */
+#define ASYNC_STATE_PENDING    0
+#define ASYNC_STATE_COMPLETED  1
+#define ASYNC_STATE_CANCELLED  2
+
 static inline BOOL valid_async_handle(PRPC_ASYNC_STATE pAsync)
 {
     return pAsync->Signature == RPC_ASYNC_SIGNATURE;
@@ -91,8 +101,23 @@ RPC_STATUS WINAPI RpcAsyncInitializeHandle(PRPC_ASYNC_STATE pAsync, unsigned int
  */
 RPC_STATUS WINAPI RpcAsyncGetCallStatus(PRPC_ASYNC_STATE pAsync)
 {
-    FIXME("(%p): stub\n", pAsync);
-    return RPC_S_INVALID_ASYNC_HANDLE;
+    LONG s;
+
+    TRACE("(%p)\n", pAsync);
+
+    if (!valid_async_handle(pAsync))
+        return RPC_S_INVALID_ASYNC_HANDLE;
+
+    s = InterlockedCompareExchange(&pAsync->Lock, 0, 0);
+    switch (s)
+    {
+    case ASYNC_STATE_PENDING:    return RPC_S_ASYNC_CALL_PENDING;
+    case ASYNC_STATE_COMPLETED:  return RPC_S_OK;
+    case ASYNC_STATE_CANCELLED:  return RPC_S_CALL_CANCELLED;
+    default:
+        ERR("unexpected Lock state %ld\n", s);
+        return RPC_S_INTERNAL_ERROR;
+    }
 }
 
 /***********************************************************************
@@ -111,21 +136,38 @@ RPC_STATUS WINAPI RpcAsyncGetCallStatus(PRPC_ASYNC_STATE pAsync)
 RPC_STATUS WINAPI RpcAsyncCompleteCall(PRPC_ASYNC_STATE pAsync, void *Reply)
 {
     struct async_call_data *data;
+    RPC_STATUS status;
+    LONG prev;
 
     TRACE("(%p, %p)\n", pAsync, Reply);
 
     if (!valid_async_handle(pAsync))
         return RPC_S_INVALID_ASYNC_HANDLE;
 
-    /* FIXME: check completed */
+    /* Transition Lock from PENDING → COMPLETED.  If we lose the race to
+     * a concurrent RpcAsyncCancelCall (state already CANCELLED), report
+     * cancellation and leave the entry alone — the cancel path is
+     * responsible for its own cleanup notifier. */
+    prev = InterlockedCompareExchange(&pAsync->Lock,
+                                      ASYNC_STATE_COMPLETED,
+                                      ASYNC_STATE_PENDING);
+    if (prev == ASYNC_STATE_CANCELLED)
+        return RPC_S_CALL_CANCELLED;
+    if (prev != ASYNC_STATE_PENDING)
+    {
+        ERR("RpcAsyncCompleteCall on a handle in unexpected state %ld\n", prev);
+        return RPC_S_INVALID_ASYNC_HANDLE;
+    }
 
     TRACE("pAsync %p, pAsync->StubInfo %p\n", pAsync, pAsync->StubInfo);
 
     data = pAsync->StubInfo;
     if (data->pStubMsg->IsClient)
-        return NdrpCompleteAsyncClientCall(pAsync, Reply);
+        status = NdrpCompleteAsyncClientCall(pAsync, Reply);
+    else
+        status = NdrpCompleteAsyncServerCall(pAsync, Reply);
 
-    return NdrpCompleteAsyncServerCall(pAsync, Reply);
+    return status;
 }
 
 /***********************************************************************
@@ -143,8 +185,25 @@ RPC_STATUS WINAPI RpcAsyncCompleteCall(PRPC_ASYNC_STATE pAsync, void *Reply)
  */
 RPC_STATUS WINAPI RpcAsyncAbortCall(PRPC_ASYNC_STATE pAsync, ULONG ExceptionCode)
 {
-    FIXME("(%p, %ld/0x%lx): stub\n", pAsync, ExceptionCode, ExceptionCode);
-    return RPC_S_INVALID_ASYNC_HANDLE;
+    /* Server-side abort: the server stub uses this to send a fault PDU
+     * back to the client with the given exception code.  Wine's server-
+     * side async stub implementation in NdrpCompleteAsyncServerCall
+     * doesn't yet wire fault-PDU emission per the FIXME at
+     * rpc_message.c:1971; without that, marking the abort here is the
+     * best we can do.  Reflects the intent in the Lock state machine
+     * so server code that observes state transitions sees a terminal
+     * state. */
+    TRACE("(%p, %ld/0x%lx)\n", pAsync, ExceptionCode, ExceptionCode);
+
+    if (!valid_async_handle(pAsync))
+        return RPC_S_INVALID_ASYNC_HANDLE;
+
+    InterlockedCompareExchange(&pAsync->Lock,
+                               ASYNC_STATE_CANCELLED,
+                               ASYNC_STATE_PENDING);
+    /* TODO: wire fault PDU emission once NdrpCompleteAsyncServerCall
+     * supports it. */
+    return RPC_S_OK;
 }
 
 /***********************************************************************
@@ -163,6 +222,39 @@ RPC_STATUS WINAPI RpcAsyncAbortCall(PRPC_ASYNC_STATE pAsync, ULONG ExceptionCode
  */
 RPC_STATUS WINAPI RpcAsyncCancelCall(PRPC_ASYNC_STATE pAsync, BOOL fAbortCall)
 {
-    FIXME("(%p, %s): stub\n", pAsync, fAbortCall ? "TRUE" : "FALSE");
-    return RPC_S_INVALID_ASYNC_HANDLE;
+    struct async_call_data *data;
+    LONG prev;
+
+    TRACE("(%p, %s)\n", pAsync, fAbortCall ? "TRUE" : "FALSE");
+
+    if (!valid_async_handle(pAsync))
+        return RPC_S_INVALID_ASYNC_HANDLE;
+
+    /* Race with RpcAsyncCompleteCall — if the call already completed
+     * naturally, just return success (the user wanted termination, the
+     * call is terminated). */
+    prev = InterlockedCompareExchange(&pAsync->Lock,
+                                      ASYNC_STATE_CANCELLED,
+                                      ASYNC_STATE_PENDING);
+    if (prev != ASYNC_STATE_PENDING)
+        return RPC_S_OK;
+
+    /* Wake the connection's blocking I/O so async_notifier_proc returns
+     * promptly.  conn->ops->cancel_call is the existing transport-vtable
+     * entry — for ncacn_ip_tcp/http it sets cancel_event; for ncalrpc/
+     * ncacn_np it issues NtCancelIoFileEx. */
+    data = pAsync->StubInfo;
+    if (data && data->pStubMsg && data->pStubMsg->RpcMsg &&
+        data->pStubMsg->RpcMsg->ReservedForRuntime)
+    {
+        RpcConnection *conn = data->pStubMsg->RpcMsg->ReservedForRuntime;
+        if (conn->ops->cancel_call) conn->ops->cancel_call(conn);
+    }
+
+    /* fAbortCall=TRUE additionally requests an explicit cancel PDU to
+     * the server.  Wine doesn't currently emit those PDUs (the cancel
+     * path stays purely client-side); the I/O cancellation above is the
+     * best-effort behaviour upstream apps already get from the TCP cancel
+     * path's existing cancel_event mechanism.  Filed as TODO. */
+    return RPC_S_OK;
 }

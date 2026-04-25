@@ -1607,10 +1607,21 @@ RPC_STATUS WINAPI RpcMgmtStopServerListening ( RPC_BINDING_HANDLE Binding )
 
 /***********************************************************************
  *             RpcMgmtEnableIdleCleanup (RPCRT4.@)
+ *
+ * Enables periodic cleanup of idle client connections in the per-
+ * association free pool.  Wine previously stubbed this — connections
+ * accumulated in the pool indefinitely, leaking memory + handles
+ * across long-running app sessions.
+ *
+ * Implementation lives in rpc_assoc.c: a flag flips on, and
+ * RpcAssoc_GetIdleConnection sweeps stale entries from the pool
+ * before searching it.  Bounded, no background thread, no extra
+ * locking.
  */
 RPC_STATUS WINAPI RpcMgmtEnableIdleCleanup(void)
 {
-    FIXME("(): stub\n");
+    TRACE("()\n");
+    RpcAssoc_EnableIdleCleanup();
     return RPC_S_OK;
 }
 

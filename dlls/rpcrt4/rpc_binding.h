@@ -86,6 +86,7 @@ typedef struct _RpcConnection
   ULONG assoc_group_id; /* association group returned during binding */
   RPC_ASYNC_STATE *async_state;
   struct _RpcAssoc *assoc; /* association this connection is part of */
+  DWORD last_used_tick;    /* GetTickCount() at last release into pool — used by Phase 2.D idle cleanup. */
 
   /* server-only */
   /* The active interface bound to server. */

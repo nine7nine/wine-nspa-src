@@ -317,53 +317,81 @@ HRESULT WINAPI InternalIrotRegister(const MonikerComparisonData *moniker_data,
         const InterfaceData *object, const InterfaceData *moniker,
         const FILETIME *time, DWORD flags, IrotCookie *cookie, IrotContextHandle *ctxt_handle)
 {
-    RPCSS_CALL_START
-    hr = IrotRegister(get_irot_handle(), moniker_data, object, moniker, time, flags, cookie, ctxt_handle);
-    RPCSS_CALL_END
+    if (nspa_rpc_bypass_irot())
+        return nspa_irot_register( moniker_data, object, moniker, time, flags, cookie, ctxt_handle );
+    {
+        RPCSS_CALL_START
+        hr = IrotRegister(get_irot_handle(), moniker_data, object, moniker, time, flags, cookie, ctxt_handle);
+        RPCSS_CALL_END
+    }
 }
 
 HRESULT WINAPI InternalIrotIsRunning(const MonikerComparisonData *moniker_data)
 {
-    RPCSS_CALL_START
-    hr = IrotIsRunning(get_irot_handle(), moniker_data);
-    RPCSS_CALL_END
+    if (nspa_rpc_bypass_irot())
+        return nspa_irot_is_running( moniker_data );
+    {
+        RPCSS_CALL_START
+        hr = IrotIsRunning(get_irot_handle(), moniker_data);
+        RPCSS_CALL_END
+    }
 }
 
 HRESULT WINAPI InternalIrotGetObject(const MonikerComparisonData *moniker_data, PInterfaceData *obj,
         IrotCookie *cookie)
 {
-    RPCSS_CALL_START
-    hr = IrotGetObject(get_irot_handle(), moniker_data, obj, cookie);
-    RPCSS_CALL_END
+    if (nspa_rpc_bypass_irot())
+        return nspa_irot_get_object( moniker_data, obj, cookie );
+    {
+        RPCSS_CALL_START
+        hr = IrotGetObject(get_irot_handle(), moniker_data, obj, cookie);
+        RPCSS_CALL_END
+    }
 }
 
 HRESULT WINAPI InternalIrotNoteChangeTime(IrotCookie cookie, const FILETIME *time)
 {
-    RPCSS_CALL_START
-    hr = IrotNoteChangeTime(get_irot_handle(), cookie, time);
-    RPCSS_CALL_END
+    if (nspa_rpc_bypass_irot())
+        return nspa_irot_note_change_time( cookie, time );
+    {
+        RPCSS_CALL_START
+        hr = IrotNoteChangeTime(get_irot_handle(), cookie, time);
+        RPCSS_CALL_END
+    }
 }
 
 HRESULT WINAPI InternalIrotGetTimeOfLastChange(const MonikerComparisonData *moniker_data, FILETIME *time)
 {
-    RPCSS_CALL_START
-    hr = IrotGetTimeOfLastChange(get_irot_handle(), moniker_data, time);
-    RPCSS_CALL_END
+    if (nspa_rpc_bypass_irot())
+        return nspa_irot_get_time_of_last_change( moniker_data, time );
+    {
+        RPCSS_CALL_START
+        hr = IrotGetTimeOfLastChange(get_irot_handle(), moniker_data, time);
+        RPCSS_CALL_END
+    }
 }
 
 HRESULT WINAPI InternalIrotEnumRunning(PInterfaceList *list)
 {
-    RPCSS_CALL_START
-    hr = IrotEnumRunning(get_irot_handle(), list);
-    RPCSS_CALL_END
+    if (nspa_rpc_bypass_irot())
+        return nspa_irot_enum_running( list );
+    {
+        RPCSS_CALL_START
+        hr = IrotEnumRunning(get_irot_handle(), list);
+        RPCSS_CALL_END
+    }
 }
 
 HRESULT WINAPI InternalIrotRevoke(IrotCookie cookie, IrotContextHandle *ctxt_handle, PInterfaceData *object,
         PInterfaceData *moniker)
 {
-    RPCSS_CALL_START
-    hr = IrotRevoke(get_irot_handle(), cookie, ctxt_handle, object, moniker);
-    RPCSS_CALL_END
+    if (nspa_rpc_bypass_irot())
+        return nspa_irot_revoke( cookie, ctxt_handle, object, moniker );
+    {
+        RPCSS_CALL_START
+        hr = IrotRevoke(get_irot_handle(), cookie, ctxt_handle, object, moniker);
+        RPCSS_CALL_END
+    }
 }
 
 static HRESULT rpcss_server_register(REFCLSID clsid, DWORD flags, MInterfacePointer *obj, unsigned int *cookie)

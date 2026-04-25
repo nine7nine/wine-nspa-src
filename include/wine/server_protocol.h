@@ -1378,8 +1378,10 @@ struct init_first_thread_reply
     unsigned int session_id;
     obj_handle_t inproc_device;
     int          has_request_shm;
+    int          has_request_channel;
     data_size_t  info_size;
     /* VARARG(machines,ushorts); */
+    char __pad_44[4];
 };
 
 
@@ -7651,6 +7653,6 @@ union generic_reply
     struct nspa_irot_enum_running_reply nspa_irot_enum_running_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 951
+#define SERVER_PROTOCOL_VERSION 952
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

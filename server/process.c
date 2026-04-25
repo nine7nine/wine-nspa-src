@@ -703,6 +703,8 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
     memset( &process->image_info, 0, sizeof(process->image_info) );
 #ifdef __linux__
     process->client_poll_bitmap = NULL;
+    process->request_channel_fd = -1;
+    process->channel_dispatcher_running = 0;
 #endif
     list_init( &process->rawinput_entry );
     list_init( &process->kernel_object );

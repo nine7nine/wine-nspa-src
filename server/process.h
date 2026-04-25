@@ -90,6 +90,9 @@ struct process
     struct pe_image_info image_info;      /* main exe image info */
 #ifdef __linux__
     volatile unsigned char *client_poll_bitmap; /* NSPA E2: per-fd bitmap in first thread's request_shm tail */
+    int                  request_channel_fd;    /* NSPA gamma: ntsync channel for shm-IPC */
+    pthread_t            channel_dispatcher;    /* NSPA gamma: 1 pthread per process */
+    int                  channel_dispatcher_running; /* NSPA gamma: lifecycle gate */
 #endif
 };
 

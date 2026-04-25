@@ -34,4 +34,36 @@ extern HRESULT nspa_irpcss_get_class_factory( REFCLSID clsid,
 
 extern HRESULT nspa_irpcss_alloc_thread_seq_id( DWORD *id );
 
+
+/* ---- Phase 1.B — irot (Running Object Table) bypass ---- */
+
+/* Bit 1 of NSPA_RPC_BYPASS gates the irot path independently of irpcss.
+ * Default off — when off, dlls/combase/rpc.c falls through to the legacy
+ * ncalrpc path unchanged. */
+extern int nspa_rpc_bypass_irot(void);
+
+extern HRESULT nspa_irot_register( const MonikerComparisonData *moniker_data,
+                                   const InterfaceData *object,
+                                   const InterfaceData *moniker,
+                                   const FILETIME *time, DWORD flags,
+                                   IrotCookie *cookie,
+                                   IrotContextHandle *ctxt_handle );
+
+extern HRESULT nspa_irot_revoke( IrotCookie cookie,
+                                 IrotContextHandle *ctxt_handle,
+                                 PInterfaceData *object,
+                                 PInterfaceData *moniker );
+
+extern HRESULT nspa_irot_is_running( const MonikerComparisonData *moniker_data );
+
+extern HRESULT nspa_irot_get_object( const MonikerComparisonData *moniker_data,
+                                     PInterfaceData *obj, IrotCookie *cookie );
+
+extern HRESULT nspa_irot_note_change_time( IrotCookie cookie, const FILETIME *time );
+
+extern HRESULT nspa_irot_get_time_of_last_change( const MonikerComparisonData *moniker_data,
+                                                  FILETIME *time );
+
+extern HRESULT nspa_irot_enum_running( PInterfaceList *list );
+
 #endif /* __WINE_COMBASE_NSPA_RPC_BYPASS_H */

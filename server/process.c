@@ -64,6 +64,7 @@
 #include "request.h"
 #include "user.h"
 #include "security.h"
+#include "nspa/rpc_state.h"
 
 /* process object */
 
@@ -997,6 +998,7 @@ static void process_killed( struct process *process )
     assert( !process->console );
 
     destroy_process_classes( process );
+    nspa_rpc_state_release( process );
     free_mapped_views( process );
     free_process_user_handles( process );
     remove_process_locks( process );

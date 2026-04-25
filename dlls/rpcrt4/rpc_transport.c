@@ -1388,7 +1388,19 @@ static RPC_STATUS rpcrt4_conn_tcp_handoff(RpcConnection *old_conn, RpcConnection
   ret = accept(server->sock, (struct sockaddr*) &address, &addrsize);
   if (ret < 0)
   {
-    ERR("Failed to accept a TCP connection: error %d\n", ret);
+    int err = WSAGetLastError();
+    if (err == WSAEWOULDBLOCK || err == WSAEINTR)
+    {
+      /* The non-blocking-socket race documented at the FIONBIO call
+       * site: poll/select reported the listener as readable, but the
+       * pending connection dropped before accept() could grab it.
+       * Not a fatal error — the listener-thread caller loops back to
+       * waiting.  Demote the log level so this doesn't pollute logs
+       * during normal connection churn. */
+      TRACE("accept() race: poll said ready but socket is now empty (err %d)\n", err);
+      return RPC_S_SERVER_TOO_BUSY;
+    }
+    ERR("Failed to accept a TCP connection: error %d\n", err);
     return RPC_S_OUT_OF_RESOURCES;
   }
 

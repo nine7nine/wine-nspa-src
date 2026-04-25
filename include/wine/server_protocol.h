@@ -6472,6 +6472,78 @@ struct nspa_get_inode_table_reply
 };
 
 
+/* nspa rpc — relocate rpcss state into wineserver
+ *
+ * Phase 1.A: irpcss (COM class-factory registry).  Replaces the four
+ * irpcss_* RPC calls in dlls/combase/rpc.c with direct wineserver
+ * requests.  Server-side state lives in server/nspa/rpc_state.c and is
+ * keyed on the registering process; cleanup is hooked into the existing
+ * process_destroy chain (matches the RPC [context_handle] ownership
+ * model rpcss uses today).
+ *
+ * Gated client-side by NSPA_RPC_BYPASS bitmask (bit 0 = irpcss).  When
+ * the gate is off, dlls/combase/rpc.c falls through to the legacy
+ * ncalrpc path unchanged.
+ *
+ * See nspa/docs/rpc-fast-and-solid-plan.md.  Plan 1.B (irot) and 1.C
+ * (epm) will append further requests below. */
+
+struct nspa_register_class_factory_request
+{
+    struct request_header __header;
+    char __pad_12[4];
+    unsigned __int64 clsid_lo;
+    unsigned __int64 clsid_hi;
+    unsigned int    flags;
+    /* VARARG(object,bytes); */
+    char __pad_36[4];
+};
+struct nspa_register_class_factory_reply
+{
+    struct reply_header __header;
+    unsigned int    cookie;
+    char __pad_12[4];
+};
+
+
+struct nspa_revoke_class_factory_request
+{
+    struct request_header __header;
+    unsigned int    cookie;
+};
+struct nspa_revoke_class_factory_reply
+{
+    struct reply_header __header;
+};
+
+
+struct nspa_get_class_factory_request
+{
+    struct request_header __header;
+    char __pad_12[4];
+    unsigned __int64 clsid_lo;
+    unsigned __int64 clsid_hi;
+};
+struct nspa_get_class_factory_reply
+{
+    struct reply_header __header;
+    /* VARARG(object,bytes); */
+};
+
+
+struct nspa_alloc_thread_seq_id_request
+{
+    struct request_header __header;
+    char __pad_12[4];
+};
+struct nspa_alloc_thread_seq_id_reply
+{
+    struct reply_header __header;
+    unsigned int    seq_id;
+    char __pad_12[4];
+};
+
+
 enum request
 {
     REQ_new_process,
@@ -6785,6 +6857,10 @@ enum request
     REQ_nspa_create_mapping_from_unix_fd,
     REQ_nspa_create_file_from_unix_fd,
     REQ_nspa_get_inode_table,
+    REQ_nspa_register_class_factory,
+    REQ_nspa_revoke_class_factory,
+    REQ_nspa_get_class_factory,
+    REQ_nspa_alloc_thread_seq_id,
     REQ_NB_REQUESTS
 };
 
@@ -7103,6 +7179,10 @@ union generic_request
     struct nspa_create_mapping_from_unix_fd_request nspa_create_mapping_from_unix_fd_request;
     struct nspa_create_file_from_unix_fd_request nspa_create_file_from_unix_fd_request;
     struct nspa_get_inode_table_request nspa_get_inode_table_request;
+    struct nspa_register_class_factory_request nspa_register_class_factory_request;
+    struct nspa_revoke_class_factory_request nspa_revoke_class_factory_request;
+    struct nspa_get_class_factory_request nspa_get_class_factory_request;
+    struct nspa_alloc_thread_seq_id_request nspa_alloc_thread_seq_id_request;
 };
 union generic_reply
 {
@@ -7419,8 +7499,12 @@ union generic_reply
     struct nspa_create_mapping_from_unix_fd_reply nspa_create_mapping_from_unix_fd_reply;
     struct nspa_create_file_from_unix_fd_reply nspa_create_file_from_unix_fd_reply;
     struct nspa_get_inode_table_reply nspa_get_inode_table_reply;
+    struct nspa_register_class_factory_reply nspa_register_class_factory_reply;
+    struct nspa_revoke_class_factory_reply nspa_revoke_class_factory_reply;
+    struct nspa_get_class_factory_reply nspa_get_class_factory_reply;
+    struct nspa_alloc_thread_seq_id_reply nspa_alloc_thread_seq_id_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 948
+#define SERVER_PROTOCOL_VERSION 950
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

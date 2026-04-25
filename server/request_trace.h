@@ -3582,6 +3582,44 @@ static void dump_nspa_get_inode_table_reply( const struct nspa_get_inode_table_r
     fprintf( stderr, ", table_size=%08x", req->table_size );
 }
 
+static void dump_nspa_register_class_factory_request( const struct nspa_register_class_factory_request *req )
+{
+    dump_uint64( " clsid_lo=", &req->clsid_lo );
+    dump_uint64( ", clsid_hi=", &req->clsid_hi );
+    fprintf( stderr, ", flags=%08x", req->flags );
+    dump_varargs_bytes( ", object=", cur_size );
+}
+
+static void dump_nspa_register_class_factory_reply( const struct nspa_register_class_factory_reply *req )
+{
+    fprintf( stderr, " cookie=%08x", req->cookie );
+}
+
+static void dump_nspa_revoke_class_factory_request( const struct nspa_revoke_class_factory_request *req )
+{
+    fprintf( stderr, " cookie=%08x", req->cookie );
+}
+
+static void dump_nspa_get_class_factory_request( const struct nspa_get_class_factory_request *req )
+{
+    dump_uint64( " clsid_lo=", &req->clsid_lo );
+    dump_uint64( ", clsid_hi=", &req->clsid_hi );
+}
+
+static void dump_nspa_get_class_factory_reply( const struct nspa_get_class_factory_reply *req )
+{
+    dump_varargs_bytes( " object=", cur_size );
+}
+
+static void dump_nspa_alloc_thread_seq_id_request( const struct nspa_alloc_thread_seq_id_request *req )
+{
+}
+
+static void dump_nspa_alloc_thread_seq_id_reply( const struct nspa_alloc_thread_seq_id_reply *req )
+{
+    fprintf( stderr, " seq_id=%08x", req->seq_id );
+}
+
 typedef void (*dump_func)( const void *req );
 
 static const dump_func req_dumpers[REQ_NB_REQUESTS] =
@@ -3897,6 +3935,10 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_nspa_create_mapping_from_unix_fd_request,
     (dump_func)dump_nspa_create_file_from_unix_fd_request,
     (dump_func)dump_nspa_get_inode_table_request,
+    (dump_func)dump_nspa_register_class_factory_request,
+    (dump_func)dump_nspa_revoke_class_factory_request,
+    (dump_func)dump_nspa_get_class_factory_request,
+    (dump_func)dump_nspa_alloc_thread_seq_id_request,
 };
 
 static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
@@ -4212,6 +4254,10 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_nspa_create_mapping_from_unix_fd_reply,
     (dump_func)dump_nspa_create_file_from_unix_fd_reply,
     (dump_func)dump_nspa_get_inode_table_reply,
+    (dump_func)dump_nspa_register_class_factory_reply,
+    NULL,
+    (dump_func)dump_nspa_get_class_factory_reply,
+    (dump_func)dump_nspa_alloc_thread_seq_id_reply,
 };
 
 static const char * const req_names[REQ_NB_REQUESTS] =
@@ -4527,6 +4573,10 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "nspa_create_mapping_from_unix_fd",
     "nspa_create_file_from_unix_fd",
     "nspa_get_inode_table",
+    "nspa_register_class_factory",
+    "nspa_revoke_class_factory",
+    "nspa_get_class_factory",
+    "nspa_alloc_thread_seq_id",
 };
 
 static const struct

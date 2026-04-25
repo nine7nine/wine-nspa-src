@@ -391,6 +391,15 @@ static unsigned int nspa_send_request_channel( struct __server_request_info *req
     args.payload_off = (__u64)GetCurrentThreadId();
     args.reply_off   = args.payload_off;
 
+    /* Compute the reply-data offset BEFORE overwriting req->u.reply:
+     * req->u.req and req->u.reply share union memory, so reading
+     * request_header.request_size after the memcpy below would actually
+     * read reply_header.reply_size (same byte offset in the union) and
+     * drive data_ptr to the wrong place.  v2.4 had the same constraint;
+     * computing offsets first matches that ordering. */
+    data_ptr = (char *)(request_shm + 1) + req->u.req.request_header.request_size;
+    copy_limit = (char *)request_shm + NSPA_REQUEST_SHM_SIZE - data_ptr;
+
     ret = ioctl( nspa_request_channel_fd, NTSYNC_IOC_CHANNEL_SEND_PI, &args );
     if (ret < 0)
     {
@@ -406,9 +415,6 @@ static unsigned int nspa_send_request_channel( struct __server_request_info *req
      * Kernel ioctl boundaries are full barriers; no explicit fence
      * needed on x86_64. */
     memcpy( &req->u.reply, (void *)&request_shm->u.reply, sizeof(req->u.reply) );
-
-    data_ptr = (char *)(request_shm + 1) + req->u.req.request_header.request_size;
-    copy_limit = (char *)request_shm + NSPA_REQUEST_SHM_SIZE - data_ptr;
 
     if (req->u.reply.reply_header.reply_size)
     {

@@ -65,6 +65,7 @@
 #include "user.h"
 #include "security.h"
 #include "nspa/rpc_state.h"
+#include "nspa/shmem_channel.h"
 
 /* process object */
 
@@ -705,6 +706,7 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
     process->client_poll_bitmap = NULL;
     process->request_channel_fd = -1;
     process->channel_dispatcher_running = 0;
+    nspa_shmem_channel_init( process );
 #endif
     list_init( &process->rawinput_entry );
     list_init( &process->kernel_object );
@@ -791,6 +793,9 @@ static void process_destroy( struct object *obj )
 
     close_process_handles( process );
     set_process_startup_state( process, STARTUP_ABORTED );
+#ifdef __linux__
+    nspa_shmem_channel_destroy( process );
+#endif
 
     if (process->job)
     {

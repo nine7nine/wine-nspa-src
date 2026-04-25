@@ -31,6 +31,8 @@ SOURCES = \
 	nspa/rpc_state.h \
 	nspa/rt.c \
 	nspa/rt.h \
+	nspa/shmem_channel.c \
+	nspa/shmem_channel.h \
 	object.c \
 	process.c \
 	procfs.c \

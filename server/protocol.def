@@ -1356,6 +1356,7 @@ typedef volatile struct
     unsigned int session_id;   /* process session id */
     obj_handle_t inproc_device;/* inproc device fd in flight with this handle */
     int          has_request_shm; /* NSPA v1.5: request shared memory fd in flight with reply->tid */
+    int          has_request_channel; /* NSPA gamma: ntsync channel fd in flight with reply->pid|2 */
     data_size_t  info_size;    /* total size of startup info */
     VARARG(machines,ushorts);  /* array of supported machines */
 @END

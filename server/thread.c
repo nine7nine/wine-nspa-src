@@ -2045,11 +2045,17 @@ DECL_HANDLER(init_first_thread)
 #ifdef __linux__
     /* NSPA v1.5 shmem IPC: pass per-thread shmem fd to the client.
      * Ordering: inproc_device (above) is sent first if present, then
-     * request_shm. Client-side server_init_process receives in the same
-     * order. The fd handle token is reply->tid to disambiguate from
-     * inproc_device's token. */
+     * request_shm, then (gamma) request_channel.  Client-side
+     * server_init_process receives in the same order.  The fd handle
+     * tokens disambiguate: inproc_device = pid|1, request_shm = tid,
+     * request_channel = pid|2. */
     if ((reply->has_request_shm = current->request_shm_fd != -1))
         send_client_fd( current->process, current->request_shm_fd, reply->tid );
+
+    /* NSPA gamma: pass per-process ntsync channel fd to the client. */
+    if ((reply->has_request_channel = current->process->request_channel_fd != -1))
+        send_client_fd( current->process, current->process->request_channel_fd,
+                        get_process_id( current->process ) | 2 );
 
     /* NSPA E2: use the tail of the first thread's request_shm as the
      * client-poll bitmap.  No separate shmem or protocol field needed. */

@@ -27,6 +27,8 @@ SOURCES = \
 	nspa/local_file.c \
 	nspa/local_file.h \
 	nspa/profile.c \
+	nspa/rpc_state.c \
+	nspa/rpc_state.h \
 	nspa/rt.c \
 	nspa/rt.h \
 	object.c \

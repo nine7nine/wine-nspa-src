@@ -1721,8 +1721,16 @@ static DWORD WINAPI async_notifier_proc(LPVOID p)
     RpcConnection *conn = p;
     RPC_ASYNC_STATE *state = conn->async_state;
 
-    if (state && conn->ops->wait_for_incoming_data(conn) != -1)
+    if (state)
     {
+        /* Wait for either a real reply or an I/O cancellation.  A -1
+         * return previously caused us to drop the user's notifier on
+         * the floor — async clients then hung in their own waits with
+         * no way to learn the call had failed.  Fire the notifier in
+         * either case; the user can call RpcAsyncGetCallStatus to
+         * distinguish RPC_S_OK from RPC_S_CALL_CANCELLED. */
+        (void)conn->ops->wait_for_incoming_data(conn);
+
         state->Event = RpcCallComplete;
         switch (state->NotificationType)
         {

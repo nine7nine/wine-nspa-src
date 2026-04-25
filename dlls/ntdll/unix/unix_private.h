@@ -108,15 +108,15 @@ static inline BOOL is_arm64ec(void)
 #endif
 struct request_shm
 {
-    int reply_futex;          /* NSPA Shape A: server→client wake word. 0 =
-                               * idle, 1 = reply ready. Server writes 1 and
-                               * FUTEX_WAKEs; client waits on 0 and resets
-                               * to 0 after reading the reply. Single-
-                               * producer/single-consumer per thread. */
-    int _pad;                 /* Reserved. Was server_dispatch_tid in NSPA
-                               * v2.4 (manual PI). Retained as padding so
-                               * struct size / 1 MB shmem offsets don't
-                               * shift. */
+    int futex;
+    int server_dispatch_tid;  /* NSPA v2.4: Linux TID of the wineserver
+                               * dispatch thread for this shm. Written
+                               * once by that thread on startup. The
+                               * client reads this to manually boost
+                               * the server's scheduling priority while
+                               * blocked on a reply (manual PI, same
+                               * pattern as CS-PI v2.3). 0 = not set.
+                               * Must match server/thread.h exactly. */
     union
     {
         union generic_request req;

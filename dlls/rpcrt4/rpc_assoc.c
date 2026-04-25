@@ -34,6 +34,29 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(rpc);
 
+
+/* Idle connection cleanup (Phase 2.D — RpcMgmtEnableIdleCleanup).
+ *
+ * When an app calls RpcMgmtEnableIdleCleanup, idle_cleanup_enabled
+ * flips to 1.  Subsequent connection-pool lookups via
+ * RpcAssoc_GetIdleConnection sweep the assoc's free_connection_pool
+ * before searching, freeing every entry whose last_used_tick is
+ * older than IDLE_CLEANUP_THRESHOLD_MS.  Without this, the pool
+ * grows unbounded over the prefix's life — confirmed by the
+ * audit's load-bearing FIXMEs.
+ *
+ * Sweep is bounded by pool size (typical apps: <10 entries) and
+ * runs under the assoc->cs the lookup already takes, so no extra
+ * locking, no extra wakeups, and no background thread. */
+#define IDLE_CLEANUP_THRESHOLD_MS  60000   /* 60 s */
+static LONG idle_cleanup_enabled;
+
+void RpcAssoc_EnableIdleCleanup(void)
+{
+    InterlockedExchange(&idle_cleanup_enabled, 1);
+}
+
+
 static CRITICAL_SECTION assoc_list_cs;
 static CRITICAL_SECTION_DEBUG assoc_list_cs_debug =
 {
@@ -368,6 +391,25 @@ static RpcConnection *RpcAssoc_GetIdleConnection(RpcAssoc *assoc,
 {
     RpcConnection *Connection;
     EnterCriticalSection(&assoc->cs);
+
+    /* Phase 2.D: prune idle connections opportunistically before
+     * searching.  Bounded by pool size and runs only when the app
+     * has called RpcMgmtEnableIdleCleanup. */
+    if (InterlockedCompareExchange(&idle_cleanup_enabled, 0, 0))
+    {
+        DWORD now = GetTickCount();
+        RpcConnection *cursor;
+        LIST_FOR_EACH_ENTRY_SAFE(Connection, cursor, &assoc->free_connection_pool,
+                                 RpcConnection, conn_pool_entry)
+        {
+            if ((DWORD)(now - Connection->last_used_tick) >= IDLE_CLEANUP_THRESHOLD_MS)
+            {
+                list_remove(&Connection->conn_pool_entry);
+                RPCRT4_ReleaseConnection(Connection);
+            }
+        }
+    }
+
     /* try to find a compatible connection from the connection pool */
     LIST_FOR_EACH_ENTRY(Connection, &assoc->free_connection_pool, RpcConnection, conn_pool_entry)
     {
@@ -438,6 +480,7 @@ void RpcAssoc_ReleaseIdleConnection(RpcAssoc *assoc, RpcConnection *Connection)
 {
     assert(!Connection->server);
     Connection->async_state = NULL;
+    Connection->last_used_tick = GetTickCount();
     EnterCriticalSection(&assoc->cs);
     if (!assoc->assoc_group_id) assoc->assoc_group_id = Connection->assoc_group_id;
     list_add_head(&assoc->free_connection_pool, &Connection->conn_pool_entry);

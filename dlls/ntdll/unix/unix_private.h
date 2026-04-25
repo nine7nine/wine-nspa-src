@@ -280,6 +280,7 @@ extern USHORT supported_machines[8];
 extern BOOL process_exiting;
 extern HANDLE keyed_event;
 extern int inproc_device_fd;
+extern int nspa_request_channel_fd; /* NSPA gamma: per-process ntsync channel for shm-IPC */
 extern timeout_t server_start_time;
 extern sigset_t server_block_set;
 extern pi_mutex_t fd_cache_mutex;

@@ -93,6 +93,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(sync);
 
 HANDLE keyed_event = 0;
 int inproc_device_fd = -1;
+int nspa_request_channel_fd = -1; /* NSPA gamma: ntsync channel for shm-IPC */
 
 static const char *debugstr_timeout( const LARGE_INTEGER *timeout )
 {

@@ -1956,6 +1956,11 @@ size_t server_init_process(void)
                     assert( handle == data->tid );
                     received_shm = TRUE;
                 }
+                if (reply->has_request_channel)
+                {
+                    nspa_request_channel_fd = wine_server_receive_fd( &handle );
+                    assert( handle == (obj_handle_t)(pid | 2) );
+                }
                 /* NSPA E2: client_poll_bitmap is in the tail of request_shm.
                  * Set up the pointer after mmap below. */
             }

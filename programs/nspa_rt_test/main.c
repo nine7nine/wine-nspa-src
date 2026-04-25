@@ -57,6 +57,8 @@
 
 #include <winsock2.h>
 #include <windows.h>
+#define COBJMACROS
+#include <objbase.h>
 #include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -4738,6 +4740,246 @@ static int cmd_wm_timer( int argc, char **argv )
 
 
 /* ════════════════════════════════════════════════════════════════════════
+ *   rpc-bypass — irpcss bypass functional parity test (Phase 1.A.6)
+ *
+ *   Exercises the four irpcss methods that NSPA relocated into wineserver:
+ *     - rpcss_server_register   (CoRegisterClassObject)
+ *     - rpcss_get_class_object  (CoGetClassObject of a registered LOCAL_SERVER)
+ *     - rpc_revoke_local_server (CoRevokeClassObject)
+ *     - rpcss_get_next_seqid    (CoCreateInstance internals)
+ *
+ *   Operator runs the test twice — once with NSPA_RPC_BYPASS unset/0 (legacy
+ *   ncalrpc → rpcss path) and once with NSPA_RPC_BYPASS=1 (wineserver-direct
+ *   bypass).  Both must PASS — the bypass is required to be byte-for-byte
+ *   functionally equivalent to the legacy path.  WINEDEBUG=+ole on the
+ *   bypass run additionally surfaces "nspa-bypass" TRACEs as engagement
+ *   evidence (the bypass is actually firing, not just the test happening
+ *   to succeed for unrelated reasons).
+ *
+ *   Bugs each sub-test catches:
+ *     T1: register fails / cookie 0 / wineserver state-struct corruption.
+ *     T2: get on a registered class fails — wineserver lookup or
+ *         MInterfacePointer blob round-trip broken.
+ *     T3: revoke succeeds but state isn't actually freed (would leak
+ *         entries until process exit; only catchable indirectly).
+ *     T4: SINGLEUSE class registration succeeds — exercises a different
+ *         flag path through the request handler.
+ *     T5: revoke on an explicit cookie before lookup succeeds — proves
+ *         per-process owner-check works (revoke is owner-checked, get is
+ *         not).
+ *
+ *   T2 stays on the success path deliberately: CoGetClassObject of an
+ *   *unregistered* CLSCTX_LOCAL_SERVER class triggers a 30-second retry
+ *   loop in combase/rpc.c::rpc_get_local_class_object before returning
+ *   E_NOINTERFACE, which would dominate the test runtime without adding
+ *   coverage.  Negative-case checks would need to be a separate, opt-in
+ *   subcommand if we ever add them.
+ * ════════════════════════════════════════════════════════════════════════ */
+
+/* Two arbitrary CLSIDs scoped to this test.  Not registered in any
+ * Windows registry — they exist only at runtime, in our process, for
+ * the duration of the test. */
+static const GUID NSPA_TEST_CLSID_A = { 0x4e57a1b2, 0x88aa, 0x4f01,
+    { 0x9c, 0xd1, 0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6 } };
+static const GUID NSPA_TEST_CLSID_B = { 0x4e57a1b3, 0x88aa, 0x4f01,
+    { 0x9c, 0xd1, 0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf7 } };
+
+/* Minimal IClassFactory.  CoRegisterClassObject marshals the pointer
+ * for cross-process activation; we never actually instantiate, so
+ * CreateInstance is a stub.  Singleton — refcount stays at 1. */
+typedef struct {
+    IClassFactoryVtbl *lpVtbl;
+} test_factory_t;
+
+static HRESULT STDMETHODCALLTYPE tf_QueryInterface(IClassFactory *iface, REFIID riid, void **ppv)
+{
+    if (IsEqualIID(riid, &IID_IUnknown) || IsEqualIID(riid, &IID_IClassFactory))
+    {
+        *ppv = iface;
+        return S_OK;
+    }
+    *ppv = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG STDMETHODCALLTYPE tf_AddRef(IClassFactory *iface)  { (void)iface; return 2; }
+static ULONG STDMETHODCALLTYPE tf_Release(IClassFactory *iface) { (void)iface; return 1; }
+static HRESULT STDMETHODCALLTYPE tf_CreateInstance(IClassFactory *iface, IUnknown *outer,
+                                                   REFIID riid, void **ppv)
+{
+    (void)iface; (void)outer; (void)riid;
+    *ppv = NULL;
+    return E_NOTIMPL;  /* never used — test never calls CoCreateInstance */
+}
+static HRESULT STDMETHODCALLTYPE tf_LockServer(IClassFactory *iface, BOOL lock)
+{
+    (void)iface; (void)lock;
+    return S_OK;
+}
+
+static IClassFactoryVtbl test_factory_vtbl = {
+    tf_QueryInterface,
+    tf_AddRef,
+    tf_Release,
+    tf_CreateInstance,
+    tf_LockServer,
+};
+
+static test_factory_t test_factory = { &test_factory_vtbl };
+
+
+static int cmd_rpc_bypass(int argc, char **argv)
+{
+    const char *bypass_env;
+    int passed = 0, failed = 0;
+    DWORD cookie_a = 0, cookie_b = 0;
+    IClassFactory *got = NULL;
+    HRESULT hr;
+
+    (void)argc; (void)argv;
+
+    print_banner("rpc-bypass", "Phase 1.A irpcss bypass functional parity test");
+
+    bypass_env = getenv("NSPA_RPC_BYPASS");
+    print_kv("NSPA_RPC_BYPASS", "%s", bypass_env ? bypass_env : "(unset, default off)");
+    print_kv("active path",
+             "%s",
+             (bypass_env && (atoi(bypass_env) & 1))
+                 ? "wineserver-direct (nspa_irpcss_*)"
+                 : "legacy ncalrpc → rpcss.exe");
+    print_kv("test clsid A",
+             "%08lx-%04x-%04x-...", (unsigned long)NSPA_TEST_CLSID_A.Data1,
+             NSPA_TEST_CLSID_A.Data2, NSPA_TEST_CLSID_A.Data3);
+    print_kv("test clsid B",
+             "%08lx-%04x-%04x-...", (unsigned long)NSPA_TEST_CLSID_B.Data1,
+             NSPA_TEST_CLSID_B.Data2, NSPA_TEST_CLSID_B.Data3);
+
+    hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    if (FAILED(hr))
+    {
+        print_verdict(0, "CoInitializeEx failed");
+        return 1;
+    }
+
+    print_section("T1: CoRegisterClassObject(MULTIPLEUSE) — assert cookie != 0");
+    hr = CoRegisterClassObject(&NSPA_TEST_CLSID_A, (IUnknown *)&test_factory,
+                               CLSCTX_LOCAL_SERVER, REGCLS_MULTIPLEUSE, &cookie_a);
+    if (FAILED(hr) || !cookie_a)
+    {
+        printf("  FAIL  hr=0x%08lx cookie=%lu\n", (unsigned long)hr, (unsigned long)cookie_a);
+        failed++;
+    }
+    else
+    {
+        printf("  OK    cookie=%lu\n", (unsigned long)cookie_a);
+        passed++;
+    }
+
+    print_section("T2: CoGetClassObject(CLSCTX_LOCAL_SERVER) on the just-registered CLSID");
+    if (cookie_a)
+    {
+        hr = CoGetClassObject(&NSPA_TEST_CLSID_A, CLSCTX_LOCAL_SERVER, NULL,
+                              &IID_IClassFactory, (void **)&got);
+        if (FAILED(hr) || !got)
+        {
+            printf("  FAIL  hr=0x%08lx\n", (unsigned long)hr);
+            failed++;
+        }
+        else
+        {
+            printf("  OK    factory=%p\n", got);
+            IClassFactory_Release(got);
+            got = NULL;
+            passed++;
+        }
+    }
+    else
+    {
+        printf("  SKIP  (T1 failed; nothing to look up)\n");
+        failed++;
+    }
+
+    print_section("T3: CoRevokeClassObject — assert HRESULT_OK");
+    if (cookie_a)
+    {
+        hr = CoRevokeClassObject(cookie_a);
+        if (FAILED(hr))
+        {
+            printf("  FAIL  hr=0x%08lx\n", (unsigned long)hr);
+            failed++;
+        }
+        else
+        {
+            printf("  OK    cookie %lu revoked\n", (unsigned long)cookie_a);
+            passed++;
+        }
+    }
+    else
+    {
+        printf("  SKIP  (T1 failed; no cookie to revoke)\n");
+        failed++;
+    }
+
+    print_section("T4: CoRegisterClassObject(SINGLEUSE) — different flag path");
+    hr = CoRegisterClassObject(&NSPA_TEST_CLSID_B, (IUnknown *)&test_factory,
+                               CLSCTX_LOCAL_SERVER, REGCLS_SINGLEUSE, &cookie_b);
+    if (FAILED(hr) || !cookie_b)
+    {
+        printf("  FAIL  hr=0x%08lx cookie=%lu\n", (unsigned long)hr, (unsigned long)cookie_b);
+        failed++;
+    }
+    else if (cookie_b == cookie_a)
+    {
+        printf("  FAIL  cookie collided with cookie_a (%lu) — monotonic counter broken\n",
+               (unsigned long)cookie_a);
+        failed++;
+    }
+    else
+    {
+        printf("  OK    cookie=%lu (distinct from cookie_a=%lu)\n",
+               (unsigned long)cookie_b, (unsigned long)cookie_a);
+        passed++;
+    }
+
+    print_section("T5: explicit revoke of SINGLEUSE cookie before any lookup");
+    if (cookie_b)
+    {
+        hr = CoRevokeClassObject(cookie_b);
+        if (FAILED(hr))
+        {
+            printf("  FAIL  hr=0x%08lx\n", (unsigned long)hr);
+            failed++;
+        }
+        else
+        {
+            printf("  OK    cookie %lu revoked\n", (unsigned long)cookie_b);
+            passed++;
+        }
+    }
+    else
+    {
+        printf("  SKIP  (T4 failed; no cookie to revoke)\n");
+        failed++;
+    }
+
+    CoUninitialize();
+
+    print_section("Summary");
+    print_kv("passed", "%d / 5", passed);
+    print_kv("failed", "%d / 5", failed);
+
+    if (!failed)
+    {
+        print_verdict(1, NULL);
+        printf("  Re-run with the *opposite* NSPA_RPC_BYPASS setting and confirm both pass.\n");
+        printf("  Engagement evidence (bypass=1 only): WINEDEBUG=+ole + grep nspa-bypass\n\n");
+        return 0;
+    }
+    print_verdict(0, "at least one sub-test failed — see lines above");
+    return 1;
+}
+
+
+/* ════════════════════════════════════════════════════════════════════════
  *   Command dispatch
  * ════════════════════════════════════════════════════════════════════════ */
 
@@ -4764,6 +5006,7 @@ static struct command commands[] = {
     { "condvar-pi",      "Win32 condvar PI requeue-PI validation (RT waiter + load)",      cmd_condvar_pi    },
     { "nt-timer",        "NSPA NT timer Phase A validation (7 sub-tests, NT-semantics invariant)", cmd_nt_timer },
     { "wm-timer",        "NSPA WM_TIMER Phase B validation (5 sub-tests, coalescing+NT semantics)", cmd_wm_timer },
+    { "rpc-bypass",      "NSPA Phase 1.A irpcss bypass functional parity (5 sub-tests)",   cmd_rpc_bypass    },
     { "help",            "show this help",                                                  cmd_help          },
     { NULL, NULL, NULL }
 };

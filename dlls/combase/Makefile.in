@@ -13,6 +13,8 @@ SOURCES = \
 	irpcss.idl \
 	malloc.c \
 	marshal.c \
+	nspa/rpc_bypass.c \
+	nspa/rpc_bypass.h \
 	roapi.c \
 	rpc.c \
 	string.c \

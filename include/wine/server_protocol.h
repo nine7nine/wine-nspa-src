@@ -6544,6 +6544,131 @@ struct nspa_alloc_thread_seq_id_reply
 };
 
 
+/* nspa rpc — Phase 1.B: irot (Running Object Table) state.
+ *
+ * Replaces the seven IrotRegister / IrotRevoke / IrotIsRunning /
+ * IrotGetObject / IrotNoteChangeTime / IrotGetTimeOfLastChange /
+ * IrotEnumRunning RPC methods that today round-trip through
+ * ncalrpc → rpcss.exe.  Server-side state in server/nspa/rpc_state.c
+ * (extends the file added in Phase 1.A.2); per-process cleanup
+ * reuses the existing nspa_rpc_state_release() hook in
+ * server/process.c.
+ *
+ * Gated client-side by NSPA_RPC_BYPASS bit 1 (irot bypass).  Bit 0
+ * is irpcss (Phase 1.A); the bits are independent so each phase can
+ * be A/B'd in isolation.
+ *
+ * Multi-blob requests (register and revoke-reply) pack the variable-
+ * size payloads into a single VARARG(bytes) and use explicit length
+ * fields to slice on the receiving side.  This avoids the multi-
+ * VARARG length-encoding gymnastics and matches the convention
+ * already used by other Wine requests with several payloads.
+ *
+ * MonikerComparisonData and InterfaceData are both
+ * {ulCntData; abData[]} on the wire — we transmit the whole struct
+ * as raw bytes, not split.  The "len" fields in the requests are
+ * the TOTAL blob size including the ulCntData DWORD header.
+ */
+
+struct nspa_irot_register_request
+{
+    struct request_header __header;
+    unsigned int    moniker_data_len;
+    unsigned int    object_len;
+    unsigned int    moniker_len;
+    unsigned int    flags;
+    char __pad_28[4];
+    unsigned __int64 time;
+    /* VARARG(blobs,bytes); */
+};
+struct nspa_irot_register_reply
+{
+    struct reply_header __header;
+    unsigned int    cookie;
+    unsigned int    already_registered;
+};
+
+
+struct nspa_irot_revoke_request
+{
+    struct request_header __header;
+    unsigned int    cookie;
+};
+struct nspa_irot_revoke_reply
+{
+    struct reply_header __header;
+    unsigned int    object_len;
+    unsigned int    moniker_len;
+    /* VARARG(blobs,bytes); */
+};
+
+
+struct nspa_irot_is_running_request
+{
+    struct request_header __header;
+    /* VARARG(moniker_data,bytes); */
+    char __pad_12[4];
+};
+struct nspa_irot_is_running_reply
+{
+    struct reply_header __header;
+};
+
+
+struct nspa_irot_get_object_request
+{
+    struct request_header __header;
+    /* VARARG(moniker_data,bytes); */
+    char __pad_12[4];
+};
+struct nspa_irot_get_object_reply
+{
+    struct reply_header __header;
+    unsigned int    cookie;
+    /* VARARG(object,bytes); */
+    char __pad_12[4];
+};
+
+
+struct nspa_irot_note_change_time_request
+{
+    struct request_header __header;
+    unsigned int    cookie;
+    unsigned __int64 time;
+};
+struct nspa_irot_note_change_time_reply
+{
+    struct reply_header __header;
+};
+
+
+struct nspa_irot_get_time_of_last_change_request
+{
+    struct request_header __header;
+    /* VARARG(moniker_data,bytes); */
+    char __pad_12[4];
+};
+struct nspa_irot_get_time_of_last_change_reply
+{
+    struct reply_header __header;
+    unsigned __int64 time;
+};
+
+
+struct nspa_irot_enum_running_request
+{
+    struct request_header __header;
+    char __pad_12[4];
+};
+struct nspa_irot_enum_running_reply
+{
+    struct reply_header __header;
+    unsigned int    count;
+    /* VARARG(list,bytes); */
+    char __pad_12[4];
+};
+
+
 enum request
 {
     REQ_new_process,
@@ -6861,6 +6986,13 @@ enum request
     REQ_nspa_revoke_class_factory,
     REQ_nspa_get_class_factory,
     REQ_nspa_alloc_thread_seq_id,
+    REQ_nspa_irot_register,
+    REQ_nspa_irot_revoke,
+    REQ_nspa_irot_is_running,
+    REQ_nspa_irot_get_object,
+    REQ_nspa_irot_note_change_time,
+    REQ_nspa_irot_get_time_of_last_change,
+    REQ_nspa_irot_enum_running,
     REQ_NB_REQUESTS
 };
 
@@ -7183,6 +7315,13 @@ union generic_request
     struct nspa_revoke_class_factory_request nspa_revoke_class_factory_request;
     struct nspa_get_class_factory_request nspa_get_class_factory_request;
     struct nspa_alloc_thread_seq_id_request nspa_alloc_thread_seq_id_request;
+    struct nspa_irot_register_request nspa_irot_register_request;
+    struct nspa_irot_revoke_request nspa_irot_revoke_request;
+    struct nspa_irot_is_running_request nspa_irot_is_running_request;
+    struct nspa_irot_get_object_request nspa_irot_get_object_request;
+    struct nspa_irot_note_change_time_request nspa_irot_note_change_time_request;
+    struct nspa_irot_get_time_of_last_change_request nspa_irot_get_time_of_last_change_request;
+    struct nspa_irot_enum_running_request nspa_irot_enum_running_request;
 };
 union generic_reply
 {
@@ -7503,8 +7642,15 @@ union generic_reply
     struct nspa_revoke_class_factory_reply nspa_revoke_class_factory_reply;
     struct nspa_get_class_factory_reply nspa_get_class_factory_reply;
     struct nspa_alloc_thread_seq_id_reply nspa_alloc_thread_seq_id_reply;
+    struct nspa_irot_register_reply nspa_irot_register_reply;
+    struct nspa_irot_revoke_reply nspa_irot_revoke_reply;
+    struct nspa_irot_is_running_reply nspa_irot_is_running_reply;
+    struct nspa_irot_get_object_reply nspa_irot_get_object_reply;
+    struct nspa_irot_note_change_time_reply nspa_irot_note_change_time_reply;
+    struct nspa_irot_get_time_of_last_change_reply nspa_irot_get_time_of_last_change_reply;
+    struct nspa_irot_enum_running_reply nspa_irot_enum_running_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 950
+#define SERVER_PROTOCOL_VERSION 951
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

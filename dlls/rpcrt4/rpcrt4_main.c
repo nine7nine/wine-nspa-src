@@ -51,6 +51,7 @@
 
 #include "rpc_binding.h"
 #include "rpc_server.h"
+#include "nspa/timeouts.h"
 
 #include "wine/debug.h"
 
@@ -119,6 +120,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 
     switch (fdwReason) {
     case DLL_PROCESS_ATTACH:
+        nspa_rpc_io_init();
         break;
 
     case DLL_THREAD_DETACH:

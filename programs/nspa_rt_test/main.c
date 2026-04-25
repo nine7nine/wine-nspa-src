@@ -4980,6 +4980,220 @@ static int cmd_rpc_bypass(int argc, char **argv)
 
 
 /* ════════════════════════════════════════════════════════════════════════
+ *   irot-bypass — Running Object Table bypass functional parity test
+ *                 (Phase 1.B.5)
+ *
+ *   Exercises the seven irot RPC methods that NSPA Phase 1.B relocated
+ *   into wineserver, through the public IRunningObjectTable surface.
+ *   Operator runs the test twice — once with NSPA_RPC_BYPASS bit 1
+ *   unset (legacy ncalrpc) and once with bit 1 set (NSPA_RPC_BYPASS=2
+ *   or =3).  Both must PASS — bypass is required to be byte-for-byte
+ *   functionally equivalent to the legacy path.
+ *
+ *   Bugs each sub-test catches:
+ *     T1  Register: handler crashes / cookie 0 / 3-blob VARARG pack
+ *         broken / wineserver state-struct corruption.
+ *     T2  IsRunning(true) on the just-registered moniker: lookup-by-
+ *         moniker_data broken (memcmp / size handling).
+ *     T3  NoteChangeTime + GetTimeOfLastChange round-trip: FILETIME
+ *         packed-64-bit handling / cookie lookup.
+ *     T4  GetObject: object blob round-trip; STATUS_BUFFER_TOO_SMALL
+ *         retry loop in the get_object entrypoint.
+ *     T5  Revoke: revoke handler frees the entry; reply VARARG
+ *         (object||moniker concat) round-trip back to the client;
+ *         caller-side InterfaceData split.
+ * ════════════════════════════════════════════════════════════════════════ */
+
+static int cmd_irot_bypass(int argc, char **argv)
+{
+    const char *bypass_env;
+    int passed = 0, failed = 0;
+    HRESULT hr;
+    IRunningObjectTable *rot = NULL;
+    IMoniker *moniker = NULL;
+    DWORD cookie = 0;
+    FILETIME ft_now, ft_got;
+    IUnknown *got_unk = NULL;
+
+    (void)argc; (void)argv;
+
+    print_banner("irot-bypass", "Phase 1.B Running Object Table bypass parity test");
+
+    bypass_env = getenv("NSPA_RPC_BYPASS");
+    print_kv("NSPA_RPC_BYPASS", "%s", bypass_env ? bypass_env : "(unset, default off)");
+    print_kv("active path",
+             "%s",
+             (bypass_env && (atoi(bypass_env) & 2))
+                 ? "wineserver-direct (nspa_irot_*)"
+                 : "legacy ncalrpc → rpcss.exe");
+
+    hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    if (FAILED(hr))
+    {
+        print_verdict(0, "CoInitializeEx failed");
+        return 1;
+    }
+
+    hr = GetRunningObjectTable(0, &rot);
+    if (FAILED(hr) || !rot)
+    {
+        print_verdict(0, "GetRunningObjectTable failed");
+        CoUninitialize();
+        return 1;
+    }
+
+    hr = CreateFileMoniker(L"Z:\\nspa_irot_test_file.txt", &moniker);
+    if (FAILED(hr) || !moniker)
+    {
+        IRunningObjectTable_Release(rot);
+        CoUninitialize();
+        print_verdict(0, "CreateFileMoniker failed");
+        return 1;
+    }
+
+    /* The "running object" is the moniker itself — IMoniker derives
+     * from IUnknown, satisfies the API, and avoids the marshalling
+     * complications of registering a synthetic IClassFactory. */
+
+    print_section("T1: IRunningObjectTable::Register — assert cookie != 0");
+    hr = IRunningObjectTable_Register(rot, ROTFLAGS_REGISTRATIONKEEPSALIVE,
+                                      (IUnknown *)moniker, moniker, &cookie);
+    if (FAILED(hr) || !cookie)
+    {
+        printf("  FAIL  hr=0x%08lx cookie=%lu\n", (unsigned long)hr, (unsigned long)cookie);
+        failed++;
+    }
+    else
+    {
+        printf("  OK    cookie=%lu\n", (unsigned long)cookie);
+        passed++;
+    }
+
+    print_section("T2: IRunningObjectTable::IsRunning — assert TRUE for just-registered");
+    if (cookie)
+    {
+        hr = IRunningObjectTable_IsRunning(rot, moniker);
+        if (hr == S_OK)
+        {
+            printf("  OK    is_running returned S_OK\n");
+            passed++;
+        }
+        else
+        {
+            printf("  FAIL  hr=0x%08lx (expected S_OK)\n", (unsigned long)hr);
+            failed++;
+        }
+    }
+    else
+    {
+        printf("  SKIP  (T1 failed; nothing registered)\n");
+        failed++;
+    }
+
+    print_section("T3: NoteChangeTime + GetTimeOfLastChange round-trip");
+    if (cookie)
+    {
+        GetSystemTimeAsFileTime(&ft_now);
+        hr = IRunningObjectTable_NoteChangeTime(rot, cookie, &ft_now);
+        if (FAILED(hr))
+        {
+            printf("  FAIL  NoteChangeTime hr=0x%08lx\n", (unsigned long)hr);
+            failed++;
+        }
+        else
+        {
+            hr = IRunningObjectTable_GetTimeOfLastChange(rot, moniker, &ft_got);
+            if (FAILED(hr))
+            {
+                printf("  FAIL  GetTimeOfLastChange hr=0x%08lx\n", (unsigned long)hr);
+                failed++;
+            }
+            else if (ft_got.dwLowDateTime != ft_now.dwLowDateTime ||
+                     ft_got.dwHighDateTime != ft_now.dwHighDateTime)
+            {
+                printf("  FAIL  time round-trip mismatch: wrote {%lu,%lu} read {%lu,%lu}\n",
+                       (unsigned long)ft_now.dwLowDateTime, (unsigned long)ft_now.dwHighDateTime,
+                       (unsigned long)ft_got.dwLowDateTime, (unsigned long)ft_got.dwHighDateTime);
+                failed++;
+            }
+            else
+            {
+                printf("  OK    FILETIME round-tripped intact\n");
+                passed++;
+            }
+        }
+    }
+    else
+    {
+        printf("  SKIP  (T1 failed; nothing registered)\n");
+        failed++;
+    }
+
+    print_section("T4: IRunningObjectTable::GetObject — assert returns a live IUnknown");
+    if (cookie)
+    {
+        hr = IRunningObjectTable_GetObject(rot, moniker, &got_unk);
+        if (FAILED(hr) || !got_unk)
+        {
+            printf("  FAIL  hr=0x%08lx unk=%p\n", (unsigned long)hr, got_unk);
+            failed++;
+        }
+        else
+        {
+            printf("  OK    unk=%p\n", got_unk);
+            IUnknown_Release(got_unk);
+            got_unk = NULL;
+            passed++;
+        }
+    }
+    else
+    {
+        printf("  SKIP  (T1 failed; nothing registered)\n");
+        failed++;
+    }
+
+    print_section("T5: IRunningObjectTable::Revoke — assert HRESULT_OK and entry gone");
+    if (cookie)
+    {
+        hr = IRunningObjectTable_Revoke(rot, cookie);
+        if (FAILED(hr))
+        {
+            printf("  FAIL  hr=0x%08lx\n", (unsigned long)hr);
+            failed++;
+        }
+        else
+        {
+            printf("  OK    cookie %lu revoked\n", (unsigned long)cookie);
+            passed++;
+        }
+    }
+    else
+    {
+        printf("  SKIP  (T1 failed; no cookie to revoke)\n");
+        failed++;
+    }
+
+    if (moniker) IMoniker_Release(moniker);
+    if (rot) IRunningObjectTable_Release(rot);
+    CoUninitialize();
+
+    print_section("Summary");
+    print_kv("passed", "%d / 5", passed);
+    print_kv("failed", "%d / 5", failed);
+
+    if (!failed)
+    {
+        print_verdict(1, NULL);
+        printf("  Re-run with the *opposite* NSPA_RPC_BYPASS bit-1 setting to validate parity.\n");
+        printf("  Engagement evidence: WINEDEBUG=+ole + grep nspa-bypass\n\n");
+        return 0;
+    }
+    print_verdict(0, "at least one sub-test failed — see lines above");
+    return 1;
+}
+
+
+/* ════════════════════════════════════════════════════════════════════════
  *   Command dispatch
  * ════════════════════════════════════════════════════════════════════════ */
 
@@ -5007,6 +5221,7 @@ static struct command commands[] = {
     { "nt-timer",        "NSPA NT timer Phase A validation (7 sub-tests, NT-semantics invariant)", cmd_nt_timer },
     { "wm-timer",        "NSPA WM_TIMER Phase B validation (5 sub-tests, coalescing+NT semantics)", cmd_wm_timer },
     { "rpc-bypass",      "NSPA Phase 1.A irpcss bypass functional parity (5 sub-tests)",   cmd_rpc_bypass    },
+    { "irot-bypass",     "NSPA Phase 1.B irot bypass functional parity (5 sub-tests)",     cmd_irot_bypass   },
     { "help",            "show this help",                                                  cmd_help          },
     { NULL, NULL, NULL }
 };

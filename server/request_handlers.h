@@ -322,6 +322,13 @@ DECL_HANDLER(nspa_register_class_factory);
 DECL_HANDLER(nspa_revoke_class_factory);
 DECL_HANDLER(nspa_get_class_factory);
 DECL_HANDLER(nspa_alloc_thread_seq_id);
+DECL_HANDLER(nspa_irot_register);
+DECL_HANDLER(nspa_irot_revoke);
+DECL_HANDLER(nspa_irot_is_running);
+DECL_HANDLER(nspa_irot_get_object);
+DECL_HANDLER(nspa_irot_note_change_time);
+DECL_HANDLER(nspa_irot_get_time_of_last_change);
+DECL_HANDLER(nspa_irot_enum_running);
 
 typedef void (*req_handler)( const void *req, void *reply );
 static const req_handler req_handlers[REQ_NB_REQUESTS] =
@@ -641,6 +648,13 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_nspa_revoke_class_factory,
     (req_handler)req_nspa_get_class_factory,
     (req_handler)req_nspa_alloc_thread_seq_id,
+    (req_handler)req_nspa_irot_register,
+    (req_handler)req_nspa_irot_revoke,
+    (req_handler)req_nspa_irot_is_running,
+    (req_handler)req_nspa_irot_get_object,
+    (req_handler)req_nspa_irot_note_change_time,
+    (req_handler)req_nspa_irot_get_time_of_last_change,
+    (req_handler)req_nspa_irot_enum_running,
 };
 
 C_ASSERT( sizeof(abstime_t) == 8 );
@@ -2448,3 +2462,30 @@ C_ASSERT( sizeof(struct nspa_get_class_factory_reply) == 8 );
 C_ASSERT( sizeof(struct nspa_alloc_thread_seq_id_request) == 16 );
 C_ASSERT( offsetof(struct nspa_alloc_thread_seq_id_reply, seq_id) == 8 );
 C_ASSERT( sizeof(struct nspa_alloc_thread_seq_id_reply) == 16 );
+C_ASSERT( offsetof(struct nspa_irot_register_request, moniker_data_len) == 12 );
+C_ASSERT( offsetof(struct nspa_irot_register_request, object_len) == 16 );
+C_ASSERT( offsetof(struct nspa_irot_register_request, moniker_len) == 20 );
+C_ASSERT( offsetof(struct nspa_irot_register_request, flags) == 24 );
+C_ASSERT( offsetof(struct nspa_irot_register_request, time) == 32 );
+C_ASSERT( sizeof(struct nspa_irot_register_request) == 40 );
+C_ASSERT( offsetof(struct nspa_irot_register_reply, cookie) == 8 );
+C_ASSERT( offsetof(struct nspa_irot_register_reply, already_registered) == 12 );
+C_ASSERT( sizeof(struct nspa_irot_register_reply) == 16 );
+C_ASSERT( offsetof(struct nspa_irot_revoke_request, cookie) == 12 );
+C_ASSERT( sizeof(struct nspa_irot_revoke_request) == 16 );
+C_ASSERT( offsetof(struct nspa_irot_revoke_reply, object_len) == 8 );
+C_ASSERT( offsetof(struct nspa_irot_revoke_reply, moniker_len) == 12 );
+C_ASSERT( sizeof(struct nspa_irot_revoke_reply) == 16 );
+C_ASSERT( sizeof(struct nspa_irot_is_running_request) == 16 );
+C_ASSERT( sizeof(struct nspa_irot_get_object_request) == 16 );
+C_ASSERT( offsetof(struct nspa_irot_get_object_reply, cookie) == 8 );
+C_ASSERT( sizeof(struct nspa_irot_get_object_reply) == 16 );
+C_ASSERT( offsetof(struct nspa_irot_note_change_time_request, cookie) == 12 );
+C_ASSERT( offsetof(struct nspa_irot_note_change_time_request, time) == 16 );
+C_ASSERT( sizeof(struct nspa_irot_note_change_time_request) == 24 );
+C_ASSERT( sizeof(struct nspa_irot_get_time_of_last_change_request) == 16 );
+C_ASSERT( offsetof(struct nspa_irot_get_time_of_last_change_reply, time) == 8 );
+C_ASSERT( sizeof(struct nspa_irot_get_time_of_last_change_reply) == 16 );
+C_ASSERT( sizeof(struct nspa_irot_enum_running_request) == 16 );
+C_ASSERT( offsetof(struct nspa_irot_enum_running_reply, count) == 8 );
+C_ASSERT( sizeof(struct nspa_irot_enum_running_reply) == 16 );

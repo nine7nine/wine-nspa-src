@@ -4601,3 +4601,84 @@ enum inproc_sync_type
 @REPLY
     unsigned int    seq_id;      /* monotonic thread sequence id */
 @END
+
+
+/* nspa rpc — Phase 1.B: irot (Running Object Table) state.
+ *
+ * Replaces the seven IrotRegister / IrotRevoke / IrotIsRunning /
+ * IrotGetObject / IrotNoteChangeTime / IrotGetTimeOfLastChange /
+ * IrotEnumRunning RPC methods that today round-trip through
+ * ncalrpc → rpcss.exe.  Server-side state in server/nspa/rpc_state.c
+ * (extends the file added in Phase 1.A.2); per-process cleanup
+ * reuses the existing nspa_rpc_state_release() hook in
+ * server/process.c.
+ *
+ * Gated client-side by NSPA_RPC_BYPASS bit 1 (irot bypass).  Bit 0
+ * is irpcss (Phase 1.A); the bits are independent so each phase can
+ * be A/B'd in isolation.
+ *
+ * Multi-blob requests (register and revoke-reply) pack the variable-
+ * size payloads into a single VARARG(bytes) and use explicit length
+ * fields to slice on the receiving side.  This avoids the multi-
+ * VARARG length-encoding gymnastics and matches the convention
+ * already used by other Wine requests with several payloads.
+ *
+ * MonikerComparisonData and InterfaceData are both
+ * {ulCntData; abData[]} on the wire — we transmit the whole struct
+ * as raw bytes, not split.  The "len" fields in the requests are
+ * the TOTAL blob size including the ulCntData DWORD header.
+ */
+
+@REQ(nspa_irot_register)
+    unsigned int    moniker_data_len; /* size of moniker_data blob (header + body) */
+    unsigned int    object_len;       /* size of object blob */
+    unsigned int    moniker_len;      /* size of moniker blob */
+    unsigned int    flags;            /* ROTFLAGS_* */
+    unsigned __int64 time;            /* FILETIME packed (lo | hi << 32) */
+    VARARG(blobs,bytes);              /* moniker_data || object || moniker, concatenated */
+@REPLY
+    unsigned int    cookie;
+    unsigned int    already_registered; /* 1 → MK_S_MONIKERALREADYREGISTERED on the client */
+@END
+
+
+@REQ(nspa_irot_revoke)
+    unsigned int    cookie;
+@REPLY
+    unsigned int    object_len;       /* size of returned object blob */
+    unsigned int    moniker_len;      /* size of returned moniker blob */
+    VARARG(blobs,bytes);              /* object || moniker, concatenated */
+@END
+
+
+@REQ(nspa_irot_is_running)
+    VARARG(moniker_data,bytes);
+@END
+
+
+@REQ(nspa_irot_get_object)
+    VARARG(moniker_data,bytes);
+@REPLY
+    unsigned int    cookie;
+    VARARG(object,bytes);
+@END
+
+
+@REQ(nspa_irot_note_change_time)
+    unsigned int    cookie;
+    unsigned __int64 time;
+@END
+
+
+@REQ(nspa_irot_get_time_of_last_change)
+    VARARG(moniker_data,bytes);
+@REPLY
+    unsigned __int64 time;
+@END
+
+
+@REQ(nspa_irot_enum_running)
+@REPLY
+    unsigned int    count;            /* number of entries in the list */
+    VARARG(list,bytes);               /* TLV stream: for each entry, u32 size + size bytes */
+@END

@@ -3622,6 +3622,76 @@ static void dump_nspa_alloc_thread_seq_id_reply( const struct nspa_alloc_thread_
     fprintf( stderr, " seq_id=%08x", req->seq_id );
 }
 
+static void dump_nspa_irot_register_request( const struct nspa_irot_register_request *req )
+{
+    fprintf( stderr, " moniker_data_len=%08x", req->moniker_data_len );
+    fprintf( stderr, ", object_len=%08x", req->object_len );
+    fprintf( stderr, ", moniker_len=%08x", req->moniker_len );
+    fprintf( stderr, ", flags=%08x", req->flags );
+    dump_uint64( ", time=", &req->time );
+    dump_varargs_bytes( ", blobs=", cur_size );
+}
+
+static void dump_nspa_irot_register_reply( const struct nspa_irot_register_reply *req )
+{
+    fprintf( stderr, " cookie=%08x", req->cookie );
+    fprintf( stderr, ", already_registered=%08x", req->already_registered );
+}
+
+static void dump_nspa_irot_revoke_request( const struct nspa_irot_revoke_request *req )
+{
+    fprintf( stderr, " cookie=%08x", req->cookie );
+}
+
+static void dump_nspa_irot_revoke_reply( const struct nspa_irot_revoke_reply *req )
+{
+    fprintf( stderr, " object_len=%08x", req->object_len );
+    fprintf( stderr, ", moniker_len=%08x", req->moniker_len );
+    dump_varargs_bytes( ", blobs=", cur_size );
+}
+
+static void dump_nspa_irot_is_running_request( const struct nspa_irot_is_running_request *req )
+{
+    dump_varargs_bytes( " moniker_data=", cur_size );
+}
+
+static void dump_nspa_irot_get_object_request( const struct nspa_irot_get_object_request *req )
+{
+    dump_varargs_bytes( " moniker_data=", cur_size );
+}
+
+static void dump_nspa_irot_get_object_reply( const struct nspa_irot_get_object_reply *req )
+{
+    fprintf( stderr, " cookie=%08x", req->cookie );
+    dump_varargs_bytes( ", object=", cur_size );
+}
+
+static void dump_nspa_irot_note_change_time_request( const struct nspa_irot_note_change_time_request *req )
+{
+    fprintf( stderr, " cookie=%08x", req->cookie );
+    dump_uint64( ", time=", &req->time );
+}
+
+static void dump_nspa_irot_get_time_of_last_change_request( const struct nspa_irot_get_time_of_last_change_request *req )
+{
+    dump_varargs_bytes( " moniker_data=", cur_size );
+}
+
+static void dump_nspa_irot_get_time_of_last_change_reply( const struct nspa_irot_get_time_of_last_change_reply *req )
+{
+    dump_uint64( " time=", &req->time );
+}
+
+static void dump_nspa_irot_enum_running_request( const struct nspa_irot_enum_running_request *req )
+{
+}
+
+static void dump_nspa_irot_enum_running_reply( const struct nspa_irot_enum_running_reply *req )
+{
+    fprintf( stderr, " count=%08x", req->count );
+    dump_varargs_bytes( ", list=", cur_size );
+}
+
 typedef void (*dump_func)( const void *req );
 
 static const dump_func req_dumpers[REQ_NB_REQUESTS] =
@@ -3941,6 +4011,13 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_nspa_revoke_class_factory_request,
     (dump_func)dump_nspa_get_class_factory_request,
     (dump_func)dump_nspa_alloc_thread_seq_id_request,
+    (dump_func)dump_nspa_irot_register_request,
+    (dump_func)dump_nspa_irot_revoke_request,
+    (dump_func)dump_nspa_irot_is_running_request,
+    (dump_func)dump_nspa_irot_get_object_request,
+    (dump_func)dump_nspa_irot_note_change_time_request,
+    (dump_func)dump_nspa_irot_get_time_of_last_change_request,
+    (dump_func)dump_nspa_irot_enum_running_request,
 };
 
 static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
@@ -4260,6 +4337,13 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     NULL,
     (dump_func)dump_nspa_get_class_factory_reply,
     (dump_func)dump_nspa_alloc_thread_seq_id_reply,
+    (dump_func)dump_nspa_irot_register_reply,
+    (dump_func)dump_nspa_irot_revoke_reply,
+    NULL,
+    (dump_func)dump_nspa_irot_get_object_reply,
+    NULL,
+    (dump_func)dump_nspa_irot_get_time_of_last_change_reply,
+    (dump_func)dump_nspa_irot_enum_running_reply,
 };
 
 static const char * const req_names[REQ_NB_REQUESTS] =
@@ -4579,6 +4663,13 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "nspa_revoke_class_factory",
     "nspa_get_class_factory",
     "nspa_alloc_thread_seq_id",
+    "nspa_irot_register",
+    "nspa_irot_revoke",
+    "nspa_irot_is_running",
+    "nspa_irot_get_object",
+    "nspa_irot_note_change_time",
+    "nspa_irot_get_time_of_last_change",
+    "nspa_irot_enum_running",
 };
 
 static const struct

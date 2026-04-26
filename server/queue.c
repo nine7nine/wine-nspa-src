@@ -750,8 +750,8 @@ void add_queue_hook_count( struct thread *thread, unsigned int index, int count 
 
 /* NSPA Tier 1: single-source-of-truth gate for whether the client-owned
  * shmem refcount (nspa_queue_bypass_shm_t::nspa_hook_walk_counts[]) is
- * being used for this queue's hook-chain pinning.  True iff NSPA_HOOK_TIER1
- * env is set (server-side) AND the memfd-backed bypass shm has been
+ * being used for this queue's hook-chain pinning.  True unless
+ * NSPA_DISABLE_HOOK_TIER1 is set AND the memfd-backed bypass shm has been
  * allocated for this queue.  The server publishes this per-RPC in
  * start_hook_chain reply->tier1_active so the client matches without
  * reading env independently. */
@@ -760,8 +760,8 @@ static int nspa_hook_tier1_env_enabled( void )
     static int cached = -1;
     if (cached < 0)
     {
-        const char *v = getenv( "NSPA_HOOK_TIER1" );
-        cached = (v && *v && *v != '0');
+        const char *v = getenv( "NSPA_DISABLE_HOOK_TIER1" );
+        cached = !(v && *v && *v != '0');
     }
     return cached;
 }

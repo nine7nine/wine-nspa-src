@@ -2153,17 +2153,73 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
     }
     else rw_mode = O_RDONLY;
 
-    if ((fd->unix_fd = openat( dirfd, name, rw_mode | (flags & ~O_TRUNC), *mode )) == -1)
+    /* NSPA Phase B — release global_lock around the openat() syscall(s)
+     * so the audio thread (or any other RT waiter) can make progress
+     * while a slow file open (cold-cache page-in / metadata I/O) is
+     * pending in the kernel.  This is the drum-load xrun fix from
+     * nspa/docs/open-fd-async-plan.md.
+     *
+     * Safety:
+     *   - `fd` was just allocated by alloc_fd_object(); only this thread
+     *     knows about it, but we grab a defensive ref so the unlocked
+     *     window is bullet-proof.
+     *   - `root` is held by the caller's request handler; we grab a ref
+     *     so a concurrent close-handle of root cannot free it during
+     *     our syscall.
+     *   - `current` is the wineserver per-request thread pointer
+     *     (request.c:121, GLOBAL).  Another handler running in our
+     *     unlocked window will trample it; save and restore.
+     *   - `current->error` belongs to our request and gets read by the
+     *     reply path (call_req_handler_shm); save and restore so we
+     *     don't pick up another handler's error state.
+     *   - `errno` is per-thread; preserved across the lock dance
+     *     naturally, but we still snapshot the openat() errno
+     *     explicitly so the file_set_error()/STATUS check below sees
+     *     exactly what openat returned and not an errno set by
+     *     pi_mutex_lock or any other intervening libc call.
+     *   - `name`, `flags`, `*mode`, `dirfd`, `rw_mode`, `options`,
+     *     `access` are caller-stack data; safe across the unlocked
+     *     window.
+     *
+     * Kept under the lock: mkdirat above (rare path during plugin
+     * loads — defer to a follow-up), the post-open fstat/get_inode/
+     * inode-list manipulation below (manipulates wineserver state).
+     */
     {
-        /* if we tried to open a directory for write access, retry read-only */
-        if (errno == EISDIR)
+        struct thread *saved_current = current;
+        unsigned int saved_error = saved_current ? saved_current->error : 0;
+        struct fd *fd_ref = (struct fd *)grab_object( fd );
+        struct fd *root_ref = root ? (struct fd *)grab_object( root ) : NULL;
+        int local_unix_fd, local_errno = 0;
+
+        pi_mutex_unlock( &global_lock );
+
+        local_unix_fd = openat( dirfd, name, rw_mode | (flags & ~O_TRUNC), *mode );
+        if (local_unix_fd == -1)
         {
-            if ((access & FILE_UNIX_WRITE_ACCESS) || (flags & O_CREAT))
-                fd->unix_fd = openat( dirfd, name, O_RDONLY | (flags & ~(O_TRUNC | O_CREAT | O_EXCL)), *mode );
+            local_errno = errno;
+            /* if we tried to open a directory for write access, retry read-only */
+            if (local_errno == EISDIR &&
+                ((access & FILE_UNIX_WRITE_ACCESS) || (flags & O_CREAT)))
+            {
+                local_unix_fd = openat( dirfd, name,
+                                        O_RDONLY | (flags & ~(O_TRUNC | O_CREAT | O_EXCL)),
+                                        *mode );
+                local_errno = (local_unix_fd == -1) ? errno : 0;
+            }
         }
 
+        pi_mutex_lock( &global_lock );
+
+        current = saved_current;
+        if (saved_current) saved_current->error = saved_error;
+        if (root_ref) release_object( root_ref );
+        release_object( fd_ref );
+
+        fd->unix_fd = local_unix_fd;
         if (fd->unix_fd == -1)
         {
+            errno = local_errno;
             /* check for trailing slash on file path */
             if ((errno == ENOENT || (errno == ENOTDIR && !(options & FILE_DIRECTORY_FILE))) && name[strlen(name) - 1] == '/')
                 set_error( STATUS_OBJECT_NAME_INVALID );

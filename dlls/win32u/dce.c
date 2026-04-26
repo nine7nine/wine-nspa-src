@@ -1577,6 +1577,86 @@ static BOOL redraw_window_rects( HWND hwnd, UINT flags, const RECT *rects, UINT 
     return ret;
 }
 
+/* NSPA msg-ring v2 Phase B1.0 — get_update_flags fast path.
+ *
+ * get_update_flags always sends UPDATE_NOREGION on the wire (see
+ * req->flags below) and is the dominant get_update_region cost in
+ * the post-Phase-A residual: 9.6k RPCs / 120s of Ableton playback.
+ * The dominant call site is the erase_now() for(;;) loop at line
+ * 1862, which polls until the queue's paint state goes clean.
+ *
+ * The server already publishes a queue-level "anything dirty?"
+ * answer in queue_shm->wake_bits via QS_PAINT — set whenever
+ * inc_queue_paint_count flips paint_count to >0, cleared when it
+ * returns to 0 (server/queue.c::inc_queue_paint_count).  When this
+ * thread owns hwnd AND QS_PAINT is clear, get_update_region is
+ * guaranteed to return flags=0 (no window in this queue is dirty,
+ * so no paint can be returned for any of its hwnds), so we can
+ * short-circuit without the RPC.
+ *
+ * Validity preconditions:
+ *   1. hwnd is owned by current thread (is_current_thread_window) —
+ *      otherwise QS_PAINT on this queue tells us nothing about hwnd.
+ *   2. Bypass shm and queue_shm are mapped (early-process startup
+ *      may not yet have these).
+ *   3. QS_PAINT bit is clear (dirty bit is sticky until validate).
+ *
+ * On hit, the fast path returns to the caller as if the RPC had
+ * succeeded with reply->flags=0 / reply->child=hwnd, which makes
+ * erase_now exit the loop via the !flags break.
+ *
+ * Default-on; opt-out via NSPA_DISABLE_PAINT_CACHE (env-var name
+ * shared with the future B1.1 per-window probe cache so callers
+ * can disable the entire B1 family with a single var). */
+static unsigned long long nspa_paint_fastpath_hits;
+static unsigned long long nspa_paint_fastpath_misses;
+
+static int nspa_paint_fastpath_disabled( void )
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *v = getenv( "NSPA_DISABLE_PAINT_CACHE" );
+        cached = (v && *v && *v != '0');
+    }
+    return cached;
+}
+
+static BOOL nspa_get_update_flags_try_fastpath( HWND hwnd, HWND *child, UINT *flags )
+{
+    struct object_lock lock = OBJECT_LOCK_INIT;
+    const queue_shm_t *queue_shm;
+    unsigned int wake_bits = 0;
+    UINT status;
+
+    if (nspa_paint_fastpath_disabled()) return FALSE;
+
+    /* No hwnd → server interprets as "any window owned by current
+     * thread"; the queue-level QS_PAINT bit IS the answer for that
+     * case, no ownership check needed.  Otherwise hwnd must be
+     * owned by current thread. */
+    if (hwnd && !is_current_thread_window( hwnd )) return FALSE;
+
+    /* Bypass shm not mapped yet (early in process startup). */
+    if (!nspa_get_own_bypass_shm_public()) return FALSE;
+
+    while ((status = get_shared_queue( &lock, &queue_shm )) == STATUS_PENDING)
+        wake_bits = queue_shm->wake_bits;
+    if (status) return FALSE;
+
+    /* QS_PAINT set → at least one window in this queue is dirty.
+     * Cannot tell from a single queue bit whether *this* hwnd is
+     * the dirty one (or a parent/sibling of from_child); fall back
+     * to the RPC. */
+    if (wake_bits & QS_PAINT) return FALSE;
+
+    /* QS_PAINT clear → no paint state in this queue → get_update_region
+     * would return flags=0.  Short-circuit. */
+    if (child) *child = hwnd;
+    *flags = 0;
+    return TRUE;
+}
+
 /***********************************************************************
  *           get_update_flags
  *
@@ -1585,6 +1665,13 @@ static BOOL redraw_window_rects( HWND hwnd, UINT flags, const RECT *rects, UINT 
 static BOOL get_update_flags( HWND hwnd, HWND *child, UINT *flags )
 {
     BOOL ret;
+
+    if (nspa_get_update_flags_try_fastpath( hwnd, child, flags ))
+    {
+        __atomic_fetch_add( &nspa_paint_fastpath_hits, 1, __ATOMIC_RELAXED );
+        return TRUE;
+    }
+    __atomic_fetch_add( &nspa_paint_fastpath_misses, 1, __ATOMIC_RELAXED );
 
     SERVER_START_REQ( get_update_region )
     {

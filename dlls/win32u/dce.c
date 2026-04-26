@@ -1613,11 +1613,15 @@ static unsigned long long nspa_paint_fastpath_misses;
 
 static int nspa_paint_fastpath_disabled( void )
 {
+    /* DEFAULT-DISABLED pending audit — see nspa/docs/nspa-bypass-audit.md.
+     * B1.0 produced a host lockup on first validation run.  Two suspected
+     * mechanisms (FIFO seqlock spin, DELAYED_ERASE not in QS_PAINT) are
+     * not yet ruled out.  Code retained for diagnostic A/B; opt-in only. */
     static int cached = -1;
     if (cached < 0)
     {
-        const char *v = getenv( "NSPA_DISABLE_PAINT_CACHE" );
-        cached = (v && *v && *v != '0');
+        const char *v = getenv( "NSPA_ENABLE_PAINT_CACHE" );
+        cached = !(v && *v && *v != '0');
     }
     return cached;
 }

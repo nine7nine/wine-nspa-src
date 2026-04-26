@@ -3120,7 +3120,14 @@ static int peek_message( MSG *msg, const struct peek_message_filter *filter )
                 info.nspa_reply_slot  = pop_slot;
                 hw_id                 = 0;
             }
-            else SERVER_START_REQ( get_message )
+            else
+            {
+                /* msg-ring v2 Phase C diag: categorise why the v1 ring pops
+                 * didn't satisfy this peek.  Opt-in via NSPA_SEND_DIAG=1;
+                 * bump function is a no-op when off. */
+                nspa_get_message_diag_bump( signal_bits,
+                                            nspa_get_own_bypass_shm_public() != NULL );
+                SERVER_START_REQ( get_message )
             {
                 req->internal  = filter->internal;
                 req->flags     = flags;
@@ -3149,6 +3156,7 @@ static int peek_message( MSG *msg, const struct peek_message_filter *filter )
                 else buffer_size = reply->total;
             }
             SERVER_END_REQ;
+            }
         }
 
         if (res)

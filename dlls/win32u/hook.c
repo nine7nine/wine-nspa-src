@@ -30,6 +30,7 @@
 #include "ntuser_private.h"
 #include "wine/server.h"
 #include "wine/debug.h"
+#include "nspa_hook_filter.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(hook);
 
@@ -106,6 +107,15 @@ static unsigned long long nspa_hook_tier1_shmem_inc;
 static unsigned long long nspa_hook_tier1_shmem_dec;
 static unsigned long long nspa_hook_tier1_finish_skipped;
 static unsigned long long nspa_hook_tier1_finish_forced;
+/* NSPA Tier 2 diag counters: track how often the seqlock-stable shmem
+ * cache served the dispatch vs falling back to the legacy RPC trio.
+ * dispatched = top-level call_message_hooks served from cache;
+ * next       = NtUserCallNextHookEx served from cache (pure savings on
+ *              chains > 1);
+ * fallback   = cache reported overflow / retry exhausted / not mapped. */
+static unsigned long long nspa_hook_tier2_dispatched;
+static unsigned long long nspa_hook_tier2_next;
+static unsigned long long nspa_hook_tier2_fallback;
 /* Category counters — sampled at server-dispatch time on the conditions
  * a future safe-bypass would care about.  Together they tell us, for
  * a given workload, how big the safely-bypassable subset would be:
@@ -185,6 +195,15 @@ static void nspa_hook_diag_dump( void )
                 t1skip, (t1skip + t1keep) ? 100.0 * (double)t1skip / (double)(t1skip + t1keep) : 0.0);
         fprintf(f, "  finish_forced          %llu  (global-path or tier1 inactive)\n", t1keep);
     }
+    {
+        unsigned long long t2disp = __atomic_load_n( &nspa_hook_tier2_dispatched, __ATOMIC_RELAXED );
+        unsigned long long t2next = __atomic_load_n( &nspa_hook_tier2_next,       __ATOMIC_RELAXED );
+        unsigned long long t2fb   = __atomic_load_n( &nspa_hook_tier2_fallback,   __ATOMIC_RELAXED );
+        fprintf(f, "\n[Tier 2 cache]\n");
+        fprintf(f, "  dispatched_from_cache  %llu  (top-level)\n", t2disp);
+        fprintf(f, "  next_from_cache        %llu  (CallNextHookEx, chain>1)\n", t2next);
+        fprintf(f, "  fallback_to_rpc        %llu  (overflow / retry exhausted / not mapped)\n", t2fb);
+    }
     fclose(f);
     rename(tmp, path);
 }
@@ -215,6 +234,175 @@ static void nspa_hook_diag_start_once_fn( void )
 static void nspa_hook_diag_lazy_start( void )
 {
     pthread_once( &nspa_hook_diag_start_once, nspa_hook_diag_start_once_fn );
+}
+
+/* ---------------------------------------------------------------------
+ * NSPA Tier 2 hook cache reader.
+ *
+ * The wineserver maintains a per-(queue, hook id) snapshot of the chain
+ * in nspa_queue_bypass_shm_t::nspa_hook_chains[] under a seqlock (see
+ * server/nspa/hook_cache.c).  When the snapshot is stable and not
+ * marked overflowed, the client iterates entries directly from shmem
+ * instead of round-tripping start_hook_chain / get_hook_info /
+ * finish_hook_chain.
+ *
+ * Walker is allocated on the dispatching thread's stack inside
+ * call_message_hooks; nspa_hook_walker_current points at the innermost
+ * walker so NtUserCallNextHookEx can advance through entries[] without
+ * an RPC.  Nested calls (one hook proc triggering another hook chain)
+ * push/pop via the prev pointer.
+ *
+ * Default-on; opt out with NSPA_DISABLE_HOOK_TIER2.  Falls back to the
+ * Tier 1 RPC path on overflow, seqlock retry exhaustion, or any
+ * structural reason the cache can't serve the request. */
+
+struct nspa_hook_walker
+{
+    struct nspa_hook_walker *prev;                /* nesting chain */
+    int                      count;               /* entries[0..count-1] valid */
+    int                      hook_id;             /* WH_* */
+    nspa_hook_entry_t        entries[NSPA_HOOK_CHAIN_CAP];
+    /* Per-entry copy of the module name from bypass->nspa_hook_module_pool.
+     * Copied during the seqlock-stable snapshot so subsequent server-side
+     * rebuilds can't pull the bytes out from under us. */
+    WCHAR                    modules[NSPA_HOOK_CHAIN_CAP][MAX_PATH];
+    unsigned int             module_lengths[NSPA_HOOK_CHAIN_CAP]; /* WCHARs, no NUL */
+};
+
+static __thread struct nspa_hook_walker *nspa_hook_walker_current;
+
+static int nspa_hook_tier2_env_enabled( void )
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *v = getenv( "NSPA_DISABLE_HOOK_TIER2" );
+        cached = !(v && *v && *v != '0');
+    }
+    return cached;
+}
+
+/* Try to populate `walker` from the cache.  Returns count of matching
+ * entries (>=0) on success, or -1 on overflow / retry exhaustion /
+ * bypass shm unavailable / module copy out of range.  Caller falls back
+ * to RPC on -1; on >=0 result, walker is populated and call sites must
+ * push it onto nspa_hook_walker_current before dispatching. */
+static int nspa_hook_try_read_cache( struct nspa_hook_walker *walker, int hook_id, int event )
+{
+    nspa_queue_bypass_shm_t *bypass;
+    nspa_hook_chain_t *chain;
+    unsigned int my_pid;
+    unsigned int my_tid;
+    int idx;
+    int retry;
+
+    if (!nspa_hook_tier2_env_enabled()) return -1;
+
+    bypass = (nspa_queue_bypass_shm_t *)nspa_get_own_bypass_shm_public();
+    if (!bypass) return -1;
+
+    idx = hook_id - WH_MINHOOK;
+    if (idx < 0 || idx >= NB_HOOKS) return -1;
+
+    chain = (nspa_hook_chain_t *)&bypass->nspa_hook_chains[idx];
+    my_pid = HandleToULong( NtCurrentTeb()->ClientId.UniqueProcess );
+    my_tid = HandleToULong( NtCurrentTeb()->ClientId.UniqueThread );
+
+    for (retry = 0; retry < 8; retry++)
+    {
+        unsigned int v1, v2;
+        unsigned int cnt;
+        unsigned int over;
+        nspa_hook_entry_t local[NSPA_HOOK_CHAIN_CAP];
+        WCHAR local_modules[NSPA_HOOK_CHAIN_CAP][MAX_PATH];
+        unsigned int local_modlen[NSPA_HOOK_CHAIN_CAP];
+        unsigned int i;
+        int copy_failed = 0;
+
+        v1 = __atomic_load_n( &chain->version, __ATOMIC_ACQUIRE );
+        if (v1 & 1) { sched_yield(); continue; }
+
+        cnt  = chain->count;
+        over = chain->overflowed;
+        if (over) return -1;
+        if (cnt > NSPA_HOOK_CHAIN_CAP) return -1;
+
+        for (i = 0; i < cnt; i++)
+        {
+            unsigned int mlen;
+            local[i] = chain->entries[i];
+            mlen = local[i].module_size;
+            if (mlen >= MAX_PATH) { copy_failed = 1; break; }
+            local_modlen[i] = mlen;
+            if (mlen)
+            {
+                unsigned int off = local[i].module_offset;
+                if (off == 0 || off + mlen * sizeof(WCHAR) > NSPA_HOOK_MODULE_POOL)
+                {
+                    copy_failed = 1; break;
+                }
+                memcpy( local_modules[i],
+                        (const void *)&bypass->nspa_hook_module_pool[off],
+                        mlen * sizeof(WCHAR) );
+            }
+            local_modules[i][mlen] = 0;
+        }
+
+        v2 = __atomic_load_n( &chain->version, __ATOMIC_ACQUIRE );
+        if (v1 != v2 || (v2 & 1)) { sched_yield(); continue; }
+        if (copy_failed) return -1;
+
+        /* Stable snapshot — apply filter, copy survivors to walker. */
+        {
+            int out = 0;
+            for (i = 0; i < cnt; i++)
+            {
+                if (!nspa_hook_match_thread( local[i].pid, local[i].tid, local[i].flags,
+                                             my_pid, my_tid )) continue;
+                if (!nspa_hook_match_event( event, local[i].event_min, local[i].event_max )) continue;
+                walker->entries[out] = local[i];
+                memcpy( walker->modules[out], local_modules[i],
+                        (local_modlen[i] + 1) * sizeof(WCHAR) );
+                walker->module_lengths[out] = local_modlen[i];
+                out++;
+            }
+            walker->count   = out;
+            walker->hook_id = hook_id;
+            walker->prev    = NULL;  /* caller chains */
+            return out;
+        }
+    }
+    return -1;  /* retry exhausted — likely server churn; fall back to RPC */
+}
+
+/* Find the entry index whose handle matches.  Returns -1 if not present
+ * (caller falls back to RPC for this CallNextHookEx). */
+static int nspa_hook_walker_find( const struct nspa_hook_walker *walker, user_handle_t handle )
+{
+    int i;
+    for (i = 0; i < walker->count; i++)
+        if (walker->entries[i].handle == handle) return i;
+    return -1;
+}
+
+/* Populate a win_hook_params struct from a Tier 2 cache entry.  module
+ * is copied into `module_out` (caller-supplied buffer of MAX_PATH). */
+static void nspa_hook_fill_info_from_entry( struct win_hook_params *info,
+                                            const struct nspa_hook_walker *walker,
+                                            int idx, WCHAR *module_out )
+{
+    const nspa_hook_entry_t *e = &walker->entries[idx];
+    info->handle       = wine_server_ptr_handle( e->handle );
+    info->id           = walker->hook_id;
+    info->pid          = e->pid;
+    info->tid          = e->tid;
+    info->proc         = wine_server_get_ptr( e->proc );
+    info->next_unicode = e->unicode;
+    if (walker->module_lengths[idx])
+        memcpy( module_out, walker->modules[idx],
+                (walker->module_lengths[idx] + 1) * sizeof(WCHAR) );
+    else
+        module_out[0] = 0;
 }
 
 /* Categorize a server-arbitrated hook dispatch on the conditions a
@@ -541,10 +729,34 @@ static LRESULT call_hook( struct win_hook_params *info, const WCHAR *module, siz
 LRESULT WINAPI NtUserCallNextHookEx( HHOOK hhook, INT code, WPARAM wparam, LPARAM lparam )
 {
     struct user_thread_info *thread_info = get_user_thread_info();
+    struct nspa_hook_walker *walker = nspa_hook_walker_current;
     struct win_hook_params info;
     WCHAR module[MAX_PATH];
 
     memset( &info, 0, sizeof(info) );
+
+    /* NSPA Tier 2: if we're inside a cache-served dispatch, advance
+     * through the snapshot's entries[] without an RPC.  Identifies the
+     * "current" entry by matching thread_info->hook (set by call_hook
+     * before invoking the proc) against entries[].handle. */
+    if (walker)
+    {
+        user_handle_t cur = wine_server_user_handle( thread_info->hook );
+        int idx = nspa_hook_walker_find( walker, cur );
+        if (idx >= 0)
+        {
+            if (idx + 1 >= walker->count) return 0;  /* end of chain */
+            nspa_hook_fill_info_from_entry( &info, walker, idx + 1, module );
+            info.code         = code;
+            info.wparam       = wparam;
+            info.lparam       = lparam;
+            info.prev_unicode = thread_info->hook_unicode;
+            __atomic_fetch_add( &nspa_hook_tier2_next, 1, __ATOMIC_RELAXED );
+            return call_hook( &info, module, 0, 0, FALSE );
+        }
+        /* current handle isn't in this walker — likely a nested dispatch
+         * from a non-Tier-2 path.  Fall through to RPC. */
+    }
 
     SERVER_START_REQ( get_hook_info )
     {
@@ -650,6 +862,39 @@ LRESULT call_message_hooks( INT id, INT code, WPARAM wparam, LPARAM lparam, size
     {
         __atomic_fetch_add( &bypass->nspa_hook_walk_counts[idx], 1, __ATOMIC_ACQ_REL );
         __atomic_fetch_add( &nspa_hook_tier1_shmem_inc, 1, __ATOMIC_RELAXED );
+    }
+
+    /* NSPA Tier 2: try the seqlock-stable shmem cache first.  On success
+     * we dispatch the chain entirely client-side (no start/get/finish
+     * RPCs).  On overflow / retry exhaustion / bypass not mapped, fall
+     * through to the legacy RPC path. */
+    if (bypass)
+    {
+        struct nspa_hook_walker walker;
+        int n = nspa_hook_try_read_cache( &walker, id, EVENT_MIN );
+        if (n >= 0)
+        {
+            walker.prev = nspa_hook_walker_current;
+            nspa_hook_walker_current = &walker;
+            __atomic_fetch_add( &nspa_hook_tier2_dispatched, 1, __ATOMIC_RELAXED );
+            if (n > 0)
+            {
+                WCHAR mod[MAX_PATH];
+                nspa_hook_fill_info_from_entry( &info, &walker, 0, mod );
+                info.code         = code;
+                info.wparam       = wparam;
+                info.lparam       = lparam;
+                /* prev_unicode comes from outer call_hook context; for the
+                 * top-level dispatch it's TRUE (Unicode), set above. */
+                ret = call_hook( &info, mod, lparam_size, message_size, ansi );
+            }
+            nspa_hook_walker_current = walker.prev;
+            /* Tier 1 dec balances the inc above; no finish_hook_chain RPC. */
+            __atomic_fetch_sub( &bypass->nspa_hook_walk_counts[idx], 1, __ATOMIC_ACQ_REL );
+            __atomic_fetch_add( &nspa_hook_tier1_shmem_dec, 1, __ATOMIC_RELAXED );
+            return ret;
+        }
+        __atomic_fetch_add( &nspa_hook_tier2_fallback, 1, __ATOMIC_RELAXED );
     }
 
     SERVER_START_REQ( start_hook_chain )

@@ -2966,6 +2966,13 @@ static BOOL check_queue_bits( UINT wake_mask, UINT changed_mask, UINT signal_bit
         wake = queue_shm->wake_bits | ring_bits;
         changed = queue_shm->changed_bits | ring_changed;
 
+        /* NSPA: publish the actual wake/changed values unconditionally so the
+         * FALSE-path caller (peek_message fall-through) can classify *why* the
+         * ring drains weren't satisfied — by the real queue state, not the
+         * filter mask.  Skip-true callers ignore the OUT params anyway. */
+        *wake_bits = wake;
+        *changed_bits = changed;
+
         if (internal) skip = !(queue_shm->internal_bits & QS_HARDWARE);
         /* if the masks need an update */
         else if (queue_shm->wake_mask != wake_mask) skip = FALSE;
@@ -2975,8 +2982,6 @@ static BOOL check_queue_bits( UINT wake_mask, UINT changed_mask, UINT signal_bit
         else if (changed & clear_bits) skip = FALSE;
         else
         {
-            *wake_bits = wake;
-            *changed_bits = changed;
             skip = get_tick_count() - (UINT64)queue_shm->access_time / 10000 < 3000; /* avoid hung queue */
         }
     }
@@ -3124,8 +3129,10 @@ static int peek_message( MSG *msg, const struct peek_message_filter *filter )
             {
                 /* msg-ring v2 Phase C diag: categorise why the v1 ring pops
                  * didn't satisfy this peek.  Opt-in via NSPA_SEND_DIAG=1;
-                 * bump function is a no-op when off. */
-                nspa_get_message_diag_bump( signal_bits,
+                 * bump function is a no-op when off.  wake_bits comes from
+                 * check_queue_bits — the actual queue wake state that
+                 * triggered fall-through, not the caller's filter mask. */
+                nspa_get_message_diag_bump( wake_bits,
                                             nspa_get_own_bypass_shm_public() != NULL );
                 SERVER_START_REQ( get_message )
             {
@@ -3156,6 +3163,11 @@ static int peek_message( MSG *msg, const struct peek_message_filter *filter )
                 else buffer_size = reply->total;
             }
             SERVER_END_REQ;
+            /* Bump reply-side classifier: what did the server actually
+             * deliver?  Together with [wake], this gives us a cross-table
+             * of (wake bit fired) × (reply class).  Out of the SERVER_END_REQ
+             * scope so we don't shadow the request locals. */
+            nspa_get_message_reply_diag_bump( res, info.type, info.msg.message );
             }
         }
 

@@ -123,26 +123,29 @@ extern int get_inproc_device_fd(void); /* server/inproc_sync.c */
  * path, then signals completion via CHANNEL_REPLY.  Exits on EBADF
  * (channel closed by destroy).
  *
- * NSPA_DISPATCHER_USE_TOKEN=1 (default off) opts in to RECV2 +
- * direct thread_token consumption, skipping get_thread_from_id when
- * the kernel provides a non-zero token.  Falls back gracefully if
- * RECV2 returns -ENOTTY (running against an old kernel without the
- * 1005 patch) or if token is zero (sender thread predates registration).
+ * Default since 2026-04-26 is RECV2 + direct thread_token consumption
+ * (skips get_thread_from_id when the kernel provides a non-zero token,
+ * ~10% dispatcher CPU reclaim per perf 2026-04-26).  Falls back
+ * gracefully if RECV2 returns -ENOTTY (running against an old kernel
+ * without the 1005 patch) or if token is zero (sender thread predates
+ * registration).  Set NSPA_DISPATCHER_USE_TOKEN=0 to force legacy RECV
+ * + get_thread_from_id for A/B testing.
  */
 static void *channel_dispatcher( void *param )
 {
     int channel_fd = (int)(uintptr_t)param;
     unsigned long generation = 0;
 
-    /* One-time env-var read: same pattern as NSPA_DISABLE_EPOLL.
-     * `recv2_state`: -1 = uninitialised, 0 = use legacy RECV, 1 = try RECV2
-     * (with on-the-fly fallback to legacy if RECV2 returns -ENOTTY). */
+    /* One-time env-var read: same pattern as NSPA_DISABLE_EPOLL /
+     * NSPA_OPENFD_LOCKDROP.  recv2_state: -1 = uninitialised, 0 = use
+     * legacy RECV, 1 = try RECV2 (with on-the-fly fallback to legacy
+     * if RECV2 returns -ENOTTY). */
     static int cached_use_token = -1;
     static int recv2_state = -1;
     if (cached_use_token < 0)
     {
         const char *v = getenv( "NSPA_DISPATCHER_USE_TOKEN" );
-        cached_use_token = (v && *v && *v != '0');
+        cached_use_token = !(v && *v == '0');
         recv2_state = cached_use_token ? 1 : 0;
     }
 

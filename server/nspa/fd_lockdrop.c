@@ -19,6 +19,31 @@
 
 #include "fd_lockdrop.h"
 
+/* Inline helper to do the openat() + EISDIR retry without touching the
+ * lock.  Used by both the gated-on (lock-drop) and gated-off (lock
+ * held throughout) paths so the syscall sequence is byte-identical
+ * between them. */
+static inline int do_openat( int dirfd, const char *name, int rw_mode,
+                             int flags, mode_t mode, unsigned int access,
+                             int *out_errno )
+{
+    int fd = openat( dirfd, name, rw_mode | (flags & ~O_TRUNC), mode );
+    if (fd == -1)
+    {
+        *out_errno = errno;
+        if (*out_errno == EISDIR &&
+            ((access & FILE_UNIX_WRITE_ACCESS) || (flags & O_CREAT)))
+        {
+            fd = openat( dirfd, name,
+                         O_RDONLY | (flags & ~(O_TRUNC | O_CREAT | O_EXCL)),
+                         mode );
+            *out_errno = (fd == -1) ? errno : 0;
+        }
+    }
+    else *out_errno = 0;
+    return fd;
+}
+
 int nspa_openat_lockdrop( struct fd *fd_object,
                           struct fd *root_object,
                           int dirfd,
@@ -28,7 +53,34 @@ int nspa_openat_lockdrop( struct fd *fd_object,
                           mode_t *mode,
                           unsigned int access )
 {
-    /* `current` is a global (server/request.c:121) holding the per-
+    int unix_fd, local_errno = 0;
+
+    /* NSPA: opt-in gate for the lock-drop.  Default OFF after a host
+     * lockup on first validation run (2026-04-26) — same shape as the
+     * msg-ring v2 B1.0 lockup that birthed feedback_validate_before_
+     * default_on.md.  With the gate off, the helper holds global_lock
+     * throughout and behaves identically to the pre-Phase-B (Phase-A-
+     * only) build.  Set NSPA_OPENFD_LOCKDROP=1 to opt in once the
+     * latent gamma-RT-scheduler issue is rooted out and the lock-drop
+     * is re-validated in isolation. */
+    {
+        static int cached_enabled = -1;
+        if (cached_enabled < 0)
+        {
+            const char *v = getenv( "NSPA_OPENFD_LOCKDROP" );
+            cached_enabled = (v && *v && *v != '0');
+        }
+        if (!cached_enabled)
+        {
+            unix_fd = do_openat( dirfd, name, rw_mode, flags, *mode, access, &local_errno );
+            errno = local_errno;
+            return unix_fd;
+        }
+    }
+
+    /* Lock-drop path.
+     *
+     * `current` is a global (server/request.c:121) holding the per-
      * request thread pointer.  Another handler running in our unlocked
      * window will overwrite it; save and restore.
      *
@@ -49,35 +101,23 @@ int nspa_openat_lockdrop( struct fd *fd_object,
      * openat returned and not an errno set by pi_mutex_lock or any
      * other intervening libc call.
      */
-    struct thread *saved_current = current;
-    unsigned int saved_error = saved_current ? saved_current->error : 0;
-    struct object *fd_ref = fd_object ? grab_object( fd_object ) : NULL;
-    struct object *root_ref = root_object ? grab_object( root_object ) : NULL;
-    int unix_fd, local_errno = 0;
-
-    pi_mutex_unlock( &global_lock );
-
-    unix_fd = openat( dirfd, name, rw_mode | (flags & ~O_TRUNC), *mode );
-    if (unix_fd == -1)
     {
-        local_errno = errno;
-        /* if we tried to open a directory for write access, retry read-only */
-        if (local_errno == EISDIR &&
-            ((access & FILE_UNIX_WRITE_ACCESS) || (flags & O_CREAT)))
-        {
-            unix_fd = openat( dirfd, name,
-                              O_RDONLY | (flags & ~(O_TRUNC | O_CREAT | O_EXCL)),
-                              *mode );
-            local_errno = (unix_fd == -1) ? errno : 0;
-        }
+        struct thread *saved_current = current;
+        unsigned int saved_error = saved_current ? saved_current->error : 0;
+        struct object *fd_ref = fd_object ? grab_object( fd_object ) : NULL;
+        struct object *root_ref = root_object ? grab_object( root_object ) : NULL;
+
+        pi_mutex_unlock( &global_lock );
+
+        unix_fd = do_openat( dirfd, name, rw_mode, flags, *mode, access, &local_errno );
+
+        pi_mutex_lock( &global_lock );
+
+        current = saved_current;
+        if (saved_current) saved_current->error = saved_error;
+        if (root_ref) release_object( root_ref );
+        if (fd_ref)   release_object( fd_ref );
     }
-
-    pi_mutex_lock( &global_lock );
-
-    current = saved_current;
-    if (saved_current) saved_current->error = saved_error;
-    if (root_ref) release_object( root_ref );
-    if (fd_ref)   release_object( fd_ref );
 
     errno = local_errno;
     return unix_fd;

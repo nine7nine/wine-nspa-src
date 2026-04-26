@@ -23,7 +23,6 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <pthread.h>       /* NSPA v1.5: for request_shm_thread */
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -459,7 +458,6 @@ static inline void init_thread_structure( struct thread *thread )
 #ifdef __linux__
     thread->request_shm_fd  = -1;
     thread->request_shm     = NULL;
-    thread->request_shm_thread_running = 0;
 #endif
     thread->state           = RUNNING;
     thread->exit_code       = 0;
@@ -545,113 +543,6 @@ static struct context *create_thread_context( struct thread *thread )
 }
 
 
-/* create a new thread */
-#ifdef __linux__
-
-/* NSPA v1.5 shmem IPC: helpers for the per-client dispatcher pthread.
- * See server/file.h for global_lock / poll_generation semantics. */
-
-#define NSPA_FUTEX_WAIT 0
-#define NSPA_FUTEX_WAKE 1
-
-static void nspa_handle_shm_request( struct thread *thread, struct request_shm *request_shm )
-{
-    set_current_time();
-    read_request_shm( thread, request_shm );
-}
-
-/* Dispatcher pthread: one per client thread. Sits in FUTEX_WAIT on the
- * client's request_shm->futex. When the client wakes it (futex 0->1),
- * it grabs global_lock, dispatches the request via the existing
- * req_handlers[] table, writes the reply into shared memory, transitions
- * the futex back to 0, FUTEX_WAKEs the client, and loops.
- *
- * On teardown (futex set to -1 by cleanup_thread), it releases its hold on
- * the shm mapping and exits. */
-static void *nspa_request_shm_thread( void *param )
-{
-    struct thread *thread = param;
-    int request_shm_fd;
-    volatile struct request_shm *request_shm;
-    unsigned long generation = 0;
-
-    pi_mutex_lock( &global_lock );
-    request_shm_fd = thread->request_shm_fd;
-    request_shm = thread->request_shm;
-    pi_mutex_unlock( &global_lock );
-
-    /* NSPA v2.4: publish our Linux TID to the shm so the client can boost
-     * us via sched_setscheduler when it's blocked on a reply at a higher
-     * RT priority than our own. Release ordering pairs with the client's
-     * acquire load in nspa_shm_pi_boost. Written once per dispatch thread
-     * lifetime — we never clear it, which is fine because the client only
-     * reads it while this thread is still servicing the shm. */
-    if (request_shm)
-        __atomic_store_n( &request_shm->server_dispatch_tid,
-                          (int)syscall( __NR_gettid ),
-                          __ATOMIC_RELEASE );
-
-    for (;;)
-    {
-        int val;
-
-        while ((val = request_shm->futex) != 1)
-        {
-            if (val == -1) goto done;
-            if (val != 0)
-                fatal_protocol_error( thread, "nspa shmem: unknown futex state %d\n", val );
-            syscall( __NR_futex, &request_shm->futex, NSPA_FUTEX_WAIT, val, NULL, NULL, 0 );
-        }
-
-        pi_mutex_lock( &global_lock );
-        generation = poll_generation;
-
-        val = request_shm->futex;
-        if (val != 1)
-        {
-            if (val != -1)
-                fatal_protocol_error( thread, "nspa shmem: unknown futex state %d (locked)\n", val );
-            goto done_locked;
-        }
-
-        /* aarch64-correct memory barriers: compiler fences alone are
-         * insufficient on weakly-ordered architectures. Ensure all writes
-         * made by the client before FUTEX_WAKE are visible to us before
-         * we dispatch, and all our writes are visible before we transition
-         * the futex back to 0. */
-        __atomic_thread_fence( __ATOMIC_SEQ_CST );
-        nspa_handle_shm_request( thread, (struct request_shm *)request_shm );
-        __atomic_thread_fence( __ATOMIC_SEQ_CST );
-
-        request_shm_fd = thread->request_shm_fd;
-        request_shm = thread->request_shm;
-        if (request_shm_fd == -1 || !request_shm) goto done_locked;
-
-        val = __sync_val_compare_and_swap( &request_shm->futex, 1, 0 );
-        if (val != 1 && val != -1)
-            fatal_protocol_error( thread, "nspa shmem: unknown futex state %d (post)\n", val );
-
-        pi_mutex_unlock( &global_lock );
-        syscall( __NR_futex, &request_shm->futex, NSPA_FUTEX_WAKE, 1, NULL, NULL, 0 );
-
-        if (poll_generation != generation)
-            force_exit_poll();
-    }
-
-done:
-    pi_mutex_lock( &global_lock );
-done_locked:
-    if (request_shm_fd != -1) close( request_shm_fd );
-    if (request_shm) munmap( (void *)request_shm, REQUEST_SHM_SIZE );
-    release_object( thread );
-    pi_mutex_unlock( &global_lock );
-    if (poll_generation != generation)
-        force_exit_poll();
-    return NULL;
-}
-
-#endif /* __linux__ */
-
 /* NSPA v1.5: cleanup reply_data honoring shared memory ownership.
  * If reply_data points into the request_shm region, it is not a heap
  * allocation and must not be free()'d. */
@@ -675,9 +566,6 @@ struct thread *create_thread( int fd, struct process *process, const struct secu
     struct desktop *desktop;
     struct thread *thread;
     int request_pipe[2];
-#ifdef __linux__
-    pthread_t pthread;
-#endif
 
     if (fd == -1)
     {
@@ -739,57 +627,13 @@ struct thread *create_thread( int fd, struct process *process, const struct secu
     if (get_inproc_device_fd() >= 0 && !(thread->alert_sync = create_inproc_internal_sync( 1, 0 ))) goto error;
 
 #ifdef __linux__
-    /* Create per-thread shared memory + dispatcher pthread. Failure is soft:
-     * the thread falls back to socket IPC.
-     *
-     * v1.1 note: if wineserver RT is active (nspa_srv_rt_prio > 0), the
-     * dispatcher is created with explicit FIFO scheduling attrs via
-     * PTHREAD_EXPLICIT_SCHED. This bypasses inheritance and ensures the
-     * child is born RT even when the parent has SCHED_RESET_ON_FORK set.
-     * Without explicit attrs the child would start at SCHED_OTHER because
-     * reset-on-fork applies to clone()/pthread_create too, not just
-     * fork() — which would cause priority inversion when an audio-class
-     * client thread waits on a wineserver reply dispatched by a
-     * SCHED_OTHER pthread. */
-    if (create_request_shm( &thread->request_shm_fd, (struct request_shm **)&thread->request_shm ))
-    {
-        pthread_attr_t attr;
-        pthread_attr_t *pattr = NULL;
-        int created;
-
-        if (nspa_srv_rt_prio > 0)
-        {
-            struct sched_param shm_param = { .sched_priority = nspa_srv_rt_prio };
-            pthread_attr_init( &attr );
-            pthread_attr_setinheritsched( &attr, PTHREAD_EXPLICIT_SCHED );
-            pthread_attr_setschedpolicy( &attr, nspa_srv_rt_policy );
-            pthread_attr_setschedparam( &attr, &shm_param );
-            pthread_attr_setscope( &attr, PTHREAD_SCOPE_SYSTEM );
-            pattr = &attr;
-        }
-
-        grab_object( thread );  /* hold for the dispatcher pthread */
-        created = pthread_create( &pthread, pattr, nspa_request_shm_thread, thread );
-        if (pattr) pthread_attr_destroy( &attr );
-
-        if (created == 0)
-        {
-            pthread_detach( pthread );
-            thread->request_shm_thread_running = 1;
-        }
-        else
-        {
-            release_object( thread );
-            close( thread->request_shm_fd );
-            munmap( (void *)thread->request_shm, REQUEST_SHM_SIZE );
-            thread->request_shm_fd = -1;
-            thread->request_shm = NULL;
-        }
-    }
-    else
-    {
-        clear_error();  /* shmem is a fast path, socket is still valid */
-    }
+    /* NSPA: allocate the per-thread request_shm region used as the
+     * zero-copy payload buffer for wineserver requests.  Signalling
+     * is handled by the per-process gamma channel (see
+     * server/nspa/shmem_channel.c); no per-thread dispatcher pthread
+     * is needed.  Failure is soft — the thread falls back to socket IPC. */
+    if (!create_request_shm( &thread->request_shm_fd, (struct request_shm **)&thread->request_shm ))
+        clear_error();
 #endif
 
     if (process->desktop)
@@ -859,19 +703,10 @@ static void cleanup_thread( struct thread *thread )
     if (thread->reply_fd) release_object( thread->reply_fd );
     if (thread->wait_fd) release_object( thread->wait_fd );
 #ifdef __linux__
-    /* NSPA v1.5: signal the dispatcher pthread to exit by transitioning the
-     * futex to -1 and waking it. The pthread owns the fd+mmap cleanup in its
-     * exit path; we only clean them up here if the pthread never started. */
-    if (thread->request_shm)
-    {
-        __atomic_exchange_n( &thread->request_shm->futex, -1, __ATOMIC_SEQ_CST );
-        syscall( __NR_futex, &thread->request_shm->futex, NSPA_FUTEX_WAKE, 1, NULL, NULL, 0 );
-    }
-    if (!thread->request_shm_thread_running)
-    {
-        if (thread->request_shm_fd != -1) close( thread->request_shm_fd );
-        if (thread->request_shm) munmap( (void *)thread->request_shm, REQUEST_SHM_SIZE );
-    }
+    /* NSPA: tear down the per-thread request_shm region.  No dispatcher
+     * pthread to coordinate with under gamma — close fd + munmap directly. */
+    if (thread->request_shm_fd != -1) close( thread->request_shm_fd );
+    if (thread->request_shm) munmap( (void *)thread->request_shm, REQUEST_SHM_SIZE );
 #endif
     cleanup_clipboard_thread(thread);
     destroy_thread_windows( thread );
@@ -894,7 +729,6 @@ static void cleanup_thread( struct thread *thread )
 #ifdef __linux__
     thread->request_shm_fd = -1;
     thread->request_shm = NULL;
-    thread->request_shm_thread_running = 0;
 #endif
     thread->desktop = 0;
     thread->desc = NULL;

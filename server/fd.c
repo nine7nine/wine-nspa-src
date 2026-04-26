@@ -646,6 +646,22 @@ static inline void main_loop_epoll(void)
     static int failed_epoll_pwait2 = 0;
 #endif
 
+    /* NSPA: opt-out for PREEMPT_RT correctness experiments.  epoll's
+     * internal wait-queue locks (raw spinlocks converted to rt_mutex
+     * on PREEMPT_RT) interact poorly under contention with FIFO
+     * priorities, and wakeup distribution is not priority-ordered.
+     * Setting NSPA_DISABLE_EPOLL=1 falls through to the plain poll()
+     * loop in main_loop().  No rebuild needed to A/B. */
+    {
+        static int cached_disabled = -1;
+        if (cached_disabled < 0)
+        {
+            const char *v = getenv( "NSPA_DISABLE_EPOLL" );
+            cached_disabled = (v && *v && *v != '0');
+        }
+        if (cached_disabled) return;
+    }
+
     assert( POLLIN == EPOLLIN );
     assert( POLLOUT == EPOLLOUT );
     assert( POLLERR == EPOLLERR );

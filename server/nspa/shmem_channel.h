@@ -11,6 +11,7 @@
 #define __WINE_SERVER_NSPA_SHMEM_CHANNEL_H
 
 struct process;
+struct thread;
 
 #ifdef __linux__
 
@@ -23,10 +24,24 @@ extern void nspa_shmem_channel_init( struct process *process );
  * via EBADF on its blocked CHANNEL_RECV.  Idempotent. */
 extern void nspa_shmem_channel_destroy( struct process *process );
 
+/* NSPA thread-token pass-through (T2 plumbing).  Register the
+ * (thread->unix_tid, (uint64_t)thread) pair with the kernel so
+ * subsequent CHANNEL_SEND_PI from this thread stamp the entry's
+ * thread_token.  No-op if the channel isn't up or the thread has no
+ * unix_tid yet.  Idempotent (existing registration is replaced). */
+extern void nspa_shmem_channel_register_thread( struct process *process, struct thread *thread );
+
+/* Inverse: drop the registration.  Called from destroy_thread.
+ * Idempotent.  Does NOT affect already-enqueued channel entries —
+ * they retain the token they were stamped with at SEND_PI. */
+extern void nspa_shmem_channel_deregister_thread( struct process *process, struct thread *thread );
+
 #else
 
 static inline void nspa_shmem_channel_init( struct process *process ) {}
 static inline void nspa_shmem_channel_destroy( struct process *process ) {}
+static inline void nspa_shmem_channel_register_thread( struct process *process, struct thread *thread ) {}
+static inline void nspa_shmem_channel_deregister_thread( struct process *process, struct thread *thread ) {}
 
 #endif
 

@@ -81,6 +81,31 @@ struct ntsync_channel_recv_args {
 # define NTSYNC_IOC_CHANNEL_REPLY   _IOW ('N', 0x93, __u64)
 #endif
 
+/* NSPA gamma: thread-token pass-through fallback (1005-ntsync-channel-thread-token).
+ * Independent #ifndef so it works against both pre-1004 and post-1004
+ * kernel headers that lack the 1005 additions. */
+#ifndef NTSYNC_IOC_CHANNEL_REGISTER_THREAD
+struct ntsync_channel_register_thread_args {
+    __u32 tid;
+    __u32 __pad;
+    __u64 token;
+};
+struct ntsync_channel_recv2_args {
+    __u64 entry_id;
+    __u64 payload_off;
+    __u64 reply_off;
+    __u32 sender_tid;
+    __u32 prio;
+    __u64 thread_token;
+};
+# define NTSYNC_IOC_CHANNEL_REGISTER_THREAD \
+            _IOW ('N', 0x94, struct ntsync_channel_register_thread_args)
+# define NTSYNC_IOC_CHANNEL_DEREGISTER_THREAD \
+            _IOW ('N', 0x95, __u32)
+# define NTSYNC_IOC_CHANNEL_RECV2 \
+            _IOWR('N', 0x96, struct ntsync_channel_recv2_args)
+#endif
+
 #include "process.h"
 #include "thread.h"
 #include "request.h"
@@ -93,22 +118,64 @@ struct ntsync_channel_recv_args {
 extern int get_inproc_device_fd(void); /* server/inproc_sync.c */
 
 /*
- * Dispatcher pthread: blocks on CHANNEL_RECV, dispatches the request
- * via the existing read_request_shm code path, then signals completion
- * via CHANNEL_REPLY.  Exits on EBADF (channel closed by destroy).
+ * Dispatcher pthread: blocks on CHANNEL_RECV (or RECV2 if the gate is
+ * on), dispatches the request via the existing read_request_shm code
+ * path, then signals completion via CHANNEL_REPLY.  Exits on EBADF
+ * (channel closed by destroy).
+ *
+ * NSPA_DISPATCHER_USE_TOKEN=1 (default off) opts in to RECV2 +
+ * direct thread_token consumption, skipping get_thread_from_id when
+ * the kernel provides a non-zero token.  Falls back gracefully if
+ * RECV2 returns -ENOTTY (running against an old kernel without the
+ * 1005 patch) or if token is zero (sender thread predates registration).
  */
 static void *channel_dispatcher( void *param )
 {
     int channel_fd = (int)(uintptr_t)param;
     unsigned long generation = 0;
 
+    /* One-time env-var read: same pattern as NSPA_DISABLE_EPOLL.
+     * `recv2_state`: -1 = uninitialised, 0 = use legacy RECV, 1 = try RECV2
+     * (with on-the-fly fallback to legacy if RECV2 returns -ENOTTY). */
+    static int cached_use_token = -1;
+    static int recv2_state = -1;
+    if (cached_use_token < 0)
+    {
+        const char *v = getenv( "NSPA_DISPATCHER_USE_TOKEN" );
+        cached_use_token = (v && *v && *v != '0');
+        recv2_state = cached_use_token ? 1 : 0;
+    }
+
     for (;;)
     {
-        struct ntsync_channel_recv_args recv;
-        struct thread *thread;
+        struct ntsync_channel_recv2_args recv;
+        struct thread *thread = NULL;
         int ret;
 
-        ret = ioctl( channel_fd, NTSYNC_IOC_CHANNEL_RECV, &recv );
+        if (recv2_state == 1)
+        {
+            ret = ioctl( channel_fd, NTSYNC_IOC_CHANNEL_RECV2, &recv );
+            if (ret < 0 && errno == ENOTTY)
+            {
+                /* Old kernel without 1005 patch — fall back permanently. */
+                recv2_state = 0;
+                continue;
+            }
+        }
+        else
+        {
+            struct ntsync_channel_recv_args recv1;
+            ret = ioctl( channel_fd, NTSYNC_IOC_CHANNEL_RECV, &recv1 );
+            if (ret >= 0)
+            {
+                recv.entry_id     = recv1.entry_id;
+                recv.payload_off  = recv1.payload_off;
+                recv.reply_off    = recv1.reply_off;
+                recv.sender_tid   = recv1.sender_tid;
+                recv.prio         = recv1.prio;
+                recv.thread_token = 0;
+            }
+        }
         if (ret < 0)
         {
             if (errno == EINTR) continue;
@@ -119,7 +186,15 @@ static void *channel_dispatcher( void *param )
         pi_mutex_lock( &global_lock );
         generation = poll_generation;
 
-        thread = get_thread_from_id( (thread_id_t)recv.payload_off );
+        /* Resolve the originating thread.  Prefer the kernel-provided
+         * token (no userspace lookup); fall back to get_thread_from_id
+         * when token is zero (un-registered sender, e.g. very early
+         * pre-init traffic) or when the recv2 path is disabled. */
+        if (recv.thread_token)
+            thread = (struct thread *)(uintptr_t)recv.thread_token;
+        else
+            thread = get_thread_from_id( (thread_id_t)recv.payload_off );
+
         if (thread)
         {
             /* Validate the resolved thread belongs to this dispatcher's
@@ -138,10 +213,11 @@ static void *channel_dispatcher( void *param )
                 read_request_shm( thread, (struct request_shm *)thread->request_shm );
                 __atomic_thread_fence( __ATOMIC_SEQ_CST );
             }
-            /* get_thread_from_id grabbed a refcount; release it now that
-             * we are done.  Missing this leaks one thread reference per
-             * channel request and prevents thread/process cleanup. */
-            release_object( thread );
+            /* Only release the ref if get_thread_from_id grabbed one.
+             * The token path borrows the registration's reference (kept
+             * alive by deregister-after-last-reply invariant). */
+            if (!recv.thread_token)
+                release_object( thread );
         }
 
         pi_mutex_unlock( &global_lock );
@@ -217,6 +293,47 @@ void nspa_shmem_channel_destroy( struct process *process )
     close( process->request_channel_fd );
     process->request_channel_fd = -1;
     process->channel_dispatcher_running = 0;
+}
+
+/* NSPA thread-token: register (thread->unix_tid -> thread *) with the
+ * kernel.  Idempotent (existing registration is replaced).  No-op if
+ * the channel isn't up or the thread has no unix_tid yet.  Safe against
+ * old kernels — the ioctl returns -ENOTTY and we silently skip.
+ *
+ * Lifetime invariant: register BEFORE the client may send any request
+ * that would resolve to `thread`.  In practice we register from
+ * req_init_first_thread / req_init_thread, both of which run inside a
+ * server handler that completes BEFORE the client sees the reply. */
+void nspa_shmem_channel_register_thread( struct process *process, struct thread *thread )
+{
+    struct ntsync_channel_register_thread_args args;
+
+    if (process->request_channel_fd < 0) return;
+    if (thread->unix_tid <= 0) return;
+
+    args.tid   = (__u32)thread->unix_tid;
+    args.__pad = 0;
+    args.token = (__u64)(uintptr_t)thread;
+
+    /* Failure (ENOTTY on old kernel; ENOMEM extremely unlikely) is non-
+     * fatal — dispatcher token path will see token=0 and fall through
+     * to get_thread_from_id. */
+    (void)ioctl( process->request_channel_fd, NTSYNC_IOC_CHANNEL_REGISTER_THREAD, &args );
+}
+
+/* NSPA thread-token: drop the registration.  Idempotent.  Already-
+ * enqueued channel entries retain the token they were stamped with at
+ * SEND_PI; this only affects FUTURE sends from this tid (which won't
+ * happen because the thread is being destroyed). */
+void nspa_shmem_channel_deregister_thread( struct process *process, struct thread *thread )
+{
+    __u32 tid;
+
+    if (process->request_channel_fd < 0) return;
+    if (thread->unix_tid <= 0) return;
+
+    tid = (__u32)thread->unix_tid;
+    (void)ioctl( process->request_channel_fd, NTSYNC_IOC_CHANNEL_DEREGISTER_THREAD, &tid );
 }
 
 #endif /* __linux__ */

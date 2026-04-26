@@ -262,6 +262,7 @@ int main( int argc, char *argv[] )
     if (debug_level) fprintf( stderr, "wineserver: starting (pid=%ld)\n", (long) getpid() );
     set_current_time();
     nspa_profile_init();
+    nspa_device_diag_init();
     init_signals();
     init_memory();
     init_directories( load_intl_file() );

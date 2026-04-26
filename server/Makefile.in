@@ -24,6 +24,8 @@ SOURCES = \
 	mapping.c \
 	mutex.c \
 	named_pipe.c \
+	nspa/device_diag.c \
+	nspa/device_diag.h \
 	nspa/hook_cache.c \
 	nspa/hook_cache.h \
 	nspa/redraw_ring.c \

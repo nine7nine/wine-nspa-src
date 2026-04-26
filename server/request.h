@@ -78,6 +78,13 @@ extern void nspa_profile_end( unsigned int req, unsigned long long start_ns,
 extern void nspa_profile_dump(void);
 extern void nspa_profile_reset(void);
 
+/* NSPA device-request diagnostic (nspa/device_diag.c).  Detailed
+ * prototypes in nspa/device_diag.h; only the SIGUSR1/SIGUSR2 hooks
+ * are exposed here so server/signal.c can call them. */
+extern void nspa_device_diag_init(void);
+extern void nspa_device_diag_dump(void);
+extern void nspa_device_diag_reset(void);
+
 /* get current tick count to return to client */
 static inline unsigned int get_tick_count(void)
 {

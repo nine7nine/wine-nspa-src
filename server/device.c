@@ -36,6 +36,7 @@
 #include "file.h"
 #include "handle.h"
 #include "request.h"
+#include "nspa/device_diag.h"
 #include "process.h"
 
 /* IRP object */
@@ -963,6 +964,13 @@ DECL_HANDLER(get_next_device_request)
     struct device_manager *manager;
     struct list *ptr;
     struct iosb *iosb;
+    /* R2.2 — sechost investigation diagnostic.  Record the dispatch
+     * outcome at every exit so we can disambiguate Shape A/B/C/D from
+     * nspa/docs/sechost-investigation.md §4.  Outcome defaults to
+     * BLOCKED_NO_REQUESTS; overwritten as we determine more. */
+    enum nspa_device_outcome nspa_outcome = NSPA_DEV_OUTCOME_BLOCKED_NO_REQUESTS;
+    const WCHAR *nspa_dev_name = NULL;
+    data_size_t nspa_dev_name_len = 0;
 
     if (!(manager = (struct device_manager *)get_handle_obj( current->process, req->manager,
                                                              0, &device_manager_ops )))
@@ -1025,7 +1033,10 @@ DECL_HANDLER(get_next_device_request)
             reply->in_size = iosb->in_size;
 
         if (iosb && iosb->in_size > get_reply_max_size())
+        {
             set_error( STATUS_BUFFER_OVERFLOW );
+            nspa_outcome = NSPA_DEV_OUTCOME_BUFFER_OVERFLOW;
+        }
         else if (!irp->file || (reply->next = alloc_handle_no_access_check( current->process, irp, 0, 0 )))
         {
             if (fill_irp_params( manager, irp, &reply->params ))
@@ -1043,11 +1054,28 @@ DECL_HANDLER(get_next_device_request)
                 /* we already own the object if it's only on manager queue */
                 if (irp->file) grab_object( irp );
                 manager->current_call = irp;
+
+                /* R2.2 — RETURNED_IRP outcome with device name (if any). */
+                nspa_outcome = NSPA_DEV_OUTCOME_RETURNED_IRP;
+                if (irp->file && irp->file->device)
+                    nspa_dev_name = get_object_name( &irp->file->device->obj, &nspa_dev_name_len );
             }
             else close_handle( current->process, reply->next );
         }
+        else
+        {
+            /* alloc_handle_no_access_check returned 0 */
+            nspa_outcome = NSPA_DEV_OUTCOME_HANDLE_ALLOC_FAILED;
+        }
     }
     else set_error( STATUS_PENDING );
+
+    /* R2.2 — record before releasing manager so the device pointer
+     * (and its name) is still valid. */
+    nspa_device_diag_record( nspa_outcome,
+                             current->unix_tid,
+                             nspa_dev_name,
+                             (unsigned int)(nspa_dev_name_len / sizeof(WCHAR)) );
 
     release_object( manager );
 }

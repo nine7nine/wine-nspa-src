@@ -26,6 +26,8 @@ SOURCES = \
 	named_pipe.c \
 	nspa/device_diag.c \
 	nspa/device_diag.h \
+	nspa/fd_lockdrop.c \
+	nspa/fd_lockdrop.h \
 	nspa/hook_cache.c \
 	nspa/hook_cache.h \
 	nspa/redraw_ring.c \

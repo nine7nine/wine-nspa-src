@@ -194,18 +194,16 @@ static void sigint_callback(void)
     shutdown_master_socket();
 }
 
-/* NSPA: SIGUSR1 callback — dump request profile + device diag */
+/* NSPA: SIGUSR1 callback — dump request profile */
 static void sigusr1_callback(void)
 {
     nspa_profile_dump();
-    nspa_device_diag_dump();
 }
 
-/* NSPA: SIGUSR2 callback — reset request profile + device diag counters */
+/* NSPA: SIGUSR2 callback — reset request profile counters */
 static void sigusr2_callback(void)
 {
     nspa_profile_reset();
-    nspa_device_diag_reset();
 }
 
 /* SIGHUP handler */

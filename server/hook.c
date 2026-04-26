@@ -35,34 +35,8 @@
 #include "process.h"
 #include "request.h"
 #include "user.h"
-
-struct hook_table;
-
-struct hook
-{
-    struct list         chain;    /* hook chain entry */
-    user_handle_t       handle;   /* user handle for this hook */
-    struct desktop     *desktop;  /* desktop the hook is registered for */
-    struct process     *process;  /* process the hook is set to */
-    struct thread      *thread;   /* thread the hook is set to */
-    struct thread      *owner;    /* owner of the out of context hook */
-    struct hook_table  *table;    /* hook table that contains this hook */
-    int                 index;    /* hook table index */
-    int                 event_min;
-    int                 event_max;
-    int                 flags;
-    client_ptr_t        proc;     /* hook function */
-    int                 unicode;  /* is it a unicode hook? */
-    WCHAR              *module;   /* module name for global hooks */
-    data_size_t         module_size;
-};
-
-struct hook_table
-{
-    struct object obj;              /* object header */
-    struct list   hooks[NB_HOOKS];  /* array of hook chains */
-    int           counts[NB_HOOKS]; /* use counts for each hook chain */
-};
+#include "hook.h"
+#include "nspa/hook_cache.h"
 
 static void hook_table_dump( struct object *obj, int verbose );
 static void hook_table_destroy( struct object *obj );
@@ -110,7 +84,7 @@ static struct hook_table *alloc_hook_table(void)
     return table;
 }
 
-static struct hook_table *get_global_hooks( struct thread *thread )
+struct hook_table *get_global_hooks( struct thread *thread )
 {
     struct hook_table *table;
     struct desktop *desktop;
@@ -123,7 +97,7 @@ static struct hook_table *get_global_hooks( struct thread *thread )
 }
 
 /* check if a given hook should run in the given thread */
-static int run_hook_in_thread( struct hook *hook, struct thread *thread )
+int run_hook_in_thread( struct hook *hook, struct thread *thread )
 {
     if (hook->process && hook->process != thread->process) return 0;
     if ((hook->flags & WINEVENT_SKIPOWNPROCESS) && hook->process == thread->process) return 0;
@@ -495,6 +469,12 @@ DECL_HANDLER(set_hook)
          * moment: a state-changing hook API call for this queue. */
         if (!global && nspa_queue_hook_tier1_active( hook->thread ))
             nspa_queue_hook_chain_sweep( hook->thread, hook->index );
+        /* NSPA Tier 2: refresh the chain snapshot so subsequent client
+         * walks can use the cache instead of the start_hook_chain RPC.
+         * Queue-local: rebuild for this thread's queue.  Global: rebuild
+         * for every queue on the desktop the hook fires in. */
+        if (!global) nspa_hook_cache_rebuild( hook->thread, hook->index );
+        else         nspa_hook_cache_rebuild_global( desktop, hook->index );
     }
     else free( module );
 
@@ -511,6 +491,10 @@ DECL_HANDLER(remove_hook)
     struct hook *hook;
     struct thread *sweep_thread = NULL;
     int sweep_index = -1;
+    int hook_was_global;
+    struct desktop *cache_desktop;
+    struct thread *cache_thread = NULL;
+    int cache_index;
 
     if (req->handle)
     {
@@ -540,17 +524,38 @@ DECL_HANDLER(remove_hook)
      * hook, which release_object()s hook->thread and could leave the
      * captured pointer dangling.  The sweep only touches hooks with
      * proc=0; the hook being removed still has proc!=0 at this point,
-     * so sweep does not interfere with the impending remove. */
-    if (hook->table != hook->desktop->global_hooks
-        && nspa_queue_hook_tier1_active( hook->thread ))
+     * so sweep does not interfere with the impending remove.
+     *
+     * NSPA Tier 2: also capture the desktop pointer + global flag for the
+     * cache rebuild after remove_hook returns.  Same lifetime concern. */
+    hook_was_global = (hook->table == hook->desktop->global_hooks);
+    cache_desktop   = hook_was_global ? (struct desktop *)grab_object( hook->desktop ) : NULL;
+    cache_index     = hook->index;
+    if (!hook_was_global)
     {
-        sweep_thread = hook->thread;
-        sweep_index  = hook->index;
+        cache_thread = (struct thread *)grab_object( hook->thread );
+        if (nspa_queue_hook_tier1_active( hook->thread ))
+        {
+            sweep_thread = hook->thread;
+            sweep_index  = hook->index;
+        }
     }
 
     if (sweep_thread) nspa_queue_hook_chain_sweep( sweep_thread, sweep_index );
 
     remove_hook( hook );
+
+    /* NSPA Tier 2: refresh the cache after the chain has been mutated. */
+    if (cache_thread)
+    {
+        nspa_hook_cache_rebuild( cache_thread, cache_index );
+        release_object( cache_thread );
+    }
+    if (cache_desktop)
+    {
+        nspa_hook_cache_rebuild_global( cache_desktop, cache_index );
+        release_object( cache_desktop );
+    }
 }
 
 

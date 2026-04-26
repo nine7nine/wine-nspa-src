@@ -98,9 +98,10 @@ static unsigned long long nspa_hook_top_calls;        /* every call_message_hook
 static unsigned long long nspa_hook_skipped_no_hooks; /* is_hooked() returned FALSE */
 static unsigned long long nspa_hook_server_dispatch;  /* reached start_hook_chain RTT */
 /* NSPA Tier 1 diag counters: track the client-shmem refcount path's actual
- * engagement vs fallback so we can verify the optimisation is taking effect
- * when NSPA_HOOK_TIER1 is on.  Matched pairs (inc==dec) confirm the ++/--
- * is balanced; skipped vs forced finish counts prove the RPC saving. */
+ * engagement vs fallback so we can verify the optimisation is taking effect.
+ * Tier 1 is default-on; opt-out via NSPA_DISABLE_HOOK_TIER1.  Matched pairs
+ * (inc==dec) confirm the ++/-- is balanced; skipped vs forced finish counts
+ * prove the RPC saving. */
 static unsigned long long nspa_hook_tier1_shmem_inc;
 static unsigned long long nspa_hook_tier1_shmem_dec;
 static unsigned long long nspa_hook_tier1_finish_skipped;

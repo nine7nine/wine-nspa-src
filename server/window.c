@@ -3098,6 +3098,38 @@ DECL_HANDLER(redraw_window)
     if (region) free_region( region );
 }
 
+/* NSPA msg-ring v2 Phase A: reusable wrapper for the redraw_window
+ * push-ring drain.  Mirrors the handler above, but takes explicit
+ * args instead of pulling from the current request.  Keeps the
+ * struct-window internals private; nspa code calls in via this seam. */
+void nspa_redraw_apply( struct thread *thread, user_handle_t window_handle,
+                        unsigned int flags, const void *rect_data, data_size_t rect_size )
+{
+    struct region *region = NULL;
+    struct window *win;
+
+    if (!window_handle)
+    {
+        if (!(win = get_desktop_window( thread ))) return;
+    }
+    else
+    {
+        if (!(win = get_window( window_handle ))) return;
+        if (is_desktop_window( win )) flags &= ~RDW_ALLCHILDREN;
+    }
+
+    if (!is_visible( win )) return;
+
+    if ((flags & (RDW_VALIDATE|RDW_INVALIDATE)) && rect_size)
+    {
+        if (!(region = create_region_from_req_data( rect_data, rect_size ))) return;
+        if (win->ex_style & WS_EX_LAYOUTRTL) mirror_region( &win->client_rect, region );
+    }
+
+    redraw_window( win, region, flags, 0 );
+    if (region) free_region( region );
+}
+
 
 /* set a window property */
 DECL_HANDLER(set_window_property)

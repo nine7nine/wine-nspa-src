@@ -1150,6 +1150,39 @@ typedef volatile struct
     nspa_hook_entry_t   entries[NSPA_HOOK_CHAIN_CAP];
 } nspa_hook_chain_t;
 
+/* NSPA msg-ring v2 Phase A: redraw_window push ring.  RedrawWindow is
+ * one-way (no @REPLY) — client appends an entry here and the server
+ * drains lazily during the next request handler dispatched from this
+ * queue.  SPSC: the queue-owning thread is the sole producer, the
+ * wineserver main thread is the sole consumer.  Cross-thread
+ * RedrawWindow (caller != window-owner) falls back to RPC; regions
+ * with more than NSPA_REDRAW_INLINE_RECTS rectangles also fall back. */
+#define NSPA_REDRAW_RING_SLOTS    32
+#define NSPA_REDRAW_INLINE_RECTS  4
+
+#define NSPA_REDRAW_STATE_EMPTY    0
+#define NSPA_REDRAW_STATE_WRITING  1
+#define NSPA_REDRAW_STATE_READY    2
+#define NSPA_REDRAW_STATE_CONSUMED 3
+
+typedef volatile struct
+{
+    unsigned int      state;
+    user_handle_t     window;
+    unsigned int      flags;
+    unsigned int      rect_count;
+    struct rectangle  rects[NSPA_REDRAW_INLINE_RECTS];
+} nspa_redraw_slot_t;
+
+typedef volatile struct
+{
+    unsigned int           head;
+    unsigned int           tail;
+    unsigned int           overflow;
+    unsigned int           active;
+    nspa_redraw_slot_t     slots[NSPA_REDRAW_RING_SLOTS];
+} nspa_redraw_ring_t;
+
 typedef volatile struct
 {
     nspa_msg_ring_t      nspa_msg_ring;
@@ -1158,6 +1191,7 @@ typedef volatile struct
     int                  nspa_hook_walk_counts[NB_HOOKS];
     nspa_hook_chain_t    nspa_hook_chains[NB_HOOKS];
     unsigned char        nspa_hook_module_pool[NSPA_HOOK_MODULE_POOL];
+    nspa_redraw_ring_t   nspa_redraw_ring;
 } nspa_queue_bypass_shm_t;
 
 /* NSPA local-file bypass — Phase 1A.2 shared inode aggregation table
@@ -7693,6 +7727,6 @@ union generic_reply
     struct nspa_irot_enum_running_reply nspa_irot_enum_running_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 953
+#define SERVER_PROTOCOL_VERSION 954
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

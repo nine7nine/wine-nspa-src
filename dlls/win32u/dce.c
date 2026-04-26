@@ -1484,6 +1484,72 @@ static HRGN get_update_region( HWND hwnd, UINT *flags, HWND *child )
     return hrgn;
 }
 
+/* NSPA msg-ring v2 Phase A: redraw_window push ring (client side).
+ * RedrawWindow has no @REPLY in protocol.def — it's fire-and-forget
+ * from the caller's perspective.  We append to a per-queue SPSC ring
+ * in the memfd-backed bypass shm; the wineserver drains lazily on the
+ * next request handler dispatched from this queue (drain hook in
+ * server/request.c::call_req_handler{,_shm}).  Default-on; opt-out
+ * via NSPA_DISABLE_REDRAW_RING.  Falls back to the legacy RPC for
+ * regions with > NSPA_REDRAW_INLINE_RECTS rectangles, when the ring
+ * is full, or when the bypass shm isn't mapped. */
+static unsigned long long nspa_redraw_ring_pushed;
+static unsigned long long nspa_redraw_ring_fallback;
+
+static int nspa_redraw_ring_disabled( void )
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *v = getenv( "NSPA_DISABLE_REDRAW_RING" );
+        cached = (v && *v && *v != '0');
+    }
+    return cached;
+}
+
+static BOOL nspa_redraw_ring_try_push( HWND hwnd, UINT flags, const RECT *rects, UINT count )
+{
+    nspa_queue_bypass_shm_t *bypass;
+    nspa_redraw_ring_t *ring;
+    nspa_redraw_slot_t *slot;
+    unsigned int head, tail, i;
+
+    if (nspa_redraw_ring_disabled()) return FALSE;
+    if (count > NSPA_REDRAW_INLINE_RECTS) return FALSE;
+
+    bypass = (nspa_queue_bypass_shm_t *)nspa_get_own_bypass_shm_public();
+    if (!bypass) return FALSE;
+    ring = (nspa_redraw_ring_t *)&bypass->nspa_redraw_ring;
+
+    /* SPSC: this thread is the sole producer for its own queue's ring.
+     * Relaxed read of head we own; acquire on tail to see consumer
+     * progress. */
+    head = ring->head;
+    tail = __atomic_load_n( &ring->tail, __ATOMIC_ACQUIRE );
+    if (head - tail >= NSPA_REDRAW_RING_SLOTS)
+    {
+        __atomic_fetch_add( &ring->overflow, 1, __ATOMIC_RELAXED );
+        return FALSE;
+    }
+
+    slot = (nspa_redraw_slot_t *)&ring->slots[head % NSPA_REDRAW_RING_SLOTS];
+    __atomic_store_n( &slot->state, NSPA_REDRAW_STATE_WRITING, __ATOMIC_RELAXED );
+    slot->window     = wine_server_user_handle( hwnd );
+    slot->flags      = flags;
+    slot->rect_count = count;
+    for (i = 0; i < count; i++)
+    {
+        slot->rects[i].left   = rects[i].left;
+        slot->rects[i].top    = rects[i].top;
+        slot->rects[i].right  = rects[i].right;
+        slot->rects[i].bottom = rects[i].bottom;
+    }
+    __atomic_store_n( &slot->state, NSPA_REDRAW_STATE_READY, __ATOMIC_RELEASE );
+    __atomic_store_n( &ring->head, head + 1, __ATOMIC_RELEASE );
+    __atomic_fetch_add( &nspa_redraw_ring_pushed, 1, __ATOMIC_RELAXED );
+    return TRUE;
+}
+
 /***********************************************************************
  *           redraw_window_rects
  *
@@ -1495,6 +1561,10 @@ static BOOL redraw_window_rects( HWND hwnd, UINT flags, const RECT *rects, UINT 
 
     if (!(flags & (RDW_INVALIDATE|RDW_VALIDATE|RDW_INTERNALPAINT|RDW_NOINTERNALPAINT)))
         return TRUE;  /* nothing to do */
+
+    if (nspa_redraw_ring_try_push( hwnd, flags, rects, count ))
+        return TRUE;
+    __atomic_fetch_add( &nspa_redraw_ring_fallback, 1, __ATOMIC_RELAXED );
 
     SERVER_START_REQ( redraw_window )
     {

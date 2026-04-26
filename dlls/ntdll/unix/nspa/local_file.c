@@ -38,7 +38,6 @@
 #include "wine/debug.h"
 #include "../unix_private.h"
 #include "debug.h"
-#include "nspa_retry_histo.h"
 #include <rtpi.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(nspa_lfile);
@@ -108,28 +107,6 @@ static unsigned long long       nspa_lf_promote_calls;        /* nspa_local_file
 static unsigned long long       nspa_lf_promote_cached_hit;   /* server_handle already cached, returned immediately */
 static unsigned long long       nspa_lf_promote_minted;       /* server_handle minted via RPC (lazy) */
 static unsigned long long       nspa_lf_promote_fail;         /* RPC returned 0 handle */
-
-/* R1.3 — retry-count distribution for the inode-table seqlock read.
- * Refines the existing nspa_lf_lookup_seq_retry / nspa_lf_seq_exhausted
- * aggregates into a per-call distribution so we can see whether retry
- * counts cluster at 0 (canonical) or push toward 8 (writer pinned). */
-static nspa_retry_histo_t       nspa_lf_lookup_retry_histo;
-
-/* Gate for the histo records below.  Without this gate the bumps fire on
- * every nspa_lf_lookup call, even when no diag dump is wanted — paying
- * ~5 ns per call plus shared cache-line contention on the histogram
- * bucket from multiple threads.  Same env var the lf diag dump itself
- * uses (see nspa_lf_diag_dump). */
-static int nspa_send_diag_enabled( void )
-{
-    static int cached = -1;
-    if (cached < 0)
-    {
-        const char *v = getenv( "NSPA_SEND_DIAG" );
-        cached = (v && *v && *v != '0');
-    }
-    return cached;
-}
 
 static void nspa_lf_table_open_once_fn( void )
 {
@@ -218,7 +195,6 @@ int nspa_local_file_table_lookup( unsigned long long device, unsigned long long 
     const nspa_inode_bucket_t *bucket;
     unsigned int seq_before, seq_after, i;
     int retries = 8;
-    unsigned int retries_used = 0;  /* R1.3 — value passed to histogram on every exit */
 
     nspa_lf_table_open_lazy();
     if (nspa_lf_table_state != 1) return 0;
@@ -232,7 +208,7 @@ int nspa_local_file_table_lookup( unsigned long long device, unsigned long long 
         nspa_inode_slot_t snapshot;
 
         seq_before = __atomic_load_n( &bucket->seq, __ATOMIC_ACQUIRE );
-        if (seq_before & 1u) { retries_used++; continue; }   /* writer in progress */
+        if (seq_before & 1u) continue;   /* writer in progress */
 
         for (i = 0; i < NSPA_INODE_SLOTS_PER_BUCKET; i++)
         {
@@ -244,12 +220,9 @@ int nspa_local_file_table_lookup( unsigned long long device, unsigned long long 
                 {
                     *out = snapshot;
                     __atomic_fetch_add( &nspa_lf_lookup_hit, 1, __ATOMIC_RELAXED );
-                    if (nspa_send_diag_enabled())
-                        nspa_histo_record( &nspa_lf_lookup_retry_histo, retries_used );
                     return 1;
                 }
                 __atomic_fetch_add( &nspa_lf_lookup_seq_retry, 1, __ATOMIC_RELAXED );
-                retries_used++;
                 goto retry;
             }
         }
@@ -260,12 +233,9 @@ int nspa_local_file_table_lookup( unsigned long long device, unsigned long long 
         if (seq_after == seq_before)
         {
             __atomic_fetch_add( &nspa_lf_lookup_miss, 1, __ATOMIC_RELAXED );
-            if (nspa_send_diag_enabled())
-                nspa_histo_record( &nspa_lf_lookup_retry_histo, retries_used );
             return 0;
         }
         __atomic_fetch_add( &nspa_lf_lookup_seq_retry, 1, __ATOMIC_RELAXED );
-        retries_used++;
     retry:
         ;
     }
@@ -277,8 +247,6 @@ int nspa_local_file_table_lookup( unsigned long long device, unsigned long long 
      * specific signal that the retry loop gave up. */
     __atomic_fetch_add( &nspa_lf_lookup_miss,   1, __ATOMIC_RELAXED );
     __atomic_fetch_add( &nspa_lf_seq_exhausted, 1, __ATOMIC_RELAXED );
-    if (nspa_send_diag_enabled())
-        nspa_histo_record( &nspa_lf_lookup_retry_histo, retries_used );
     return 0;
 }
 
@@ -493,12 +461,6 @@ static void nspa_lf_diag_dump( void )
             }
         }
     }
-
-    /* R1.3 — inode-table seqlock retry-count distribution.  Bucket 0
-     * dominating means the bucket is essentially uncontended; bucket 4+
-     * entries mean writers (server publish path) are pinning buckets. */
-    fprintf(f, "\n");
-    nspa_histo_dump( &nspa_lf_lookup_retry_histo, "local_file lookup seqlock retries", f );
 
     fclose(f);
     rename(tmp, path);

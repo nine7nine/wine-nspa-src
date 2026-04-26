@@ -743,6 +743,7 @@ SOURCES = \
 	npapi.h \
 	nserror.h \
 	nspa_hook_filter.h \
+	nspa_retry_histo.h \
 	nspapi.h \
 	ntddcdrm.h \
 	ntddkbd.h \

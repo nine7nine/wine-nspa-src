@@ -120,14 +120,28 @@ static void *channel_dispatcher( void *param )
         generation = poll_generation;
 
         thread = get_thread_from_id( (thread_id_t)recv.payload_off );
-        if (thread && thread->request_shm)
+        if (thread)
         {
-            /* Memory barriers: ensure we observe all of the sender's
-             * shmem writes before reading the request, and that all
-             * our reply writes are visible before we wake the sender. */
-            __atomic_thread_fence( __ATOMIC_SEQ_CST );
-            read_request_shm( thread, (struct request_shm *)thread->request_shm );
-            __atomic_thread_fence( __ATOMIC_SEQ_CST );
+            /* Validate the resolved thread belongs to this dispatcher's
+             * process.  The channel is per-process; a payload_off that
+             * resolves to a thread elsewhere is either client tampering
+             * or a logic bug, and running the handler against the wrong
+             * process would corrupt unrelated state.  thread->process
+             * is kept alive by the ref grab_object grants on the thread
+             * (thread.c:602 holds a strong process ref for every thread). */
+            if (thread->process->request_channel_fd == channel_fd && thread->request_shm)
+            {
+                /* Memory barriers: ensure we observe all of the sender's
+                 * shmem writes before reading the request, and that all
+                 * our reply writes are visible before we wake the sender. */
+                __atomic_thread_fence( __ATOMIC_SEQ_CST );
+                read_request_shm( thread, (struct request_shm *)thread->request_shm );
+                __atomic_thread_fence( __ATOMIC_SEQ_CST );
+            }
+            /* get_thread_from_id grabbed a refcount; release it now that
+             * we are done.  Missing this leaks one thread reference per
+             * channel request and prevents thread/process cleanup. */
+            release_object( thread );
         }
 
         pi_mutex_unlock( &global_lock );
@@ -138,6 +152,9 @@ static void *channel_dispatcher( void *param )
             ioctl( channel_fd, NTSYNC_IOC_CHANNEL_REPLY, &entry_id );
         }
 
+        /* Read poll_generation outside the lock — RELAXED is intentional.
+         * Worst case is one missed or one spurious force_exit_poll call;
+         * both are benign (force_exit_poll is just a wakeup nudge). */
         if (poll_generation != generation)
             force_exit_poll();
     }

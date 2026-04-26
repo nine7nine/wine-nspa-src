@@ -29,6 +29,7 @@ void nspa_redraw_ring_drain( struct thread *thread )
     nspa_queue_bypass_shm_t *shm;
     nspa_redraw_ring_t *ring;
     unsigned int tail, head;
+    unsigned int saved_error;
 
     if (!thread) return;
     if (!(shm = nspa_queue_bypass_shm( thread ))) return;
@@ -36,6 +37,21 @@ void nspa_redraw_ring_drain( struct thread *thread )
 
     head = __atomic_load_n( &ring->head, __ATOMIC_ACQUIRE );
     tail = ring->tail;
+    if (tail == head) return;  /* empty-ring fast path: no save/restore needed */
+
+    /* The drain runs at the top of the request dispatcher with current==thread,
+     * BEFORE clear_error() has reached the actual handler.  Any apply that hits
+     * a stale handle (window destroyed between client push and drain), a region
+     * validation failure, or a server alloc failure will set_error() — and that
+     * error then leaks into the otherwise-successful reply of the unrelated
+     * request that triggered the drain.  Symptoms: caller sees STATUS_INVALID_
+     * WINDOW_HANDLE / STATUS_INVALID_PARAMETER on a successful get_update_region
+     * / get_visible_region / get_message; treats valid reply data as failed,
+     * tight-loops repaint, eventually wedges KWin/X11.  Same end picture as the
+     * gamma offset corruption fix — different mechanism.  Snapshot here, restore
+     * after the loop. */
+    saved_error = thread->error;
+
     while (tail != head)
     {
         nspa_redraw_slot_t *slot = (nspa_redraw_slot_t *)&ring->slots[tail % NSPA_REDRAW_RING_SLOTS];
@@ -65,4 +81,7 @@ void nspa_redraw_ring_drain( struct thread *thread )
         tail++;
         __atomic_store_n( &ring->tail, tail, __ATOMIC_RELEASE );
     }
+
+    thread->error = saved_error;
+    if (thread == current) global_error = saved_error;
 }

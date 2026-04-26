@@ -63,12 +63,6 @@ extern BOOL nspa_try_pop_own_ring_post( HWND filter_hwnd, UINT first, UINT last,
  * the server round-trip to learn of pending ring SENDs. */
 extern const nspa_queue_bypass_shm_t *nspa_get_own_bypass_shm_public( void );
 
-/* msg-ring v2 Phase C diag — categorise the get_message RPC fall-through.
- * Bumped from peek_message at the SERVER_START_REQ(get_message) site after
- * all v1 ring pops returned FALSE.  Opt-in via NSPA_SEND_DIAG=1; counts dump
- * to /tmp/nspa_send_diag.<pid>.log alongside the existing send/post sections. */
-extern void nspa_get_message_diag_bump( UINT signal_bits, BOOL bypass_present );
-
 /* Phase 4.6: pop a ring SEND from own ring client-side, eliminating the
  * wineserver get_message RTT on the dispatch hot path.  Called from
  * peek_message before the server request.  Returns TRUE if a SEND-class

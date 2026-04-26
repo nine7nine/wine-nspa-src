@@ -366,75 +366,6 @@ static void nspa_post_diag_bump( enum nspa_post_reason r )
     nspa_diag_lazy_start();
 }
 
-/* msg-ring v2 Phase C — get_message fall-through categorisation.
- *
- * Bumped from message.c::peek_message at the SERVER_START_REQ(get_message)
- * call site, after all v1 ring pops have returned FALSE.  Each fall-through
- * bumps exactly one bucket (priority order — most actionable first), plus
- * the GMSG_ENTRY total.  Buckets map to remediation paths:
- *
- *   GMSG_BYPASS_ABSENT          → bypass shm bootstrap not yet attached
- *   GMSG_WANT_PAINT             → Phase B (paint cache) target
- *   GMSG_WANT_HARDWARE          → no-current-coverage; future hardware-input ring
- *   GMSG_WANT_HOTKEY            → no-current-coverage; server-synthesised
- *   GMSG_WANT_POST_RING_EMPTY   → v1 POST ring missed (cross-process? filter?)
- *   GMSG_WANT_SEND_RING_EMPTY   → v1 SEND ring missed (cross-process? filter?)
- *   GMSG_WANT_TIMER_RING_EMPTY  → v1 timer ring missed (system timer? cross-process?)
- *   GMSG_WANT_OTHER             → unclassified bits
- */
-enum nspa_get_message_reason
-{
-    GMSG_ENTRY = 0,
-    GMSG_BYPASS_ABSENT,
-    GMSG_WANT_PAINT,
-    GMSG_WANT_HARDWARE,
-    GMSG_WANT_HOTKEY,
-    GMSG_WANT_POST_RING_EMPTY,
-    GMSG_WANT_SEND_RING_EMPTY,
-    GMSG_WANT_TIMER_RING_EMPTY,
-    GMSG_WANT_OTHER,
-    GMSG_REASON_NB
-};
-
-static const char *const nspa_get_message_reason_name[GMSG_REASON_NB] = {
-    "entry",
-    "bypass_absent",
-    "want_paint",
-    "want_hardware",
-    "want_hotkey",
-    "want_post_ring_empty",
-    "want_send_ring_empty",
-    "want_timer_ring_empty",
-    "want_other",
-};
-
-static uint64_t nspa_diag_get_message[GMSG_REASON_NB];
-
-static enum nspa_get_message_reason nspa_classify_get_message( UINT signal_bits, BOOL bypass_present )
-{
-    if (!bypass_present) return GMSG_BYPASS_ABSENT;
-    /* Priority order: ring-class buckets first (covered today, miss is actionable),
-     * then no-current-coverage classes (Phase B / future work). */
-    if (signal_bits & (QS_POSTMESSAGE | QS_ALLPOSTMESSAGE)) return GMSG_WANT_POST_RING_EMPTY;
-    if (signal_bits & QS_SENDMESSAGE)                       return GMSG_WANT_SEND_RING_EMPTY;
-    if (signal_bits & QS_TIMER)                             return GMSG_WANT_TIMER_RING_EMPTY;
-    if (signal_bits & QS_PAINT)                             return GMSG_WANT_PAINT;
-    if (signal_bits & (QS_KEY | QS_MOUSEMOVE | QS_MOUSEBUTTON | QS_RAWINPUT | QS_INPUT))
-        return GMSG_WANT_HARDWARE;
-    if (signal_bits & QS_HOTKEY)                            return GMSG_WANT_HOTKEY;
-    return GMSG_WANT_OTHER;
-}
-
-void nspa_get_message_diag_bump( UINT signal_bits, BOOL bypass_present )
-{
-    enum nspa_get_message_reason r;
-    if (!nspa_send_diag_enabled()) return;
-    r = nspa_classify_get_message( signal_bits, bypass_present );
-    __atomic_fetch_add( &nspa_diag_get_message[GMSG_ENTRY], 1, __ATOMIC_RELAXED );
-    __atomic_fetch_add( &nspa_diag_get_message[r], 1, __ATOMIC_RELAXED );
-    nspa_diag_lazy_start();
-}
-
 static time_t nspa_diag_start_epoch;
 
 static void nspa_diag_dump( void )
@@ -517,22 +448,6 @@ static void nspa_diag_dump( void )
     {
         uint64_t overflow = __atomic_load_n( &nspa_diag_tid_overflow, __ATOMIC_RELAXED );
         if (overflow) fprintf( f, "  tid-table overflow bumps: %llu\n", (unsigned long long)overflow );
-    }
-
-    fprintf( f, "\n[get_message] fall-through (msg-ring v2 Phase C diag)\n" );
-    {
-        uint64_t entry = __atomic_load_n( &nspa_diag_get_message[GMSG_ENTRY], __ATOMIC_RELAXED );
-        uint64_t buckets_total = 0;
-        for (i = 1; i < GMSG_REASON_NB; i++)
-        {
-            uint64_t v = __atomic_load_n( &nspa_diag_get_message[i], __ATOMIC_RELAXED );
-            fprintf( f, "  %-24s %llu\n", nspa_get_message_reason_name[i], (unsigned long long)v );
-            buckets_total += v;
-        }
-        fprintf( f, "  sanity  entry=%llu  buckets_sum=%llu  delta=%lld\n",
-                 (unsigned long long)entry,
-                 (unsigned long long)buckets_total,
-                 (long long)(entry - buckets_total) );
     }
 
     fclose( f );

@@ -509,7 +509,14 @@ static void nspa_diag_lazy_start( void )
  *   CONSUMED -> EMPTY (server-side tail advance during dequeue)
  * --------------------------------------------------------------------- */
 
-/* Reserve a slot index via CAS.  Returns U32_MAX on FULL. */
+/* Reserve a slot index via CAS.  Returns U32_MAX on FULL.
+ *
+ * Defensive: __builtin_ia32_pause() is emitted only on the retry path
+ * (after a failed CAS), so the contention-free fast path pays zero cost.
+ * On x86 PAUSE relieves SMT sibling pressure and reduces cache-line
+ * ping-pong on ring->head; this is hygiene against the FIFO-spin hazard
+ * the bypass audit §3.4 + §4.1 flagged, not a fix for a livelock path
+ * (a true bounded backoff would still need a yield/RPC fallback). */
 static unsigned int ring_reserve_slot( volatile nspa_msg_ring_t *ring )
 {
     unsigned int head, tail, next;
@@ -533,6 +540,7 @@ static unsigned int ring_reserve_slot( volatile nspa_msg_ring_t *ring )
             return head;
         }
         retries++;
+        __builtin_ia32_pause();
     }
 }
 

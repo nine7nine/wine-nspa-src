@@ -26,6 +26,8 @@ SOURCES = \
 	named_pipe.c \
 	nspa/hook_cache.c \
 	nspa/hook_cache.h \
+	nspa/redraw_ring.c \
+	nspa/redraw_ring.h \
 	nspa/local_file.c \
 	nspa/local_file.h \
 	nspa/profile.c \

@@ -1166,6 +1166,39 @@ typedef volatile struct
     nspa_hook_entry_t   entries[NSPA_HOOK_CHAIN_CAP];
 } nspa_hook_chain_t;
 
+/* NSPA msg-ring v2 Phase A: redraw_window push ring.  RedrawWindow is
+ * one-way (no @REPLY) — client appends an entry here and the server
+ * drains lazily during the next request handler dispatched from this
+ * queue.  SPSC: the queue-owning thread is the sole producer, the
+ * wineserver main thread is the sole consumer.  Cross-thread
+ * RedrawWindow (caller != window-owner) falls back to RPC; regions
+ * with more than NSPA_REDRAW_INLINE_RECTS rectangles also fall back. */
+#define NSPA_REDRAW_RING_SLOTS    32
+#define NSPA_REDRAW_INLINE_RECTS  4
+
+#define NSPA_REDRAW_STATE_EMPTY    0
+#define NSPA_REDRAW_STATE_WRITING  1
+#define NSPA_REDRAW_STATE_READY    2
+#define NSPA_REDRAW_STATE_CONSUMED 3
+
+typedef volatile struct
+{
+    unsigned int      state;        /* NSPA_REDRAW_STATE_* */
+    user_handle_t     window;       /* 0 = desktop window */
+    unsigned int      flags;        /* RDW_* */
+    unsigned int      rect_count;   /* 0..NSPA_REDRAW_INLINE_RECTS; 0 = whole window */
+    struct rectangle  rects[NSPA_REDRAW_INLINE_RECTS];
+} nspa_redraw_slot_t;
+
+typedef volatile struct
+{
+    unsigned int           head;       /* producer (client) advances; mod slots */
+    unsigned int           tail;       /* consumer (server) advances */
+    unsigned int           overflow;   /* dropped on ring full */
+    unsigned int           active;     /* 0 = consumer not set up */
+    nspa_redraw_slot_t     slots[NSPA_REDRAW_RING_SLOTS];
+} nspa_redraw_ring_t;
+
 typedef volatile struct
 {
     nspa_msg_ring_t      nspa_msg_ring;    /* incoming messages (senders -> me) */
@@ -1174,6 +1207,7 @@ typedef volatile struct
     int                  nspa_hook_walk_counts[NB_HOOKS]; /* Tier 1: client-owned walk refcount for queue-local hook chains (see server/hook.c + dlls/win32u/hook.c) */
     nspa_hook_chain_t    nspa_hook_chains[NB_HOOKS]; /* Tier 2: per-hook-id chain snapshot, server-written under seqlock */
     unsigned char        nspa_hook_module_pool[NSPA_HOOK_MODULE_POOL]; /* Tier 2: shared UTF-16 string pool referenced by entries[].module_offset */
+    nspa_redraw_ring_t   nspa_redraw_ring; /* msg-ring v2 Phase A: client-pushed redraw_window entries, server drains lazily */
 } nspa_queue_bypass_shm_t;
 
 /* NSPA local-file bypass — Phase 1A.2 shared inode aggregation table

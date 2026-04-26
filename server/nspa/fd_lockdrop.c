@@ -55,20 +55,21 @@ int nspa_openat_lockdrop( struct fd *fd_object,
 {
     int unix_fd, local_errno = 0;
 
-    /* NSPA: opt-in gate for the lock-drop.  Default OFF after a host
-     * lockup on first validation run (2026-04-26) — same shape as the
-     * msg-ring v2 B1.0 lockup that birthed feedback_validate_before_
-     * default_on.md.  With the gate off, the helper holds global_lock
-     * throughout and behaves identically to the pre-Phase-B (Phase-A-
-     * only) build.  Set NSPA_OPENFD_LOCKDROP=1 to opt in once the
-     * latent gamma-RT-scheduler issue is rooted out and the lock-drop
-     * is re-validated in isolation. */
+    /* NSPA: lock-drop default ON since 2026-04-26.  Originally gated
+     * default-off after a host lockup on the first validation run, but
+     * the root cause was traced to ntsync driver bugs (kfree under
+     * raw_spinlock_t — fixed in ntsync-patches/1006-ntsync-rt-alloc-
+     * hoist.patch), not Phase B itself.  Re-validated post-1006 with
+     * Ableton drum-track-load-while-playing (the file-open-burst
+     * workload Phase B targets) — clean and measurably better.
+     * Set NSPA_OPENFD_LOCKDROP=0 to fall back to the pre-Phase-B
+     * (held-throughout) helper for A/B testing. */
     {
         static int cached_enabled = -1;
         if (cached_enabled < 0)
         {
             const char *v = getenv( "NSPA_OPENFD_LOCKDROP" );
-            cached_enabled = (v && *v && *v != '0');
+            cached_enabled = !(v && *v == '0');
         }
         if (!cached_enabled)
         {

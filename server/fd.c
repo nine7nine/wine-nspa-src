@@ -2096,6 +2096,7 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
     struct closed_fd *closed_fd;
     struct fd *fd;
     int root_fd = -1;
+    int dirfd;
     int rw_mode;
     char *path;
 
@@ -2115,21 +2116,26 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
         return NULL;
     }
 
+    /* NSPA Phase A — replace the historical fchdir(root_fd) + open(name)
+     * pair with openat(root_fd, name).  The two-step variant changed the
+     * process-wide cwd, which made it unsafe to ever release global_lock
+     * mid-handler (a concurrent handler doing fchdir would steal the cwd
+     * between our fchdir and our open).  openat performs the dirfd-
+     * relative resolution atomically, eliminating that race and
+     * unblocking the future audio-xrun fix in nspa/docs/open-fd-async-
+     * plan.md.  Behaviourally identical: kernel resolves "name" against
+     * dirfd exactly as the old "fchdir(root_fd) then open(name)" did. */
+    dirfd = AT_FDCWD;
     if (root)
     {
         if ((root_fd = get_unix_fd( root )) == -1) goto error;
-        if (fchdir( root_fd ) == -1)
-        {
-            file_set_error();
-            root_fd = -1;
-            goto error;
-        }
+        dirfd = root_fd;
     }
 
     /* create the directory if needed */
     if ((options & FILE_DIRECTORY_FILE) && (flags & O_CREAT))
     {
-        if (mkdir( name, *mode ) == -1)
+        if (mkdirat( dirfd, name, *mode ) == -1)
         {
             if (errno != EEXIST || (flags & O_EXCL))
             {
@@ -2147,13 +2153,13 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
     }
     else rw_mode = O_RDONLY;
 
-    if ((fd->unix_fd = open( name, rw_mode | (flags & ~O_TRUNC), *mode )) == -1)
+    if ((fd->unix_fd = openat( dirfd, name, rw_mode | (flags & ~O_TRUNC), *mode )) == -1)
     {
         /* if we tried to open a directory for write access, retry read-only */
         if (errno == EISDIR)
         {
             if ((access & FILE_UNIX_WRITE_ACCESS) || (flags & O_CREAT))
-                fd->unix_fd = open( name, O_RDONLY | (flags & ~(O_TRUNC | O_CREAT | O_EXCL)), *mode );
+                fd->unix_fd = openat( dirfd, name, O_RDONLY | (flags & ~(O_TRUNC | O_CREAT | O_EXCL)), *mode );
         }
 
         if (fd->unix_fd == -1)
@@ -2265,13 +2271,13 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
     }
 #endif
 
-    if (root_fd != -1) fchdir( server_dir_fd ); /* go back to the server dir */
+    /* NSPA Phase A — no fchdir to undo; openat above did not change cwd. */
     return fd;
 
 error:
     release_object( fd );
     free( closed_fd );
-    if (root_fd != -1) fchdir( server_dir_fd ); /* go back to the server dir */
+    /* NSPA Phase A — no fchdir to undo; openat above did not change cwd. */
     return NULL;
 }
 

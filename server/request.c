@@ -60,6 +60,7 @@
 #include "security.h"
 #include "handle.h"
 #include "request_handlers.h"
+#include "nspa/redraw_ring.h"
 
 /* Some versions of glibc don't define this */
 #ifndef SCM_RIGHTS
@@ -374,6 +375,11 @@ static void call_req_handler_shm( struct thread *thread, struct request_shm *req
 
     if (debug_level) trace_request();
 
+    /* NSPA msg-ring v2 Phase A: drain any pending redraw_window entries
+     * pushed by the client before the handler runs so a follow-up
+     * get_update_region sees the up-to-date region. */
+    nspa_redraw_ring_drain( current );
+
     if (req < REQ_NB_REQUESTS)
     {
         unsigned long long nspa_t0 = nspa_profile_start();
@@ -434,6 +440,10 @@ static void call_req_handler( struct thread *thread )
     memset( &reply, 0, sizeof(reply) );
 
     if (debug_level) trace_request();
+
+    /* NSPA msg-ring v2 Phase A: see call_req_handler_shm for the same
+     * drain — pending redraws applied before any handler runs. */
+    nspa_redraw_ring_drain( current );
 
     if (req < REQ_NB_REQUESTS)
     {

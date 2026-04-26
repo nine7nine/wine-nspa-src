@@ -1692,6 +1692,19 @@ static BOOL get_update_flags( HWND hwnd, HWND *child, UINT *flags )
     return ret;
 }
 
+/* Print fast-path engagement on process exit so default-on doesn't ship
+ * blind to whether the path is actually used.  Quiet for the common
+ * case where the gate didn't engage. */
+static void __attribute__((destructor)) nspa_paint_fastpath_print_stats( void )
+{
+    unsigned long long h = __atomic_load_n( &nspa_paint_fastpath_hits, __ATOMIC_RELAXED );
+    unsigned long long m = __atomic_load_n( &nspa_paint_fastpath_misses, __ATOMIC_RELAXED );
+    unsigned long long total = h + m;
+    unsigned long long pct = total ? (h * 100 / total) : 0;
+    if (total)
+        ERR( "NSPA RT:PaintCache: %llu hits / %llu misses (%llu%% hit)\n", h, m, pct );
+}
+
 /***********************************************************************
  *           send_ncpaint
  *

@@ -368,160 +368,70 @@ static void nspa_post_diag_bump( enum nspa_post_reason r )
 
 /* msg-ring v2 Phase C — get_message fall-through categorisation.
  *
- * Two histograms, both bumped per fall-through:
+ * Bumped from message.c::peek_message at the SERVER_START_REQ(get_message)
+ * call site, after all v1 ring pops have returned FALSE.  Each fall-through
+ * bumps exactly one bucket (priority order — most actionable first), plus
+ * the GMSG_ENTRY total.  Buckets map to remediation paths:
  *
- * [wake]  bumped before the RPC, classifies by the *actual* queue wake bits
- *         (as published by check_queue_bits → wake_bits OUT param) — i.e. the
- *         class(es) the server told us were ready that the local ring drains
- *         couldn't satisfy.  Source-of-cost view.
- *
- * [reply] bumped after the RPC returns, classifies by the reply type/msg —
- *         i.e. what the server actually delivered.  Outcome view.  Compared
- *         against [wake], gives us false-positive rate (sticky wake bits)
- *         and true coverage gaps.
- *
- * v1 of this diag (single histogram bumped with `signal_bits = flags >> 16`)
- * was misleading: signal_bits is the FILTER mask, not the wake state, so
- * every QS_ALLINPUT peek landed in the highest-priority bucket regardless of
- * what actually woke us.
+ *   GMSG_BYPASS_ABSENT          → bypass shm bootstrap not yet attached
+ *   GMSG_WANT_PAINT             → Phase B (paint cache) target
+ *   GMSG_WANT_HARDWARE          → no-current-coverage; future hardware-input ring
+ *   GMSG_WANT_HOTKEY            → no-current-coverage; server-synthesised
+ *   GMSG_WANT_POST_RING_EMPTY   → v1 POST ring missed (cross-process? filter?)
+ *   GMSG_WANT_SEND_RING_EMPTY   → v1 SEND ring missed (cross-process? filter?)
+ *   GMSG_WANT_TIMER_RING_EMPTY  → v1 timer ring missed (system timer? cross-process?)
+ *   GMSG_WANT_OTHER             → unclassified bits
  */
-enum nspa_get_message_wake_reason
+enum nspa_get_message_reason
 {
-    GMSG_W_ENTRY = 0,
-    GMSG_W_BYPASS_ABSENT,
-    GMSG_W_NO_BITS,        /* wake==0 — racing publish or pure mask-update path */
-    GMSG_W_POST,
-    GMSG_W_SEND,
-    GMSG_W_TIMER,
-    GMSG_W_PAINT,
-    GMSG_W_HARDWARE,
-    GMSG_W_HOTKEY,
-    GMSG_W_OTHER,
-    GMSG_W_REASON_NB
+    GMSG_ENTRY = 0,
+    GMSG_BYPASS_ABSENT,
+    GMSG_WANT_PAINT,
+    GMSG_WANT_HARDWARE,
+    GMSG_WANT_HOTKEY,
+    GMSG_WANT_POST_RING_EMPTY,
+    GMSG_WANT_SEND_RING_EMPTY,
+    GMSG_WANT_TIMER_RING_EMPTY,
+    GMSG_WANT_OTHER,
+    GMSG_REASON_NB
 };
 
-static const char *const nspa_get_message_wake_reason_name[GMSG_W_REASON_NB] = {
+static const char *const nspa_get_message_reason_name[GMSG_REASON_NB] = {
     "entry",
     "bypass_absent",
-    "no_bits",
-    "wake_post",
-    "wake_send",
-    "wake_timer",
-    "wake_paint",
-    "wake_hardware",
-    "wake_hotkey",
-    "wake_other",
+    "want_paint",
+    "want_hardware",
+    "want_hotkey",
+    "want_post_ring_empty",
+    "want_send_ring_empty",
+    "want_timer_ring_empty",
+    "want_other",
 };
 
-static uint64_t nspa_diag_get_message_wake[GMSG_W_REASON_NB];
+static uint64_t nspa_diag_get_message[GMSG_REASON_NB];
 
-enum nspa_get_message_reply_reason
+static enum nspa_get_message_reason nspa_classify_get_message( UINT signal_bits, BOOL bypass_present )
 {
-    GMSG_R_ENTRY = 0,
-    GMSG_R_PENDING,         /* res != STATUS_SUCCESS — no message delivered */
-    GMSG_R_ERROR,           /* res non-success non-pending */
-    GMSG_R_POSTED_PAINT,    /* WM_PAINT */
-    GMSG_R_POSTED_TIMER,    /* WM_TIMER / WM_SYSTIMER */
-    GMSG_R_POSTED_QUIT,     /* WM_QUIT */
-    GMSG_R_POSTED_HOTKEY,   /* WM_HOTKEY */
-    GMSG_R_POSTED_APP,      /* MSG_POSTED with msg >= WM_USER */
-    GMSG_R_POSTED_SYS,      /* MSG_POSTED with msg < WM_USER, none of the above */
-    GMSG_R_HARDWARE,
-    GMSG_R_ASCII,
-    GMSG_R_UNICODE,
-    GMSG_R_NOTIFY,
-    GMSG_R_CALLBACK,
-    GMSG_R_CALLBACK_RESULT,
-    GMSG_R_WINEVENT,
-    GMSG_R_OTHER_PROCESS,
-    GMSG_R_OTHER_TYPE,
-    GMSG_R_REASON_NB
-};
-
-static const char *const nspa_get_message_reply_reason_name[GMSG_R_REASON_NB] = {
-    "entry",
-    "pending",
-    "error",
-    "rpl_posted_paint",
-    "rpl_posted_timer",
-    "rpl_posted_quit",
-    "rpl_posted_hotkey",
-    "rpl_posted_app",
-    "rpl_posted_sys",
-    "rpl_hardware",
-    "rpl_ascii",
-    "rpl_unicode",
-    "rpl_notify",
-    "rpl_callback",
-    "rpl_callback_result",
-    "rpl_winevent",
-    "rpl_other_process",
-    "rpl_other_type",
-};
-
-static uint64_t nspa_diag_get_message_reply[GMSG_R_REASON_NB];
-
-static enum nspa_get_message_wake_reason nspa_classify_get_message_wake( UINT wake_bits, BOOL bypass_present )
-{
-    if (!bypass_present) return GMSG_W_BYPASS_ABSENT;
-    if (!wake_bits)      return GMSG_W_NO_BITS;
+    if (!bypass_present) return GMSG_BYPASS_ABSENT;
     /* Priority order: ring-class buckets first (covered today, miss is actionable),
      * then no-current-coverage classes (Phase B / future work). */
-    if (wake_bits & (QS_POSTMESSAGE | QS_ALLPOSTMESSAGE)) return GMSG_W_POST;
-    if (wake_bits & QS_SENDMESSAGE)                       return GMSG_W_SEND;
-    if (wake_bits & QS_TIMER)                             return GMSG_W_TIMER;
-    if (wake_bits & QS_PAINT)                             return GMSG_W_PAINT;
-    if (wake_bits & (QS_KEY | QS_MOUSEMOVE | QS_MOUSEBUTTON | QS_RAWINPUT | QS_INPUT))
-        return GMSG_W_HARDWARE;
-    if (wake_bits & QS_HOTKEY)                            return GMSG_W_HOTKEY;
-    return GMSG_W_OTHER;
+    if (signal_bits & (QS_POSTMESSAGE | QS_ALLPOSTMESSAGE)) return GMSG_WANT_POST_RING_EMPTY;
+    if (signal_bits & QS_SENDMESSAGE)                       return GMSG_WANT_SEND_RING_EMPTY;
+    if (signal_bits & QS_TIMER)                             return GMSG_WANT_TIMER_RING_EMPTY;
+    if (signal_bits & QS_PAINT)                             return GMSG_WANT_PAINT;
+    if (signal_bits & (QS_KEY | QS_MOUSEMOVE | QS_MOUSEBUTTON | QS_RAWINPUT | QS_INPUT))
+        return GMSG_WANT_HARDWARE;
+    if (signal_bits & QS_HOTKEY)                            return GMSG_WANT_HOTKEY;
+    return GMSG_WANT_OTHER;
 }
 
-void nspa_get_message_diag_bump( UINT wake_bits, BOOL bypass_present )
+void nspa_get_message_diag_bump( UINT signal_bits, BOOL bypass_present )
 {
-    enum nspa_get_message_wake_reason r;
+    enum nspa_get_message_reason r;
     if (!nspa_send_diag_enabled()) return;
-    r = nspa_classify_get_message_wake( wake_bits, bypass_present );
-    __atomic_fetch_add( &nspa_diag_get_message_wake[GMSG_W_ENTRY], 1, __ATOMIC_RELAXED );
-    __atomic_fetch_add( &nspa_diag_get_message_wake[r], 1, __ATOMIC_RELAXED );
-    nspa_diag_lazy_start();
-}
-
-/* Called from peek_message after SERVER_END_REQ.  res is the wine_server_call
- * status; type is the reply->type (MSG_POSTED / MSG_HARDWARE / etc); msg is
- * reply->msg (only meaningful for MSG_POSTED). */
-void nspa_get_message_reply_diag_bump( UINT res, UINT type, UINT msg )
-{
-    enum nspa_get_message_reply_reason r;
-    if (!nspa_send_diag_enabled()) return;
-
-    if (res == STATUS_PENDING)
-        r = GMSG_R_PENDING;
-    else if (res != 0)
-        r = GMSG_R_ERROR;
-    else switch (type)
-    {
-    case MSG_POSTED:
-        if (msg == WM_PAINT)                       r = GMSG_R_POSTED_PAINT;
-        else if (msg == WM_TIMER || msg == 0x0118 /*WM_SYSTIMER*/) r = GMSG_R_POSTED_TIMER;
-        else if (msg == WM_QUIT)                   r = GMSG_R_POSTED_QUIT;
-        else if (msg == WM_HOTKEY)                 r = GMSG_R_POSTED_HOTKEY;
-        else if (msg >= WM_USER)                   r = GMSG_R_POSTED_APP;
-        else                                       r = GMSG_R_POSTED_SYS;
-        break;
-    case MSG_HARDWARE:        r = GMSG_R_HARDWARE; break;
-    case MSG_ASCII:           r = GMSG_R_ASCII; break;
-    case MSG_UNICODE:         r = GMSG_R_UNICODE; break;
-    case MSG_NOTIFY:          r = GMSG_R_NOTIFY; break;
-    case MSG_CALLBACK:        r = GMSG_R_CALLBACK; break;
-    case MSG_CALLBACK_RESULT: r = GMSG_R_CALLBACK_RESULT; break;
-    case MSG_WINEVENT:        r = GMSG_R_WINEVENT; break;
-    case MSG_OTHER_PROCESS:   r = GMSG_R_OTHER_PROCESS; break;
-    default:                  r = GMSG_R_OTHER_TYPE; break;
-    }
-
-    __atomic_fetch_add( &nspa_diag_get_message_reply[GMSG_R_ENTRY], 1, __ATOMIC_RELAXED );
-    __atomic_fetch_add( &nspa_diag_get_message_reply[r], 1, __ATOMIC_RELAXED );
+    r = nspa_classify_get_message( signal_bits, bypass_present );
+    __atomic_fetch_add( &nspa_diag_get_message[GMSG_ENTRY], 1, __ATOMIC_RELAXED );
+    __atomic_fetch_add( &nspa_diag_get_message[r], 1, __ATOMIC_RELAXED );
     nspa_diag_lazy_start();
 }
 
@@ -609,30 +519,14 @@ static void nspa_diag_dump( void )
         if (overflow) fprintf( f, "  tid-table overflow bumps: %llu\n", (unsigned long long)overflow );
     }
 
-    fprintf( f, "\n[get_message wake] pre-RPC classification by actual queue wake bits\n" );
+    fprintf( f, "\n[get_message] fall-through (msg-ring v2 Phase C diag)\n" );
     {
-        uint64_t entry = __atomic_load_n( &nspa_diag_get_message_wake[GMSG_W_ENTRY], __ATOMIC_RELAXED );
+        uint64_t entry = __atomic_load_n( &nspa_diag_get_message[GMSG_ENTRY], __ATOMIC_RELAXED );
         uint64_t buckets_total = 0;
-        for (i = 1; i < GMSG_W_REASON_NB; i++)
+        for (i = 1; i < GMSG_REASON_NB; i++)
         {
-            uint64_t v = __atomic_load_n( &nspa_diag_get_message_wake[i], __ATOMIC_RELAXED );
-            fprintf( f, "  %-24s %llu\n", nspa_get_message_wake_reason_name[i], (unsigned long long)v );
-            buckets_total += v;
-        }
-        fprintf( f, "  sanity  entry=%llu  buckets_sum=%llu  delta=%lld\n",
-                 (unsigned long long)entry,
-                 (unsigned long long)buckets_total,
-                 (long long)(entry - buckets_total) );
-    }
-
-    fprintf( f, "\n[get_message reply] post-RPC classification by reply type/msg\n" );
-    {
-        uint64_t entry = __atomic_load_n( &nspa_diag_get_message_reply[GMSG_R_ENTRY], __ATOMIC_RELAXED );
-        uint64_t buckets_total = 0;
-        for (i = 1; i < GMSG_R_REASON_NB; i++)
-        {
-            uint64_t v = __atomic_load_n( &nspa_diag_get_message_reply[i], __ATOMIC_RELAXED );
-            fprintf( f, "  %-24s %llu\n", nspa_get_message_reply_reason_name[i], (unsigned long long)v );
+            uint64_t v = __atomic_load_n( &nspa_diag_get_message[i], __ATOMIC_RELAXED );
+            fprintf( f, "  %-24s %llu\n", nspa_get_message_reason_name[i], (unsigned long long)v );
             buckets_total += v;
         }
         fprintf( f, "  sanity  entry=%llu  buckets_sum=%llu  delta=%lld\n",

@@ -63,6 +63,7 @@
 #include "request.h"
 #include "user.h"
 #include "nspa/rt.h"
+#include "nspa/shmem_channel.h"
 #include "security.h"
 
 
@@ -740,6 +741,16 @@ static void destroy_thread( struct object *obj )
 {
     struct thread *thread = (struct thread *)obj;
     assert( obj->ops == &thread_ops );
+
+#ifdef __linux__
+    /* NSPA gamma thread-token: drop the kernel registration BEFORE
+     * release_object(thread->process) below — process may be the last
+     * ref and trigger nspa_shmem_channel_destroy, after which the
+     * channel fd is closed and the deregister ioctl would noop anyway,
+     * but doing it first keeps the kernel hash clean even when the
+     * process outlives this thread. */
+    nspa_shmem_channel_deregister_thread( thread->process, thread );
+#endif
 
     list_remove( &thread->entry );
     cleanup_thread( thread );
@@ -1891,6 +1902,11 @@ DECL_HANDLER(init_first_thread)
         send_client_fd( current->process, current->process->request_channel_fd,
                         get_process_id( current->process ) | 2 );
 
+    /* NSPA gamma thread-token: register the first thread BEFORE the
+     * client receives the channel fd, so its first SEND_PI on the
+     * channel finds a populated (tid -> thread) mapping. */
+    nspa_shmem_channel_register_thread( current->process, current );
+
     /* NSPA E2: use the tail of the first thread's request_shm as the
      * client-poll bitmap.  No separate shmem or protocol field needed. */
     if (current->request_shm && !current->process->client_poll_bitmap)
@@ -1926,6 +1942,12 @@ DECL_HANDLER(init_thread)
     /* NSPA v1.5: pass per-thread shmem fd (fd handle token = current's tid). */
     if ((reply->has_request_shm = current->request_shm_fd != -1))
         send_client_fd( current->process, current->request_shm_fd, get_thread_id( current ) );
+
+    /* NSPA gamma thread-token: register this thread with the per-process
+     * channel so future SEND_PIs from this tid get stamped with the
+     * thread token.  Must run before this handler returns so the client's
+     * very first request (post-init) sees a populated registration. */
+    nspa_shmem_channel_register_thread( current->process, current );
 #endif
 }
 

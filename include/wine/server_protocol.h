@@ -1112,12 +1112,52 @@ typedef volatile struct
     nspa_timer_slot_t slots[NSPA_TIMER_RING_SLOTS];
 } nspa_timer_ring_t;
 
+/* NSPA Tier 2 hook cache.  Each (queue, hook id) pair gets a bounded
+ * snapshot of the current chain entries so the client can iterate them
+ * without round-tripping the wineserver.  Server rewrites the snapshot
+ * under a seqlock on add_hook / remove_hook; client reads with the
+ * standard even/odd seqlock retry, then runs the same filter logic
+ * the server's check_hook_filter would have run.  Falls back to RPC on
+ * `overflowed`, retry exhaustion, or for hooks the cache doesn't
+ * cover (currently desktop-global). */
+#define NSPA_HOOK_CHAIN_CAP     8
+#define NSPA_HOOK_MODULE_POOL   4096
+
+typedef volatile struct
+{
+    user_handle_t   handle;
+    client_ptr_t    proc;
+    unsigned int    flags;
+    unsigned int    event_min;
+    unsigned int    event_max;
+    user_handle_t   window;
+    int             object_id;
+    int             child_id;
+    unsigned int    pid;
+    unsigned int    tid;
+    unsigned int    module_offset;
+    unsigned int    module_size;
+    unsigned int    unicode;
+    unsigned int    __pad;
+} nspa_hook_entry_t;
+
+typedef volatile struct
+{
+    unsigned int        version;
+    unsigned short      count;
+    unsigned short      overflowed;
+    unsigned int        __pad;
+    nspa_hook_entry_t   entries[NSPA_HOOK_CHAIN_CAP];
+} nspa_hook_chain_t;
+
 typedef volatile struct
 {
     nspa_msg_ring_t      nspa_msg_ring;
     nspa_reply_ring_t    nspa_reply_ring;
     nspa_timer_ring_t    nspa_timer_ring;
     int                  nspa_hook_walk_counts[NB_HOOKS];
+    nspa_hook_chain_t    nspa_hook_chains[NB_HOOKS];
+    unsigned char        nspa_hook_module_pool[NSPA_HOOK_MODULE_POOL];
 } nspa_queue_bypass_shm_t;
 
 /* NSPA local-file bypass — Phase 1A.2 shared inode aggregation table
@@ -7653,6 +7693,6 @@ union generic_reply
     struct nspa_irot_enum_running_reply nspa_irot_enum_running_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 952
+#define SERVER_PROTOCOL_VERSION 953
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

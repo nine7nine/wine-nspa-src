@@ -53,7 +53,6 @@
 
 /* message_type enum from server protocol (same values used internally) */
 #include "wine/server.h"
-#include "nspa_retry_histo.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(msg);
 WINE_DECLARE_DEBUG_CHANNEL(nspa_bypass);
@@ -263,14 +262,6 @@ struct nspa_diag_tid
 static struct nspa_diag_tid nspa_diag_tids[NSPA_DIAG_TID_SLOTS];
 static uint64_t nspa_diag_tid_overflow;
 
-/* R1.2 — CAS-retry distribution for ring_reserve_slot.  Records the
- * number of failed CAS attempts (i.e., contention with another
- * producer) before a successful reserve OR a FULL exit.  Audit §3.4
- * flagged this as the only true unbounded for(;;) loop in the bypass
- * paths.  Validated empirically via nspa_diag_dump → /tmp/nspa_send_diag
- * .<pid>.log when NSPA_SEND_DIAG=1.  See nspa-bypass-audit.md §6.1. */
-static nspa_retry_histo_t nspa_ring_reserve_histo;
-
 static int nspa_send_diag_enabled( void )
 {
     static int cached = -1;
@@ -459,12 +450,6 @@ static void nspa_diag_dump( void )
         if (overflow) fprintf( f, "  tid-table overflow bumps: %llu\n", (unsigned long long)overflow );
     }
 
-    /* R1.2 — ring_reserve_slot CAS retry distribution.  Tells us whether
-     * the unbounded for(;;) loop in ring_reserve_slot is empirically
-     * bounded under workload (expectation: 0 dominates by >99%). */
-    fprintf( f, "\n" );
-    nspa_histo_dump( &nspa_ring_reserve_histo, "ring_reserve_slot CAS retries", f );
-
     fclose( f );
     rename( tmp, path );
 }
@@ -520,7 +505,6 @@ static void nspa_diag_lazy_start( void )
 static unsigned int ring_reserve_slot( volatile nspa_msg_ring_t *ring )
 {
     unsigned int head, tail, next;
-    unsigned int retries = 0;
 
     for (;;)
     {
@@ -529,19 +513,14 @@ static unsigned int ring_reserve_slot( volatile nspa_msg_ring_t *ring )
         if (head - tail >= NSPA_MSG_RING_SLOTS)
         {
             __atomic_fetch_add( &ring->overflow, 1, __ATOMIC_RELAXED );
-            if (nspa_send_diag_enabled())
-                nspa_histo_record( &nspa_ring_reserve_histo, retries );
             return ~0u;
         }
         next = head + 1;
         if (__atomic_compare_exchange_n( &ring->head, &head, next, 0,
                                          __ATOMIC_ACQUIRE, __ATOMIC_RELAXED ))
         {
-            if (nspa_send_diag_enabled())
-                nspa_histo_record( &nspa_ring_reserve_histo, retries );
             return head;
         }
-        retries++;
         __builtin_ia32_pause();
     }
 }

@@ -773,6 +773,15 @@ int nspa_queue_hook_tier1_active( struct thread *thread )
     return thread->queue->nspa_shared != NULL;
 }
 
+/* NSPA Tier 2: hand the per-queue bypass shm pointer to callers outside
+ * server/queue.c (notably server/hook.c, which writes the Tier 2 hook
+ * chain cache).  Returns NULL if the queue or shm isn't allocated yet. */
+nspa_queue_bypass_shm_t *nspa_queue_bypass_shm( struct thread *thread )
+{
+    if (!thread || !thread->queue) return NULL;
+    return thread->queue->nspa_shared;
+}
+
 /* NSPA Tier 1: is a walker currently pinning the queue-local hook chain at
  * `index`?  Read via the memfd-backed bypass shm, written by the client's
  * ACQ_REL ++/-- around its walk.  SEQ_CST load on the server pairs with

@@ -119,6 +119,8 @@ extern void set_queue_hooks( struct thread *thread, struct hook_table *hooks );
 extern void add_queue_hook_count( struct thread *thread, unsigned int index, int count );
 extern int  nspa_queue_hook_tier1_active( struct thread *thread );
 extern int  nspa_queue_hook_chain_busy_tier1( struct thread *thread, int index );
+extern nspa_queue_bypass_shm_t *nspa_queue_bypass_shm( struct thread *thread );
+/* Tier 2 hook cache API lives in server/nspa/hook_cache.h. */
 extern void inc_queue_paint_count( struct thread *thread, int incr );
 extern void queue_cleanup_window( struct thread *thread, user_handle_t win );
 extern int init_thread_queue( struct thread *thread );

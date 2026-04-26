@@ -1613,15 +1613,19 @@ static unsigned long long nspa_paint_fastpath_misses;
 
 static int nspa_paint_fastpath_disabled( void )
 {
-    /* DEFAULT-DISABLED pending audit — see nspa/docs/nspa-bypass-audit.md.
-     * B1.0 produced a host lockup on first validation run.  Two suspected
-     * mechanisms (FIFO seqlock spin, DELAYED_ERASE not in QS_PAINT) are
-     * not yet ruled out.  Code retained for diagnostic A/B; opt-in only. */
+    /* DEFAULT-ON post-1006.  The original B1.0 host lockup was traced
+     * to ntsync RT-illegal kfree/kzalloc under raw_spinlock_t (fixed
+     * in ntsync-patches/1006-ntsync-rt-alloc-hoist.patch); B1.0
+     * itself was exonerated by Ableton workload re-validation.  The
+     * "three suspected mechanisms" (FIFO seqlock spin, DELAYED_ERASE
+     * vs QS_PAINT, mutation drop) were speculation under the wrong
+     * premise — none reproduced.  NSPA_ENABLE_PAINT_CACHE=0 disables;
+     * polarity matches NSPA_OPENFD_LOCKDROP / NSPA_DISPATCHER_USE_TOKEN. */
     static int cached = -1;
     if (cached < 0)
     {
         const char *v = getenv( "NSPA_ENABLE_PAINT_CACHE" );
-        cached = !(v && *v && *v != '0');
+        cached = (v && *v == '0');
     }
     return cached;
 }

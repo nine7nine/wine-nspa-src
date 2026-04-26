@@ -529,14 +529,16 @@ static unsigned int ring_reserve_slot( volatile nspa_msg_ring_t *ring )
         if (head - tail >= NSPA_MSG_RING_SLOTS)
         {
             __atomic_fetch_add( &ring->overflow, 1, __ATOMIC_RELAXED );
-            nspa_histo_record( &nspa_ring_reserve_histo, retries );
+            if (nspa_send_diag_enabled())
+                nspa_histo_record( &nspa_ring_reserve_histo, retries );
             return ~0u;
         }
         next = head + 1;
         if (__atomic_compare_exchange_n( &ring->head, &head, next, 0,
                                          __ATOMIC_ACQUIRE, __ATOMIC_RELAXED ))
         {
-            nspa_histo_record( &nspa_ring_reserve_histo, retries );
+            if (nspa_send_diag_enabled())
+                nspa_histo_record( &nspa_ring_reserve_histo, retries );
             return head;
         }
         retries++;

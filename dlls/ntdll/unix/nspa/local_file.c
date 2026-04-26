@@ -115,6 +115,22 @@ static unsigned long long       nspa_lf_promote_fail;         /* RPC returned 0 
  * counts cluster at 0 (canonical) or push toward 8 (writer pinned). */
 static nspa_retry_histo_t       nspa_lf_lookup_retry_histo;
 
+/* Gate for the histo records below.  Without this gate the bumps fire on
+ * every nspa_lf_lookup call, even when no diag dump is wanted — paying
+ * ~5 ns per call plus shared cache-line contention on the histogram
+ * bucket from multiple threads.  Same env var the lf diag dump itself
+ * uses (see nspa_lf_diag_dump). */
+static int nspa_send_diag_enabled( void )
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *v = getenv( "NSPA_SEND_DIAG" );
+        cached = (v && *v && *v != '0');
+    }
+    return cached;
+}
+
 static void nspa_lf_table_open_once_fn( void )
 {
     int fd = -1;
@@ -228,7 +244,8 @@ int nspa_local_file_table_lookup( unsigned long long device, unsigned long long 
                 {
                     *out = snapshot;
                     __atomic_fetch_add( &nspa_lf_lookup_hit, 1, __ATOMIC_RELAXED );
-                    nspa_histo_record( &nspa_lf_lookup_retry_histo, retries_used );
+                    if (nspa_send_diag_enabled())
+                        nspa_histo_record( &nspa_lf_lookup_retry_histo, retries_used );
                     return 1;
                 }
                 __atomic_fetch_add( &nspa_lf_lookup_seq_retry, 1, __ATOMIC_RELAXED );
@@ -243,7 +260,8 @@ int nspa_local_file_table_lookup( unsigned long long device, unsigned long long 
         if (seq_after == seq_before)
         {
             __atomic_fetch_add( &nspa_lf_lookup_miss, 1, __ATOMIC_RELAXED );
-            nspa_histo_record( &nspa_lf_lookup_retry_histo, retries_used );
+            if (nspa_send_diag_enabled())
+                nspa_histo_record( &nspa_lf_lookup_retry_histo, retries_used );
             return 0;
         }
         __atomic_fetch_add( &nspa_lf_lookup_seq_retry, 1, __ATOMIC_RELAXED );
@@ -259,7 +277,8 @@ int nspa_local_file_table_lookup( unsigned long long device, unsigned long long 
      * specific signal that the retry loop gave up. */
     __atomic_fetch_add( &nspa_lf_lookup_miss,   1, __ATOMIC_RELAXED );
     __atomic_fetch_add( &nspa_lf_seq_exhausted, 1, __ATOMIC_RELAXED );
-    nspa_histo_record( &nspa_lf_lookup_retry_histo, retries_used );
+    if (nspa_send_diag_enabled())
+        nspa_histo_record( &nspa_lf_lookup_retry_histo, retries_used );
     return 0;
 }
 

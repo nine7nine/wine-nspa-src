@@ -386,7 +386,17 @@ static int nspa_hook_walker_find( const struct nspa_hook_walker *walker, user_ha
 }
 
 /* Populate a win_hook_params struct from a Tier 2 cache entry.  module
- * is copied into `module_out` (caller-supplied buffer of MAX_PATH). */
+ * is copied into `module_out` (caller-supplied buffer of MAX_PATH).
+ *
+ * Note on info->tid: the cache entry's e->tid is the bound thread (used
+ * by the run-in-thread filter we already passed).  But struct
+ * win_hook_params interprets a non-zero info->tid as "dispatch via
+ * send_internal_message_timeout cross-thread", which is only valid for
+ * low-level hooks (WH_MOUSE_LL / WH_KEYBOARD_LL).  Tier 2 only serves
+ * hooks the cache could legitimately populate (low-level hooks are
+ * forced global, and global hooks force overflowed=1), so dispatch is
+ * always in-thread — info->tid must stay 0 to take call_hook's local
+ * branch. */
 static void nspa_hook_fill_info_from_entry( struct win_hook_params *info,
                                             const struct nspa_hook_walker *walker,
                                             int idx, WCHAR *module_out )
@@ -395,7 +405,7 @@ static void nspa_hook_fill_info_from_entry( struct win_hook_params *info,
     info->handle       = wine_server_ptr_handle( e->handle );
     info->id           = walker->hook_id;
     info->pid          = e->pid;
-    info->tid          = e->tid;
+    info->tid          = 0;  /* in-thread dispatch only — see comment above */
     info->proc         = wine_server_get_ptr( e->proc );
     info->next_unicode = e->unicode;
     if (walker->module_lengths[idx])

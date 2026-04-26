@@ -100,23 +100,17 @@ static inline BOOL is_arm64ec(void)
 }
 
 #ifdef __linux__
-/* NSPA v1.5 shmem IPC: mirror of server-side struct request_shm layout.
- * Must match server/thread.h exactly. See request.c send_request_shm /
- * wait_reply_shm for the state machine. */
+/* NSPA shmem IPC: mirror of server-side struct request_shm layout.
+ * Must match server/thread.h exactly.  Under the gamma channel, the
+ * leading 8 bytes (was futex + server_dispatch_tid in v1.5/v2.4) are
+ * unused — signalling and PI delivery moved into NTSYNC_IOC_CHANNEL_SEND_PI.
+ * The padding stays so the union offset doesn't shift. */
 #ifndef NSPA_REQUEST_SHM_SIZE
 # define NSPA_REQUEST_SHM_SIZE (1 * 1024 * 1024)
 #endif
 struct request_shm
 {
-    int futex;
-    int server_dispatch_tid;  /* NSPA v2.4: Linux TID of the wineserver
-                               * dispatch thread for this shm. Written
-                               * once by that thread on startup. The
-                               * client reads this to manually boost
-                               * the server's scheduling priority while
-                               * blocked on a reply (manual PI, same
-                               * pattern as CS-PI v2.3). 0 = not set.
-                               * Must match server/thread.h exactly. */
+    int _pad[2];   /* reserved; retired futex + server_dispatch_tid */
     union
     {
         union generic_request req;

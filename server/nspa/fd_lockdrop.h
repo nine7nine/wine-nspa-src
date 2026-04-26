@@ -26,15 +26,16 @@ struct fd;
  *                   O_RDONLY | (flags & ~(O_TRUNC | O_CREAT | O_EXCL)),
  *                   *mode);
  *
- * Gated by NSPA_OPENFD_LOCKDROP (default OFF after 2026-04-26 host
- * lockup on first validation).  With the gate ON, global_lock is
- * released across the syscall(s) and the wineserver per-thread state
- * (current, current->error) is saved/restored around the unlocked
- * window so a concurrent handler running on the other RT thread
- * cannot trample us; fd_object and root_object are pinned via
+ * Default ON since 2026-04-26 (originally gated default-off due to a
+ * host lockup later traced to ntsync driver bugs, not Phase B; see
+ * ntsync-patches/1006-ntsync-rt-alloc-hoist.patch).  With the gate
+ * ON, global_lock is released across the syscall(s) and the wineserver
+ * per-thread state (current, current->error) is saved/restored around
+ * the unlocked window so a concurrent handler running on the other RT
+ * thread cannot trample us; fd_object and root_object are pinned via
  * grab_object for the unlocked window so neither can be freed by a
- * concurrent handler.  With the gate OFF, the lock is held throughout
- * and behaviour matches the pre-Phase-B (Phase-A-only) build exactly.
+ * concurrent handler.  Set NSPA_OPENFD_LOCKDROP=0 to fall back to the
+ * pre-Phase-B (held-throughout) helper for A/B testing.
  *
  * Caller MUST hold global_lock; on return the caller again holds it.
  *

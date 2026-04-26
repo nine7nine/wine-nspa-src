@@ -58,23 +58,22 @@ struct inflight_fd
  *   1  = request pending (client wrote, woke server)
  *   -1 = thread killed / teardown
  *
- * Layout: futex + padding, then union of current request or reply.
- * The trailing space up to REQUEST_SHM_SIZE holds variable-size data. */
+ * Layout: 8 bytes of reserved padding (was the v1.5 `futex` and v2.4
+ * `server_dispatch_tid` fields, both retired by the gamma channel —
+ * NTSYNC_IOC_CHANNEL_SEND_PI now carries signalling and PI, so neither
+ * field is read or written), then the union of current request or
+ * reply.  The trailing space up to REQUEST_SHM_SIZE holds variable-
+ * size data.
+ *
+ * The padding stays so existing offset / size assumptions in client
+ * mirrors (dlls/ntdll/unix/unix_private.h) and external snapshot
+ * tooling don't shift; the bytes are now unused. */
 #ifndef REQUEST_SHM_SIZE
 # define REQUEST_SHM_SIZE (1 * 1024 * 1024)
 #endif
 struct request_shm
 {
-    int futex;
-    int server_dispatch_tid;  /* NSPA v2.4: Linux TID of the wineserver
-                               * dispatch thread for this request_shm,
-                               * written once by that thread on startup.
-                               * The client reads this to boost the
-                               * server's scheduling priority while
-                               * blocked on a reply (manual PI, same
-                               * pattern as CS-PI v2.3). 0 = not yet
-                               * written. See nspa_shm_pi_boost in
-                               * dlls/ntdll/unix/server.c. */
+    int _pad[2];   /* reserved; retired futex + server_dispatch_tid */
     union
     {
         union generic_request req;
@@ -114,7 +113,6 @@ struct thread
 #ifdef __linux__
     int                    request_shm_fd;    /* NSPA v1.5: shared memory fd */
     volatile struct request_shm *request_shm; /* NSPA v1.5: shared memory mapping */
-    int                    request_shm_thread_running; /* NSPA v1.5: shm dispatcher pthread status */
 #endif
     enum run_state         state;         /* running state */
     int                    exit_code;     /* thread exit code */

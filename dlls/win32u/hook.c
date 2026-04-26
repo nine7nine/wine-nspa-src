@@ -31,6 +31,7 @@
 #include "wine/server.h"
 #include "wine/debug.h"
 #include "nspa_hook_filter.h"
+#include "nspa_retry_histo.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(hook);
 
@@ -131,6 +132,14 @@ static unsigned long long nspa_hook_cat_module_bearing;
 static unsigned long long nspa_hook_cat_safe_subset;
 static time_t nspa_hook_diag_start_epoch;
 
+/* R1.3 — Retry-count distribution for the hook tier 2 seqlock read.
+ * The loop is bounded (8 retries) and already calls sched_yield() on
+ * mid-write — audit §3.3 verdict was "loop is shaped right; histogram
+ * confirms empirical max retry under workload".  Expectation: bucket 0
+ * dominates, bucket 7 (== NSPA_HOOK_TIER2_MAX_RETRIES) tells us the
+ * 8-bound is being hit (i.e., tier 2 falls back to RPC). */
+static nspa_retry_histo_t nspa_hook_tier2_retry_histo;
+
 static void nspa_hook_diag_dump( void )
 {
     char path[128];
@@ -204,6 +213,14 @@ static void nspa_hook_diag_dump( void )
         fprintf(f, "  next_from_cache        %llu  (CallNextHookEx, chain>1)\n", t2next);
         fprintf(f, "  fallback_to_rpc        %llu  (overflow / retry exhausted / not mapped)\n", t2fb);
     }
+
+    /* R1.3 — Tier 2 seqlock retry-count distribution.  Bucket 0 dominating
+     * means the seqlock writer (server cache rebuild) rarely contends our
+     * read.  Bucket 8+ entries mean the 8-retry bound is being hit and we
+     * fall back to RPC. */
+    fprintf(f, "\n");
+    nspa_histo_dump( &nspa_hook_tier2_retry_histo, "hook tier 2 seqlock retries", f );
+
     fclose(f);
     rename(tmp, path);
 }
@@ -324,8 +341,8 @@ static int nspa_hook_try_read_cache( struct nspa_hook_walker *walker, int hook_i
 
         cnt  = chain->count;
         over = chain->overflowed;
-        if (over) return -1;
-        if (cnt > NSPA_HOOK_CHAIN_CAP) return -1;
+        if (over) { nspa_histo_record( &nspa_hook_tier2_retry_histo, retry ); return -1; }
+        if (cnt > NSPA_HOOK_CHAIN_CAP) { nspa_histo_record( &nspa_hook_tier2_retry_histo, retry ); return -1; }
 
         for (i = 0; i < cnt; i++)
         {
@@ -350,7 +367,7 @@ static int nspa_hook_try_read_cache( struct nspa_hook_walker *walker, int hook_i
 
         v2 = __atomic_load_n( &chain->version, __ATOMIC_ACQUIRE );
         if (v1 != v2 || (v2 & 1)) { sched_yield(); continue; }
-        if (copy_failed) return -1;
+        if (copy_failed) { nspa_histo_record( &nspa_hook_tier2_retry_histo, retry ); return -1; }
 
         /* Stable snapshot — apply filter, copy survivors to walker. */
         {
@@ -369,10 +386,15 @@ static int nspa_hook_try_read_cache( struct nspa_hook_walker *walker, int hook_i
             walker->count   = out;
             walker->hook_id = hook_id;
             walker->prev    = NULL;  /* caller chains */
+            nspa_histo_record( &nspa_hook_tier2_retry_histo, retry );
             return out;
         }
     }
-    return -1;  /* retry exhausted — likely server churn; fall back to RPC */
+    /* retry exhausted — likely server churn; fall back to RPC.  Bucket 7
+     * (or higher if NSPA_HOOK_CHAIN_CAP changes) in the histogram dump
+     * indicates how often this fires under workload. */
+    nspa_histo_record( &nspa_hook_tier2_retry_histo, 8u );
+    return -1;
 }
 
 /* Find the entry index whose handle matches.  Returns -1 if not present

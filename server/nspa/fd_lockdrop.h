@@ -15,7 +15,7 @@
 
 struct fd;
 
-/* openat() with global_lock released across the syscall.
+/* openat() with global_lock optionally released across the syscall.
  *
  * Behaviour-equivalent to:
  *
@@ -26,16 +26,17 @@ struct fd;
  *                   O_RDONLY | (flags & ~(O_TRUNC | O_CREAT | O_EXCL)),
  *                   *mode);
  *
- * but with global_lock released across the syscall(s) and the
- * wineserver per-thread state (current, current->error) saved/restored
- * around the unlocked window so a concurrent handler running on the
- * other RT thread cannot trample us.
+ * Gated by NSPA_OPENFD_LOCKDROP (default OFF after 2026-04-26 host
+ * lockup on first validation).  With the gate ON, global_lock is
+ * released across the syscall(s) and the wineserver per-thread state
+ * (current, current->error) is saved/restored around the unlocked
+ * window so a concurrent handler running on the other RT thread
+ * cannot trample us; fd_object and root_object are pinned via
+ * grab_object for the unlocked window so neither can be freed by a
+ * concurrent handler.  With the gate OFF, the lock is held throughout
+ * and behaviour matches the pre-Phase-B (Phase-A-only) build exactly.
  *
- * Pins fd_object and root_object via grab_object for the unlocked
- * window so neither can be freed by a concurrent handler.
- *
- * Caller MUST hold global_lock; this function releases and re-
- * acquires it internally.  On return the caller again holds it.
+ * Caller MUST hold global_lock; on return the caller again holds it.
  *
  * Returns the unix fd on success, -1 on failure with errno set to the
  * value the openat() syscall returned (so the caller's existing

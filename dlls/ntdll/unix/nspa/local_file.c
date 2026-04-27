@@ -207,6 +207,11 @@ int nspa_local_file_table_lookup( unsigned long long device, unsigned long long 
     {
         nspa_inode_slot_t snapshot;
 
+        /* PAUSE per audit §4.1 — relieves SMT sibling pressure during
+         * the seqlock retry; the loop is already bounded at 8 with an
+         * RPC fallback. */
+        __builtin_ia32_pause();
+
         seq_before = __atomic_load_n( &bucket->seq, __ATOMIC_ACQUIRE );
         if (seq_before & 1u) continue;   /* writer in progress */
 

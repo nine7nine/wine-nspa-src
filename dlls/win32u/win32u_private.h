@@ -36,6 +36,26 @@
 /* clipboard.c */
 extern void release_clipboard_owner( HWND hwnd );
 
+/* NSPA — bound for shmem seqlock / CAS retry loops at SCHED_FIFO callsites.
+ * 256 PAUSEs ≈ tens of microseconds at modern Intel pause latency, comfortably
+ * above the writer's odd-seq window for normal traffic. On exhaustion the
+ * caller falls back to the legacy RPC, whose syscall yields the CPU and gives
+ * the kernel scheduler a chance to migrate / run any starved writer.
+ * Rationale: nspa-bypass-audit.md §4.1 (audit's "single rule" for retry
+ * loops at SCHED_FIFO callsites). */
+#define NSPA_SHM_RETRY_MAX 256
+
+/* NSPA seqlock retry guard — drop in inside a `while (... == STATUS_PENDING)`
+ * loop body.  Bounds the retry count and emits __builtin_ia32_pause() to
+ * relieve SMT/cache-line pressure.  On exhaustion, runs `exhaust_action`
+ * (typically `return ...;` or `break;`).  Keeps the upstream call sites
+ * to a single line of NSPA-flavored logic per audit §4.1 + the NSPA reorg
+ * style (concentrate NSPA intent, leave upstream thin). */
+#define NSPA_SHM_RETRY_GUARD( spin_var, exhaust_action ) do { \
+    __builtin_ia32_pause();                                   \
+    if (++(spin_var) >= NSPA_SHM_RETRY_MAX) { exhaust_action; }\
+} while (0)
+
 /* nspa_msg_bypass.c — cross-thread SendMessage shmem-ring bypass */
 extern BOOL nspa_try_post_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
                                 UINT msg, LPARAM wparam, LPARAM lparam );

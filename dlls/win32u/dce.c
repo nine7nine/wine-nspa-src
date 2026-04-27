@@ -1633,6 +1633,7 @@ static BOOL nspa_get_update_flags_try_fastpath( HWND hwnd, HWND *child, UINT *fl
     struct object_lock lock = OBJECT_LOCK_INIT;
     const queue_shm_t *queue_shm;
     unsigned int wake_bits = 0;
+    unsigned int spin = 0;
     UINT status;
 
     if (nspa_paint_fastpath_disabled()) return FALSE;
@@ -1647,7 +1648,10 @@ static BOOL nspa_get_update_flags_try_fastpath( HWND hwnd, HWND *child, UINT *fl
     if (!nspa_get_own_bypass_shm_public()) return FALSE;
 
     while ((status = get_shared_queue( &lock, &queue_shm )) == STATUS_PENDING)
+    {
         wake_bits = queue_shm->wake_bits;
+        NSPA_SHM_RETRY_GUARD( spin, return FALSE );
+    }
     if (status) return FALSE;
 
     /* QS_PAINT set → at least one window in this queue is dirty.

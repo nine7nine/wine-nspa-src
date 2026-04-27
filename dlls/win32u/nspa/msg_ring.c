@@ -494,17 +494,19 @@ static void nspa_diag_lazy_start( void )
  *   CONSUMED -> EMPTY (server-side tail advance during dequeue)
  * --------------------------------------------------------------------- */
 
-/* Reserve a slot index via CAS.  Returns U32_MAX on FULL.
+/* Reserve a slot index via CAS.  Returns U32_MAX on FULL or on retry
+ * exhaustion (caller's overflow counter conflates the two — both lead
+ * to the legacy send_message RPC, which is the right fallback).
  *
- * Defensive: __builtin_ia32_pause() is emitted only on the retry path
- * (after a failed CAS), so the contention-free fast path pays zero cost.
- * On x86 PAUSE relieves SMT sibling pressure and reduces cache-line
- * ping-pong on ring->head; this is hygiene against the FIFO-spin hazard
- * the bypass audit §3.4 + §4.1 flagged, not a fix for a livelock path
- * (a true bounded backoff would still need a yield/RPC fallback). */
+ * Bounded per audit §4.1.  __builtin_ia32_pause() relieves SMT sibling
+ * pressure on the retry path; bound forces the loop to exit in finite
+ * time even under pathological CAS thrashing (e.g., many producers at
+ * SCHED_FIFO same-prio thrashing ring->head). */
+#define NSPA_RING_RESERVE_RETRY_MAX 256
 static unsigned int ring_reserve_slot( volatile nspa_msg_ring_t *ring )
 {
     unsigned int head, tail, next;
+    unsigned int spin = 0;
 
     for (;;)
     {
@@ -522,6 +524,11 @@ static unsigned int ring_reserve_slot( volatile nspa_msg_ring_t *ring )
             return head;
         }
         __builtin_ia32_pause();
+        if (++spin >= NSPA_RING_RESERVE_RETRY_MAX)
+        {
+            __atomic_fetch_add( &ring->overflow, 1, __ATOMIC_RELAXED );
+            return ~0u;
+        }
     }
 }
 

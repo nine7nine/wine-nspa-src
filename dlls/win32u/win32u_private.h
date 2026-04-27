@@ -105,14 +105,6 @@ extern BOOL     nspa_try_pop_own_timer_ring( HWND filter_hwnd, UINT first, UINT 
                                              WPARAM *out_wparam, LPARAM *out_lparam,
                                              DWORD *out_time );
 
-/* NSPA Phase C Stage 1 — get_message residual bucketing (nspa/getmsg_diag.c).
- * Pre/post seams around the SERVER_START_REQ(get_message) site in message.c
- * so we can bucket which message category dominates the residual.  Buckets:
- * D no-bypass / A self-thread / B system synth / C cross-thread / E other.
- * Counters print on process exit; gated on total > 0. */
-extern void nspa_getmsg_diag_pre_rpc( void );
-extern void nspa_getmsg_diag_post_rpc( int reply_type, unsigned int reply_sender_tid );
-
 /* message.c — exposed so nspa_msg_bypass.c can wait on our own queue sync. */
 extern HANDLE nspa_get_own_server_queue_handle( void );
 extern void   nspa_process_sent_messages( void );

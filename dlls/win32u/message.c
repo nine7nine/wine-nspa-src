@@ -3124,41 +3124,35 @@ static int peek_message( MSG *msg, const struct peek_message_filter *filter )
                 info.nspa_reply_slot  = pop_slot;
                 hw_id                 = 0;
             }
-            else
+            else SERVER_START_REQ( get_message )
             {
-                /* NSPA Phase C Stage 1: bucket the get_message residual. */
-                nspa_getmsg_diag_pre_rpc();
-                SERVER_START_REQ( get_message )
+                req->internal  = filter->internal;
+                req->flags     = flags;
+                req->get_win   = wine_server_user_handle( hwnd );
+                req->get_first = first;
+                req->get_last  = last;
+                req->hw_id     = hw_id;
+                req->wake_mask = wake_mask;
+                req->changed_mask = filter->mask;
+                wine_server_set_reply( req, buffer, buffer_size );
+                if (!(res = wine_server_call( req )))
                 {
-                    req->internal  = filter->internal;
-                    req->flags     = flags;
-                    req->get_win   = wine_server_user_handle( hwnd );
-                    req->get_first = first;
-                    req->get_last  = last;
-                    req->hw_id     = hw_id;
-                    req->wake_mask = wake_mask;
-                    req->changed_mask = filter->mask;
-                    wine_server_set_reply( req, buffer, buffer_size );
-                    if (!(res = wine_server_call( req )))
-                    {
-                        size = wine_server_reply_size( reply );
-                        info.type             = reply->type;
-                        info.msg.hwnd         = wine_server_ptr_handle( reply->win );
-                        info.msg.message      = reply->msg;
-                        info.msg.wParam       = reply->wparam;
-                        info.msg.lParam       = reply->lparam;
-                        info.msg.time         = reply->time;
-                        info.msg.pt.x         = reply->x;
-                        info.msg.pt.y         = reply->y;
-                        info.nspa_sender_tid  = reply->nspa_sender_tid;
-                        info.nspa_reply_slot  = reply->nspa_reply_slot;
-                        hw_id                 = 0;
-                        nspa_getmsg_diag_post_rpc( info.type, info.nspa_sender_tid );
-                    }
-                    else buffer_size = reply->total;
+                    size = wine_server_reply_size( reply );
+                    info.type             = reply->type;
+                    info.msg.hwnd         = wine_server_ptr_handle( reply->win );
+                    info.msg.message      = reply->msg;
+                    info.msg.wParam       = reply->wparam;
+                    info.msg.lParam       = reply->lparam;
+                    info.msg.time         = reply->time;
+                    info.msg.pt.x         = reply->x;
+                    info.msg.pt.y         = reply->y;
+                    info.nspa_sender_tid  = reply->nspa_sender_tid;
+                    info.nspa_reply_slot  = reply->nspa_reply_slot;
+                    hw_id                 = 0;
                 }
-                SERVER_END_REQ;
+                else buffer_size = reply->total;
             }
+            SERVER_END_REQ;
         }
 
         if (res)

@@ -5194,6 +5194,204 @@ static int cmd_irot_bypass(int argc, char **argv)
 
 
 /* ════════════════════════════════════════════════════════════════════════
+ *   Subcommand: seqlock-bound  (audit §4.1 retry-loop hardening canary)
+ *
+ *   Verifies that NSPA_SHM_RETRY_GUARD-protected retry loops at SCHED_FIFO
+ *   callsites make bounded forward progress under writer-side contention.
+ *   If a regression removes the bound or the PAUSE, this subtest hangs
+ *   against the wall-clock budget or fails the per-call latency assertion.
+ *
+ *   Hot path:
+ *     GetUpdateRect()  -> NtUserGetUpdateRect  -> get_update_flags
+ *                      -> nspa_get_update_flags_try_fastpath
+ *                      -> NSPA_SHM_RETRY_GUARD seqlock retry on queue_shm
+ *
+ *   Set NSPA_ENABLE_PAINT_CACHE=1 in the launch environment so the fastpath
+ *   actually engages (default-off after the 2026-04-26 evening rollback).
+ *   Without it the test exercises the legacy RPC, which is also bounded
+ *   but not the path we're trying to validate.
+ *
+ *   See:
+ *     - nspa/docs/nspa-bypass-audit.md §4.1
+ *     - dlls/win32u/win32u_private.h   (NSPA_SHM_RETRY_GUARD macro)
+ *     - dlls/win32u/dce.c              (paint fastpath)
+ * ════════════════════════════════════════════════════════════════════════ */
+
+#define SLB_ITERS                10000
+#define SLB_WALL_BUDGET_MS       30000
+#define SLB_LATENCY_HARD_NS      10000000LL   /* 10 ms — verdict failure */
+#define SLB_LATENCY_SOFT_NS       1000000LL   /* 1 ms — info bucket */
+
+static volatile LONG g_slb_stop_load = 0;
+static HWND          g_slb_hwnd = NULL;
+
+static LRESULT CALLBACK slb_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static DWORD WINAPI slb_load_thread(LPVOID arg)
+{
+    (void)arg;
+    print_worker_start("load", GetCurrentThreadId(),
+        "SCHED_OTHER InvalidateRect loop (drives queue_shm.paint_count writer)");
+    while (!InterlockedCompareExchange(&g_slb_stop_load, 0, 0))
+    {
+        if (g_slb_hwnd) InvalidateRect(g_slb_hwnd, NULL, FALSE);
+    }
+    return 0;
+}
+
+static int cmd_seqlock_bound(int argc, char **argv)
+{
+    static const WCHAR class_name[] = L"NSPA_SLB_Class";
+    WNDCLASSW wc = {0};
+    HANDLE load_h;
+    DWORD tid;
+    LARGE_INTEGER qpc_freq, t0, t1;
+    LONGLONG ns_per_count;
+    LONGLONG max_ns = 0, sum_ns = 0;
+    int over_hard = 0, over_soft = 0;
+    LONGLONG wall_start_ms, wall_now_ms;
+    int i, hung = 0;
+    const char *paint_cache_env;
+
+    (void)argc; (void)argv;
+
+    paint_cache_env = getenv("NSPA_ENABLE_PAINT_CACHE");
+
+    print_banner("seqlock-bound",
+        "audit §4.1 retry-loop hardening canary (paint fastpath)");
+    print_section("parameters");
+    print_kv("iterations",      "%d (GetUpdateRect calls)", SLB_ITERS);
+    print_kv("wall budget",     "%d ms", SLB_WALL_BUDGET_MS);
+    print_kv("latency hard",    "%lld ns (>= triggers FAIL)", (long long)SLB_LATENCY_HARD_NS);
+    print_kv("latency soft",    "%lld ns (>= info bucket)",   (long long)SLB_LATENCY_SOFT_NS);
+    print_kv("paint cache env", "%s",
+             (paint_cache_env && paint_cache_env[0] == '1')
+                 ? "NSPA_ENABLE_PAINT_CACHE=1 (fastpath active)"
+                 : "[WARN] NSPA_ENABLE_PAINT_CACHE!=1 - test exercises legacy RPC, not the fastpath");
+    print_kv("hot path",        "GetUpdateRect -> get_update_flags -> nspa fastpath -> NSPA_SHM_RETRY_GUARD");
+
+    print_section("startup");
+
+    wc.lpfnWndProc = slb_wnd_proc;
+    wc.hInstance = GetModuleHandleW(NULL);
+    wc.lpszClassName = class_name;
+    if (!RegisterClassW(&wc))
+    {
+        print_kv("RegisterClassW", "FAILED, err %lu", (unsigned long)GetLastError());
+        print_verdict(0, "RegisterClassW failed");
+        return 1;
+    }
+    g_slb_hwnd = CreateWindowExW(0, class_name, L"slb",
+        WS_OVERLAPPEDWINDOW, 0, 0, 100, 100, NULL, NULL, wc.hInstance, NULL);
+    if (!g_slb_hwnd)
+    {
+        print_kv("CreateWindowExW", "FAILED, err %lu", (unsigned long)GetLastError());
+        UnregisterClassW(class_name, wc.hInstance);
+        print_verdict(0, "CreateWindowExW failed");
+        return 1;
+    }
+    print_kv("hwnd", "%p", g_slb_hwnd);
+
+    /* Spawn the load thread BEFORE entering realtime so it stays SCHED_OTHER. */
+    g_slb_stop_load = 0;
+    load_h = spawn_load_thread_sched_other(slb_load_thread, NULL, &tid);
+    if (!load_h)
+    {
+        print_kv("load thread", "FAILED");
+        DestroyWindow(g_slb_hwnd); g_slb_hwnd = NULL;
+        UnregisterClassW(class_name, wc.hInstance);
+        print_verdict(0, "load thread spawn failed");
+        return 1;
+    }
+    Sleep(100);   /* let the load thread run a few iterations */
+
+    enter_realtime_class();
+    print_worker_start("hot", GetCurrentThreadId(),
+        "SCHED_FIFO @NSPA_RT_PRIO GetUpdateRect timing loop");
+
+    QueryPerformanceFrequency(&qpc_freq);
+    ns_per_count = (qpc_freq.QuadPart > 0) ? (1000000000LL / qpc_freq.QuadPart) : 1;
+    if (ns_per_count == 0) ns_per_count = 1;
+    print_kv("QPC freq", "%lld Hz (%lld ns/count)",
+             (long long)qpc_freq.QuadPart, (long long)ns_per_count);
+
+    print_section("hot loop");
+    fflush(stdout);
+
+    wall_start_ms = (LONGLONG)GetTickCount64();
+    for (i = 0; i < SLB_ITERS; i++)
+    {
+        RECT rc;
+        LONGLONG dt_ns;
+
+        QueryPerformanceCounter(&t0);
+        GetUpdateRect(g_slb_hwnd, &rc, FALSE);
+        QueryPerformanceCounter(&t1);
+
+        dt_ns = (t1.QuadPart - t0.QuadPart) * ns_per_count;
+        sum_ns += dt_ns;
+        if (dt_ns > max_ns) max_ns = dt_ns;
+        if (dt_ns >= SLB_LATENCY_HARD_NS) over_hard++;
+        else if (dt_ns >= SLB_LATENCY_SOFT_NS) over_soft++;
+
+        /* Wall budget check every 1024 iters. */
+        if ((i & 0x3FF) == 0)
+        {
+            wall_now_ms = (LONGLONG)GetTickCount64();
+            if (wall_now_ms - wall_start_ms >= SLB_WALL_BUDGET_MS)
+            {
+                hung = 1;
+                break;
+            }
+        }
+    }
+
+    /* Stop load thread and clean up before printing results / verdict. */
+    InterlockedExchange(&g_slb_stop_load, 1);
+    WaitForSingleObject(load_h, 5000);
+    CloseHandle(load_h);
+
+    leave_realtime_class();
+
+    DestroyWindow(g_slb_hwnd); g_slb_hwnd = NULL;
+    UnregisterClassW(class_name, wc.hInstance);
+
+    print_section("results");
+    print_kv("iterations done",     "%d / %d", i, SLB_ITERS);
+    print_kv("max latency",         "%lld ns (%lld us)",
+             (long long)max_ns, (long long)(max_ns / 1000));
+    if (i > 0)
+        print_kv("avg latency",     "%lld ns (%lld us)",
+                 (long long)(sum_ns / i), (long long)(sum_ns / i / 1000));
+    print_kv("over soft (>=1ms)",   "%d", over_soft);
+    print_kv("over hard (>=10ms)",  "%d", over_hard);
+    print_kv("wall hung",           "%s", hung ? "YES" : "no");
+
+    /* Verdict: bounded forward progress = no single call >= hard threshold,
+     * and we completed all iterations within the wall budget. */
+    if (hung)
+    {
+        print_verdict(0, "wall budget exceeded — possible unbounded retry");
+        return 1;
+    }
+    if (over_hard > 0)
+    {
+        char reason[160];
+        snprintf(reason, sizeof(reason),
+                 "%d call(s) exceeded %lld ns hard threshold — bound likely lost",
+                 over_hard, (long long)SLB_LATENCY_HARD_NS);
+        print_verdict(0, reason);
+        return 1;
+    }
+    print_verdict(1, NULL);
+    return 0;
+}
+
+
+/* ════════════════════════════════════════════════════════════════════════
  *   Command dispatch
  * ════════════════════════════════════════════════════════════════════════ */
 
@@ -5222,6 +5420,7 @@ static struct command commands[] = {
     { "wm-timer",        "NSPA WM_TIMER Phase B validation (5 sub-tests, coalescing+NT semantics)", cmd_wm_timer },
     { "rpc-bypass",      "NSPA Phase 1.A irpcss bypass functional parity (5 sub-tests)",   cmd_rpc_bypass    },
     { "irot-bypass",     "NSPA Phase 1.B irot bypass functional parity (5 sub-tests)",     cmd_irot_bypass   },
+    { "seqlock-bound",   "audit §4.1 retry-loop hardening canary (paint fastpath bound)",  cmd_seqlock_bound },
     { "help",            "show this help",                                                  cmd_help          },
     { NULL, NULL, NULL }
 };

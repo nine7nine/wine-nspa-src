@@ -66,10 +66,16 @@ BOOL is_hooked( INT id )
     struct object_lock lock = OBJECT_LOCK_INIT;
     const queue_shm_t *queue_shm;
     BOOL ret = TRUE;
+    unsigned int spin = 0;
     UINT status;
 
+    /* On exhaustion return TRUE so message dispatch falls through to
+     * the legacy hook RPCs (server has the authoritative chain). */
     while ((status = get_shared_queue( &lock, &queue_shm )) == STATUS_PENDING)
+    {
         ret = queue_shm->hooks_count[id - WH_MINHOOK] > 0;
+        NSPA_SHM_RETRY_GUARD( spin, return TRUE );
+    }
 
     if (status) return TRUE;
     return ret;
@@ -321,7 +327,7 @@ static int nspa_hook_try_read_cache( struct nspa_hook_walker *walker, int hook_i
         int copy_failed = 0;
 
         v1 = __atomic_load_n( &chain->version, __ATOMIC_ACQUIRE );
-        if (v1 & 1) { sched_yield(); continue; }
+        if (v1 & 1) { __builtin_ia32_pause(); sched_yield(); continue; }
 
         cnt  = chain->count;
         over = chain->overflowed;
@@ -350,7 +356,7 @@ static int nspa_hook_try_read_cache( struct nspa_hook_walker *walker, int hook_i
         }
 
         v2 = __atomic_load_n( &chain->version, __ATOMIC_ACQUIRE );
-        if (v1 != v2 || (v2 & 1)) { sched_yield(); continue; }
+        if (v1 != v2 || (v2 & 1)) { __builtin_ia32_pause(); sched_yield(); continue; }
         if (copy_failed) return -1;
 
         /* Stable snapshot — apply filter, copy survivors to walker. */
@@ -933,9 +939,15 @@ LRESULT call_message_hooks( INT id, INT code, WPARAM wparam, LPARAM lparam, size
                 struct object_lock lock = OBJECT_LOCK_INIT;
                 const queue_shm_t *queue_shm;
                 int chain_len = 0;
-                UINT status;
+                unsigned int spin = 0;
+                UINT status = 0;
+                /* On exhaustion the guard breaks AND sets status nonzero
+                 * so categorisation is skipped for this dispatch. */
                 while ((status = get_shared_queue( &lock, &queue_shm )) == STATUS_PENDING)
+                {
                     chain_len = queue_shm->hooks_count[idx];
+                    NSPA_SHM_RETRY_GUARD( spin, { status = STATUS_TIMEOUT; break; } );
+                }
                 if (!status)
                     nspa_hook_diag_categorize( &info, chain_len, module_size );
             }

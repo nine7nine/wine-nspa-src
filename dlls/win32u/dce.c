@@ -1611,6 +1611,23 @@ static BOOL redraw_window_rects( HWND hwnd, UINT flags, const RECT *rects, UINT 
 static unsigned long long nspa_paint_fastpath_hits;
 static unsigned long long nspa_paint_fastpath_misses;
 
+/* Paint-cache hit/miss counters are gated by NSPA_PAINT_DIAG=1.  The
+ * counters previously ran unconditionally on every get_update_flags
+ * call across every Wine process — measurable cost on Ableton's
+ * polling UI thread (~3,227 calls/session even with paint-cache
+ * disabled, since the miss counter sits outside the disabled-check).
+ * Kept for the open paint-cache deadlock investigation; off by default. */
+static int nspa_paint_diag_enabled( void )
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *v = getenv( "NSPA_PAINT_DIAG" );
+        cached = (v && *v == '1');
+    }
+    return cached;
+}
+
 static int nspa_paint_fastpath_disabled( void )
 {
     /* DEFAULT-OFF.  The 2026-04-26 default-on flip was reverted same
@@ -1678,10 +1695,12 @@ static BOOL get_update_flags( HWND hwnd, HWND *child, UINT *flags )
 
     if (nspa_get_update_flags_try_fastpath( hwnd, child, flags ))
     {
-        __atomic_fetch_add( &nspa_paint_fastpath_hits, 1, __ATOMIC_RELAXED );
+        if (nspa_paint_diag_enabled())
+            __atomic_fetch_add( &nspa_paint_fastpath_hits, 1, __ATOMIC_RELAXED );
         return TRUE;
     }
-    __atomic_fetch_add( &nspa_paint_fastpath_misses, 1, __ATOMIC_RELAXED );
+    if (nspa_paint_diag_enabled())
+        __atomic_fetch_add( &nspa_paint_fastpath_misses, 1, __ATOMIC_RELAXED );
 
     SERVER_START_REQ( get_update_region )
     {
@@ -1698,15 +1717,17 @@ static BOOL get_update_flags( HWND hwnd, HWND *child, UINT *flags )
     return ret;
 }
 
-/* Print fast-path engagement on process exit so default-on doesn't ship
- * blind to whether the path is actually used.  Quiet for the common
- * case where the gate didn't engage. */
+/* Print fast-path engagement on process exit.  Gated by NSPA_PAINT_DIAG=1
+ * since the per-call hit/miss counters that feed it are also gated. */
 static void __attribute__((destructor)) nspa_paint_fastpath_print_stats( void )
 {
-    unsigned long long h = __atomic_load_n( &nspa_paint_fastpath_hits, __ATOMIC_RELAXED );
-    unsigned long long m = __atomic_load_n( &nspa_paint_fastpath_misses, __ATOMIC_RELAXED );
-    unsigned long long total = h + m;
-    unsigned long long pct = total ? (h * 100 / total) : 0;
+    unsigned long long h, m, total, pct;
+
+    if (!nspa_paint_diag_enabled()) return;
+    h = __atomic_load_n( &nspa_paint_fastpath_hits, __ATOMIC_RELAXED );
+    m = __atomic_load_n( &nspa_paint_fastpath_misses, __ATOMIC_RELAXED );
+    total = h + m;
+    pct = total ? (h * 100 / total) : 0;
     if (total)
         ERR( "NSPA RT:PaintCache: %llu hits / %llu misses (%llu%% hit)\n", h, m, pct );
 }

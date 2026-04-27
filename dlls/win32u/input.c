@@ -849,6 +849,7 @@ static BOOL get_shared_queue_bits( UINT *wake_bits, UINT *changed_bits )
 {
     struct object_lock lock = OBJECT_LOCK_INIT;
     const queue_shm_t *queue_shm;
+    unsigned int spin = 0;
     UINT status;
 
     *wake_bits = *changed_bits = 0;
@@ -859,6 +860,7 @@ static BOOL get_shared_queue_bits( UINT *wake_bits, UINT *changed_bits )
         UINT changed_ring_bits = nspa_queue_changed_bits( queue_bypass );
         *wake_bits = queue_shm->wake_bits | ring_bits;
         *changed_bits = queue_shm->changed_bits | changed_ring_bits;
+        NSPA_SHM_RETRY_GUARD( spin, return FALSE );
     }
 
     if (status) return FALSE;

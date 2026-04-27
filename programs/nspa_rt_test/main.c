@@ -5242,18 +5242,96 @@ static DWORD WINAPI slb_load_thread(LPVOID arg)
     return 0;
 }
 
+/* Per-sub-test runner: 10000 iters of `op`, QPC-timed, with wall budget.
+ * Returns 0 if all iters completed and no call crossed the hard threshold,
+ * non-zero otherwise. Always prints results so the per-sub-test numbers
+ * stay readable even when one fails. */
+struct slb_result
+{
+    int  iters_done;
+    LONGLONG max_ns;
+    LONGLONG sum_ns;
+    int  over_hard;
+    int  over_soft;
+    int  hung;
+};
+
+static void slb_run_hotloop(const char *label, void (*op)(HWND), HWND hwnd,
+                            LONGLONG ns_per_count, struct slb_result *out)
+{
+    LARGE_INTEGER t0, t1;
+    LONGLONG wall_start_ms;
+    int i;
+
+    out->iters_done = 0;
+    out->max_ns = 0;
+    out->sum_ns = 0;
+    out->over_hard = 0;
+    out->over_soft = 0;
+    out->hung = 0;
+
+    print_section(label);
+    fflush(stdout);
+
+    wall_start_ms = (LONGLONG)GetTickCount64();
+    for (i = 0; i < SLB_ITERS; i++)
+    {
+        LONGLONG dt_ns;
+        QueryPerformanceCounter(&t0);
+        op(hwnd);
+        QueryPerformanceCounter(&t1);
+
+        dt_ns = (t1.QuadPart - t0.QuadPart) * ns_per_count;
+        out->sum_ns += dt_ns;
+        if (dt_ns > out->max_ns) out->max_ns = dt_ns;
+        if (dt_ns >= SLB_LATENCY_HARD_NS) out->over_hard++;
+        else if (dt_ns >= SLB_LATENCY_SOFT_NS) out->over_soft++;
+
+        if ((i & 0x3FF) == 0)
+        {
+            LONGLONG wall_now_ms = (LONGLONG)GetTickCount64();
+            if (wall_now_ms - wall_start_ms >= SLB_WALL_BUDGET_MS)
+            {
+                out->hung = 1;
+                break;
+            }
+        }
+    }
+    out->iters_done = i;
+
+    print_kv("iterations done",     "%d / %d", out->iters_done, SLB_ITERS);
+    print_kv("max latency",         "%lld ns (%lld us)",
+             (long long)out->max_ns, (long long)(out->max_ns / 1000));
+    if (out->iters_done > 0)
+        print_kv("avg latency",     "%lld ns (%lld us)",
+                 (long long)(out->sum_ns / out->iters_done),
+                 (long long)(out->sum_ns / out->iters_done / 1000));
+    print_kv("over soft (>=1ms)",   "%d", out->over_soft);
+    print_kv("over hard (>=10ms)",  "%d", out->over_hard);
+    print_kv("wall hung",           "%s", out->hung ? "YES" : "no");
+}
+
+/* Op stubs — one per sub-test. Each maps to a hardened call site. */
+static void slb_op_get_update_rect( HWND hwnd )
+{
+    RECT rc;
+    GetUpdateRect( hwnd, &rc, FALSE );
+}
+static void slb_op_get_queue_status( HWND hwnd )
+{
+    (void)hwnd;
+    GetQueueStatus( QS_ALLINPUT );
+}
+
 static int cmd_seqlock_bound(int argc, char **argv)
 {
     static const WCHAR class_name[] = L"NSPA_SLB_Class";
     WNDCLASSW wc = {0};
     HANDLE load_h;
     DWORD tid;
-    LARGE_INTEGER qpc_freq, t0, t1;
+    LARGE_INTEGER qpc_freq;
     LONGLONG ns_per_count;
-    LONGLONG max_ns = 0, sum_ns = 0;
-    int over_hard = 0, over_soft = 0;
-    LONGLONG wall_start_ms, wall_now_ms;
-    int i, hung = 0;
+    struct slb_result res_a, res_b;
     const char *paint_cache_env;
 
     (void)argc; (void)argv;
@@ -5261,17 +5339,18 @@ static int cmd_seqlock_bound(int argc, char **argv)
     paint_cache_env = getenv("NSPA_ENABLE_PAINT_CACHE");
 
     print_banner("seqlock-bound",
-        "audit §4.1 retry-loop hardening canary (paint fastpath)");
+        "audit §4.1 retry-loop hardening canary (paint fastpath + queue-bits)");
     print_section("parameters");
-    print_kv("iterations",      "%d (GetUpdateRect calls)", SLB_ITERS);
-    print_kv("wall budget",     "%d ms", SLB_WALL_BUDGET_MS);
-    print_kv("latency hard",    "%lld ns (>= triggers FAIL)", (long long)SLB_LATENCY_HARD_NS);
-    print_kv("latency soft",    "%lld ns (>= info bucket)",   (long long)SLB_LATENCY_SOFT_NS);
-    print_kv("paint cache env", "%s",
+    print_kv("iterations / sub",    "%d", SLB_ITERS);
+    print_kv("wall budget / sub",   "%d ms", SLB_WALL_BUDGET_MS);
+    print_kv("latency hard",        "%lld ns (>= triggers FAIL)", (long long)SLB_LATENCY_HARD_NS);
+    print_kv("latency soft",        "%lld ns (>= info bucket)",   (long long)SLB_LATENCY_SOFT_NS);
+    print_kv("paint cache env",     "%s",
              (paint_cache_env && paint_cache_env[0] == '1')
                  ? "NSPA_ENABLE_PAINT_CACHE=1 (fastpath active)"
-                 : "[WARN] NSPA_ENABLE_PAINT_CACHE!=1 - test exercises legacy RPC, not the fastpath");
-    print_kv("hot path",        "GetUpdateRect -> get_update_flags -> nspa fastpath -> NSPA_SHM_RETRY_GUARD");
+                 : "[WARN] NSPA_ENABLE_PAINT_CACHE!=1 - sub-test A exercises RPC, not the fastpath");
+    print_kv("sub-test A path",     "GetUpdateRect -> get_update_flags -> nspa paint fastpath");
+    print_kv("sub-test B path",     "GetQueueStatus -> get_shared_queue_bits (input.c site 2)");
 
     print_section("startup");
 
@@ -5310,7 +5389,7 @@ static int cmd_seqlock_bound(int argc, char **argv)
 
     enter_realtime_class();
     print_worker_start("hot", GetCurrentThreadId(),
-        "SCHED_FIFO @NSPA_RT_PRIO GetUpdateRect timing loop");
+        "SCHED_FIFO @NSPA_RT_PRIO  hot loops A + B");
 
     QueryPerformanceFrequency(&qpc_freq);
     ns_per_count = (qpc_freq.QuadPart > 0) ? (1000000000LL / qpc_freq.QuadPart) : 1;
@@ -5318,38 +5397,14 @@ static int cmd_seqlock_bound(int argc, char **argv)
     print_kv("QPC freq", "%lld Hz (%lld ns/count)",
              (long long)qpc_freq.QuadPart, (long long)ns_per_count);
 
-    print_section("hot loop");
-    fflush(stdout);
+    /* Run sub-tests in sequence; load thread keeps churning queue_shm
+     * writer side throughout. */
+    slb_run_hotloop("A: paint fastpath (GetUpdateRect)",
+                    slb_op_get_update_rect, g_slb_hwnd, ns_per_count, &res_a);
+    slb_run_hotloop("B: queue-bits seqlock (GetQueueStatus)",
+                    slb_op_get_queue_status, g_slb_hwnd, ns_per_count, &res_b);
 
-    wall_start_ms = (LONGLONG)GetTickCount64();
-    for (i = 0; i < SLB_ITERS; i++)
-    {
-        RECT rc;
-        LONGLONG dt_ns;
-
-        QueryPerformanceCounter(&t0);
-        GetUpdateRect(g_slb_hwnd, &rc, FALSE);
-        QueryPerformanceCounter(&t1);
-
-        dt_ns = (t1.QuadPart - t0.QuadPart) * ns_per_count;
-        sum_ns += dt_ns;
-        if (dt_ns > max_ns) max_ns = dt_ns;
-        if (dt_ns >= SLB_LATENCY_HARD_NS) over_hard++;
-        else if (dt_ns >= SLB_LATENCY_SOFT_NS) over_soft++;
-
-        /* Wall budget check every 1024 iters. */
-        if ((i & 0x3FF) == 0)
-        {
-            wall_now_ms = (LONGLONG)GetTickCount64();
-            if (wall_now_ms - wall_start_ms >= SLB_WALL_BUDGET_MS)
-            {
-                hung = 1;
-                break;
-            }
-        }
-    }
-
-    /* Stop load thread and clean up before printing results / verdict. */
+    /* Stop load thread and clean up before verdict. */
     InterlockedExchange(&g_slb_stop_load, 1);
     WaitForSingleObject(load_h, 5000);
     CloseHandle(load_h);
@@ -5359,35 +5414,37 @@ static int cmd_seqlock_bound(int argc, char **argv)
     DestroyWindow(g_slb_hwnd); g_slb_hwnd = NULL;
     UnregisterClassW(class_name, wc.hInstance);
 
-    print_section("results");
-    print_kv("iterations done",     "%d / %d", i, SLB_ITERS);
-    print_kv("max latency",         "%lld ns (%lld us)",
-             (long long)max_ns, (long long)(max_ns / 1000));
-    if (i > 0)
-        print_kv("avg latency",     "%lld ns (%lld us)",
-                 (long long)(sum_ns / i), (long long)(sum_ns / i / 1000));
-    print_kv("over soft (>=1ms)",   "%d", over_soft);
-    print_kv("over hard (>=10ms)",  "%d", over_hard);
-    print_kv("wall hung",           "%s", hung ? "YES" : "no");
+    /* Aggregate verdict: every sub-test must complete within wall budget
+     * AND have zero over-hard latencies. */
+    {
+        int hung = res_a.hung || res_b.hung;
+        int hard = res_a.over_hard + res_b.over_hard;
 
-    /* Verdict: bounded forward progress = no single call >= hard threshold,
-     * and we completed all iterations within the wall budget. */
-    if (hung)
-    {
-        print_verdict(0, "wall budget exceeded — possible unbounded retry");
-        return 1;
+        print_section("aggregate verdict");
+        print_kv("A max",  "%lld us  hard=%d", (long long)(res_a.max_ns/1000), res_a.over_hard);
+        print_kv("B max",  "%lld us  hard=%d", (long long)(res_b.max_ns/1000), res_b.over_hard);
+
+        if (hung)
+        {
+            char reason[160];
+            snprintf(reason, sizeof(reason),
+                     "wall budget exceeded (A hung=%d, B hung=%d) - possible unbounded retry",
+                     res_a.hung, res_b.hung);
+            print_verdict(0, reason);
+            return 1;
+        }
+        if (hard > 0)
+        {
+            char reason[160];
+            snprintf(reason, sizeof(reason),
+                     "%d call(s) >= %lld ns across A+B - bound likely lost",
+                     hard, (long long)SLB_LATENCY_HARD_NS);
+            print_verdict(0, reason);
+            return 1;
+        }
+        print_verdict(1, NULL);
+        return 0;
     }
-    if (over_hard > 0)
-    {
-        char reason[160];
-        snprintf(reason, sizeof(reason),
-                 "%d call(s) exceeded %lld ns hard threshold — bound likely lost",
-                 over_hard, (long long)SLB_LATENCY_HARD_NS);
-        print_verdict(0, reason);
-        return 1;
-    }
-    print_verdict(1, NULL);
-    return 0;
 }
 
 

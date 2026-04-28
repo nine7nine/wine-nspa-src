@@ -1198,6 +1198,20 @@ static int nspa_alloc_bypass_shm( struct msg_queue *queue )
     memset( map, 0, size );
     ((nspa_queue_bypass_shm_t *)map)->nspa_msg_ring.active = 1;
     ((nspa_queue_bypass_shm_t *)map)->nspa_timer_ring.active = 1;
+    /* Empty-PEEK shortcut: explicit sentinel for unpopulated msg-id range
+     * classes (memset would leave min=0,max=0 = "range covers WM_NULL only",
+     * which is a non-empty range and would falsely exclude any filter that
+     * doesn't include 0).  Sentinel is min>max → "class empty". */
+    {
+        nspa_queue_bypass_shm_t *shm = (nspa_queue_bypass_shm_t *)map;
+        unsigned int i;
+        for (i = 0; i < NSPA_RANGE_CLASS_COUNT; i++)
+        {
+            shm->nspa_msg_ranges[i].version = 0;
+            shm->nspa_msg_ranges[i].min_msg = ~0u;
+            shm->nspa_msg_ranges[i].max_msg = 0;
+        }
+    }
 
     queue->nspa_bypass_fd   = fd;
     queue->nspa_bypass_size = size;

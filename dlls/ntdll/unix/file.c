@@ -2300,8 +2300,7 @@ static unsigned int server_open_file_object( HANDLE *handle, ACCESS_MASK access,
     {
         req->access     = access;
         req->attributes = attr->Attributes;
-        /* NSPA: promote local-range dir handle if used as RootDirectory. */
-        req->rootdir    = wine_server_obj_handle( nspa_promote_if_local( attr->RootDirectory ) );
+        req->rootdir    = wine_server_obj_handle( attr->RootDirectory );
         req->sharing    = sharing;
         req->options    = options;
         wine_server_add_data( req, attr->ObjectName->Buffer, attr->ObjectName->Length );
@@ -5503,9 +5502,7 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
                 SERVER_START_REQ( set_fd_name_info )
                 {
                     req->handle   = wine_server_obj_handle( srv_handle );
-                    /* Promote local-range RootDirectory before sending to
-                     * server (ReplaceFileW path — Live's Undo update). */
-                    req->rootdir  = wine_server_obj_handle( nspa_promote_if_local( attr.RootDirectory ) );
+                    req->rootdir  = wine_server_obj_handle( attr.RootDirectory );
                     req->namelen  = attr.ObjectName->Length;
                     req->link     = FALSE;
                     req->flags    = flags;
@@ -5550,9 +5547,7 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
                 SERVER_START_REQ( set_fd_name_info )
                 {
                     req->handle   = wine_server_obj_handle( srv_handle );
-                    /* Promote local-range RootDirectory before sending to
-                     * server (FileLinkInformation hardlink path). */
-                    req->rootdir  = wine_server_obj_handle( nspa_promote_if_local( attr.RootDirectory ) );
+                    req->rootdir  = wine_server_obj_handle( attr.RootDirectory );
                     req->namelen  = attr.ObjectName->Length;
                     req->link     = TRUE;
                     req->flags    = flags;

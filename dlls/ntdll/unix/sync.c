@@ -327,14 +327,7 @@ unsigned int alloc_object_attributes( const OBJECT_ATTRIBUTES *attr, struct obje
 
     if (!(*ret = calloc( len, 1 ))) return STATUS_NO_MEMORY;
 
-    /* NSPA local-file: promote local-range RootDirectory handles to
-     * server handles here.  alloc_object_attributes is the single
-     * serialization point for OBJECT_ATTRIBUTES across NtCreateFile,
-     * NtOpen{Mutex,Event,Semaphore}, NtCreateSection, and many other
-     * server-bound calls.  Promoting once here catches every site
-     * that hands attr to wine_server_call without per-callsite edits.
-     * No-op for non-local-range or NULL handles. */
-    (*ret)->rootdir = wine_server_obj_handle( nspa_promote_if_local( attr->RootDirectory ) );
+    (*ret)->rootdir = wine_server_obj_handle( attr->RootDirectory );
     (*ret)->attributes = attr->Attributes;
 
     if (attr->SecurityDescriptor)
@@ -1538,8 +1531,7 @@ NTSTATUS WINAPI NtOpenSemaphore( HANDLE *handle, ACCESS_MASK access, const OBJEC
     {
         req->access     = access;
         req->attributes = attr->Attributes;
-        /* NSPA: promote local-range dir handle if used as RootDirectory. */
-        req->rootdir    = wine_server_obj_handle( nspa_promote_if_local( attr->RootDirectory ) );
+        req->rootdir    = wine_server_obj_handle( attr->RootDirectory );
         if (attr->ObjectName)
             wine_server_add_data( req, attr->ObjectName->Buffer, attr->ObjectName->Length );
         ret = wine_server_call( req );
@@ -1674,8 +1666,7 @@ NTSTATUS WINAPI NtOpenEvent( HANDLE *handle, ACCESS_MASK access, const OBJECT_AT
     {
         req->access     = access;
         req->attributes = attr->Attributes;
-        /* NSPA: promote local-range dir handle if used as RootDirectory. */
-        req->rootdir    = wine_server_obj_handle( nspa_promote_if_local( attr->RootDirectory ) );
+        req->rootdir    = wine_server_obj_handle( attr->RootDirectory );
         if (attr->ObjectName)
             wine_server_add_data( req, attr->ObjectName->Buffer, attr->ObjectName->Length );
         ret = wine_server_call( req );
@@ -1873,8 +1864,7 @@ NTSTATUS WINAPI NtOpenMutant( HANDLE *handle, ACCESS_MASK access, const OBJECT_A
     {
         req->access  = access;
         req->attributes = attr->Attributes;
-        /* NSPA: promote local-range dir handle if used as RootDirectory. */
-        req->rootdir = wine_server_obj_handle( nspa_promote_if_local( attr->RootDirectory ) );
+        req->rootdir = wine_server_obj_handle( attr->RootDirectory );
         if (attr->ObjectName)
             wine_server_add_data( req, attr->ObjectName->Buffer, attr->ObjectName->Length );
         ret = wine_server_call( req );
@@ -1988,8 +1978,7 @@ NTSTATUS WINAPI NtOpenJobObject( HANDLE *handle, ACCESS_MASK access, const OBJEC
     {
         req->access     = access;
         req->attributes = attr->Attributes;
-        /* NSPA: promote local-range dir handle if used as RootDirectory. */
-        req->rootdir    = wine_server_obj_handle( nspa_promote_if_local( attr->RootDirectory ) );
+        req->rootdir    = wine_server_obj_handle( attr->RootDirectory );
         if (attr->ObjectName)
             wine_server_add_data( req, attr->ObjectName->Buffer, attr->ObjectName->Length );
         ret = wine_server_call( req );
@@ -2462,8 +2451,7 @@ NTSTATUS WINAPI NtOpenDirectoryObject( HANDLE *handle, ACCESS_MASK access, const
     {
         req->access     = access;
         req->attributes = attr->Attributes;
-        /* NSPA: promote local-range dir handle if used as RootDirectory. */
-        req->rootdir    = wine_server_obj_handle( nspa_promote_if_local( attr->RootDirectory ) );
+        req->rootdir    = wine_server_obj_handle( attr->RootDirectory );
         if (attr->ObjectName)
             wine_server_add_data( req, attr->ObjectName->Buffer, attr->ObjectName->Length );
         ret = wine_server_call( req );
@@ -2616,8 +2604,7 @@ NTSTATUS WINAPI NtOpenSymbolicLinkObject( HANDLE *handle, ACCESS_MASK access,
     {
         req->access     = access;
         req->attributes = attr->Attributes;
-        /* NSPA: promote local-range dir handle if used as RootDirectory. */
-        req->rootdir    = wine_server_obj_handle( nspa_promote_if_local( attr->RootDirectory ) );
+        req->rootdir    = wine_server_obj_handle( attr->RootDirectory );
         if (attr->ObjectName)
             wine_server_add_data( req, attr->ObjectName->Buffer, attr->ObjectName->Length );
         ret = wine_server_call( req );
@@ -2756,8 +2743,7 @@ NTSTATUS WINAPI NtOpenTimer( HANDLE *handle, ACCESS_MASK access, const OBJECT_AT
     {
         req->access     = access;
         req->attributes = attr->Attributes;
-        /* NSPA: promote local-range dir handle if used as RootDirectory. */
-        req->rootdir    = wine_server_obj_handle( nspa_promote_if_local( attr->RootDirectory ) );
+        req->rootdir    = wine_server_obj_handle( attr->RootDirectory );
         if (attr->ObjectName)
             wine_server_add_data( req, attr->ObjectName->Buffer, attr->ObjectName->Length );
         ret = wine_server_call( req );
@@ -3294,8 +3280,7 @@ NTSTATUS WINAPI NtOpenKeyedEvent( HANDLE *handle, ACCESS_MASK access, const OBJE
     {
         req->access     = access;
         req->attributes = attr->Attributes;
-        /* NSPA: promote local-range dir handle if used as RootDirectory. */
-        req->rootdir    = wine_server_obj_handle( nspa_promote_if_local( attr->RootDirectory ) );
+        req->rootdir    = wine_server_obj_handle( attr->RootDirectory );
         if (attr->ObjectName)
             wine_server_add_data( req, attr->ObjectName->Buffer, attr->ObjectName->Length );
         ret = wine_server_call( req );
@@ -3391,8 +3376,7 @@ NTSTATUS WINAPI NtOpenIoCompletion( HANDLE *handle, ACCESS_MASK access, const OB
     {
         req->access     = access;
         req->attributes = attr->Attributes;
-        /* NSPA: promote local-range dir handle if used as RootDirectory. */
-        req->rootdir    = wine_server_obj_handle( nspa_promote_if_local( attr->RootDirectory ) );
+        req->rootdir    = wine_server_obj_handle( attr->RootDirectory );
         if (attr->ObjectName)
             wine_server_add_data( req, attr->ObjectName->Buffer, attr->ObjectName->Length );
         status = wine_server_call( req );
@@ -3740,8 +3724,7 @@ NTSTATUS WINAPI NtOpenSection( HANDLE *handle, ACCESS_MASK access, const OBJECT_
     {
         req->access     = access;
         req->attributes = attr->Attributes;
-        /* NSPA: promote local-range dir handle if used as RootDirectory. */
-        req->rootdir    = wine_server_obj_handle( nspa_promote_if_local( attr->RootDirectory ) );
+        req->rootdir    = wine_server_obj_handle( attr->RootDirectory );
         if (attr->ObjectName)
             wine_server_add_data( req, attr->ObjectName->Buffer, attr->ObjectName->Length );
         ret = wine_server_call( req );

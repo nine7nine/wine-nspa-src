@@ -303,6 +303,12 @@ extern NTSTATUS nspa_local_timer_check_duplicate( HANDLE source_handle, HANDLE s
 extern NTSTATUS nspa_local_timer_register_duplicate( HANDLE source_handle, HANDLE new_handle );
 extern void     nspa_local_file_diag_categorize( const OBJECT_ATTRIBUTES *attr, ACCESS_MASK access,
                                                  ULONG sharing, ULONG disposition, ULONG options );
+extern BOOL     nspa_local_file_disp_categorize( BOOL loader_open,
+                                                 const OBJECT_ATTRIBUTES *attr,
+                                                 ACCESS_MASK access,
+                                                 ULONG disposition,
+                                                 ULONG options );
+extern void     nspa_local_file_disp_count_outcome( NTSTATUS status );
 extern void     nspa_local_file_diag_lazy_start( void );
 extern NTSTATUS nspa_local_file_publish_open( unsigned long long device, unsigned long long inode,
                                               unsigned int access, unsigned int sharing );

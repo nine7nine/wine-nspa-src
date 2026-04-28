@@ -312,16 +312,33 @@ int nspa_local_file_table_lookup( unsigned long long device, unsigned long long 
 /* Forward decl — implementation appears later in the file (Slice 1A.1.c). */
 static void nspa_lf_table_open_lazy( void );
 
+/* Gate the per-call diagnostic counters behind NSPA_SEND_DIAG.  Without
+ * this, every NtCreateFile pays ~10 atomic-fetch-add ops to populate
+ * the [ineligibility breakdown] section of the dump even when the
+ * dump is never produced.  At ~950 NtCreateFile/sec under library-load
+ * workload, that's measurable RT-jitter cost. */
+static int nspa_lf_diag_enabled( void )
+{
+    static int cached = -1;
+    if (cached < 0) cached = (getenv( "NSPA_SEND_DIAG" ) != NULL);
+    return cached;
+}
+
 void nspa_local_file_diag_categorize( const OBJECT_ATTRIBUTES *attr, ACCESS_MASK access,
                                       ULONG sharing, ULONG disposition, ULONG options )
 {
-    __atomic_fetch_add( &nspa_lf_top_calls, 1, __ATOMIC_RELAXED );
-
     /* Trigger lazy mmap of the shared inode-table from a real Wine
      * thread context (NtCreateFile is always called from one).  The
      * background diag thread that dumps counters never calls server
-     * RPCs, so it safely inspects whatever state the open reached. */
+     * RPCs, so it safely inspects whatever state the open reached.
+     * MUST run unconditionally — bypass dispatch depends on the table
+     * being mapped. */
     nspa_lf_table_open_lazy();
+
+    /* Counters below are diagnostics only; gate on NSPA_SEND_DIAG. */
+    if (!nspa_lf_diag_enabled()) return;
+
+    __atomic_fetch_add( &nspa_lf_top_calls, 1, __ATOMIC_RELAXED );
 
     if (!attr || !attr->ObjectName)
     {
@@ -389,6 +406,11 @@ void nspa_local_file_diag_categorize( const OBJECT_ATTRIBUTES *attr, ACCESS_MASK
  * try_bypass); FALSE if any criterion rejects.  Bumps exactly one
  * counter on rejection (the first failing criterion in priority
  * order), or `attempted` on pass. */
+/* Gated counter bump — single check on the cached static; branch
+ * predictor handles the consistent path well. */
+#define NSPA_LF_DIAG_BUMP(cnt) \
+    do { if (nspa_lf_diag_enabled()) __atomic_fetch_add( &(cnt), 1, __ATOMIC_RELAXED ); } while (0)
+
 BOOL nspa_local_file_disp_categorize( BOOL loader_open,
                                       const OBJECT_ATTRIBUTES *attr,
                                       ACCESS_MASK access,
@@ -396,30 +418,31 @@ BOOL nspa_local_file_disp_categorize( BOOL loader_open,
                                       ULONG options )
 {
     if (loader_open)
-    { __atomic_fetch_add( &nspa_lf_disp_rej_loader, 1, __ATOMIC_RELAXED ); return FALSE; }
+    { NSPA_LF_DIAG_BUMP( nspa_lf_disp_rej_loader ); return FALSE; }
     if (attr && attr->RootDirectory)
-    { __atomic_fetch_add( &nspa_lf_disp_rej_rootdir, 1, __ATOMIC_RELAXED ); return FALSE; }
+    { NSPA_LF_DIAG_BUMP( nspa_lf_disp_rej_rootdir ); return FALSE; }
     if (attr && attr->SecurityDescriptor)
-    { __atomic_fetch_add( &nspa_lf_disp_rej_secdesc, 1, __ATOMIC_RELAXED ); return FALSE; }
+    { NSPA_LF_DIAG_BUMP( nspa_lf_disp_rej_secdesc ); return FALSE; }
     if (disposition != FILE_OPEN && disposition != FILE_OPEN_IF)
-    { __atomic_fetch_add( &nspa_lf_disp_rej_disposition, 1, __ATOMIC_RELAXED ); return FALSE; }
+    { NSPA_LF_DIAG_BUMP( nspa_lf_disp_rej_disposition ); return FALSE; }
     if (options & FILE_OPEN_BY_FILE_ID)
-    { __atomic_fetch_add( &nspa_lf_disp_rej_open_by_id, 1, __ATOMIC_RELAXED ); return FALSE; }
+    { NSPA_LF_DIAG_BUMP( nspa_lf_disp_rej_open_by_id ); return FALSE; }
     if (options & FILE_DIRECTORY_FILE)
-    { __atomic_fetch_add( &nspa_lf_disp_rej_directory, 1, __ATOMIC_RELAXED ); return FALSE; }
+    { NSPA_LF_DIAG_BUMP( nspa_lf_disp_rej_directory ); return FALSE; }
     if (options & FILE_DELETE_ON_CLOSE)
-    { __atomic_fetch_add( &nspa_lf_disp_rej_delete_on_close, 1, __ATOMIC_RELAXED ); return FALSE; }
+    { NSPA_LF_DIAG_BUMP( nspa_lf_disp_rej_delete_on_close ); return FALSE; }
     if (!(options & (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT)))
-    { __atomic_fetch_add( &nspa_lf_disp_rej_async, 1, __ATOMIC_RELAXED ); return FALSE; }
+    { NSPA_LF_DIAG_BUMP( nspa_lf_disp_rej_async ); return FALSE; }
     if (access & ~NSPA_LF_STD_READ_ACCESS)
-    { __atomic_fetch_add( &nspa_lf_disp_rej_access, 1, __ATOMIC_RELAXED ); return FALSE; }
-    __atomic_fetch_add( &nspa_lf_disp_attempted, 1, __ATOMIC_RELAXED );
+    { NSPA_LF_DIAG_BUMP( nspa_lf_disp_rej_access ); return FALSE; }
+    NSPA_LF_DIAG_BUMP( nspa_lf_disp_attempted );
     return TRUE;
 }
 
-/* Categorise the outcome of a try_bypass call. */
+/* Categorise the outcome of a try_bypass call.  Diagnostic only. */
 void nspa_local_file_disp_count_outcome( NTSTATUS status )
 {
+    if (!nspa_lf_diag_enabled()) return;
     if (status == STATUS_SUCCESS)
         __atomic_fetch_add( &nspa_lf_disp_bypass_success, 1, __ATOMIC_RELAXED );
     else if (status == STATUS_SHARING_VIOLATION)

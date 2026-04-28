@@ -4655,6 +4655,17 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
     if (alloc_size) FIXME( "alloc_size not supported\n" );
 
     new_attr = *attr;
+    /* NSPA local-file: if RootDirectory is a local-range directory handle
+     * (returned by our nspa_local_file directory bypass), promote it to a
+     * server-side handle BEFORE any path that hands it to the server.
+     * The server's DECL_HANDLER(create_file) at server/file.c:654 calls
+     * get_dir_obj(current->process, objattr->rootdir, 0) which looks up
+     * the handle in the server's process handle table; local-range
+     * handles aren't there, so the server-side open of any
+     * non-bypass-eligible file (e.g. DELETE access) fails.  Promotion
+     * routes through the existing create_dir_obj path on the server
+     * side.  No-op when RootDirectory is already a server handle. */
+    new_attr.RootDirectory = nspa_promote_if_local( new_attr.RootDirectory );
     if (options & FILE_OPEN_BY_FILE_ID)
     {
         status = file_id_to_unix_file_name( &new_attr, &unix_name, &nt_name );

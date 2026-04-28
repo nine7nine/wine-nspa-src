@@ -1148,27 +1148,6 @@ static inline int nspa_seq_ops_disabled(void)
     return nspa_server_seq_off;
 }
 
-/* NSPA_REFRESH_POSTBIT: lazy-refresh the QS_POSTMESSAGE wake bit at the top
- * of get_message handler.  Client-side ring pops (nspa_try_pop_own_ring_post
- * in dlls/win32u/nspa/msg_ring.c) drain the NSPA msg ring without going
- * through the server-side consume_nspa_ring_message path, so the three
- * QS_POSTMESSAGE clear sites (queue.c:1372 / 1651 / 1795) never fire for
- * those drains.  After a legacy POST is enqueued (bit set) and legacy +
- * ring both go quiet via client pops, queue_shm->wake_bits keeps
- * QS_POSTMESSAGE set indefinitely; every PeekMessage then RPCs into a
- * no-op handler.  Default OFF for first ship; flip on after Ableton
- * validation.  Set =1 to enable. */
-static int nspa_refresh_postbit_off = -1;
-static inline int nspa_refresh_postbit_enabled(void)
-{
-    if (nspa_refresh_postbit_off == -1)
-    {
-        const char *v = getenv("NSPA_REFRESH_POSTBIT");
-        nspa_refresh_postbit_off = !(v && *v == '1');  /* enabled iff "=1" */
-    }
-    return !nspa_refresh_postbit_off;
-}
-
 /* Lazy-allocate per-queue nspa_shared (bypass msg+reply rings).  Queues
  * are created with nspa_shared == NULL; this function allocates on first
  * demand and publishes the locator into queue_shm so clients can find it.
@@ -3961,23 +3940,6 @@ DECL_HANDLER(get_message)
 
     if (!queue) return;
     queue_shm = queue->shared;
-
-    /* NSPA empty-PEEK refresh: client-side ring pops drain the NSPA msg
-     * ring without going through server-side consume_nspa_ring_message,
-     * so QS_POSTMESSAGE clear paths at queue.c:1372 / 1651 / 1795 never
-     * fire for those drains.  The bit can stay set on queue_shm after
-     * both legacy list and ring drain — every subsequent PeekMessage
-     * with QS_POSTMESSAGE in its mask falls through check_queue_bits
-     * and RPCs into this handler which finds nothing.  Refresh here so
-     * the bit reflects current state.  Cheap: at most 3 cmps + an
-     * atomic add-fetch via clear_queue_bits.  Gated default-off via
-     * NSPA_REFRESH_POSTBIT for staged rollout. */
-    if (nspa_refresh_postbit_enabled() &&
-        (queue_shm->wake_bits & QS_POSTMESSAGE) &&
-        list_empty( &queue->msg_list[POST_MESSAGE] ) &&
-        !queue->quit_message &&
-        !nspa_ring_has_pending_posted( queue ))
-        clear_queue_bits( queue, QS_POSTMESSAGE | QS_ALLPOSTMESSAGE );
 
     /* check for any hardware internal message */
     if (get_hardware_message( current, req->hw_id, get_win, WM_WINE_FIRST_DRIVER_MSG,

@@ -108,6 +108,26 @@ static unsigned long long       nspa_lf_promote_cached_hit;   /* server_handle a
 static unsigned long long       nspa_lf_promote_minted;       /* server_handle minted via RPC (lazy) */
 static unsigned long long       nspa_lf_promote_fail;         /* RPC returned 0 handle */
 
+/* Dispatch-site rejection counters — accurate to the actual eligibility
+ * filter in file.c:NtCreateFile (priority order matches the if-chain
+ * there).  Distinct from nspa_lf_inelig_* above: those mirror the older
+ * categorize() criteria which have drifted from the dispatch.  These
+ * counters are the source of truth for "why did this NtCreateFile fall
+ * through to the server create_file RPC". */
+static unsigned long long       nspa_lf_disp_rej_loader;          /* .dll/.drv/.sys/.exe */
+static unsigned long long       nspa_lf_disp_rej_rootdir;          /* attr->RootDirectory */
+static unsigned long long       nspa_lf_disp_rej_secdesc;          /* attr->SecurityDescriptor */
+static unsigned long long       nspa_lf_disp_rej_disposition;      /* not OPEN / OPEN_IF */
+static unsigned long long       nspa_lf_disp_rej_open_by_id;       /* FILE_OPEN_BY_FILE_ID */
+static unsigned long long       nspa_lf_disp_rej_directory;        /* FILE_DIRECTORY_FILE */
+static unsigned long long       nspa_lf_disp_rej_delete_on_close;  /* FILE_DELETE_ON_CLOSE */
+static unsigned long long       nspa_lf_disp_rej_async;            /* lacks FILE_SYNCHRONOUS_IO_* */
+static unsigned long long       nspa_lf_disp_rej_access;           /* non-read access bits */
+static unsigned long long       nspa_lf_disp_attempted;            /* passed filter, called try_bypass */
+static unsigned long long       nspa_lf_disp_bypass_not_supported; /* try_bypass returned STATUS_NOT_SUPPORTED */
+static unsigned long long       nspa_lf_disp_bypass_sharing;       /* try_bypass returned STATUS_SHARING_VIOLATION */
+static unsigned long long       nspa_lf_disp_bypass_success;       /* try_bypass returned STATUS_SUCCESS */
+
 static void nspa_lf_table_open_once_fn( void )
 {
     int fd = -1;
@@ -344,6 +364,56 @@ void nspa_local_file_diag_categorize( const OBJECT_ATTRIBUTES *attr, ACCESS_MASK
     __atomic_fetch_add( &nspa_lf_eligible, 1, __ATOMIC_RELAXED );
 }
 
+/* Dispatch-site categorise — matches the actual eligibility filter at
+ * dlls/ntdll/unix/file.c::NtCreateFile (the if-chain that decides
+ * whether to call nspa_local_file_try_bypass).  Distinct from the older
+ * nspa_local_file_diag_categorize above; this one is the source of
+ * truth for "what dispatch criterion rejected this open" and runs
+ * inline at the dispatch site to avoid drift.
+ *
+ * Returns TRUE if the open passes the filter (caller should call
+ * try_bypass); FALSE if any criterion rejects.  Bumps exactly one
+ * counter on rejection (the first failing criterion in priority
+ * order), or `attempted` on pass. */
+BOOL nspa_local_file_disp_categorize( BOOL loader_open,
+                                      const OBJECT_ATTRIBUTES *attr,
+                                      ACCESS_MASK access,
+                                      ULONG disposition,
+                                      ULONG options )
+{
+    if (loader_open)
+    { __atomic_fetch_add( &nspa_lf_disp_rej_loader, 1, __ATOMIC_RELAXED ); return FALSE; }
+    if (attr && attr->RootDirectory)
+    { __atomic_fetch_add( &nspa_lf_disp_rej_rootdir, 1, __ATOMIC_RELAXED ); return FALSE; }
+    if (attr && attr->SecurityDescriptor)
+    { __atomic_fetch_add( &nspa_lf_disp_rej_secdesc, 1, __ATOMIC_RELAXED ); return FALSE; }
+    if (disposition != FILE_OPEN && disposition != FILE_OPEN_IF)
+    { __atomic_fetch_add( &nspa_lf_disp_rej_disposition, 1, __ATOMIC_RELAXED ); return FALSE; }
+    if (options & FILE_OPEN_BY_FILE_ID)
+    { __atomic_fetch_add( &nspa_lf_disp_rej_open_by_id, 1, __ATOMIC_RELAXED ); return FALSE; }
+    if (options & FILE_DIRECTORY_FILE)
+    { __atomic_fetch_add( &nspa_lf_disp_rej_directory, 1, __ATOMIC_RELAXED ); return FALSE; }
+    if (options & FILE_DELETE_ON_CLOSE)
+    { __atomic_fetch_add( &nspa_lf_disp_rej_delete_on_close, 1, __ATOMIC_RELAXED ); return FALSE; }
+    if (!(options & (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT)))
+    { __atomic_fetch_add( &nspa_lf_disp_rej_async, 1, __ATOMIC_RELAXED ); return FALSE; }
+    if (access & ~NSPA_LF_STD_READ_ACCESS)
+    { __atomic_fetch_add( &nspa_lf_disp_rej_access, 1, __ATOMIC_RELAXED ); return FALSE; }
+    __atomic_fetch_add( &nspa_lf_disp_attempted, 1, __ATOMIC_RELAXED );
+    return TRUE;
+}
+
+/* Categorise the outcome of a try_bypass call. */
+void nspa_local_file_disp_count_outcome( NTSTATUS status )
+{
+    if (status == STATUS_SUCCESS)
+        __atomic_fetch_add( &nspa_lf_disp_bypass_success, 1, __ATOMIC_RELAXED );
+    else if (status == STATUS_SHARING_VIOLATION)
+        __atomic_fetch_add( &nspa_lf_disp_bypass_sharing, 1, __ATOMIC_RELAXED );
+    else
+        __atomic_fetch_add( &nspa_lf_disp_bypass_not_supported, 1, __ATOMIC_RELAXED );
+}
+
 static void nspa_lf_diag_dump( void )
 {
     char path[128];
@@ -376,7 +446,7 @@ static void nspa_lf_diag_dump( void )
     fprintf(f, "  top_calls                       %llu\n", top);
     fprintf(f, "  >>> ELIGIBLE_FOR_BYPASS         %llu  (%.1f%% of top_calls)\n", elig,
             top ? 100.0 * (double)elig / (double)top : 0.0);
-    fprintf(f, "\n[ineligibility breakdown]\n");
+    fprintf(f, "\n[ineligibility breakdown — categorize() criteria, may differ from dispatch]\n");
     fprintf(f, "  no_attr                         %llu\n", noa);
     fprintf(f, "  rootdir                         %llu\n", rd);
     fprintf(f, "  security_descriptor             %llu\n", sd);
@@ -387,6 +457,40 @@ static void nspa_lf_diag_dump( void )
     fprintf(f, "  open_reparse_point              %llu\n", rp);
     fprintf(f, "  write_or_special_access         %llu\n", wa);
     fprintf(f, "  other_disqualifying_options     %llu\n", oo);
+
+    /* Dispatch-site breakdown — accurate to file.c:NtCreateFile filter.
+     * These are what actually rejected each open from the bypass. */
+    {
+        unsigned long long dl  = __atomic_load_n( &nspa_lf_disp_rej_loader,         __ATOMIC_RELAXED );
+        unsigned long long drd = __atomic_load_n( &nspa_lf_disp_rej_rootdir,        __ATOMIC_RELAXED );
+        unsigned long long dsd = __atomic_load_n( &nspa_lf_disp_rej_secdesc,        __ATOMIC_RELAXED );
+        unsigned long long ddi = __atomic_load_n( &nspa_lf_disp_rej_disposition,    __ATOMIC_RELAXED );
+        unsigned long long dob = __atomic_load_n( &nspa_lf_disp_rej_open_by_id,     __ATOMIC_RELAXED );
+        unsigned long long ddr = __atomic_load_n( &nspa_lf_disp_rej_directory,      __ATOMIC_RELAXED );
+        unsigned long long ddc = __atomic_load_n( &nspa_lf_disp_rej_delete_on_close,__ATOMIC_RELAXED );
+        unsigned long long das = __atomic_load_n( &nspa_lf_disp_rej_async,          __ATOMIC_RELAXED );
+        unsigned long long dac = __atomic_load_n( &nspa_lf_disp_rej_access,         __ATOMIC_RELAXED );
+        unsigned long long dat = __atomic_load_n( &nspa_lf_disp_attempted,          __ATOMIC_RELAXED );
+        unsigned long long dbs = __atomic_load_n( &nspa_lf_disp_bypass_success,     __ATOMIC_RELAXED );
+        unsigned long long dbn = __atomic_load_n( &nspa_lf_disp_bypass_not_supported, __ATOMIC_RELAXED );
+        unsigned long long dbv = __atomic_load_n( &nspa_lf_disp_bypass_sharing,     __ATOMIC_RELAXED );
+        unsigned long long total_rej = dl + drd + dsd + ddi + dob + ddr + ddc + das + dac;
+        fprintf(f, "\n[dispatch site breakdown — accurate to file.c filter]\n");
+        fprintf(f, "  rejected: loader (.dll/.drv/.sys/.exe) %llu\n", dl);
+        fprintf(f, "  rejected: RootDirectory                %llu\n", drd);
+        fprintf(f, "  rejected: SecurityDescriptor           %llu\n", dsd);
+        fprintf(f, "  rejected: disposition (not OPEN/OPEN_IF)%llu\n", ddi);
+        fprintf(f, "  rejected: FILE_OPEN_BY_FILE_ID         %llu\n", dob);
+        fprintf(f, "  rejected: FILE_DIRECTORY_FILE          %llu\n", ddr);
+        fprintf(f, "  rejected: FILE_DELETE_ON_CLOSE         %llu\n", ddc);
+        fprintf(f, "  rejected: async (no FILE_SYNCHRONOUS_*)%llu\n", das);
+        fprintf(f, "  rejected: non-read access bits         %llu\n", dac);
+        fprintf(f, "  total rejections                       %llu\n", total_rej);
+        fprintf(f, "  attempted bypass                       %llu\n", dat);
+        fprintf(f, "    -> success                           %llu\n", dbs);
+        fprintf(f, "    -> sharing violation                 %llu\n", dbv);
+        fprintf(f, "    -> not supported (fall back)         %llu\n", dbn);
+    }
 
     /* Slice 1A.1.c verification — show shared-table state from this
      * client's view.  Counts populated slots so we can confirm server

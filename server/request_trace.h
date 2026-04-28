@@ -1487,6 +1487,7 @@ static void dump_get_message_reply( const struct get_message_reply *req )
     fprintf( stderr, ", time=%08x", req->time );
     fprintf( stderr, ", nspa_sender_tid=%08x", req->nspa_sender_tid );
     fprintf( stderr, ", nspa_reply_slot=%08x", req->nspa_reply_slot );
+    fprintf( stderr, ", nspa_reply_gen=%08x", req->nspa_reply_gen );
     fprintf( stderr, ", total=%u", req->total );
     dump_varargs_message_data( ", data=", cur_size );
 }

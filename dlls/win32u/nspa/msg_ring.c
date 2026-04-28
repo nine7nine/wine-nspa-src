@@ -831,6 +831,7 @@ BOOL nspa_try_post_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
     slot->sender_tid  = HandleToULong( NtCurrentTeb()->ClientId.UniqueThread );
     slot->sender_pid  = HandleToULong( NtCurrentTeb()->ClientId.UniqueProcess );
     slot->reply_slot  = ~0u;        /* posted = no reply expected */
+    slot->reply_gen   = 0;          /* MR1: no reply, no generation guard */
     slot->data_size   = 0;
 
     /* Publish queue-visible pending state before making the slot READY.
@@ -851,8 +852,32 @@ BOOL nspa_try_post_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
     if (status) status = NtSetEvent( entry->sync_handle, NULL );
     if (status)
     {
+        /* MR4 fix: both signal paths failed.  The slot is published READY
+         * but no wake reached the receiver — if the receiver is idle on
+         * its queue->sync, this message could be lost indefinitely.
+         * Try to roll back the slot (CAS READY -> EMPTY); if rollback
+         * succeeds the receiver never saw it and the caller falls back
+         * to the authoritative server post path.  If rollback fails the
+         * consumer has already CAS-claimed the slot, so the message WILL
+         * be delivered (consumer drives forward progress) — keep the
+         * post-acceptance shape in that case. */
+        unsigned int expected = NSPA_MSG_STATE_READY;
+        BOOL rolled_back = __atomic_compare_exchange_n( &slot->state, &expected,
+                                                        NSPA_MSG_STATE_EMPTY, 0,
+                                                        __ATOMIC_ACQ_REL,
+                                                        __ATOMIC_RELAXED );
         nspa_clear_cache_entry( entry );
-        WARN( "failed to signal bypass queue %u\n", dest_tid );
+        WARN( "failed to signal bypass queue %u (rolled_back=%d)\n", dest_tid, rolled_back );
+        if (rolled_back)
+        {
+            /* Pair with the pending_count++ above so counters remain
+             * consistent after rollback.  change_seq is left advanced —
+             * a spurious advance just causes consumers to scan once and
+             * find nothing, which is benign. */
+            __atomic_fetch_sub( &ring->pending_count, 1, __ATOMIC_ACQ_REL );
+            nspa_post_diag_bump( POST_REJ_RING_INACTIVE );
+            return FALSE;   /* caller falls back to server post_message */
+        }
     }
     TRACE_(nspa_bypass)( "post tid=%04x dest=%04x hwnd=%p msg=%04x wp=%lx lp=%lx\n",
                          HandleToULong(NtCurrentTeb()->ClientId.UniqueThread),
@@ -1069,7 +1094,8 @@ BOOL nspa_try_pop_own_ring_send( HWND filter_hwnd, UINT first, UINT last,
                                  UINT *type_out, UINT *msg_out,
                                  WPARAM *wp_out, LPARAM *lp_out,
                                  DWORD *time_out, UINT *sender_tid_out,
-                                 UINT *reply_slot_out, HWND *win_out )
+                                 UINT *reply_slot_out, UINT *reply_gen_out,
+                                 HWND *win_out )
 {
     const nspa_queue_bypass_shm_t *own = nspa_get_own_bypass_shm_public();
     volatile nspa_msg_ring_t *ring;
@@ -1125,6 +1151,7 @@ BOOL nspa_try_pop_own_ring_send( HWND filter_hwnd, UINT first, UINT last,
         *time_out       = slot->time;
         *sender_tid_out = slot->sender_tid;
         *reply_slot_out = slot->reply_slot;
+        *reply_gen_out  = slot->reply_gen;   /* MR1 ABA guard: pass through to nspa_write_ring_reply */
         *win_out        = wine_server_ptr_handle( slot->win );
 
         __atomic_fetch_sub( &ring->pending_count, 1, __ATOMIC_ACQ_REL );
@@ -1246,6 +1273,7 @@ BOOL nspa_try_pop_own_ring_post( HWND filter_hwnd, UINT first, UINT last,
  * Returns TRUE if the reply was delivered; FALSE means the caller
  * should fall back to the server reply_message path. */
 BOOL nspa_write_ring_reply( DWORD sender_tid, UINT reply_slot_idx,
+                            UINT expected_gen,
                             LRESULT result, const void *data, UINT data_size )
 {
     struct nspa_cache_entry *entry;
@@ -1279,14 +1307,27 @@ BOOL nspa_write_ring_reply( DWORD sender_tid, UINT reply_slot_idx,
 
     slot = &((nspa_queue_bypass_shm_t *)bypass)->nspa_reply_ring.slots[reply_slot_idx];
 
-    /* Guard: only write if slot is PENDING — a FREE/READY slot means the
-     * sender already timed out or a stale reply; dropping is the right thing. */
+    /* MR1 ABA guard: the original sender may have timed out (PENDING -> FREE)
+     * and another sender on the same thread may have re-reserved this slot
+     * (FREE -> PENDING with generation++).  Capture the slot generation BEFORE
+     * the state check; if it doesn't match what the sender stamped at SEND
+     * time, drop the reply silently rather than misdelivering an LRESULT to
+     * the wrong sender.  expected_gen == 0 means the caller didn't track
+     * generation (legacy callers / pre-stamping path) — fall back to
+     * state-only check for compatibility. */
     {
+        unsigned int slot_gen = __atomic_load_n( &slot->generation, __ATOMIC_ACQUIRE );
         unsigned int state = __atomic_load_n( &slot->state, __ATOMIC_ACQUIRE );
         if (state != NSPA_REPLY_STATE_PENDING)
         {
             TRACE_(nspa_bypass)( "reply drop stale-slot sender=%04x slot=%u state=%u\n",
                                  (UINT)sender_tid, reply_slot_idx, state );
+            return FALSE;
+        }
+        if (expected_gen && slot_gen != expected_gen)
+        {
+            TRACE_(nspa_bypass)( "reply drop ABA-gen-mismatch sender=%04x slot=%u expected=%u got=%u\n",
+                                 (UINT)sender_tid, reply_slot_idx, expected_gen, slot_gen );
             return FALSE;
         }
     }
@@ -1300,8 +1341,13 @@ BOOL nspa_write_ring_reply( DWORD sender_tid, UINT reply_slot_idx,
 
     /* Wake the sender's targeted futex on slot->state.  Sender's wait loop
      * uses futex_wait directly on the reply slot value so it sees this
-     * exact transition with no false wakes from unrelated queue traffic. */
-    syscall( SYS_futex, (void *)&slot->state, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0 );
+     * exact transition with no false wakes from unrelated queue traffic.
+     *
+     * MR2: must NOT use FUTEX_WAKE_PRIVATE — slot lives in a MAP_SHARED
+     * memfd, so the sender may be in a different process.  _PRIVATE
+     * hashes the futex key per-mm, so cross-process wakes would never
+     * match the waiter.  Plain FUTEX_WAKE uses the global hash. */
+    syscall( SYS_futex, (void *)&slot->state, FUTEX_WAKE, 1, NULL, NULL, 0 );
 
     /* Also kick the queue->sync ntsync event for any waiter that came in
      * via the legacy queue-wide path (e.g. wait_message_reply on a server-
@@ -1335,6 +1381,7 @@ BOOL nspa_try_send_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
     HANDLE own_sync = NULL;
     unsigned int msg_idx;
     unsigned int reply_idx = ~0u;
+    unsigned int reply_gen = 0;     /* MR1: captured post-generation++; passed in slot */
     NTSTATUS status;
     DWORD own_tid;
     BOOL is_notify;
@@ -1462,7 +1509,11 @@ BOOL nspa_try_send_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
         reply_slot->result    = 0;
         reply_slot->error     = 0;
         reply_slot->data_size = 0;
-        reply_slot->generation++;   /* discriminates against stale writebacks */
+        /* MR1: bump generation under release ordering and capture the
+         * post-bump value to stamp into the message slot.  Receiver
+         * (nspa_write_ring_reply) checks this against the live
+         * slot->generation before writing the reply. */
+        reply_gen = __atomic_add_fetch( &reply_slot->generation, 1, __ATOMIC_RELEASE );
     }
 
     msg_idx = ring_reserve_slot( ring );
@@ -1490,6 +1541,7 @@ BOOL nspa_try_send_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
     slot->sender_tid = own_tid;
     slot->sender_pid = HandleToULong( NtCurrentTeb()->ClientId.UniqueProcess );
     slot->reply_slot = is_notify ? ~0u : reply_idx;
+    slot->reply_gen  = is_notify ? 0    : reply_gen;   /* MR1 ABA guard */
     slot->data_size  = 0;
 
     __atomic_fetch_add( &ring->pending_count, 1, __ATOMIC_ACQ_REL );
@@ -1555,11 +1607,16 @@ BOOL nspa_try_send_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
         if (state == NSPA_REPLY_STATE_READY) break;
         /* futex_wait returns immediately with EAGAIN if state has already
          * changed from PENDING (the receiver beat us to the wait), so no
-         * lost-wake race vs. the WAKE on the receiver side. */
+         * lost-wake race vs. the WAKE on the receiver side.
+         *
+         * MR2: must NOT use FUTEX_WAIT_PRIVATE — see receiver-side note in
+         * nspa_write_ring_reply.  Plain FUTEX_WAIT uses the global hash so
+         * cross-process wakes match correctly.  Same-process waits are
+         * marginally slower but correct. */
         rel.tv_sec  = 0;
         rel.tv_nsec = 10 * 1000 * 1000;  /* 10 ms */
         ret = syscall( SYS_futex, (void *)&reply_slot->state,
-                       FUTEX_WAIT_PRIVATE, NSPA_REPLY_STATE_PENDING,
+                       FUTEX_WAIT, NSPA_REPLY_STATE_PENDING,
                        &rel, NULL, 0 );
         (void)ret;  /* EAGAIN / ETIMEDOUT / 0 / EINTR all loop back to recheck */
         waits++;

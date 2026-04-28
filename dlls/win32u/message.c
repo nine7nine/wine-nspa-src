@@ -106,10 +106,14 @@ struct received_message_info
     struct received_message_info *prev;
     /* NSPA: populated when this message came from a shmem-ring SEND slot so
      * reply_message() can write the result back via the ring instead of
-     * calling the server.  Both fields zero when the message came from the
-     * legacy server-side SEND_MESSAGE list. */
+     * calling the server.  Zero when the message came from the legacy
+     * server-side SEND_MESSAGE list.
+     * nspa_reply_gen carries the sender's reply_slot->generation at SEND
+     * time (MR1 ABA guard); receiver passes it to nspa_write_ring_reply
+     * which writes only if the slot's current generation still matches. */
     DWORD nspa_sender_tid;
     UINT  nspa_reply_slot;
+    UINT  nspa_reply_gen;
 };
 
 struct packed_hook_extra_info
@@ -2124,6 +2128,7 @@ static void reply_message( struct received_message_info *info, LRESULT result, M
     if (info->nspa_sender_tid && remove)
     {
         if (nspa_write_ring_reply( info->nspa_sender_tid, info->nspa_reply_slot,
+                                   info->nspa_reply_gen,
                                    result, NULL, 0 ))
             return;
         /* On failure fall through to server reply_message — the slot may
@@ -3045,7 +3050,7 @@ static int peek_message( MSG *msg, const struct peek_message_filter *filter )
             /* Phase 4.6: pop a ring SEND locally before issuing the
              * wineserver get_message request.  Avoids a server RTT per
              * SEND dispatch — the hot path for synchronous bypass. */
-            UINT pop_type, pop_msg, pop_sender, pop_slot;
+            UINT pop_type, pop_msg, pop_sender, pop_slot, pop_gen;
             DWORD pop_time;
             WPARAM pop_wp;
             LPARAM pop_lp;
@@ -3055,7 +3060,8 @@ static int peek_message( MSG *msg, const struct peek_message_filter *filter )
                                                       &pop_type, &pop_msg,
                                                       &pop_wp, &pop_lp,
                                                       &pop_time, &pop_sender,
-                                                      &pop_slot, &pop_win );
+                                                      &pop_slot, &pop_gen,
+                                                      &pop_win );
             /* NSPA Phase B: if no SEND was popped and the filter admits
              * WM_TIMER, try the local-dispatcher timer ring before
              * falling through to the wineserver get_message RTT. */
@@ -3122,6 +3128,7 @@ static int peek_message( MSG *msg, const struct peek_message_filter *filter )
                 info.msg.pt.y         = 0;
                 info.nspa_sender_tid  = pop_sender;
                 info.nspa_reply_slot  = pop_slot;
+                info.nspa_reply_gen   = pop_gen;
                 hw_id                 = 0;
             }
             else SERVER_START_REQ( get_message )
@@ -3148,6 +3155,7 @@ static int peek_message( MSG *msg, const struct peek_message_filter *filter )
                     info.msg.pt.y         = reply->y;
                     info.nspa_sender_tid  = reply->nspa_sender_tid;
                     info.nspa_reply_slot  = reply->nspa_reply_slot;
+                    info.nspa_reply_gen   = reply->nspa_reply_gen;
                     hw_id                 = 0;
                 }
                 else buffer_size = reply->total;

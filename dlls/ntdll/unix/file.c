@@ -4702,21 +4702,19 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
                 loader_open = TRUE;
         }
 
-        if (!loader_open &&
-            !attr->RootDirectory && !attr->SecurityDescriptor &&
-            (disposition == FILE_OPEN || disposition == FILE_OPEN_IF) &&
-            !(options & (FILE_OPEN_BY_FILE_ID | FILE_DIRECTORY_FILE | FILE_DELETE_ON_CLOSE)) &&
-            /* Only synchronous opens — async (OVERLAPPED) reads route through
-             * register_async_file_read which sends the handle to the server;
-             * local-range handles can't ride that path.  Non-audio-hot, let
-             * the server path handle them. */
-            (options & (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT)) &&
-            !(access & ~(FILE_READ_DATA | FILE_READ_ATTRIBUTES | FILE_READ_EA |
-                         READ_CONTROL | SYNCHRONIZE | GENERIC_READ)))
+        /* nspa_local_file_disp_categorize: single source of truth for the
+         * dispatch eligibility filter.  Bumps per-criterion rejection
+         * counters (visible in the NSPA_SEND_DIAG=1 dump) and returns TRUE
+         * iff the open should attempt the bypass.  Order of criteria
+         * preserved from the previous inlined if-chain — async opens
+         * route through register_async_file_read which can't take local
+         * handles, so they're rejected here. */
+        if (nspa_local_file_disp_categorize( loader_open, attr, access, disposition, options ))
         {
             NTSTATUS bypass = nspa_local_file_try_bypass( handle, unix_name, attr->ObjectName,
                                                           access, sharing, options,
                                                           attr->Attributes, io );
+            nspa_local_file_disp_count_outcome( bypass );
             if (bypass == STATUS_SUCCESS)
             {
                 free( unix_name );

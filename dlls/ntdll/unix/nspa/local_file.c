@@ -138,6 +138,9 @@ static unsigned long long       nspa_lf_tb_rej_publish_overflow; /* check_and_pu
 static unsigned long long       nspa_lf_tb_rej_open_fail;      /* open() syscall failed */
 static unsigned long long       nspa_lf_tb_rej_alloc_handle;   /* handle range exhausted */
 static unsigned long long       nspa_lf_tb_rej_table_add;      /* table_add failed */
+/* Directory bypass success counter — distinct from nspa_lf_bypass_minted
+ * which counts regular-file mints. */
+static unsigned long long       nspa_lf_dir_minted;
 
 static void nspa_lf_table_open_once_fn( void )
 {
@@ -588,6 +591,8 @@ static void nspa_lf_diag_dump( void )
             unsigned long long uf = __atomic_load_n( &nspa_lf_get_unix_fd_intercepts, __ATOMIC_RELAXED );
             fprintf(f, "\n[client intercepts]\n");
             fprintf(f, "  NtCreateFile_minted             %llu\n", bm);
+            fprintf(f, "  NtCreateFile_dir_minted         %llu  (S_ISDIR via NSPA_ENABLE_LOCAL_DIR)\n",
+                    __atomic_load_n( &nspa_lf_dir_minted, __ATOMIC_RELAXED ));
             fprintf(f, "  NtClose_local                   %llu\n", ci);
             fprintf(f, "  NtCreateSection_promote         %llu (ok=%llu fail=%llu)\n", si, sok, sf);
             fprintf(f, "  server_get_unix_fd_local        %llu\n", uf);
@@ -674,6 +679,15 @@ struct nspa_local_open
     unsigned int      sharing;
     unsigned int      options;           /* FILE_OPEN options the app passed (FILE_SYNCHRONOUS_IO_NONALERT etc) */
     unsigned int      attributes;        /* ObjectAttributes->Attributes (OBJ_INHERIT etc) — forwarded on lazy promote */
+    /* server_fd_type for this fd — FD_TYPE_FILE for regular files,
+     * FD_TYPE_DIR for directories (directory bypass).  Returned by
+     * nspa_local_file_try_get_unix_fd() so callers like
+     * nt_to_unix_file_name_with_root() get the correct device-type
+     * classification.  Without this, a directory handle returned via
+     * the bypass would be classified as FD_TYPE_FILE and rejected
+     * with STATUS_BAD_DEVICE_TYPE at file.c:3859 — breaking every
+     * relative-path NtCreateFile that uses the dir as RootDirectory. */
+    enum server_fd_type kind;
     /* Original NT path captured at try_bypass time.  Sent to the server
      * on lazy promotion so the promoted struct fd carries fd->nt_name —
      * required by GetFinalPathNameByHandle / FileNameInformation queries
@@ -946,12 +960,15 @@ void nspa_local_file_publish_close( unsigned long long device, unsigned long lon
 }
 
 /* Add an open to the per-process file table.  Used by NtCreateFile
- * bypass dispatch in Phase 1A.2.d after a successful publish_open. */
+ * bypass dispatch in Phase 1A.2.d after a successful publish_open.
+ * `kind` distinguishes regular files from directories (added 2026-04-28
+ * for directory bypass — see struct nspa_local_open's kind field). */
 NTSTATUS nspa_local_file_table_add( HANDLE handle, int unix_fd,
                                     unsigned long long device, unsigned long long inode,
                                     unsigned int access, unsigned int sharing,
                                     unsigned int options,
                                     unsigned int attributes,
+                                    enum server_fd_type kind,
                                     const UNICODE_STRING *nt_name )
 {
     struct nspa_local_open *o = malloc( sizeof(*o) );
@@ -965,6 +982,7 @@ NTSTATUS nspa_local_file_table_add( HANDLE handle, int unix_fd,
     o->sharing       = sharing;
     o->options       = options;
     o->attributes    = attributes;
+    o->kind          = kind;
     o->nt_name       = NULL;
     o->nt_name_len   = 0;
     if (nt_name && nt_name->Buffer && nt_name->Length)
@@ -1036,7 +1054,8 @@ int nspa_local_file_table_lookup_unix_fd( HANDLE handle )
  * this, options=0 makes those functions treat sync handles (FILE_
  * SYNCHRONOUS_IO_NONALERT — set by the loader and most apps) as async,
  * breaking downstream callers that expect synchronous semantics. */
-int nspa_local_file_table_lookup_full( HANDLE handle, int *unix_fd_out, unsigned int *options_out )
+int nspa_local_file_table_lookup_full( HANDLE handle, int *unix_fd_out, unsigned int *options_out,
+                                       enum server_fd_type *kind_out )
 {
     struct nspa_local_open *o;
     int found = 0;
@@ -1047,6 +1066,7 @@ int nspa_local_file_table_lookup_full( HANDLE handle, int *unix_fd_out, unsigned
         {
             if (unix_fd_out) *unix_fd_out = o->unix_fd;
             if (options_out) *options_out = o->options;
+            if (kind_out)    *kind_out    = o->kind;
             found = 1;
             break;
         }
@@ -1376,6 +1396,24 @@ static int nspa_local_file_disabled( void )
     return cached;
 }
 
+/* Directory bypass — gated default-OFF.  When enabled, try_bypass also
+ * handles paths that stat() reveals as S_ISDIR.  Requires the kind
+ * plumbing through nspa_local_file_table_add /
+ * nspa_local_file_try_get_unix_fd so server_get_unix_fd correctly
+ * reports FD_TYPE_DIR for directory handles (without that, file.c's
+ * nt_to_unix_file_name_with_root rejects with STATUS_BAD_DEVICE_TYPE
+ * — the failure mode of the 2026-04-28 16:46 attempt). */
+static int nspa_local_dir_enabled( void )
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *v = getenv( "NSPA_ENABLE_LOCAL_DIR" );
+        cached = (v && *v == '1');
+    }
+    return cached;
+}
+
 /* Bypass dispatch.  Returns STATUS_SUCCESS + sets *handle on bypass
  * success (caller skips the regular create_file RPC).  Returns
  * STATUS_NOT_SUPPORTED if bypass is gated off, the file isn't a regular
@@ -1430,6 +1468,67 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
     }
     if (!S_ISREG( st.st_mode ))
     {
+        /* Directory bypass: caller did NtCreateFile on a path that turns
+         * out to be a directory but did NOT pass FILE_DIRECTORY_FILE
+         * (typical pattern: path-existence probes, attribute queries,
+         * or implicit path-resolution opens by Wine's get_nt_and_unix_names
+         * for a relative-path file open).
+         *
+         * Skip sharing arbitration entirely — directories don't have
+         * read/write/share conflicts.  Open with O_RDONLY (Linux permits
+         * this for dirs; only read() syscalls fail on a dir fd —
+         * metadata + relative-path opens via openat() work).
+         *
+         * Critical: register the entry with kind=FD_TYPE_DIR so
+         * nspa_local_file_try_get_unix_fd returns the correct type.
+         * Without this, file.c::nt_to_unix_file_name_with_root sees
+         * type==FD_TYPE_FILE for a dir fd and rejects with
+         * STATUS_BAD_DEVICE_TYPE — the breaking case from the
+         * 2026-04-28 16:46 attempt that broke "can't open files."
+         *
+         * Other operations on the dir handle promote to a server handle
+         * via the existing nspa_local_file_get_or_promote_server_handle
+         * path (already 98% cache hit rate for files; should work for
+         * dirs since the server's nspa_create_file_from_unix_fd is
+         * fd-type agnostic). */
+        if (S_ISDIR( st.st_mode ) && nspa_local_dir_enabled())
+        {
+            unix_fd = open( unix_name, O_RDONLY );
+            if (unix_fd < 0)
+            {
+                __atomic_fetch_add( &nspa_lf_tb_rej_open_fail, 1, __ATOMIC_RELAXED );
+                return STATUS_NOT_SUPPORTED;
+            }
+
+            h = nspa_lf_alloc_handle();
+            if (!h)
+            {
+                __atomic_fetch_add( &nspa_lf_tb_rej_alloc_handle, 1, __ATOMIC_RELAXED );
+                close( unix_fd );
+                return STATUS_NOT_SUPPORTED;
+            }
+
+            status = nspa_local_file_table_add( h, unix_fd,
+                                                (unsigned long long)st.st_dev,
+                                                (unsigned long long)st.st_ino,
+                                                access, sharing, options, attributes,
+                                                FD_TYPE_DIR, nt_name );
+            if (status != STATUS_SUCCESS)
+            {
+                __atomic_fetch_add( &nspa_lf_tb_rej_table_add, 1, __ATOMIC_RELAXED );
+                nspa_lf_free_handle( h );
+                close( unix_fd );
+                return STATUS_NOT_SUPPORTED;
+            }
+
+            *handle = h;
+            if (io) io->Information = FILE_OPENED;
+            __atomic_fetch_add( &nspa_lf_dir_minted, 1, __ATOMIC_RELAXED );
+            NSPA_TRACE( LF_TRACE, "NSPA-LF dir-mint h=%p fd=%d access=%x options=%x path=%s\n",
+                        h, unix_fd, (unsigned)access, (unsigned)options, unix_name );
+            return STATUS_SUCCESS;
+        }
+
         __atomic_fetch_add( &nspa_lf_tb_rej_not_regular, 1, __ATOMIC_RELAXED );
         return STATUS_NOT_SUPPORTED;
     }
@@ -1473,7 +1572,8 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
     status = nspa_local_file_table_add( h, unix_fd,
                                         (unsigned long long)st.st_dev,
                                         (unsigned long long)st.st_ino,
-                                        access, sharing, options, attributes, nt_name );
+                                        access, sharing, options, attributes,
+                                        FD_TYPE_FILE, nt_name );
     if (status != STATUS_SUCCESS)
     {
         __atomic_fetch_add( &nspa_lf_tb_rej_table_add, 1, __ATOMIC_RELAXED );
@@ -1518,10 +1618,11 @@ int nspa_local_file_try_get_unix_fd( HANDLE handle, unsigned int wanted_access,
 {
     int local_fd = -1;
     unsigned int local_options = 0;
+    enum server_fd_type local_kind = FD_TYPE_FILE;
 
     if (!nspa_local_file_is_local_handle( handle )) return STATUS_NOT_SUPPORTED;
 
-    if (!nspa_local_file_table_lookup_full( handle, &local_fd, &local_options ) || local_fd < 0)
+    if (!nspa_local_file_table_lookup_full( handle, &local_fd, &local_options, &local_kind ) || local_fd < 0)
     {
         NSPA_TRACE( LF_TRACE, "NSPA-LF get_unix_fd h=%p NOT-FOUND-IN-TABLE\n", handle );
         return STATUS_INVALID_HANDLE;
@@ -1529,7 +1630,7 @@ int nspa_local_file_try_get_unix_fd( HANDLE handle, unsigned int wanted_access,
 
     *unix_fd = local_fd;
     *needs_close = 0;
-    if (type) *type = FD_TYPE_FILE;
+    if (type) *type = local_kind;   /* FD_TYPE_FILE or FD_TYPE_DIR per stored kind */
     if (options) *options = local_options;
     nspa_local_file_get_unix_fd_intercept_bump();
     NSPA_TRACE( LF_TRACE, "NSPA-LF get_unix_fd h=%p fd=%d wanted=%x\n",

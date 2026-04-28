@@ -686,6 +686,7 @@ DECL_HANDLER(nspa_create_file_from_unix_fd)
     struct unicode_str nt_name;
     int unix_fd;
     unsigned int access;
+    struct stat st;
 
     reply->handle = 0;
 
@@ -709,8 +710,36 @@ DECL_HANDLER(nspa_create_file_from_unix_fd)
      * with STATUS_ACCESS_DENIED. */
     access = map_access( req->access, &file_type.mapping );
 
-    /* Build inode-tracked fd from the inflight unix fd.  Takes
-     * ownership of unix_fd: closes on failure. */
+    /* Directory bypass: distinguish dir vs file via fstat so we route
+     * through create_dir_obj (struct dir) for directories rather than
+     * create_inode_fd_from_unix_fd (which rejects non-regular files at
+     * fd.c:2304 with STATUS_INVALID_PARAMETER).  Skip inode tracking for
+     * dirs — directories don't have read/write/share conflicts that
+     * need check_sharing arbitration. */
+    if (fstat( unix_fd, &st ) == -1)
+    {
+        file_set_error();
+        close( unix_fd );
+        return;
+    }
+
+    if (S_ISDIR( st.st_mode ))
+    {
+        /* Anonymous fd — create_dir_obj re-binds fd_user_ops to dir_fd_ops
+         * and grabs a reference, so we release ours after wrapping. */
+        fd = create_anonymous_fd( NULL, unix_fd, NULL, req->options );
+        if (!fd) return;
+
+        if ((file_obj = create_dir_obj( fd, access, 0 )))
+        {
+            reply->handle = alloc_handle( current->process, file_obj, access, req->attributes );
+            release_object( file_obj );
+        }
+        release_object( fd );
+        return;
+    }
+
+    /* Regular-file path: existing inode-tracked fd. */
     fd = create_inode_fd_from_unix_fd( unix_fd, access, req->sharing,
                                        req->options, nt_name );
     if (!fd) return;

@@ -4670,12 +4670,6 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
 
     *handle = 0;
 
-    /* NSPA local-file diag (Phase 1A.0): categorise this open by bypass
-     * eligibility before any other work, including the NULL-attr guard.
-     * Diag-only — no behaviour change.  See nspa/docs/local-file-bypass-design.md. */
-    nspa_local_file_diag_lazy_start();
-    nspa_local_file_diag_categorize( attr, access, sharing, disposition, options );
-
     if (!attr || !attr->ObjectName) return STATUS_INVALID_PARAMETER;
 
     if (alloc_size) FIXME( "alloc_size not supported\n" );
@@ -4721,10 +4715,7 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
          * the server create_file RPC.  Returns STATUS_SUCCESS on bypass
          * (handle minted from local range), STATUS_SHARING_VIOLATION on
          * a real conflict (propagate), or STATUS_NOT_SUPPORTED to fall
-         * back to the existing server path.  Eligibility filter mirrors
-         * nspa_local_file_diag_categorize. */
-        /* Phase 1A.6 debug: broader eligibility re-enabled with stderr
-         * trace to find the unhooked op that breaks .als loads. */
+         * back to the existing server path. */
         BOOL loader_open = FALSE;
         if (attr->ObjectName && attr->ObjectName->Length >= 4 * sizeof(WCHAR))
         {
@@ -4740,18 +4731,15 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
         }
 
         /* nspa_local_file_disp_categorize: single source of truth for the
-         * dispatch eligibility filter.  Bumps per-criterion rejection
-         * counters (visible in the NSPA_SEND_DIAG=1 dump) and returns TRUE
-         * iff the open should attempt the bypass.  Order of criteria
-         * preserved from the previous inlined if-chain — async opens
-         * route through register_async_file_read which can't take local
-         * handles, so they're rejected here. */
+         * dispatch eligibility filter.  Returns TRUE iff the open should
+         * attempt the bypass.  Async opens route through
+         * register_async_file_read which can't take local handles, so
+         * they're rejected here. */
         if (nspa_local_file_disp_categorize( loader_open, attr, access, disposition, options ))
         {
             NTSTATUS bypass = nspa_local_file_try_bypass( handle, unix_name, attr->ObjectName,
                                                           access, sharing, options,
                                                           attr->Attributes, io );
-            nspa_local_file_disp_count_outcome( bypass );
             if (bypass == STATUS_SUCCESS)
             {
                 free( unix_name );

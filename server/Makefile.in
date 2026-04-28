@@ -33,6 +33,8 @@ SOURCES = \
 	nspa/local_file.c \
 	nspa/local_file.h \
 	nspa/profile.c \
+	nspa/range_publish.c \
+	nspa/range_publish.h \
 	nspa/rpc_state.c \
 	nspa/rpc_state.h \
 	nspa/rt.c \

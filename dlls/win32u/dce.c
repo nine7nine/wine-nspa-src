@@ -1630,17 +1630,24 @@ static int nspa_paint_diag_enabled( void )
 
 static int nspa_paint_fastpath_disabled( void )
 {
-    /* DEFAULT-OFF.  The 2026-04-26 default-on flip was reverted same
-     * day after Ableton reproducibly locked up in userspace ~5 min
-     * into a session with paint-cache enabled (kernel never faulted;
-     * pure userspace deadlock).  The earlier "B1.0 exonerated" claim
-     * was based on a workload that didn't hit the trigger.  Set
-     * NSPA_ENABLE_PAINT_CACHE=1 to opt in for testing. */
+    /* DEFAULT-ON since 2026-04-28.  The 2026-04-26 default-on flip
+     * had been reverted same day after Ableton reproducibly locked
+     * up in userspace ~5 min into a session with paint-cache
+     * enabled.  The MR1 (reply-slot ABA) + MR4 (POST wake-loss CAS
+     * rollback) fixes shipped 2026-04-27 in msg_ring.c resolved the
+     * cascade: paint-cache amplifies the rate of cross-thread sync
+     * sends that depend on accurate reply correlation, and the ABA-
+     * driven misdelivery / dropped-wake combo was the build-up that
+     * reached deadlock at the ~5 min mark.  Validated 2026-04-28
+     * with two clean Ableton sessions, the second with paint-cache=1
+     * past the historical 5-min lockup threshold including drum-
+     * track-load-while-playing.  Set NSPA_ENABLE_PAINT_CACHE=0 to
+     * disable for A/B testing. */
     static int cached = -1;
     if (cached < 0)
     {
         const char *v = getenv( "NSPA_ENABLE_PAINT_CACHE" );
-        cached = !(v && *v == '1');
+        cached = (v && *v == '0');
     }
     return cached;
 }

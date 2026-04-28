@@ -433,6 +433,12 @@ BOOL nspa_local_file_disp_categorize( BOOL loader_open,
                                       ULONG disposition,
                                       ULONG options )
 {
+    /* Lazy-init the inode table on first dispatch.  Previously called
+     * from nspa_local_file_diag_categorize on every NtCreateFile;
+     * moved here so it only fires when actually doing dispatch
+     * eligibility, AND only first call has any cost (pthread_once). */
+    nspa_lf_table_open_lazy();
+
     if (loader_open)
     { NSPA_LF_DIAG_BUMP( nspa_lf_disp_rej_loader ); return FALSE; }
     if (attr && attr->RootDirectory)

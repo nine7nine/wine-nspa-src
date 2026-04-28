@@ -50,7 +50,6 @@
 #include "process.h"
 #include "request.h"
 #include "user.h"
-#include "nspa/range_publish.h"
 
 #define QS_DRIVER       0x80000000
 #define QS_HARDWARE     0x40000000
@@ -1383,16 +1382,8 @@ static void remove_queue_message( struct msg_queue *queue, struct message *msg,
         if (list_empty( &queue->msg_list[kind] )) clear_queue_bits( queue, QS_SENDMESSAGE );
         break;
     case POST_MESSAGE:
-        if (list_empty( &queue->msg_list[kind] ))
-        {
-            /* Empty-PEEK shortcut: publish range BEFORE clear_queue_bits so
-             * cross-process readers see range at-least-as-fresh as the
-             * wake bit.  Independent of quit_message / nspa ring — those
-             * keep QS_POSTMESSAGE set without affecting msg_list contents. */
-            nspa_post_range_publish_empty( queue->nspa_shared );
-            if (!queue->quit_message && !nspa_ring_has_pending_posted( queue ))
-                clear_queue_bits( queue, QS_POSTMESSAGE|QS_ALLPOSTMESSAGE );
-        }
+        if (list_empty( &queue->msg_list[kind] ) && !queue->quit_message && !nspa_ring_has_pending_posted( queue ))
+            clear_queue_bits( queue, QS_POSTMESSAGE|QS_ALLPOSTMESSAGE );
         if (msg->msg == WM_HOTKEY && --queue->hotkey_count == 0)
             clear_queue_bits( queue, QS_HOTKEY );
         break;
@@ -2381,7 +2372,6 @@ found:
     msg->data_size = 0;
 
     list_add_tail( &hotkey->queue->msg_list[POST_MESSAGE], &msg->entry );
-    nspa_post_range_publish_widen( hotkey->queue->nspa_shared, msg->msg );
     set_queue_bits( hotkey->queue, QS_POSTMESSAGE|QS_ALLPOSTMESSAGE|QS_HOTKEY );
     hotkey->queue->hotkey_count++;
     return 1;
@@ -3479,7 +3469,6 @@ void post_message( user_handle_t win, unsigned int message, lparam_t wparam, lpa
         get_message_defaults( thread->queue, &msg->x, &msg->y, &msg->time );
 
         list_add_tail( &thread->queue->msg_list[POST_MESSAGE], &msg->entry );
-        nspa_post_range_publish_widen( thread->queue->nspa_shared, msg->msg );
         set_queue_bits( thread->queue, QS_POSTMESSAGE|QS_ALLPOSTMESSAGE );
         if (message == WM_HOTKEY)
         {
@@ -3858,7 +3847,6 @@ DECL_HANDLER(send_message)
         case MSG_POSTED:
             msg->post_seq = nspa_alloc_post_seq( recv_queue );
             list_add_tail( &recv_queue->msg_list[POST_MESSAGE], &msg->entry );
-            nspa_post_range_publish_widen( recv_queue->nspa_shared, msg->msg );
             set_queue_bits( recv_queue, QS_POSTMESSAGE|QS_ALLPOSTMESSAGE );
             if (msg->msg == WM_HOTKEY)
             {

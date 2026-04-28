@@ -7270,6 +7270,12 @@ NTSTATUS WINAPI NtNotifyChangeDirectoryFile( HANDLE handle, HANDLE event, PIO_AP
     struct async_fileio_read_changes *fileio;
     unsigned int status;
     ULONG size = max( 4096, buffer_size );
+    /* NSPA: promote local-range dir handle so server's read_directory_changes
+     * recognises it.  Ableton's library indexer hits this path to watch
+     * library directories; without promotion the change-notification
+     * watcher hangs and the library tree shows empty entries with a
+     * spinner forever. */
+    HANDLE srv_handle = nspa_promote_if_local( handle );
 
     TRACE( "%p %p %p %p %p %p %u %u %d\n",
            handle, event, apc, apc_context, iosb, buffer, buffer_size, filter, subtree );
@@ -7290,7 +7296,7 @@ NTSTATUS WINAPI NtNotifyChangeDirectoryFile( HANDLE handle, HANDLE event, PIO_AP
         req->filter    = filter;
         req->want_data = (buffer != NULL);
         req->subtree   = subtree;
-        req->async     = server_async( handle, &fileio->io, event, apc, apc_context, iosb_client_ptr(iosb) );
+        req->async     = server_async( srv_handle, &fileio->io, event, apc, apc_context, iosb_client_ptr(iosb) );
         status = wine_server_call( req );
     }
     SERVER_END_REQ;

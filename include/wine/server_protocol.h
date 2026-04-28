@@ -1186,6 +1186,32 @@ typedef volatile struct
     nspa_redraw_slot_t     slots[NSPA_REDRAW_RING_SLOTS];
 } nspa_redraw_ring_t;
 
+/* NSPA empty-PEEK shortcut: per-class deliverable msg-id range published
+ * by the server after every legacy-queue mutation.  Client check_queue_bits
+ * reads (min, max) under seqlock; if the caller's [first, last] filter does
+ * not intersect, the wake-bit shortcut treats QS_POSTMESSAGE as clear and
+ * skips the RPC.  Sentinel min > max = class empty.
+ *
+ * Ordering invariant: server publishes range BEFORE setting the
+ * corresponding wake bit on enqueue, and BEFORE clearing the wake bit on
+ * dequeue.  Cross-process clients see range at-least-as-fresh as the
+ * wake-bit they consult; race-window override on the client side handles
+ * the residual case (empty sentinel + bit set = mid-update, RPC).
+ *
+ * Phase 1 covers POST class only.  Hardware (different routing model via
+ * input->msg_list) is a separate plan; class slot is reserved by leaving
+ * NSPA_RANGE_CLASS_COUNT extensible. */
+#define NSPA_RANGE_CLASS_POST     0
+#define NSPA_RANGE_CLASS_COUNT    1
+
+typedef volatile struct
+{
+    unsigned int version;
+    unsigned int min_msg;
+    unsigned int max_msg;
+    unsigned int __pad;
+} nspa_msg_range_t;
+
 typedef volatile struct
 {
     nspa_msg_ring_t      nspa_msg_ring;
@@ -1195,6 +1221,7 @@ typedef volatile struct
     nspa_hook_chain_t    nspa_hook_chains[NB_HOOKS];
     unsigned char        nspa_hook_module_pool[NSPA_HOOK_MODULE_POOL];
     nspa_redraw_ring_t   nspa_redraw_ring;
+    nspa_msg_range_t     nspa_msg_ranges[NSPA_RANGE_CLASS_COUNT];
 } nspa_queue_bypass_shm_t;
 
 /* NSPA local-file bypass — Phase 1A.2 shared inode aggregation table
@@ -7730,6 +7757,6 @@ union generic_reply
     struct nspa_irot_enum_running_reply nspa_irot_enum_running_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 955
+#define SERVER_PROTOCOL_VERSION 956
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

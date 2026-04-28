@@ -116,14 +116,6 @@ extern BOOL     nspa_try_pop_own_timer_ring( HWND filter_hwnd, UINT first, UINT 
 extern HANDLE nspa_get_own_server_queue_handle( void );
 extern void   nspa_process_sent_messages( void );
 
-/* nspa/range_filter.c — empty-PEEK shortcut.  Returns TRUE iff the
- * published msg-id range for the POST class definitively excludes the
- * caller's [first, last] filter; FALSE on uncertain (race window,
- * empty sentinel with bit set, retry exhausted) — caller continues to
- * the existing wake-bit RPC path. */
-extern BOOL nspa_post_range_excludes_filter( const nspa_queue_bypass_shm_t *bypass,
-                                             UINT first, UINT last );
-
 /* cursoricon.c */
 extern BOOL process_wine_setcursor( HWND hwnd, HWND window, HCURSOR handle );
 extern HICON alloc_cursoricon_handle( BOOL is_icon );

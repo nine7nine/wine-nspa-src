@@ -1043,7 +1043,10 @@ typedef volatile struct
     unsigned int  sender_pid;
     unsigned int  reply_slot;
     unsigned int  data_size;
-    unsigned int  __pad;
+    unsigned int  reply_gen;        /* sender's reply_slot->generation at SEND time;
+                                     * MR1 ABA guard — receiver passes through to
+                                     * nspa_write_ring_reply, which writes only if
+                                     * the reply slot's current generation matches. */
     unsigned char data[NSPA_MSG_INLINE_MAX];
 } nspa_msg_slot_t;
 
@@ -3428,9 +3431,9 @@ struct get_message_reply
     unsigned int    time;
     unsigned int    nspa_sender_tid;
     unsigned int    nspa_reply_slot;
+    unsigned int    nspa_reply_gen;
     data_size_t     total;
     /* VARARG(data,message_data); */
-    char __pad_60[4];
 };
 
 
@@ -7727,6 +7730,6 @@ union generic_reply
     struct nspa_irot_enum_running_reply nspa_irot_enum_running_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 954
+#define SERVER_PROTOCOL_VERSION 955
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

@@ -1476,6 +1476,7 @@ static void receive_message( struct msg_queue *queue, struct message *msg,
     reply->time   = msg->time;
     reply->nspa_sender_tid = 0;
     reply->nspa_reply_slot = 0;
+    reply->nspa_reply_gen  = 0;
 
     if (msg->data) set_reply_data_ptr( msg->data, msg->data_size );
 
@@ -1681,16 +1682,20 @@ static int return_nspa_ring_message( struct msg_queue *queue, struct nspa_posted
 
     /* Reply routing for SEND slots: populate sender_tid + reply slot index
      * so the client's reply_message() can write back via the ring instead
-     * of through the server. */
+     * of through the server.  reply_gen is the MR1 ABA guard — receiver
+     * passes it to nspa_write_ring_reply, which writes only if the live
+     * slot generation still matches. */
     if (is_send)
     {
         reply->nspa_sender_tid = slot->sender_tid;
         reply->nspa_reply_slot = slot->reply_slot;
+        reply->nspa_reply_gen  = slot->reply_gen;
     }
     else
     {
         reply->nspa_sender_tid = 0;
         reply->nspa_reply_slot = 0;
+        reply->nspa_reply_gen  = 0;
     }
 
     if (flags & PM_REMOVE) consume_nspa_ring_message( queue, match );
@@ -1737,6 +1742,7 @@ static int get_posted_message( struct msg_queue *queue, user_handle_t win,
     reply->time   = msg->time;
     reply->nspa_sender_tid = 0;
     reply->nspa_reply_slot = 0;
+    reply->nspa_reply_gen  = 0;
 
     if (flags & PM_REMOVE)
     {

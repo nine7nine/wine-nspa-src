@@ -21,8 +21,23 @@ LDFLAGS=${LDFLAGS:--lpthread}
 
 NATIVE_TESTS=(
     test-event-set-pi
-    test-cross-boost
     test-channel-recv-exclusive
+)
+
+# Tests skipped by design (assert ntsync 1007 behaviour we rolled back —
+# 1007-1011 didn't fix the EVENT_SET_PI slab UAF and were unstable):
+#   test-cross-boost           — asserts 1007 cross-boost cleanup
+#   test-wait-rejects-channel  — asserts 1007 channel-reject in setup_wait
+# Re-enable only if a future ntsync change makes these invariants real.
+#
+# test-channel-recv-exclusive is KEPT — even though it was originally
+# written as a 1007 exclusive-recv assertion, on the post-1006 baseline
+# it deterministically hangs in ntsync_obj_ioctl, which appears to
+# reproduce the kernel-side channel bug behind production gamma-
+# dispatcher lockups (Phase B, msg-ring v2 B1.0).  Treat as a
+# regression repro for the channel hang, not as a 1007 assertion.
+SKIPPED_BY_DESIGN=(
+    test-cross-boost
     test-wait-rejects-channel
 )
 
@@ -62,6 +77,9 @@ run_native() {
     if [[ ! -r /dev/ntsync ]]; then
         echo "  $(red FATAL): /dev/ntsync not readable — check perms or run with sudo"
         return 1
+    fi
+    if [[ ${#SKIPPED_BY_DESIGN[@]} -gt 0 ]]; then
+        echo "  $(yellow "SKIPPED BY DESIGN:") ${SKIPPED_BY_DESIGN[*]}"
     fi
     for t in "${NATIVE_TESTS[@]}"; do
         echo

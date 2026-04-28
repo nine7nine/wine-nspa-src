@@ -171,12 +171,19 @@ int main(void)
         rc = 1;
     }
 
-    /* Cleanup: send a second message so R2 can wake and join. */
+    /* Cleanup: wake any stranded receiver.  Symmetric — on pre-1007
+     * ntsync, wake_up() in SEND_PI is non-exclusive: both R1 and R2 wake,
+     * race for the entry, and the loser goes back to sleep.  Either side
+     * can be the loser, so check BOTH and send a no-prio SEND_PI for
+     * whichever one didn't wake.  Each SEND_PI is synchronous and wakes
+     * exactly one waiter (the recv_wq head). */
+    if (!r1.woke) {
+        struct ntsync_channel_send_args sa = { 0 };
+        ioctl(ch_fd, NTSYNC_IOC_CHANNEL_SEND_PI, &sa);
+    }
     if (!r2.woke) {
-        struct ntsync_channel_send_args sa2 = {
-            .policy = 0, .prio = 0, .payload_off = 0, .reply_off = 0,
-        };
-        ioctl(ch_fd, NTSYNC_IOC_CHANNEL_SEND_PI, &sa2);
+        struct ntsync_channel_send_args sa = { 0 };
+        ioctl(ch_fd, NTSYNC_IOC_CHANNEL_SEND_PI, &sa);
     }
     pthread_join(sender_tid_pt, NULL);
     pthread_join(r1_tid, NULL);

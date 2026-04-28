@@ -2913,7 +2913,8 @@ static BOOL process_hardware_message( MSG *msg, UINT hw_id, const struct hardwar
  * returns FALSE if we need to make a server request to update the queue masks or bits
  */
 static BOOL check_queue_bits( UINT wake_mask, UINT changed_mask, UINT signal_bits, UINT clear_bits,
-                              UINT *wake_bits, UINT *changed_bits, BOOL internal )
+                              UINT *wake_bits, UINT *changed_bits, BOOL internal,
+                              UINT filter_first, UINT filter_last )
 {
     struct object_lock lock = OBJECT_LOCK_INIT;
     const queue_shm_t *queue_shm;
@@ -2970,6 +2971,16 @@ static BOOL check_queue_bits( UINT wake_mask, UINT changed_mask, UINT signal_bit
         }
         wake = queue_shm->wake_bits | ring_bits;
         changed = queue_shm->changed_bits | ring_changed;
+
+        /* NSPA empty-PEEK shortcut: if the published msg-id range for the
+         * legacy POST list definitively excludes [filter_first, filter_last],
+         * mask off QS_POSTMESSAGE so the existing skip logic correctly
+         * returns TRUE for filter-mismatch peeks.  Mask only the
+         * filter-aware bit; QS_ALLPOSTMESSAGE keeps its broader semantic.
+         * Gated inside nspa_post_range_excludes_filter via NSPA_RANGE_FILTER. */
+        if (queue_bypass && (wake & QS_POSTMESSAGE) &&
+            nspa_post_range_excludes_filter( queue_bypass, filter_first, filter_last ))
+            wake &= ~QS_POSTMESSAGE;
 
         if (internal) skip = !(queue_shm->internal_bits & QS_HARDWARE);
         /* if the masks need an update */
@@ -3039,7 +3050,7 @@ static int peek_message( MSG *msg, const struct peek_message_filter *filter )
         wake_mask = filter->mask & (QS_SENDMESSAGE | QS_SMRESULT);
 
         if (check_queue_bits( wake_mask, filter->mask, wake_mask | signal_bits, filter->mask | clear_bits,
-                              &wake_bits, &changed_bits, filter->internal ))
+                              &wake_bits, &changed_bits, filter->internal, first, last ))
             res = STATUS_PENDING;
         else
         {
@@ -3963,7 +3974,7 @@ static void wait_message_reply( UINT flags )
         UINT wake_bits, changed_bits;
 
         if (check_queue_bits( wake_mask, wake_mask, wake_mask, wake_mask,
-                              &wake_bits, &changed_bits, FALSE ))
+                              &wake_bits, &changed_bits, FALSE, 0, ~0u ))
             wake_bits = wake_bits & wake_mask;
         else SERVER_START_REQ( set_queue_mask )
         {

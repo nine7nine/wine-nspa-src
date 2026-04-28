@@ -1059,7 +1059,10 @@ typedef volatile struct
     unsigned int  sender_pid;       /* wineserver process_id of sender */
     unsigned int  reply_slot;       /* index into sender's reply ring, or ~0u if no-reply */
     unsigned int  data_size;        /* bytes used in data[] */
-    unsigned int  __pad;
+    unsigned int  reply_gen;        /* sender's reply_slot->generation at SEND time;
+                                     * MR1 ABA guard — receiver passes through to
+                                     * nspa_write_ring_reply, which writes only if
+                                     * the reply slot's current generation matches. */
     unsigned char data[NSPA_MSG_INLINE_MAX];
 } nspa_msg_slot_t;
 
@@ -2684,6 +2687,7 @@ enum message_type
     unsigned int    time;      /* message time */
     unsigned int    nspa_sender_tid; /* NSPA: ring sender tid (0 if not ring) */
     unsigned int    nspa_reply_slot; /* NSPA: ring reply slot index */
+    unsigned int    nspa_reply_gen;  /* NSPA: reply slot generation at SEND time (MR1 ABA guard) */
     data_size_t     total;     /* total size of extra data */
     VARARG(data,message_data); /* message data for sent messages */
 @END

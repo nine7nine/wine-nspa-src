@@ -69,6 +69,7 @@
 #include <linux/types.h>
 
 /* Local UAPI subset */
+struct ntsync_sem_args { __u32 count; __u32 max; };
 struct ntsync_event_args { __u32 manual; __u32 signaled; };
 struct ntsync_mutex_args { __u32 owner; __u32 count; };
 struct ntsync_wait_args {
@@ -88,12 +89,17 @@ struct ntsync_channel_recv_args {
 };
 struct ntsync_channel_register_thread_args { __u32 tid; __u64 token; };
 
+#define NTSYNC_IOC_CREATE_SEM               _IOW ('N', 0x80, struct ntsync_sem_args)
+#define NTSYNC_IOC_SEM_RELEASE              _IOWR('N', 0x81, __u32)
+#define NTSYNC_IOC_SEM_READ                 _IOR ('N', 0x8b, struct ntsync_sem_args)
 #define NTSYNC_IOC_CREATE_EVENT             _IOW ('N', 0x87, struct ntsync_event_args)
 #define NTSYNC_IOC_CREATE_MUTEX             _IOW ('N', 0x84, struct ntsync_mutex_args)
 #define NTSYNC_IOC_CREATE_CHANNEL           _IOWR('N', 0x90, struct ntsync_channel_create_args)
 #define NTSYNC_IOC_WAIT_ANY                 _IOWR('N', 0x82, struct ntsync_wait_args)
+#define NTSYNC_IOC_WAIT_ALL                 _IOWR('N', 0x83, struct ntsync_wait_args)
 #define NTSYNC_IOC_EVENT_SET                _IOR ('N', 0x88, __u32)
 #define NTSYNC_IOC_EVENT_RESET              _IOR ('N', 0x89, __u32)
+#define NTSYNC_IOC_EVENT_PULSE              _IOR ('N', 0x8a, __u32)
 #define NTSYNC_IOC_EVENT_SET_PI             _IOW ('N', 0x8e, struct ntsync_event_set_pi_args)
 #define NTSYNC_IOC_MUTEX_UNLOCK             _IOWR('N', 0x85, struct ntsync_mutex_args)
 #define NTSYNC_IOC_CHANNEL_SEND_PI          _IOWR('N', 0x91, struct ntsync_channel_send_args)
@@ -113,22 +119,29 @@ static __u64 abs_deadline_ns(__u64 rel_ns)
 
 #define N_EVENTS 4
 #define N_MUTEXES 4
+#define N_SEMS 2
 #define N_UI 3
 #define N_CHAN_SEND 3
 #define N_CHAN_RECV 3
+#define N_SEM_WORKERS 2
+#define N_WAIT_ALL_WORKERS 2
 
 /* Shared */
 static int g_dev_fd;
 static int g_event_fds[N_EVENTS];
 static int g_mutex_fds[N_MUTEXES];
+static int g_sem_fds[N_SEMS];
 static int g_chan_fd;
 static atomic_int g_stop;
 
 /* Op counters */
 static atomic_long c_audio_waits, c_audio_woke, c_audio_boosts;
-static atomic_long c_ui_set_pi, c_ui_set, c_ui_reset, c_ui_mutex_acq, c_ui_mutex_rel;
+static atomic_long c_ui_set_pi, c_ui_set, c_ui_reset, c_ui_pulse;
+static atomic_long c_ui_mutex_acq, c_ui_mutex_rel;
 static atomic_long c_chan_send, c_chan_recv, c_chan_reply;
 static atomic_long c_reg, c_dereg;
+static atomic_long c_sem_release, c_sem_acquire, c_sem_read;
+static atomic_long c_wait_all_acq, c_wait_all_rel;
 static atomic_long c_errors;
 static atomic_long c_shutdown_races;  /* benign races during signal-based shutdown */
 
@@ -214,8 +227,16 @@ static void *ui_signaler_fn(void *arg)
                 atomic_fetch_add_explicit(&c_ui_set, 1, memory_order_relaxed);
             break;
         case 4:
-            if (ioctl(g_event_fds[ev], NTSYNC_IOC_EVENT_RESET, &prev) == 0)
-                atomic_fetch_add_explicit(&c_ui_reset, 1, memory_order_relaxed);
+            /* Bias 50/50 between RESET and PULSE — both exercise event
+             * state transitions but PULSE is the auto-reset variant
+             * (sets, wakes one waiter, resets immediately). */
+            if (rng & 0x10000) {
+                if (ioctl(g_event_fds[ev], NTSYNC_IOC_EVENT_RESET, &prev) == 0)
+                    atomic_fetch_add_explicit(&c_ui_reset, 1, memory_order_relaxed);
+            } else {
+                if (ioctl(g_event_fds[ev], NTSYNC_IOC_EVENT_PULSE, &prev) == 0)
+                    atomic_fetch_add_explicit(&c_ui_pulse, 1, memory_order_relaxed);
+            }
             break;
         case 5: case 6: case 7: { /* mutex acquire+release */
             struct ntsync_wait_args wa;
@@ -321,6 +342,91 @@ static void *registrar_fn(void *arg)
     return NULL;
 }
 
+/* Sem worker: hammer SEM_RELEASE / WAIT_ANY (acquire) / SEM_READ.
+ * Different code path than events/mutexes: count-based, no PI.  Makes
+ * sure the ntsync slab cache for sem_args / wait_args / wq paths
+ * doesn't have UAFs we missed by only stressing events. */
+static void *sem_worker_fn(void *arg)
+{
+    int id = (int)(uintptr_t)arg;
+    unsigned rng = id * 1664525u + 0xa5a5u;
+    while (!atomic_load_explicit(&g_stop, memory_order_relaxed)) {
+        rng = rng * 1664525u + 0xa5a5u;
+        unsigned s = rng % N_SEMS;
+        unsigned op = (rng >> 4) & 3;
+        switch (op) {
+        case 0:
+        case 1: { /* release — bias toward producing tokens */
+            __u32 add = 1 + ((rng >> 8) & 3);
+            __u32 prev;
+            if (ioctl(g_sem_fds[s], NTSYNC_IOC_SEM_RELEASE, &add) == 0)
+                atomic_fetch_add_explicit(&c_sem_release, 1, memory_order_relaxed);
+            else if (errno != EINTR && errno != EOVERFLOW)
+                atomic_fetch_add_explicit(&c_errors, 1, memory_order_relaxed);
+            (void)prev;
+            break;
+        }
+        case 2: { /* acquire (wait_any decrements count) */
+            struct ntsync_wait_args wa;
+            int objs[1] = { g_sem_fds[s] };
+            memset(&wa, 0, sizeof(wa));
+            wa.count = 1; wa.objs = (uintptr_t)objs;
+            wa.owner = gettid_compat();
+            wa.timeout = abs_deadline_ns(20ULL * 1000000ULL);
+            int rc = ioctl(g_dev_fd, NTSYNC_IOC_WAIT_ANY, &wa);
+            if (rc == 0)
+                atomic_fetch_add_explicit(&c_sem_acquire, 1, memory_order_relaxed);
+            else if (errno != EINTR && errno != ETIMEDOUT)
+                atomic_fetch_add_explicit(&c_errors, 1, memory_order_relaxed);
+            break;
+        }
+        case 3: { /* read — non-blocking */
+            struct ntsync_sem_args sa;
+            if (ioctl(g_sem_fds[s], NTSYNC_IOC_SEM_READ, &sa) == 0)
+                atomic_fetch_add_explicit(&c_sem_read, 1, memory_order_relaxed);
+            break;
+        }
+        }
+    }
+    return NULL;
+}
+
+/* Wait_all worker: tests the wait_all path which has DIFFERENT locking
+ * (rt_mutex(wait_all_lock) + dev_lock_obj per obj instead of obj_lock).
+ * Multi-obj wait-for-all-signaled-simultaneously.  We pick (event,
+ * mutex, sem) so the kernel has to atomically arrange all three.
+ * Short timeout because the conjunction is unlikely to be true often. */
+static void *wait_all_worker_fn(void *arg)
+{
+    int id = (int)(uintptr_t)arg;
+    unsigned rng = id * 1664525u + 0x5a5au;
+    while (!atomic_load_explicit(&g_stop, memory_order_relaxed)) {
+        rng = rng * 1664525u + 0x5a5au;
+        struct ntsync_wait_args wa;
+        int objs[3] = {
+            g_event_fds[rng % N_EVENTS],
+            g_mutex_fds[(rng >> 4) % N_MUTEXES],
+            g_sem_fds  [(rng >> 8) % N_SEMS],
+        };
+        memset(&wa, 0, sizeof(wa));
+        wa.count = 3; wa.objs = (uintptr_t)objs; wa.owner = gettid_compat();
+        wa.timeout = abs_deadline_ns(10ULL * 1000000ULL);  /* 10ms */
+        int rc = ioctl(g_dev_fd, NTSYNC_IOC_WAIT_ALL, &wa);
+        if (rc == 0) {
+            atomic_fetch_add_explicit(&c_wait_all_acq, 1, memory_order_relaxed);
+            /* On success, we now own the mutex — release it (and the
+             * sem was decremented as part of the conjunction).  Event
+             * is manual-reset so its state stays. */
+            struct ntsync_mutex_args ma = { .owner = gettid_compat(), .count = 0 };
+            if (ioctl(objs[1], NTSYNC_IOC_MUTEX_UNLOCK, &ma) == 0)
+                atomic_fetch_add_explicit(&c_wait_all_rel, 1, memory_order_relaxed);
+        } else if (errno != EINTR && errno != ETIMEDOUT) {
+            atomic_fetch_add_explicit(&c_errors, 1, memory_order_relaxed);
+        }
+    }
+    return NULL;
+}
+
 /* Churn — periodically signals a random worker to interrupt its
  * blocked syscall.  This mimics Ableton's thread-cycle pattern AND
  * exercises the EINTR path of every ioctl in the test. */
@@ -369,16 +475,22 @@ int main(int argc, char **argv)
         g_mutex_fds[i] = ioctl(g_dev_fd, NTSYNC_IOC_CREATE_MUTEX, &ma);
         if (g_mutex_fds[i] < 0) { perror("CREATE_MUTEX"); return 2; }
     }
+    for (int i = 0; i < N_SEMS; i++) {
+        struct ntsync_sem_args sa = { .count = 8, .max = 1024 };
+        g_sem_fds[i] = ioctl(g_dev_fd, NTSYNC_IOC_CREATE_SEM, &sa);
+        if (g_sem_fds[i] < 0) { perror("CREATE_SEM"); return 2; }
+    }
     {
         struct ntsync_channel_create_args ca = { .max_depth = 32, .__pad = 0 };
         g_chan_fd = ioctl(g_dev_fd, NTSYNC_IOC_CREATE_CHANNEL, &ca);
         if (g_chan_fd < 0) { perror("CREATE_CHANNEL"); return 2; }
     }
 
-    printf("== mixed-load stress: %d events + %d mutexes + 1 channel "
-           "for %ds ==\n", N_EVENTS, N_MUTEXES, duration);
+    printf("== mixed-load stress: %d events + %d mutexes + %d sems + 1 channel "
+           "for %ds ==\n", N_EVENTS, N_MUTEXES, N_SEMS, duration);
 
-    int total = 1 + N_UI + N_CHAN_SEND + N_CHAN_RECV + 1;  /* +registrar */
+    int total = 1 + N_UI + N_CHAN_SEND + N_CHAN_RECV + 1
+                + N_SEM_WORKERS + N_WAIT_ALL_WORKERS;
     g_workers = calloc(total, sizeof(pthread_t));
     g_n_workers = total;
 
@@ -391,6 +503,10 @@ int main(int argc, char **argv)
     for (int i = 0; i < N_CHAN_RECV; i++)
         pthread_create(&g_workers[idx++], NULL, chan_recv_fn, (void*)(uintptr_t)i);
     pthread_create(&g_workers[idx++], NULL, registrar_fn, NULL);
+    for (int i = 0; i < N_SEM_WORKERS; i++)
+        pthread_create(&g_workers[idx++], NULL, sem_worker_fn, (void*)(uintptr_t)i);
+    for (int i = 0; i < N_WAIT_ALL_WORKERS; i++)
+        pthread_create(&g_workers[idx++], NULL, wait_all_worker_fn, (void*)(uintptr_t)i);
 
     pthread_t churn;
     pthread_create(&churn, NULL, churn_fn, NULL);
@@ -407,6 +523,7 @@ int main(int argc, char **argv)
     free(g_workers);
 
     close(g_chan_fd);
+    for (int i = 0; i < N_SEMS;    i++) close(g_sem_fds[i]);
     for (int i = 0; i < N_MUTEXES; i++) close(g_mutex_fds[i]);
     for (int i = 0; i < N_EVENTS;  i++) close(g_event_fds[i]);
     close(g_dev_fd);
@@ -416,6 +533,7 @@ int main(int argc, char **argv)
     long uspi = atomic_load(&c_ui_set_pi);
     long us = atomic_load(&c_ui_set);
     long ur = atomic_load(&c_ui_reset);
+    long up = atomic_load(&c_ui_pulse);
     long uma = atomic_load(&c_ui_mutex_acq);
     long umr = atomic_load(&c_ui_mutex_rel);
     long cs = atomic_load(&c_chan_send);
@@ -423,17 +541,24 @@ int main(int argc, char **argv)
     long cp = atomic_load(&c_chan_reply);
     long rg = atomic_load(&c_reg);
     long dg = atomic_load(&c_dereg);
+    long sl = atomic_load(&c_sem_release);
+    long sa = atomic_load(&c_sem_acquire);
+    long sd = atomic_load(&c_sem_read);
+    long wa = atomic_load(&c_wait_all_acq);
+    long wr = atomic_load(&c_wait_all_rel);
     long er = atomic_load(&c_errors);
     long sr = atomic_load(&c_shutdown_races);
 
     printf("\n== Results ==\n");
     printf("audio waits:        %ld   (woke: %ld)\n", aw, ak);
     printf("ui EVENT_SET_PI:    %ld\n", uspi);
-    printf("ui EVENT_SET:       %ld   ui EVENT_RESET: %ld\n", us, ur);
+    printf("ui EVENT_SET:       %ld   RESET: %ld   PULSE: %ld\n", us, ur, up);
     printf("ui mutex acq/rel:   %ld / %ld\n", uma, umr);
     printf("chan SEND_PI:       %ld\n", cs);
     printf("chan RECV / REPLY:  %ld / %ld   (shutdown races: %ld)\n", cr, cp, sr);
     printf("chan REG/DEREG:     %ld / %ld\n", rg, dg);
+    printf("sem release/acq/rd: %ld / %ld / %ld\n", sl, sa, sd);
+    printf("wait_all acq/rel:   %ld / %ld\n", wa, wr);
     printf("syscall errors:     %ld\n", er);
     printf("\nKASAN:        check `journalctl -k --since \"%ds ago\" | grep BUG`\n",
            duration + 5);
@@ -453,6 +578,11 @@ int main(int argc, char **argv)
     if (uma != umr) {
         printf("RESULT: FAIL (mutex acq %ld != rel %ld — leak or doubled)\n",
                uma, umr);
+        return 1;
+    }
+    if (wa != wr) {
+        printf("RESULT: FAIL (wait_all acq %ld != rel %ld — leak via wait_all path)\n",
+               wa, wr);
         return 1;
     }
     printf("RESULT: PASS\n");

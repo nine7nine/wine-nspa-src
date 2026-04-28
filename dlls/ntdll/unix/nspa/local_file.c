@@ -42,6 +42,34 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(nspa_lfile);
 
+/* Diagnostic gate — cached at module init via nspa_lf_diag_init_once_fn
+ * so the per-call cost is a single load + branch (predictable, ~free
+ * when off).  NEVER use a function call in the per-call gate path —
+ * see feedback_debug_off_means_off.md.  Default 0 (disabled).  Set to
+ * 1 if NSPA_SEND_DIAG=<anything> in the environment when the first
+ * NtCreateFile fires. */
+static int nspa_lf_diag_active = 0;
+
+/* Init-once gate — first NtCreateFile triggers this via
+ * nspa_local_file_diag_categorize.  Sets nspa_lf_diag_active by
+ * checking getenv ONCE.  After init, all per-call sites just
+ * check the global. */
+static pthread_once_t nspa_lf_diag_init_once = PTHREAD_ONCE_INIT;
+static void nspa_lf_diag_init_once_fn( void )
+{
+    nspa_lf_diag_active = (getenv( "NSPA_SEND_DIAG" ) != NULL);
+}
+
+/* Gate macro for per-call diagnostic counters.  Expands to a single
+ * load + branch on nspa_lf_diag_active.  When the gate is off, the
+ * atomic_fetch_add is skipped at runtime — no function call, no cache
+ * miss on a static, just one cmp+jne.  Defined here (top of file) so
+ * it's available to ALL later uses including nspa_local_file_table_lookup
+ * and the try_bypass internal counters.
+ * See feedback_debug_off_means_off.md for the principle. */
+#define NSPA_LF_DIAG_BUMP(cnt) \
+    do { if (nspa_lf_diag_active) __atomic_fetch_add( &(cnt), 1, __ATOMIC_RELAXED ); } while (0)
+
 /* Counter set — mirrors the eligibility checks in the categoriser
  * below.  ineligible_* are mutually exclusive: each ineligible call
  * bumps exactly one ineligible_* counter (the first failing condition
@@ -233,7 +261,7 @@ int nspa_local_file_table_lookup( unsigned long long device, unsigned long long 
     nspa_lf_table_open_lazy();
     if (nspa_lf_table_state != 1) return 0;
 
-    __atomic_fetch_add( &nspa_lf_lookup_attempt, 1, __ATOMIC_RELAXED );
+    NSPA_LF_DIAG_BUMP( nspa_lf_lookup_attempt );
 
     bucket = &nspa_lf_table->buckets[ nspa_lf_bucket_index( device, inode ) ];
 
@@ -258,10 +286,10 @@ int nspa_local_file_table_lookup( unsigned long long device, unsigned long long 
                 if (seq_after == seq_before)
                 {
                     *out = snapshot;
-                    __atomic_fetch_add( &nspa_lf_lookup_hit, 1, __ATOMIC_RELAXED );
+                    NSPA_LF_DIAG_BUMP( nspa_lf_lookup_hit );
                     return 1;
                 }
-                __atomic_fetch_add( &nspa_lf_lookup_seq_retry, 1, __ATOMIC_RELAXED );
+                NSPA_LF_DIAG_BUMP( nspa_lf_lookup_seq_retry );
                 goto retry;
             }
         }
@@ -271,10 +299,10 @@ int nspa_local_file_table_lookup( unsigned long long device, unsigned long long 
         seq_after = __atomic_load_n( &bucket->seq, __ATOMIC_ACQUIRE );
         if (seq_after == seq_before)
         {
-            __atomic_fetch_add( &nspa_lf_lookup_miss, 1, __ATOMIC_RELAXED );
+            NSPA_LF_DIAG_BUMP( nspa_lf_lookup_miss );
             return 0;
         }
-        __atomic_fetch_add( &nspa_lf_lookup_seq_retry, 1, __ATOMIC_RELAXED );
+        NSPA_LF_DIAG_BUMP( nspa_lf_lookup_seq_retry );
     retry:
         ;
     }
@@ -284,8 +312,8 @@ int nspa_local_file_table_lookup( unsigned long long device, unsigned long long 
      * caller falls back to server.  lookup_miss also bumped for
      * continuity with existing dump consumers; seq_exhausted is the
      * specific signal that the retry loop gave up. */
-    __atomic_fetch_add( &nspa_lf_lookup_miss,   1, __ATOMIC_RELAXED );
-    __atomic_fetch_add( &nspa_lf_seq_exhausted, 1, __ATOMIC_RELAXED );
+    NSPA_LF_DIAG_BUMP( nspa_lf_lookup_miss );
+    NSPA_LF_DIAG_BUMP( nspa_lf_seq_exhausted );
     return 0;
 }
 
@@ -312,21 +340,14 @@ int nspa_local_file_table_lookup( unsigned long long device, unsigned long long 
 /* Forward decl — implementation appears later in the file (Slice 1A.1.c). */
 static void nspa_lf_table_open_lazy( void );
 
-/* Gate the per-call diagnostic counters behind NSPA_SEND_DIAG.  Without
- * this, every NtCreateFile pays ~10 atomic-fetch-add ops to populate
- * the [ineligibility breakdown] section of the dump even when the
- * dump is never produced.  At ~950 NtCreateFile/sec under library-load
- * workload, that's measurable RT-jitter cost. */
-static int nspa_lf_diag_enabled( void )
-{
-    static int cached = -1;
-    if (cached < 0) cached = (getenv( "NSPA_SEND_DIAG" ) != NULL);
-    return cached;
-}
-
 void nspa_local_file_diag_categorize( const OBJECT_ATTRIBUTES *attr, ACCESS_MASK access,
                                       ULONG sharing, ULONG disposition, ULONG options )
 {
+    /* Set nspa_lf_diag_active from environment ONCE.  After this,
+     * every per-call NSPA_LF_DIAG_BUMP and `if (!nspa_lf_diag_active)`
+     * site is just a load + branch — no getenv, no function call. */
+    pthread_once( &nspa_lf_diag_init_once, nspa_lf_diag_init_once_fn );
+
     /* Trigger lazy mmap of the shared inode-table from a real Wine
      * thread context (NtCreateFile is always called from one).  The
      * background diag thread that dumps counters never calls server
@@ -336,7 +357,7 @@ void nspa_local_file_diag_categorize( const OBJECT_ATTRIBUTES *attr, ACCESS_MASK
     nspa_lf_table_open_lazy();
 
     /* Counters below are diagnostics only; gate on NSPA_SEND_DIAG. */
-    if (!nspa_lf_diag_enabled()) return;
+    if (!nspa_lf_diag_active) return;
 
     __atomic_fetch_add( &nspa_lf_top_calls, 1, __ATOMIC_RELAXED );
 
@@ -406,11 +427,6 @@ void nspa_local_file_diag_categorize( const OBJECT_ATTRIBUTES *attr, ACCESS_MASK
  * try_bypass); FALSE if any criterion rejects.  Bumps exactly one
  * counter on rejection (the first failing criterion in priority
  * order), or `attempted` on pass. */
-/* Gated counter bump — single check on the cached static; branch
- * predictor handles the consistent path well. */
-#define NSPA_LF_DIAG_BUMP(cnt) \
-    do { if (nspa_lf_diag_enabled()) __atomic_fetch_add( &(cnt), 1, __ATOMIC_RELAXED ); } while (0)
-
 BOOL nspa_local_file_disp_categorize( BOOL loader_open,
                                       const OBJECT_ATTRIBUTES *attr,
                                       ACCESS_MASK access,
@@ -442,7 +458,7 @@ BOOL nspa_local_file_disp_categorize( BOOL loader_open,
 /* Categorise the outcome of a try_bypass call.  Diagnostic only. */
 void nspa_local_file_disp_count_outcome( NTSTATUS status )
 {
-    if (!nspa_lf_diag_enabled()) return;
+    if (!nspa_lf_diag_active) return;
     if (status == STATUS_SUCCESS)
         __atomic_fetch_add( &nspa_lf_disp_bypass_success, 1, __ATOMIC_RELAXED );
     else if (status == STATUS_SHARING_VIOLATION)
@@ -821,7 +837,7 @@ NTSTATUS nspa_local_file_publish_open( unsigned long long device, unsigned long 
         if (empty_slot_idx < 0)
         {
             /* Bucket overflow — caller falls back to server. */
-            __atomic_fetch_add( &nspa_lf_bucket_overflow, 1, __ATOMIC_RELAXED );
+            NSPA_LF_DIAG_BUMP( nspa_lf_bucket_overflow );
             pi_mutex_unlock( nspa_lf_lock_of( bucket ) );
             return STATUS_INSUFFICIENT_RESOURCES;
         }
@@ -847,7 +863,7 @@ NTSTATUS nspa_local_file_publish_open( unsigned long long device, unsigned long 
         {
             /* Subentry overflow — too many client procs hold this inode.
              * Caller falls back to server. */
-            __atomic_fetch_add( &nspa_lf_subentry_overflow, 1, __ATOMIC_RELAXED );
+            NSPA_LF_DIAG_BUMP( nspa_lf_subentry_overflow );
             pi_mutex_unlock( nspa_lf_lock_of( bucket ) );
             return STATUS_INSUFFICIENT_RESOURCES;
         }
@@ -1385,6 +1401,7 @@ static void nspa_lf_free_handle( HANDLE h )
  * counters directly).  cause: 0=enter, 1=success, 2=fail. */
 void nspa_local_file_section_intercept_bump( int cause )
 {
+    if (!nspa_lf_diag_active) return;
     if (cause == 0) __atomic_fetch_add( &nspa_lf_section_intercepts, 1, __ATOMIC_RELAXED );
     else if (cause == 1) __atomic_fetch_add( &nspa_lf_section_promote_ok, 1, __ATOMIC_RELAXED );
     else __atomic_fetch_add( &nspa_lf_section_promote_fail, 1, __ATOMIC_RELAXED );
@@ -1392,6 +1409,9 @@ void nspa_local_file_section_intercept_bump( int cause )
 
 void nspa_local_file_get_unix_fd_intercept_bump( void )
 {
+    /* Hottest counter in the bypass — fired ~600k times per Ableton
+     * library scan.  Always gated by NSPA_SEND_DIAG. */
+    if (!nspa_lf_diag_active) return;
     __atomic_fetch_add( &nspa_lf_get_unix_fd_intercepts, 1, __ATOMIC_RELAXED );
 }
 
@@ -1457,9 +1477,9 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
     HANDLE h;
 
     if (nspa_local_file_disabled())
-    { __atomic_fetch_add( &nspa_lf_tb_rej_disabled, 1, __ATOMIC_RELAXED ); return STATUS_NOT_SUPPORTED; }
+    { NSPA_LF_DIAG_BUMP( nspa_lf_tb_rej_disabled ); return STATUS_NOT_SUPPORTED; }
     if (nspa_lf_table_state != 1)
-    { __atomic_fetch_add( &nspa_lf_tb_rej_table_state, 1, __ATOMIC_RELAXED ); return STATUS_NOT_SUPPORTED; }
+    { NSPA_LF_DIAG_BUMP( nspa_lf_tb_rej_table_state ); return STATUS_NOT_SUPPORTED; }
 
     /* Expand GENERIC_* into specific bits before any sharing arbitration
      * or storage — server's create_file does the same with map_access().
@@ -1486,7 +1506,7 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
     if (stat( unix_name, &st ) != 0)
     {
         /* Real open failure — let caller's normal path map errno. */
-        __atomic_fetch_add( &nspa_lf_tb_rej_stat_fail, 1, __ATOMIC_RELAXED );
+        NSPA_LF_DIAG_BUMP( nspa_lf_tb_rej_stat_fail );
         return STATUS_NOT_SUPPORTED;   /* fall back rather than guess errno mapping */
     }
     if (!S_ISREG( st.st_mode ))
@@ -1519,14 +1539,14 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
             unix_fd = open( unix_name, O_RDONLY );
             if (unix_fd < 0)
             {
-                __atomic_fetch_add( &nspa_lf_tb_rej_open_fail, 1, __ATOMIC_RELAXED );
+                NSPA_LF_DIAG_BUMP( nspa_lf_tb_rej_open_fail );
                 return STATUS_NOT_SUPPORTED;
             }
 
             h = nspa_lf_alloc_handle();
             if (!h)
             {
-                __atomic_fetch_add( &nspa_lf_tb_rej_alloc_handle, 1, __ATOMIC_RELAXED );
+                NSPA_LF_DIAG_BUMP( nspa_lf_tb_rej_alloc_handle );
                 close( unix_fd );
                 return STATUS_NOT_SUPPORTED;
             }
@@ -1538,7 +1558,7 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
                                                 FD_TYPE_DIR, nt_name );
             if (status != STATUS_SUCCESS)
             {
-                __atomic_fetch_add( &nspa_lf_tb_rej_table_add, 1, __ATOMIC_RELAXED );
+                NSPA_LF_DIAG_BUMP( nspa_lf_tb_rej_table_add );
                 nspa_lf_free_handle( h );
                 close( unix_fd );
                 return STATUS_NOT_SUPPORTED;
@@ -1546,13 +1566,13 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
 
             *handle = h;
             if (io) io->Information = FILE_OPENED;
-            __atomic_fetch_add( &nspa_lf_dir_minted, 1, __ATOMIC_RELAXED );
+            NSPA_LF_DIAG_BUMP( nspa_lf_dir_minted );
             NSPA_TRACE( LF_TRACE, "NSPA-LF dir-mint h=%p fd=%d access=%x options=%x path=%s\n",
                         h, unix_fd, (unsigned)access, (unsigned)options, unix_name );
             return STATUS_SUCCESS;
         }
 
-        __atomic_fetch_add( &nspa_lf_tb_rej_not_regular, 1, __ATOMIC_RELAXED );
+        NSPA_LF_DIAG_BUMP( nspa_lf_tb_rej_not_regular );
         return STATUS_NOT_SUPPORTED;
     }
 
@@ -1564,7 +1584,7 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
         return status;   /* real error — propagate to caller */
     if (status != STATUS_SUCCESS)
     {
-        __atomic_fetch_add( &nspa_lf_tb_rej_publish_overflow, 1, __ATOMIC_RELAXED );
+        NSPA_LF_DIAG_BUMP( nspa_lf_tb_rej_publish_overflow );
         return STATUS_NOT_SUPPORTED;   /* overflow/etc → fall back */
     }
 
@@ -1576,7 +1596,7 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
     if (unix_fd < 0)
     {
         /* Open failed — undo our publish, return fall-back. */
-        __atomic_fetch_add( &nspa_lf_tb_rej_open_fail, 1, __ATOMIC_RELAXED );
+        NSPA_LF_DIAG_BUMP( nspa_lf_tb_rej_open_fail );
         nspa_local_file_publish_close( (unsigned long long)st.st_dev,
                                        (unsigned long long)st.st_ino );
         return STATUS_NOT_SUPPORTED;
@@ -1585,7 +1605,7 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
     h = nspa_lf_alloc_handle();
     if (!h)
     {
-        __atomic_fetch_add( &nspa_lf_tb_rej_alloc_handle, 1, __ATOMIC_RELAXED );
+        NSPA_LF_DIAG_BUMP( nspa_lf_tb_rej_alloc_handle );
         nspa_local_file_publish_close( (unsigned long long)st.st_dev,
                                        (unsigned long long)st.st_ino );
         close( unix_fd );
@@ -1599,7 +1619,7 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
                                         FD_TYPE_FILE, nt_name );
     if (status != STATUS_SUCCESS)
     {
-        __atomic_fetch_add( &nspa_lf_tb_rej_table_add, 1, __ATOMIC_RELAXED );
+        NSPA_LF_DIAG_BUMP( nspa_lf_tb_rej_table_add );
         nspa_lf_free_handle( h );
         nspa_local_file_publish_close( (unsigned long long)st.st_dev,
                                        (unsigned long long)st.st_ino );
@@ -1609,7 +1629,7 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
 
     *handle = h;
     if (io) io->Information = FILE_OPENED;
-    __atomic_fetch_add( &nspa_lf_bypass_minted, 1, __ATOMIC_RELAXED );
+    NSPA_LF_DIAG_BUMP( nspa_lf_bypass_minted );
     /* Phase 1A.6 debug: log mint with path so we can correlate with
      * subsequent operations on this handle.  Filtered: only log if
      * NSPA_LF_TRACE=1 to avoid spam. */
@@ -1707,7 +1727,7 @@ HANDLE nspa_local_file_get_or_promote_server_handle( HANDLE local_handle )
     HANDLE result = 0;
 
     if (!nspa_local_file_is_local_handle( local_handle )) return 0;
-    __atomic_fetch_add( &nspa_lf_promote_calls, 1, __ATOMIC_RELAXED );
+    NSPA_LF_DIAG_BUMP( nspa_lf_promote_calls );
     NSPA_TRACE( LF_TRACE, "NSPA-LF promote-call h=%p\n", local_handle );
 
     pi_mutex_lock( &nspa_lf_opens_mutex );
@@ -1743,7 +1763,7 @@ HANDLE nspa_local_file_get_or_promote_server_handle( HANDLE local_handle )
 
     if (result)
     {
-        __atomic_fetch_add( &nspa_lf_promote_cached_hit, 1, __ATOMIC_RELAXED );
+        NSPA_LF_DIAG_BUMP( nspa_lf_promote_cached_hit );
         return result;
     }
     if (!need_promote) { free( nt_name_copy ); return result; }
@@ -1781,10 +1801,10 @@ HANDLE nspa_local_file_get_or_promote_server_handle( HANDLE local_handle )
         nt_name_copy = NULL;
         if (!promoted)
         {
-            __atomic_fetch_add( &nspa_lf_promote_fail, 1, __ATOMIC_RELAXED );
+            NSPA_LF_DIAG_BUMP( nspa_lf_promote_fail );
             return 0;
         }
-        __atomic_fetch_add( &nspa_lf_promote_minted, 1, __ATOMIC_RELAXED );
+        NSPA_LF_DIAG_BUMP( nspa_lf_promote_minted );
 
         /* Store back, racing safely with another concurrent promotion
          * (we keep whichever lands first; close our own if loser). */
@@ -1863,7 +1883,7 @@ int nspa_local_file_close( HANDLE handle )
     int found = 0;
 
     if (!nspa_local_file_is_local_handle( handle )) return 0;
-    __atomic_fetch_add( &nspa_lf_close_intercepts, 1, __ATOMIC_RELAXED );
+    NSPA_LF_DIAG_BUMP( nspa_lf_close_intercepts );
     NSPA_TRACE( LF_TRACE, "NSPA-LF close h=%p\n", handle );
 
     /* Inline-extended remove that also captures server_handle for

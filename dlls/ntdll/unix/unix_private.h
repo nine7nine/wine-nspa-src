@@ -320,15 +320,11 @@ extern void     nspa_local_timer_close( HANDLE handle );
 extern NTSTATUS nspa_local_timer_check_duplicate( HANDLE source_handle, HANDLE source_process,
                                                   HANDLE target_process );
 extern NTSTATUS nspa_local_timer_register_duplicate( HANDLE source_handle, HANDLE new_handle );
-extern void     nspa_local_file_diag_categorize( const OBJECT_ATTRIBUTES *attr, ACCESS_MASK access,
-                                                 ULONG sharing, ULONG disposition, ULONG options );
 extern BOOL     nspa_local_file_disp_categorize( BOOL loader_open,
                                                  const OBJECT_ATTRIBUTES *attr,
                                                  ACCESS_MASK access,
                                                  ULONG disposition,
                                                  ULONG options );
-extern void     nspa_local_file_disp_count_outcome( NTSTATUS status );
-extern void     nspa_local_file_diag_lazy_start( void );
 extern NTSTATUS nspa_local_file_publish_open( unsigned long long device, unsigned long long inode,
                                               unsigned int access, unsigned int sharing );
 extern void     nspa_local_file_publish_close( unsigned long long device, unsigned long long inode );
@@ -355,8 +351,6 @@ extern NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_nam
 extern void     nspa_local_file_promote_inheritable( void );
 extern int      nspa_local_file_is_local_handle( HANDLE h );
 extern int      nspa_local_file_close( HANDLE handle );
-extern void     nspa_local_file_section_intercept_bump( int cause );
-extern void     nspa_local_file_get_unix_fd_intercept_bump( void );
 extern HANDLE   nspa_local_file_get_or_promote_server_handle( HANDLE local_handle );
 extern HANDLE   nspa_promote_if_local( HANDLE h );
 extern HANDLE   nspa_promote_if_local_traced( HANDLE h, const char *tag, unsigned int info );

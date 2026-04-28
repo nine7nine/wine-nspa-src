@@ -138,6 +138,10 @@ static unsigned long long       nspa_lf_tb_rej_publish_overflow; /* check_and_pu
 static unsigned long long       nspa_lf_tb_rej_open_fail;      /* open() syscall failed */
 static unsigned long long       nspa_lf_tb_rej_alloc_handle;   /* handle range exhausted */
 static unsigned long long       nspa_lf_tb_rej_table_add;      /* table_add failed */
+/* Directory bypass success counter — distinct from nspa_lf_bypass_minted
+ * which counts regular-file mints.  Rolled into the dump's [client
+ * intercepts] section. */
+static unsigned long long       nspa_lf_dir_minted;            /* directory bypass success */
 
 static void nspa_lf_table_open_once_fn( void )
 {
@@ -588,6 +592,8 @@ static void nspa_lf_diag_dump( void )
             unsigned long long uf = __atomic_load_n( &nspa_lf_get_unix_fd_intercepts, __ATOMIC_RELAXED );
             fprintf(f, "\n[client intercepts]\n");
             fprintf(f, "  NtCreateFile_minted             %llu\n", bm);
+            fprintf(f, "  NtCreateFile_dir_minted         %llu  (S_ISDIR via NSPA_ENABLE_LOCAL_DIR)\n",
+                    __atomic_load_n( &nspa_lf_dir_minted, __ATOMIC_RELAXED ));
             fprintf(f, "  NtClose_local                   %llu\n", ci);
             fprintf(f, "  NtCreateSection_promote         %llu (ok=%llu fail=%llu)\n", si, sok, sf);
             fprintf(f, "  server_get_unix_fd_local        %llu\n", uf);
@@ -1376,6 +1382,25 @@ static int nspa_local_file_disabled( void )
     return cached;
 }
 
+/* Directory bypass — gated default-OFF for first ship.  When enabled,
+ * try_bypass also handles paths that stat() reveals as S_ISDIR (Wine
+ * apps frequently NtCreateFile on directory paths without the
+ * FILE_DIRECTORY_FILE flag — path probes, attribute queries, etc).
+ * Skip sharing arbitration entirely (directories don't conflict).
+ * Diagnostics (2026-04-28) showed 99.8% of try_bypass NOT_SUPPORTED
+ * returns are !S_ISREG, almost all directories.  Set
+ * NSPA_ENABLE_LOCAL_DIR=1 to enable. */
+static int nspa_local_dir_enabled( void )
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *v = getenv( "NSPA_ENABLE_LOCAL_DIR" );
+        cached = (v && *v == '1');
+    }
+    return cached;
+}
+
 /* Bypass dispatch.  Returns STATUS_SUCCESS + sets *handle on bypass
  * success (caller skips the regular create_file RPC).  Returns
  * STATUS_NOT_SUPPORTED if bypass is gated off, the file isn't a regular
@@ -1430,6 +1455,55 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
     }
     if (!S_ISREG( st.st_mode ))
     {
+        /* Directory bypass: caller did NtCreateFile on a path that turns
+         * out to be a directory but did NOT pass FILE_DIRECTORY_FILE
+         * (the explicit-dir-open opt-in is filtered earlier at the
+         * dispatch site).  Typical pattern: path-existence probes,
+         * attribute queries, current-directory tracking.  We open the
+         * directory locally with O_RDONLY (Linux permits this — only
+         * read() syscalls fail on a dir fd; metadata syscalls work).
+         * Sharing arbitration is skipped — directories don't have
+         * read/write/share conflicts.  Other operations on the
+         * resulting handle promote to a server handle on demand via
+         * the existing nspa_local_file_get_or_promote_server_handle
+         * path. */
+        if (S_ISDIR( st.st_mode ) && nspa_local_dir_enabled())
+        {
+            unix_fd = open( unix_name, O_RDONLY );
+            if (unix_fd < 0)
+            {
+                __atomic_fetch_add( &nspa_lf_tb_rej_open_fail, 1, __ATOMIC_RELAXED );
+                return STATUS_NOT_SUPPORTED;
+            }
+
+            h = nspa_lf_alloc_handle();
+            if (!h)
+            {
+                __atomic_fetch_add( &nspa_lf_tb_rej_alloc_handle, 1, __ATOMIC_RELAXED );
+                close( unix_fd );
+                return STATUS_NOT_SUPPORTED;
+            }
+
+            status = nspa_local_file_table_add( h, unix_fd,
+                                                (unsigned long long)st.st_dev,
+                                                (unsigned long long)st.st_ino,
+                                                access, sharing, options, attributes, nt_name );
+            if (status != STATUS_SUCCESS)
+            {
+                __atomic_fetch_add( &nspa_lf_tb_rej_table_add, 1, __ATOMIC_RELAXED );
+                nspa_lf_free_handle( h );
+                close( unix_fd );
+                return STATUS_NOT_SUPPORTED;
+            }
+
+            *handle = h;
+            if (io) io->Information = FILE_OPENED;
+            __atomic_fetch_add( &nspa_lf_dir_minted, 1, __ATOMIC_RELAXED );
+            NSPA_TRACE( LF_TRACE, "NSPA-LF dir-mint h=%p fd=%d access=%x options=%x path=%s\n",
+                        h, unix_fd, (unsigned)access, (unsigned)options, unix_name );
+            return STATUS_SUCCESS;
+        }
+
         __atomic_fetch_add( &nspa_lf_tb_rej_not_regular, 1, __ATOMIC_RELAXED );
         return STATUS_NOT_SUPPORTED;
     }

@@ -7304,8 +7304,15 @@ NTSTATUS WINAPI NtNotifyChangeDirectoryFile( HANDLE handle, HANDLE event, PIO_AP
     if (!iosb) return STATUS_ACCESS_VIOLATION;
     if (filter == 0 || (filter & ~FILE_NOTIFY_ALL)) return STATUS_INVALID_PARAMETER;
 
+    /* Both the server_async AND the alloc_fileio handle MUST be the
+     * promoted server handle.  read_changes_apc (line 7181) uses
+     * fileio->io.handle to issue the read_change RPC that fetches the
+     * actual change data when the async fires ALERTED.  If that handle
+     * is the local-range one, server doesn't recognise it and the RPC
+     * fails — change is dropped, library spinner spins forever even
+     * though the watcher was set up correctly. */
     fileio = (struct async_fileio_read_changes *)alloc_fileio(
-        offsetof(struct async_fileio_read_changes, data[size]), read_changes_apc, handle );
+        offsetof(struct async_fileio_read_changes, data[size]), read_changes_apc, srv_handle );
     if (!fileio) return STATUS_NO_MEMORY;
 
     fileio->buffer      = buffer;

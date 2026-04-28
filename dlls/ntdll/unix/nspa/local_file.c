@@ -488,10 +488,21 @@ static pthread_once_t nspa_lf_diag_start_once = PTHREAD_ONCE_INIT;
 static void nspa_lf_diag_start_once_fn( void )
 {
     pthread_t th;
+    pthread_attr_t attr;
     nspa_lf_diag_start_epoch = time( NULL );
     atexit( nspa_lf_diag_dump );
-    if (pthread_create( &th, NULL, nspa_lf_diag_thread_main, NULL ) == 0)
+    /* Explicit SCHED_OTHER — without this, pthread_create with NULL attr
+     * inherits the calling thread's schedclass (PTHREAD_INHERIT_SCHED).
+     * If the first NtCreateFile is on a SCHED_FIFO@80 audio-priority
+     * thread (typical under NSPA RT), the diag thread inherits FIFO@80
+     * and does fopen/fprintf/rename on /tmp at audio priority — RT-safety
+     * violation per project_msg_ring_phase_c_diag_reverted.md. */
+    pthread_attr_init( &attr );
+    pthread_attr_setinheritsched( &attr, PTHREAD_EXPLICIT_SCHED );
+    pthread_attr_setschedpolicy( &attr, SCHED_OTHER );
+    if (pthread_create( &th, &attr, nspa_lf_diag_thread_main, NULL ) == 0)
         pthread_detach( th );
+    pthread_attr_destroy( &attr );
     TRACE( "NSPA local-file diag: started, dumps to /tmp/nspa_local_file_diag.<pid>.log when NSPA_SEND_DIAG=1\n" );
 }
 

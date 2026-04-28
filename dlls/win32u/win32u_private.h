@@ -62,7 +62,13 @@ extern BOOL nspa_try_post_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
 extern BOOL nspa_try_send_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
                                 UINT msg, LPARAM wparam, LPARAM lparam,
                                 LRESULT *result_out );
+/* MR1 ABA guard: @expected_gen is the reply slot's generation captured at
+ * SEND time.  nspa_write_ring_reply writes only if the slot's current
+ * generation matches; mismatch means the original sender timed out and
+ * the slot has been recycled, so the reply is silently dropped to avoid
+ * misdelivering a stale LRESULT to a different sender. */
 extern BOOL nspa_write_ring_reply( DWORD sender_tid, UINT reply_slot_idx,
+                                   UINT expected_gen,
                                    LRESULT result, const void *data, UINT data_size );
 /* Phase 4.7: client-side POST-class pop from own ring.  Returns TRUE if
  * a MSG_POSTED slot was claimed (READY → CONSUMED) and fields populated.
@@ -91,7 +97,8 @@ extern BOOL nspa_try_pop_own_ring_send( HWND filter_hwnd, UINT first, UINT last,
                                         UINT *type_out, UINT *msg_out,
                                         WPARAM *wp_out, LPARAM *lp_out,
                                         DWORD *time_out, UINT *sender_tid_out,
-                                        UINT *reply_slot_out, HWND *win_out );
+                                        UINT *reply_slot_out, UINT *reply_gen_out,
+                                        HWND *win_out );
 
 /* NSPA Phase B — local WM_TIMER dispatcher (dlls/win32u/nspa_local_wm_timer.c).
  * STATUS_NOT_IMPLEMENTED on any entry point means "caller falls through to

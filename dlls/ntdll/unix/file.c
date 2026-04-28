@@ -2828,10 +2828,15 @@ static unsigned int get_cached_dir_data( HANDLE handle, struct dir_data **data_r
     int entry = -1, free_entries[16];
     unsigned int status;
     BOOLEAN fresh_handle;
+    /* NSPA: promote local-range dir handle so the server's
+     * get_directory_cache_entry handler recognises it.  Without this,
+     * NtQueryDirectoryFile returns no entries for our bypass-minted
+     * dir handles → empty library tree in apps like Ableton. */
+    HANDLE srv_handle = nspa_promote_if_local( handle );
 
     SERVER_START_REQ( get_directory_cache_entry )
     {
-        req->handle = wine_server_obj_handle( handle );
+        req->handle = wine_server_obj_handle( srv_handle );
         wine_server_set_reply( req, free_entries, sizeof(free_entries) );
         if (!(status = wine_server_call( req ))) entry = reply->entry;
 

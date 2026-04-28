@@ -127,6 +127,17 @@ static unsigned long long       nspa_lf_disp_attempted;            /* passed fil
 static unsigned long long       nspa_lf_disp_bypass_not_supported; /* try_bypass returned STATUS_NOT_SUPPORTED */
 static unsigned long long       nspa_lf_disp_bypass_sharing;       /* try_bypass returned STATUS_SHARING_VIOLATION */
 static unsigned long long       nspa_lf_disp_bypass_success;       /* try_bypass returned STATUS_SUCCESS */
+/* Internal try_bypass rejection counters — sub-categorise the
+ * NOT_SUPPORTED returns from nspa_local_file_try_bypass.  Bumped at
+ * each early-exit point in priority order. */
+static unsigned long long       nspa_lf_tb_rej_disabled;       /* env gate off (rare) */
+static unsigned long long       nspa_lf_tb_rej_table_state;    /* table not mapped */
+static unsigned long long       nspa_lf_tb_rej_stat_fail;      /* stat() ENOENT etc */
+static unsigned long long       nspa_lf_tb_rej_not_regular;    /* !S_ISREG (dir, pipe, dev) */
+static unsigned long long       nspa_lf_tb_rej_publish_overflow; /* check_and_publish_open overflow */
+static unsigned long long       nspa_lf_tb_rej_open_fail;      /* open() syscall failed */
+static unsigned long long       nspa_lf_tb_rej_alloc_handle;   /* handle range exhausted */
+static unsigned long long       nspa_lf_tb_rej_table_add;      /* table_add failed */
 
 static void nspa_lf_table_open_once_fn( void )
 {
@@ -490,6 +501,28 @@ static void nspa_lf_diag_dump( void )
         fprintf(f, "    -> success                           %llu\n", dbs);
         fprintf(f, "    -> sharing violation                 %llu\n", dbv);
         fprintf(f, "    -> not supported (fall back)         %llu\n", dbn);
+    }
+
+    /* try_bypass internal rejection sub-categories — the actual
+     * reasons NOT_SUPPORTED gets returned from inside try_bypass. */
+    {
+        unsigned long long tbd = __atomic_load_n( &nspa_lf_tb_rej_disabled,         __ATOMIC_RELAXED );
+        unsigned long long tbt = __atomic_load_n( &nspa_lf_tb_rej_table_state,      __ATOMIC_RELAXED );
+        unsigned long long tbs = __atomic_load_n( &nspa_lf_tb_rej_stat_fail,        __ATOMIC_RELAXED );
+        unsigned long long tbn = __atomic_load_n( &nspa_lf_tb_rej_not_regular,      __ATOMIC_RELAXED );
+        unsigned long long tbp = __atomic_load_n( &nspa_lf_tb_rej_publish_overflow, __ATOMIC_RELAXED );
+        unsigned long long tbo = __atomic_load_n( &nspa_lf_tb_rej_open_fail,        __ATOMIC_RELAXED );
+        unsigned long long tba = __atomic_load_n( &nspa_lf_tb_rej_alloc_handle,     __ATOMIC_RELAXED );
+        unsigned long long tba2 = __atomic_load_n( &nspa_lf_tb_rej_table_add,       __ATOMIC_RELAXED );
+        fprintf(f, "\n[try_bypass internal NOT_SUPPORTED breakdown]\n");
+        fprintf(f, "  env gate off                           %llu\n", tbd);
+        fprintf(f, "  table not mapped                       %llu\n", tbt);
+        fprintf(f, "  stat() failed (ENOENT etc)             %llu\n", tbs);
+        fprintf(f, "  !S_ISREG (dir/pipe/dev/special)        %llu\n", tbn);
+        fprintf(f, "  check_and_publish_open overflow        %llu\n", tbp);
+        fprintf(f, "  open() syscall failed                  %llu\n", tbo);
+        fprintf(f, "  handle range exhausted                 %llu\n", tba);
+        fprintf(f, "  table_add failed                       %llu\n", tba2);
     }
 
     /* Slice 1A.1.c verification — show shared-table state from this
@@ -1362,8 +1395,10 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
     NTSTATUS status;
     HANDLE h;
 
-    if (nspa_local_file_disabled()) return STATUS_NOT_SUPPORTED;
-    if (nspa_lf_table_state != 1)   return STATUS_NOT_SUPPORTED;
+    if (nspa_local_file_disabled())
+    { __atomic_fetch_add( &nspa_lf_tb_rej_disabled, 1, __ATOMIC_RELAXED ); return STATUS_NOT_SUPPORTED; }
+    if (nspa_lf_table_state != 1)
+    { __atomic_fetch_add( &nspa_lf_tb_rej_table_state, 1, __ATOMIC_RELAXED ); return STATUS_NOT_SUPPORTED; }
 
     /* Expand GENERIC_* into specific bits before any sharing arbitration
      * or storage — server's create_file does the same with map_access().
@@ -1390,9 +1425,14 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
     if (stat( unix_name, &st ) != 0)
     {
         /* Real open failure — let caller's normal path map errno. */
+        __atomic_fetch_add( &nspa_lf_tb_rej_stat_fail, 1, __ATOMIC_RELAXED );
         return STATUS_NOT_SUPPORTED;   /* fall back rather than guess errno mapping */
     }
-    if (!S_ISREG( st.st_mode )) return STATUS_NOT_SUPPORTED;
+    if (!S_ISREG( st.st_mode ))
+    {
+        __atomic_fetch_add( &nspa_lf_tb_rej_not_regular, 1, __ATOMIC_RELAXED );
+        return STATUS_NOT_SUPPORTED;
+    }
 
     /* Atomic check-sharing + publish_open under the bucket lock. */
     status = nspa_local_file_check_and_publish_open(
@@ -1401,7 +1441,10 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
     if (status == STATUS_SHARING_VIOLATION)
         return status;   /* real error — propagate to caller */
     if (status != STATUS_SUCCESS)
+    {
+        __atomic_fetch_add( &nspa_lf_tb_rej_publish_overflow, 1, __ATOMIC_RELAXED );
         return STATUS_NOT_SUPPORTED;   /* overflow/etc → fall back */
+    }
 
     /* Open locally.  O_RDONLY for MVP read-only access; O_NOFOLLOW
      * when caller asked for FILE_OPEN_REPARSE_POINT. */
@@ -1411,6 +1454,7 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
     if (unix_fd < 0)
     {
         /* Open failed — undo our publish, return fall-back. */
+        __atomic_fetch_add( &nspa_lf_tb_rej_open_fail, 1, __ATOMIC_RELAXED );
         nspa_local_file_publish_close( (unsigned long long)st.st_dev,
                                        (unsigned long long)st.st_ino );
         return STATUS_NOT_SUPPORTED;
@@ -1419,6 +1463,7 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
     h = nspa_lf_alloc_handle();
     if (!h)
     {
+        __atomic_fetch_add( &nspa_lf_tb_rej_alloc_handle, 1, __ATOMIC_RELAXED );
         nspa_local_file_publish_close( (unsigned long long)st.st_dev,
                                        (unsigned long long)st.st_ino );
         close( unix_fd );
@@ -1431,6 +1476,7 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
                                         access, sharing, options, attributes, nt_name );
     if (status != STATUS_SUCCESS)
     {
+        __atomic_fetch_add( &nspa_lf_tb_rej_table_add, 1, __ATOMIC_RELAXED );
         nspa_lf_free_handle( h );
         nspa_local_file_publish_close( (unsigned long long)st.st_dev,
                                        (unsigned long long)st.st_ino );

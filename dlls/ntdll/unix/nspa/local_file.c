@@ -998,20 +998,28 @@ static int nspa_local_file_disabled( void )
     return cached;
 }
 
-/* Directory bypass — gated default-OFF.  When enabled, try_bypass also
- * handles paths that stat() reveals as S_ISDIR.  Requires the kind
- * plumbing through nspa_local_file_table_add /
+/* Directory bypass — DEFAULT-ON since 2026-04-28.  When enabled,
+ * try_bypass also handles paths that stat() reveals as S_ISDIR.
+ * Requires the kind plumbing through nspa_local_file_table_add /
  * nspa_local_file_try_get_unix_fd so server_get_unix_fd correctly
  * reports FD_TYPE_DIR for directory handles (without that, file.c's
  * nt_to_unix_file_name_with_root rejects with STATUS_BAD_DEVICE_TYPE
- * — the failure mode of the 2026-04-28 16:46 attempt). */
-static int nspa_local_dir_enabled( void )
+ * — the failure mode of the 2026-04-28 16:46 attempt).
+ *
+ * Validated 2026-04-28 — Ableton library scan: 55k dir mints,
+ * 213k bypasses (77% rate), promote fail=0, no Undo popup,
+ * library populates, demo song plays.  ~24% of wineserver handler
+ * time retired.  Flipped default-on after the validation pass.
+ *
+ * Set NSPA_ENABLE_LOCAL_DIR=0 to opt out (matches paint-cache /
+ * Phase B / T3 default-on convention — `=0` disables). */
+static int nspa_local_dir_disabled( void )
 {
     static int cached = -1;
     if (cached < 0)
     {
         const char *v = getenv( "NSPA_ENABLE_LOCAL_DIR" );
-        cached = (v && *v == '1');
+        cached = (v && *v == '0');
     }
     return cached;
 }
@@ -1090,7 +1098,7 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
          * path (already 98% cache hit rate for files; should work for
          * dirs since the server's nspa_create_file_from_unix_fd is
          * fd-type agnostic). */
-        if (S_ISDIR( st.st_mode ) && nspa_local_dir_enabled())
+        if (S_ISDIR( st.st_mode ) && !nspa_local_dir_disabled())
         {
             unix_fd = open( unix_name, O_RDONLY );
             if (unix_fd < 0)

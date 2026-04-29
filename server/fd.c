@@ -2285,6 +2285,32 @@ error:
  *
  * Takes ownership of unix_fd: closes it on any failure (including
  * sharing violation), so the caller never needs to clean up. */
+/* NSPA: resolve and set fd->unix_name via readlink(/proc/self/fd/N).
+ * Used by both inode-tracked fds (create_inode_fd_from_unix_fd) and
+ * anonymous-fd directory paths (LF bypass) so APIs that require
+ * fd->unix_name (set_fd_name rename, get_handle_unix_name, dir
+ * iteration helpers) work uniformly across all server-side fds.
+ * Caller is responsible for ensuring fd_destroy will free unix_name —
+ * this is automatic for both anonymous and inode-tracked fds.  Idempotent
+ * if fd->unix_name is already non-NULL (fast-paths without re-resolving). */
+void nspa_fd_set_unix_name_from_proc( struct fd *fd )
+{
+    char proc_path[64];
+    char buf[4096];
+    ssize_t got;
+
+    if (!fd || fd->unix_name) return;
+    if (fd->unix_fd < 0) return;
+    snprintf( proc_path, sizeof(proc_path), "/proc/self/fd/%d", fd->unix_fd );
+    got = readlink( proc_path, buf, sizeof(buf) - 1 );
+    if (got > 0)
+    {
+        buf[got] = 0;
+        fd->unix_name = mem_alloc( got + 1 );
+        if (fd->unix_name) memcpy( fd->unix_name, buf, got + 1 );
+    }
+}
+
 struct fd *create_inode_fd_from_unix_fd( int unix_fd, unsigned int access,
                                          unsigned int sharing, unsigned int options,
                                          struct unicode_str nt_name )
@@ -2324,36 +2350,8 @@ struct fd *create_inode_fd_from_unix_fd( int unix_fd, unsigned int access,
 
     fd->unix_fd   = unix_fd;
     fd->nt_name   = dup_nt_name( NULL, nt_name, &fd->nt_namelen );
-
-    /* NSPA: resolve the unix path from the live fd via /proc/self/fd/N
-     * so set_fd_name (rename, e.g. atomic-write-then-rename via
-     * NtSetInformationFile/FileRenameInformation) can succeed.  That
-     * helper requires fd->unix_name non-NULL and otherwise returns
-     * STATUS_OBJECT_TYPE_MISMATCH.  Pre-fix, both LF-bypass-opened
-     * files (Phase 1A) and Phase C async-opened files left this NULL;
-     * the LF-bypass case never bit because LF eligibility excludes
-     * write opens, but Ableton's atomic-rename pattern through Phase C
-     * (open existing temp -> set_fd_name to destination) failed here.
-     *
-     * readlink on /proc/self/fd/N gives the kernel's canonical
-     * resolution of the path the fd refers to — equivalent to
-     * realpath(originally-opened-name) but works without re-opening
-     * the file or knowing the original name.  Bounded cost (~1 syscall,
-     * pseudo-fs read). */
-    {
-        char proc_path[64];
-        char buf[4096];
-        ssize_t got;
-        snprintf( proc_path, sizeof(proc_path), "/proc/self/fd/%d", unix_fd );
-        got = readlink( proc_path, buf, sizeof(buf) - 1 );
-        if (got > 0)
-        {
-            buf[got] = 0;
-            fd->unix_name = mem_alloc( got + 1 );
-            if (fd->unix_name) memcpy( fd->unix_name, buf, got + 1 );
-        }
-        else fd->unix_name = NULL;
-    }
+    fd->unix_name = NULL;
+    nspa_fd_set_unix_name_from_proc( fd );  /* sets fd->unix_name on success */
 
     inode = get_inode( st.st_dev, st.st_ino, fd->unix_fd );
     if (!inode)

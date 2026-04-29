@@ -4786,3 +4786,38 @@ enum inproc_sync_type
     unsigned int    count;            /* number of entries in the list */
     VARARG(list,bytes);               /* TLV stream: for each entry, u32 size + size bytes */
 @END
+
+
+/* msg-ring v2 Phase C Stage 3b: hardware-message batched fetch.
+ * Returns up to req->max_count fully-resolved hardware messages in
+ * a single RPC, each with the same per-msg shape get_message would
+ * return for MSG_HARDWARE.  Server applies side-effects (unique_id
+ * stamping, find_hardware_message_window resolution, key-state
+ * tracking) at fetch time, identical to get_message; client just
+ * delivers what server prepared.  See
+ * wine/nspa/docs/msg-ring-v2-phase-c-audit.md. */
+struct nspa_hw_msg_batch_entry
+{
+    user_handle_t   win;
+    unsigned int    msg;
+    lparam_t        wparam;
+    lparam_t        lparam;
+    int             type;             /* MSG_HARDWARE */
+    int             x;
+    int             y;
+    unsigned int    time;
+    unsigned int    __pad;
+    struct hardware_msg_data data;
+};
+
+@REQ(nspa_get_hw_msg_batch)
+    unsigned int    max_count;        /* max msgs to return (server caps further) */
+    unsigned int    hw_id;            /* continuation cursor (0 = start of list) */
+    user_handle_t   filter_win;
+    unsigned int    first;
+    unsigned int    last;
+    unsigned int    flags;            /* PM_* flags */
+@REPLY
+    unsigned int    returned;         /* number of entries in payload */
+    VARARG(entries,bytes);            /* nspa_hw_msg_batch_entry[returned] */
+@END

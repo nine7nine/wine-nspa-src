@@ -6775,6 +6775,48 @@ struct nspa_irot_enum_running_reply
 };
 
 
+/* msg-ring v2 Phase C Stage 3b: hardware-message batched fetch.
+ * Returns up to req->max_count fully-resolved hardware messages in
+ * a single RPC, each with the same per-msg shape get_message would
+ * return for MSG_HARDWARE.  Server applies side-effects (unique_id
+ * stamping, find_hardware_message_window resolution, key-state
+ * tracking) at fetch time, identical to get_message; client just
+ * delivers what server prepared.  See
+ * wine/nspa/docs/msg-ring-v2-phase-c-audit.md. */
+struct nspa_hw_msg_batch_entry
+{
+    user_handle_t   win;
+    unsigned int    msg;
+    lparam_t        wparam;
+    lparam_t        lparam;
+    int             type;
+    int             x;
+    int             y;
+    unsigned int    time;
+    unsigned int    __pad;
+    struct hardware_msg_data data;
+};
+
+struct nspa_get_hw_msg_batch_request
+{
+    struct request_header __header;
+    unsigned int    max_count;
+    unsigned int    hw_id;
+    user_handle_t   filter_win;
+    unsigned int    first;
+    unsigned int    last;
+    unsigned int    flags;
+    char __pad_36[4];
+};
+struct nspa_get_hw_msg_batch_reply
+{
+    struct reply_header __header;
+    unsigned int    returned;
+    /* VARARG(entries,bytes); */
+    char __pad_12[4];
+};
+
+
 enum request
 {
     REQ_new_process,
@@ -7099,6 +7141,7 @@ enum request
     REQ_nspa_irot_note_change_time,
     REQ_nspa_irot_get_time_of_last_change,
     REQ_nspa_irot_enum_running,
+    REQ_nspa_get_hw_msg_batch,
     REQ_NB_REQUESTS
 };
 
@@ -7428,6 +7471,7 @@ union generic_request
     struct nspa_irot_note_change_time_request nspa_irot_note_change_time_request;
     struct nspa_irot_get_time_of_last_change_request nspa_irot_get_time_of_last_change_request;
     struct nspa_irot_enum_running_request nspa_irot_enum_running_request;
+    struct nspa_get_hw_msg_batch_request nspa_get_hw_msg_batch_request;
 };
 union generic_reply
 {
@@ -7755,8 +7799,9 @@ union generic_reply
     struct nspa_irot_note_change_time_reply nspa_irot_note_change_time_reply;
     struct nspa_irot_get_time_of_last_change_reply nspa_irot_get_time_of_last_change_reply;
     struct nspa_irot_enum_running_reply nspa_irot_enum_running_reply;
+    struct nspa_get_hw_msg_batch_reply nspa_get_hw_msg_batch_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 956
+#define SERVER_PROTOCOL_VERSION 957
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

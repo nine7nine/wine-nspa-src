@@ -53,10 +53,28 @@
 #include "windef.h"
 #include "winbase.h"
 #include "winuser.h"
+#include "winternl.h"
 #include "wine/server.h"
 #include "wine/server_protocol.h"
 
+#include "../win32u_private.h"
 #include "hw_msg_cache.h"
+
+/* Wine-internal QS_HARDWARE flag for driver-class hardware msgs
+ * (WM_WINE_FIRST_DRIVER_MSG..LAST).  Defined identically in
+ * dlls/win32u/message.c:46 and server/queue.c:55. */
+#ifndef QS_HARDWARE
+#define QS_HARDWARE 0x40000000
+#endif
+
+/* Queue-bits umbrella for "any hardware msg present".  Mirrors what
+ * server/queue.c::get_hardware_msg_bit can produce — covers internal
+ * driver msgs, rawinput, pointer, keyboard, and the two mouse variants.
+ * Excludes QS_HOTKEY (returned via get_posted_message, not the batch
+ * walker).  This is the gate we use to skip the batch RPC when the
+ * calling thread's queue has no hardware queued. */
+#define NSPA_HW_QUEUE_BITS \
+    (QS_KEY | QS_MOUSEMOVE | QS_MOUSEBUTTON | QS_RAWINPUT | QS_POINTER | QS_HARDWARE)
 
 #define NSPA_HW_BATCH_CACHE_CAP 16
 
@@ -182,6 +200,30 @@ unsigned int nspa_hw_msg_cache_refill( HWND filter_hwnd, UINT first, UINT last,
     if (!hw_batch_enabled) return 0;
     cache = cache_get();
     if (!cache) return 0;
+
+    /* Hardware-presence gate.  Read the queue's wake_bits and only
+     * issue the batch RPC if the queue actually has hardware queued.
+     * Without this gate the empirical empty-refill rate on Ableton
+     * is ~78% — the caller's signal_bits filter can include QS_INPUT
+     * even when nothing is queued, and we'd waste an RPC walking an
+     * empty input->msg_list.  Same shape paint-cache uses with
+     * QS_PAINT in dce.c::nspa_get_update_flags_try_fastpath. */
+    {
+        struct object_lock lock = OBJECT_LOCK_INIT;
+        const queue_shm_t *queue_shm;
+        unsigned int wake_bits = 0;
+        unsigned int spin = 0;
+        UINT status;
+
+        while ((status = get_shared_queue( &lock, &queue_shm )) == STATUS_PENDING)
+        {
+            wake_bits = queue_shm->wake_bits;
+            NSPA_SHM_RETRY_GUARD( spin, return 0 );
+        }
+        if (status) return 0;
+
+        if (!(wake_bits & NSPA_HW_QUEUE_BITS)) return 0;
+    }
 
     /* Invalidate before refill — defensive even if filter matches.
      * The next/count fields will be set fresh from the RPC reply. */

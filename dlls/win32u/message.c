@@ -3110,6 +3110,7 @@ static int peek_message( MSG *msg, const struct peek_message_filter *filter )
                     popped     = TRUE;
                 }
             }
+            BOOL hw_cache_hit = FALSE;
             if (popped)
             {
                 res                   = STATUS_SUCCESS;
@@ -3127,7 +3128,47 @@ static int peek_message( MSG *msg, const struct peek_message_filter *filter )
                 info.nspa_reply_gen   = pop_gen;
                 hw_id                 = 0;
             }
-            else SERVER_START_REQ( get_message )
+            /* NSPA Phase C Stage 3b: hardware-message batch cache.  Drains
+             * fully-resolved hardware msgs from a per-thread cache populated
+             * by the nspa_get_hw_msg_batch RPC before the wineserver
+             * get_message RTT.  Server applies side-effects per-msg at
+             * batch time, identical to the single-msg path.  Default-OFF;
+             * opt-in via NSPA_ENABLE_HW_BATCH=1.  Gated on PM_REMOVE
+             * because server applies the per-msg PM_REMOVE decision at
+             * batch time — NOREMOVE peeks would mis-handle RAWINPUT/POINTER
+             * msgs that server list_removes during batch.  See
+             * wine/nspa/docs/msg-ring-v2-phase-c-audit.md. */
+            else if (nspa_hw_batch_enabled()
+                     && (signal_bits & QS_INPUT)
+                     && (flags & PM_REMOVE))
+            {
+                struct nspa_hw_msg_batch_entry hw_entry;
+                BOOL hit = nspa_hw_msg_cache_try_pop( hwnd, first, last, flags, &hw_entry );
+                if (!hit && nspa_hw_msg_cache_refill( hwnd, first, last, flags, hw_id ) > 0)
+                    hit = nspa_hw_msg_cache_try_pop( hwnd, first, last, flags, &hw_entry );
+                if (hit)
+                {
+                    res                   = STATUS_SUCCESS;
+                    size                  = sizeof(struct hardware_msg_data);
+                    info.type             = MSG_HARDWARE;
+                    info.msg.hwnd         = wine_server_ptr_handle( hw_entry.win );
+                    info.msg.message      = hw_entry.msg;
+                    info.msg.wParam       = hw_entry.wparam;
+                    info.msg.lParam       = hw_entry.lparam;
+                    info.msg.time         = hw_entry.time;
+                    info.msg.pt.x         = hw_entry.x;
+                    info.msg.pt.y         = hw_entry.y;
+                    info.nspa_sender_tid  = 0;
+                    info.nspa_reply_slot  = 0;
+                    info.nspa_reply_gen   = 0;
+                    memcpy( buffer, &hw_entry.data, size );
+                    msg_data              = buffer;
+                    hw_id                 = hw_entry.data.hw_id;
+                    hw_cache_hit          = TRUE;
+                }
+            }
+
+            if (!popped && !hw_cache_hit) SERVER_START_REQ( get_message )
             {
                 req->internal  = filter->internal;
                 req->flags     = flags;

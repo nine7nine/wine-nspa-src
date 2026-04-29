@@ -730,6 +730,13 @@ DECL_HANDLER(nspa_create_file_from_unix_fd)
         fd = create_anonymous_fd( NULL, unix_fd, NULL, req->options );
         if (!fd) return;
 
+        /* NSPA: anonymous fds don't have unix_name set, which makes
+         * get_handle_unix_name (and any helper that reads fd->unix_name)
+         * return STATUS_OBJECT_TYPE_MISMATCH on directory handles
+         * minted via this LF-bypass path.  Resolve via /proc/self/fd
+         * and set explicitly so dir-handle path queries work. */
+        nspa_fd_set_unix_name_from_proc( fd );
+
         if ((file_obj = create_dir_obj( fd, access, 0 )))
         {
             reply->handle = alloc_handle( current->process, file_obj, access, req->attributes );

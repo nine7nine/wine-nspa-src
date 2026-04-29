@@ -29,6 +29,7 @@ SOURCES = \
 	nspa/hook_cache.c \
 	nspa/hook_cache.h \
 	nspa/hw_msg_batch.c \
+	nspa/hw_msg_batch.h \
 	nspa/redraw_ring.c \
 	nspa/redraw_ring.h \
 	nspa/local_file.c \

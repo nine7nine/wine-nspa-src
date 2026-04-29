@@ -3692,22 +3692,6 @@ static void dump_nspa_irot_enum_running_reply( const struct nspa_irot_enum_runni
     dump_varargs_bytes( ", list=", cur_size );
 }
 
-static void dump_nspa_get_hw_msg_batch_request( const struct nspa_get_hw_msg_batch_request *req )
-{
-    fprintf( stderr, " max_count=%08x", req->max_count );
-    fprintf( stderr, ", hw_id=%08x", req->hw_id );
-    fprintf( stderr, ", filter_win=%08x", req->filter_win );
-    fprintf( stderr, ", first=%08x", req->first );
-    fprintf( stderr, ", last=%08x", req->last );
-    fprintf( stderr, ", flags=%08x", req->flags );
-}
-
-static void dump_nspa_get_hw_msg_batch_reply( const struct nspa_get_hw_msg_batch_reply *req )
-{
-    fprintf( stderr, " returned=%08x", req->returned );
-    dump_varargs_bytes( ", entries=", cur_size );
-}
-
 typedef void (*dump_func)( const void *req );
 
 static const dump_func req_dumpers[REQ_NB_REQUESTS] =
@@ -4034,7 +4018,6 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_nspa_irot_note_change_time_request,
     (dump_func)dump_nspa_irot_get_time_of_last_change_request,
     (dump_func)dump_nspa_irot_enum_running_request,
-    (dump_func)dump_nspa_get_hw_msg_batch_request,
 };
 
 static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
@@ -4361,7 +4344,6 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     NULL,
     (dump_func)dump_nspa_irot_get_time_of_last_change_reply,
     (dump_func)dump_nspa_irot_enum_running_reply,
-    (dump_func)dump_nspa_get_hw_msg_batch_reply,
 };
 
 static const char * const req_names[REQ_NB_REQUESTS] =
@@ -4688,7 +4670,6 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "nspa_irot_note_change_time",
     "nspa_irot_get_time_of_last_change",
     "nspa_irot_enum_running",
-    "nspa_get_hw_msg_batch",
 };
 
 static const struct

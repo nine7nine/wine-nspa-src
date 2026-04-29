@@ -116,17 +116,6 @@ extern BOOL     nspa_try_pop_own_timer_ring( HWND filter_hwnd, UINT first, UINT 
 extern HANDLE nspa_get_own_server_queue_handle( void );
 extern void   nspa_process_sent_messages( void );
 
-/* NSPA Phase C Stage 3b — hardware-message batched fetch (dlls/win32u/nspa/hw_msg_cache.c).
- * Drains a per-thread cache populated by the nspa_get_hw_msg_batch RPC,
- * before peek_message_internal falls through to the existing single-msg
- * get_message path.  Default-OFF; opt-in via NSPA_ENABLE_HW_BATCH=1. */
-extern BOOL         nspa_hw_batch_enabled( void );
-extern BOOL         nspa_hw_msg_cache_try_pop( HWND filter_hwnd, UINT first, UINT last,
-                                               UINT flags,
-                                               struct nspa_hw_msg_batch_entry *out );
-extern unsigned int nspa_hw_msg_cache_refill( HWND filter_hwnd, UINT first, UINT last,
-                                              UINT flags, UINT continuation_hw_id );
-
 /* cursoricon.c */
 extern BOOL process_wine_setcursor( HWND hwnd, HWND window, HCURSOR handle );
 extern HICON alloc_cursoricon_handle( BOOL is_icon );

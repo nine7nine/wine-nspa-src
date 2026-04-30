@@ -751,13 +751,18 @@ void register_window_surface( struct window_surface *old, struct window_surface 
 void flush_window_surfaces( BOOL idle )
 {
     static DWORD last_idle, last_flush;
-    /* NSPA: throttle every flush_window_surfaces invocation when
-     * NSPA_FLUSH_THROTTLE_MS=N is set.  Apps that poll peek_message at
-     * high frequency (e.g. Ableton's MainThread pump, ~8% CPU in
-     * x11drv_surface_flush in profile) trigger flush + per-surface
-     * XFlush() round-trip on every idle call; throttling caps the rate
-     * at which the actual surface flush walk happens.  Suggested
-     * values: 4-16ms.  Default 0 = upstream behaviour (no throttle). */
+    /* NSPA: throttle the flush_window_surfaces walk to at most one
+     * invocation per `throttle_ms`.  Default 8ms (~125Hz, just above
+     * 60Hz display refresh).  Apps that poll peek_message at kHz
+     * frequency (e.g. Ableton's MainThread pump) used to trigger
+     * x11drv_surface_flush + a synchronous XFlush() per pump iteration;
+     * throttling collapses dozens-to-hundreds of those into one per
+     * frame.  Profile delta on a busy Ableton playback workload
+     * (perf-busy → perf-throttle8): x11drv_surface_flush 8.23% → 4.74%,
+     * libc memmove 4.38% → 2.49%, total ~5.4pp MainThread CPU recovered.
+     *
+     * NSPA_FLUSH_THROTTLE_MS=N overrides the default (any positive int).
+     * NSPA_FLUSH_THROTTLE_MS=0 disables throttling (upstream behaviour). */
     static int throttle_ms = -1;
     DWORD now;
     struct window_surface *surface;
@@ -765,8 +770,8 @@ void flush_window_surfaces( BOOL idle )
     if (throttle_ms < 0)
     {
         const char *v = getenv( "NSPA_FLUSH_THROTTLE_MS" );
-        int n = (v && *v) ? atoi( v ) : 0;
-        throttle_ms = n > 0 ? n : 0;
+        int n = (v && *v) ? atoi( v ) : 8;  /* default 8ms */
+        throttle_ms = n > 0 ? n : 0;        /* explicit 0 disables */
     }
 
     pi_mutex_lock( &surfaces_lock );

@@ -187,6 +187,23 @@ static void create_file_cqe_callback( void *ctx_ptr, int result )
     nt_name.str = ctx->nt_name_buf;
     nt_name.len = ctx->nt_name_byte_len;
 
+    /* DIAGNOSTIC (NSPA_ENABLE_ASYNC_CREATE_FILE_DEBUG=1): log every
+     * async create_file CQE so we can trace which files go through
+     * the async path and the result.  Critical for chasing the
+     * Ableton Undo regression — gives us the path + result + access
+     * + options so we can correlate with sync-path traces. */
+    {
+        static int diag_cached = -1;
+        if (diag_cached < 0)
+        {
+            const char *v = getenv( "NSPA_ENABLE_ASYNC_CREATE_FILE_DEBUG" );
+            diag_cached = (v && *v && *v != '0') ? 1 : 0;
+        }
+        if (diag_cached)
+            fprintf( stderr, "[async-create-file] result=%d name=%s access=%#x sharing=%#x options=%#x\n",
+                     result, ctx->name, ctx->access, ctx->sharing, ctx->options );
+    }
+
     /* Initialise reply payload to safe default before we possibly
      * set_error.  send_reply_shm reads thread->error / reply_size
      * via nspa_uring_signal_reply. */

@@ -230,21 +230,21 @@ static void *channel_dispatcher( void *param )
     cached_use_token = !(v && *v == '0');
     recv2_state = cached_use_token ? 1 : 0;
 
-    /* AGGREGATE_WAIT path: OPT-IN via NSPA_AGG_WAIT=1.  Default-off
-     * for now per feedback_validate_before_default_on.md.  KNOWN
-     * concern: ntsync_channel_send_pi's PI-boost target lookup walks
-     * recv_wq only, but AGG_WAIT registers dispatcher on any_waiters
-     * — so SEND_PI from a high-prio audio thread will NOT boost an
-     * agg-waiting dispatcher.  Functionally fine (no lockup) but a
-     * real PI regression for audio workloads.  Until a follow-up
-     * patch teaches send_pi to also walk any_waiters for channel
-     * objects, opt-in is the right default.
+    /* AGGREGATE_WAIT path: DEFAULT-ON since 2026-04-29.  Validated by
+     * test-aggregate-wait 9/9 + 1k stress + Ableton level-2/3 session
+     * (boot, library scan, demo load, 60s play, GUI interaction)
+     * under NSPA_AGG_WAIT=1 with kernel CFF56DE1EF28.  The PI-boost
+     * regression that gated this default-off was fixed in ntsync 1010
+     * (send_pi any_waiters fallback + wake-after-boost reorder).
+     *
+     * Set NSPA_AGG_WAIT=0 to opt out (legacy CHANNEL_RECV2 path,
+     * today's pre-Phase-3 behaviour) for A/B testing.
      *
      *   agg_supported: -1 unknown (try once), 1 use AGG, 0 fallback.
      *   Falls back permanently on ENOTTY (pre-1010 kernel) or unexpected
      *   error (we break out — no infinite-retry loop). */
     agg_v = getenv( "NSPA_AGG_WAIT" );
-    agg_supported = (dev_fd >= 0 && agg_v && *agg_v == '1') ? -1 : 0;
+    agg_supported = (dev_fd >= 0 && !(agg_v && *agg_v == '0')) ? -1 : 0;
 
     for (;;)
     {

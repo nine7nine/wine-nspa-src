@@ -25,22 +25,15 @@ SOURCES = \
 	mutex.c \
 	named_pipe.c \
 	nspa/fd_lockdrop.c \
-	nspa/fd_lockdrop.h \
 	nspa/hook_cache.c \
-	nspa/hook_cache.h \
-	nspa/redraw_ring.c \
-	nspa/redraw_ring.h \
 	nspa/local_file.c \
-	nspa/local_file.h \
 	nspa/profile.c \
 	nspa/range_publish.c \
-	nspa/range_publish.h \
+	nspa/redraw_ring.c \
 	nspa/rpc_state.c \
-	nspa/rpc_state.h \
 	nspa/rt.c \
-	nspa/rt.h \
 	nspa/shmem_channel.c \
-	nspa/shmem_channel.h \
+	nspa/uring.c \
 	object.c \
 	process.c \
 	procfs.c \
@@ -68,6 +61,6 @@ SOURCES = \
 	winstation.c
 
 UNIX_CFLAGS = $(INOTIFY_CFLAGS)
-UNIX_LIBS   = $(LDEXECFLAGS) $(RT_LIBS) $(INOTIFY_LIBS) $(PROCSTAT_LIBS) $(PTHREAD_LIBS)
+UNIX_LIBS   = $(LDEXECFLAGS) $(RT_LIBS) $(INOTIFY_LIBS) $(PROCSTAT_LIBS) $(PTHREAD_LIBS) $(URING_LIBS)
 
 unicode_EXTRADEFS = -DBINDIR="\"${bindir}\"" -DDATADIR="\"${datadir}\""

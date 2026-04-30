@@ -1100,6 +1100,14 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
          * fd-type agnostic). */
         if (S_ISDIR( st.st_mode ) && !nspa_local_dir_disabled())
         {
+            /* Sync-parity: nspa_finalise_opened_fd returns
+             * STATUS_FILE_IS_A_DIRECTORY when caller passed
+             * FILE_NON_DIRECTORY_FILE on a directory.  Fall back to
+             * the server path, which produces that status — saves a
+             * caller-visible behaviour delta vs upstream. */
+            if (options & FILE_NON_DIRECTORY_FILE)
+                return STATUS_NOT_SUPPORTED;
+
             unix_fd = open( unix_name, O_RDONLY );
             if (unix_fd < 0)
             {

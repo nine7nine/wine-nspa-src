@@ -22,6 +22,7 @@
 #define __WINE_SERVER_PROCESS_H
 
 #include "object.h"
+#include "nspa/uring.h"
 
 struct atom_table;
 struct handle_table;
@@ -93,6 +94,7 @@ struct process
     int                  request_channel_fd;    /* NSPA gamma: ntsync channel for shm-IPC */
     pthread_t            channel_dispatcher;    /* NSPA gamma: 1 pthread per process */
     int                  channel_dispatcher_running; /* NSPA gamma: lifecycle gate */
+    struct nspa_uring_instance nspa_uring;      /* NSPA 1010: per-process server-side io_uring (Phase 2) */
 #endif
 };
 

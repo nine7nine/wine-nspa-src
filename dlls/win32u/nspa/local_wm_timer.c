@@ -469,10 +469,27 @@ NTSTATUS nspa_local_wm_timer_set( HWND hwnd, UINT_PTR id, UINT timeout,
      * scope, our process scope is wider — too messy to dedupe). */
     if (!id || !hwnd) return STATUS_NOT_IMPLEMENTED;
 
+    /* TIMERPROC path stays server-side: server stamps winproc into the
+     * delivered message's lparam so DispatchMessageW(W) invokes the
+     * callback (see user32/message.c:820, 870-884).  The local pop
+     * delivers out_lparam=0 (no slot field for it), so a TIMERPROC
+     * timer routed locally would silently drop the callback —
+     * matching only the proc==NULL case. */
+    if (winproc) return STATUS_NOT_IMPLEMENTED;
+
     /* Resolve hwnd owner; must be in this process to use local path. */
     owner_tid = get_window_thread( hwnd, &owner_pid );
     if (!owner_tid) return STATUS_NOT_IMPLEMENTED;
     if (owner_pid != GetCurrentProcessId()) return STATUS_NOT_IMPLEMENTED;
+    /* Cross-thread SetTimer: peer_shm would point into the CALLER's
+     * TLS-resident peer-cache mmap.  If the caller thread exits before
+     * KillTimer, the TLS destructor (msg_ring.c::nspa_cache_tls_destructor)
+     * munmaps that region — but the timer entry still references the
+     * stale pointer from the dispatcher pthread, producing a UAF on the
+     * next publish.  Restrict to same-thread SetTimer; cross-thread
+     * falls back to the server path (which has no such lifetime hazard
+     * because the server-side timer's queue ref is owner-rooted). */
+    if (owner_tid != GetCurrentThreadId()) return STATUS_NOT_IMPLEMENTED;
 
     /* Resolve the owner's memfd shm pointer from THIS thread, which has
      * a wineserver session.  The dispatcher thread does not — it just

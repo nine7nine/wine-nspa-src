@@ -112,6 +112,7 @@ struct ntsync_channel_recv2_args {
 #include "file.h"
 #include "nspa/rt.h"
 #include "nspa/shmem_channel.h"
+#include "nspa/uring.h"
 
 #define NSPA_CHANNEL_MAX_DEPTH 256
 
@@ -255,6 +256,13 @@ void nspa_shmem_channel_init( struct process *process )
     channel_fd = ioctl( dev_fd, NTSYNC_IOC_CREATE_CHANNEL, &args );
     if (channel_fd < 0) return;
 
+    /* NSPA 1010 Phase 2: bring up the per-process server-side io_uring
+     * before the dispatcher pthread starts.  Failure is non-fatal — the
+     * instance is left inactive and async-completing handlers fall back
+     * to synchronous behaviour.  Phase 3 will wire nspa_uring_get_eventfd()
+     * into the dispatcher's NTSYNC_IOC_AGGREGATE_WAIT call. */
+    nspa_uring_instance_init( &process->nspa_uring );
+
     /* Match v1.5 per-thread dispatcher: explicit RT attrs when
      * NSPA_SRV_RT_PRIO is active so the dispatcher is born RT
      * (PTHREAD_EXPLICIT_SCHED bypasses PR_SET_KEEPCAPS reset-on-fork). */
@@ -295,6 +303,12 @@ void nspa_shmem_channel_destroy( struct process *process )
      * the (detached) pthread observes and exits cleanly. */
     close( process->request_channel_fd );
     process->request_channel_fd = -1;
+    /* NSPA 1010 Phase 2: tear down the per-process io_uring after the
+     * channel is closed.  Phase 2 has no submitters, so this is safe
+     * regardless of dispatcher exit timing.  Phase 3+ will need to gate
+     * this on dispatcher actually having exited (it is detached, so the
+     * teardown contract evolves with the submitter set). */
+    nspa_uring_instance_shutdown( &process->nspa_uring );
     process->channel_dispatcher_running = 0;
 }
 

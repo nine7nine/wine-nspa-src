@@ -7,7 +7,8 @@
  * falls through to the existing synchronous create_file path (which
  * still uses Phase B's lock-drop around openat).
  *
- * Gated by NSPA_ENABLE_ASYNC_CREATE_FILE=1 (default OFF).
+ * Default ON since 2026-04-30.  Gate via NSPA_ENABLE_ASYNC_CREATE_FILE=0
+ * to disable and fall back to the synchronous path.
  *
  * RT-safety + lifetime:
  *   - per-process io_uring instance owned by gamma dispatcher pthread

@@ -11,7 +11,7 @@
  * Eligibility (narrow first cut, matches Phase C's read-only narrowing
  * from ffb15c8cf6d to avoid the cross-thread async/atomic-rename
  * residual that was reverted with the broken bridge):
- *   - Gate NSPA_ENABLE_ASYNC_CREATE_FILE=1 (default OFF)
+ *   - Gate NSPA_ENABLE_ASYNC_CREATE_FILE (default ON; set to 0 to disable)
  *   - objattr->rootdir == 0  (AT_FDCWD only — no rootdir-relative)
  *   - create == FILE_OPEN    (no creation/truncation paths)
  *   - !(options & FILE_DIRECTORY_FILE)
@@ -143,8 +143,10 @@ static void ctx_free( struct create_file_async_ctx *c )
 }
 
 /* -----------------------------------------------------------------
- * Gate.  Cached on first call.  Setting NSPA_ENABLE_ASYNC_CREATE_FILE=1
- * enables; default is OFF.
+ * Gate.  Cached on first call.  Default ON since 2026-04-30 (validated
+ * 9-test smoke + Ableton clean per project_phase_4_fixed_20260430.md).
+ * Set NSPA_ENABLE_ASYNC_CREATE_FILE=0 to disable and fall back to the
+ * synchronous create_file path.
  * ----------------------------------------------------------------- */
 
 static int gate_enabled( void )
@@ -153,9 +155,9 @@ static int gate_enabled( void )
     if (cached < 0)
     {
         const char *v = getenv( "NSPA_ENABLE_ASYNC_CREATE_FILE" );
-        cached = (v && *v && *v != '0') ? 1 : 0;
+        cached = (v && *v == '0') ? 0 : 1;  /* default ON; explicit 0 disables */
         if (debug_level && cached)
-            fprintf( stderr, "wineserver: nspa_uring_create_file enabled via gate\n" );
+            fprintf( stderr, "wineserver: nspa_uring_create_file enabled\n" );
     }
     return cached;
 }

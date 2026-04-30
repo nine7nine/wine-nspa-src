@@ -97,6 +97,7 @@ extern struct fd *create_inode_fd_from_unix_fd( int unix_fd, unsigned int access
                                                 unsigned int sharing, unsigned int options,
                                                 struct unicode_str nt_name );
 extern void nspa_fd_set_unix_name_from_proc( struct fd *fd );
+extern void nspa_fd_set_nt_name( struct fd *fd, struct unicode_str nt_name );
 extern struct fd *dup_fd_object( struct fd *orig, unsigned int access, unsigned int sharing,
                                  unsigned int options );
 extern struct fd *get_fd_object_for_mapping( struct fd *fd, unsigned int access, unsigned int sharing );

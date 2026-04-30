@@ -206,30 +206,33 @@ static void create_file_cqe_callback( void *ctx_ptr, int result )
         goto reply;
     }
 
-    /* result is the unix_fd.  fstat first to capture st_mode — needed
-     * by create_file_obj so file_get_fd_type returns FD_TYPE_FILE
-     * (S_ISREG check) instead of FD_TYPE_CHAR (the default when mode=0). */
+    /* result is the unix_fd.  Use nspa_create_fd_from_async_unix_fd
+     * which produces an fd with IDENTICAL NT semantics to what the
+     * synchronous open_fd path would have produced — same closed_fd
+     * disp_flags wiring, same realpath-based unix_name, same sharing
+     * check (with real flags, not 0), same FADV / O_TRUNC handling.
+     *
+     * Critical for app correctness: replacing create_inode_fd_from_unix_fd
+     * here was the fix for the Ableton Undo regression — that helper
+     * was a SUBSET of open_fd's post-openat work and shipped a
+     * half-cooked NT handle.  See feedback_async_must_match_sync_semantics.md.
+     *
+     * Takes ownership of the fd: closes on failure. */
     {
-        struct stat st;
-        if (fstat( result, &st ) == -1)
-        {
-            file_set_error();
-            close( result );
-            goto reply;
-        }
-        /* Hand the fd to create_inode_fd_from_unix_fd for the rest of
-         * the post-openat work (alloc_fd_object, get_inode, check_sharing,
-         * list_add, dup_nt_name, unix_name resolution via /proc/self/fd).
-         * Takes ownership of the fd: closes on failure. */
-        fd = create_inode_fd_from_unix_fd( result, ctx->access, ctx->sharing,
-                                           ctx->options, nt_name );
-        if (!fd) goto reply;  /* error already set by helper */
+        mode_t out_mode = 0;
+
+        fd = nspa_create_fd_from_async_unix_fd( result, NULL /* root: AT_FDCWD */,
+                                                 ctx->name, nt_name,
+                                                 ctx->open_flags, &out_mode,
+                                                 ctx->access, ctx->sharing,
+                                                 ctx->options );
+        if (!fd) goto reply;  /* error already set; unix_fd already closed */
 
         /* Wrap fd in struct file with the real st_mode so
-         * file_get_fd_type and security-descriptor paths see the file
-         * correctly.  Phase 4 eligibility excludes directories/specials
-         * so we always route through file_obj. */
-        file_obj = create_file_obj( fd, ctx->access, st.st_mode );
+         * file_get_fd_type returns FD_TYPE_FILE.  Phase 4 eligibility
+         * excludes directories/specials so we always route through
+         * file_obj. */
+        file_obj = create_file_obj( fd, ctx->access, out_mode );
         release_object( fd );
         if (!file_obj) goto reply;  /* error already set */
     }

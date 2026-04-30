@@ -2088,18 +2088,190 @@ void get_nt_name( struct fd *fd, struct unicode_str *name )
     name->len = fd->nt_namelen;
 }
 
+/* NSPA Phase 4 — extracted post-openat work from open_fd().  Both the
+ * synchronous open_fd() (after nspa_openat_lockdrop returns a unix_fd)
+ * and the async create_file CQE callback (after IORING_OP_OPENAT
+ * returns a unix_fd) call this helper so the resulting fd has IDENTICAL
+ * NT semantics regardless of which path produced it.
+ *
+ * Caller has already:
+ *   - allocated `fd` via alloc_fd_object()
+ *   - set fd->options = options
+ *   - set fd->unix_fd to the just-opened unix fd
+ *   - allocated `closed_fd` via mem_alloc(sizeof(struct closed_fd))
+ *
+ * Helper takes ownership of fd + closed_fd: on failure both are
+ * released and the caller MUST NOT touch them after a NULL return.
+ *
+ * On success: returns fd with full NT-handle state wired up
+ * (closed_fd disp_flags, inode list membership, unix_name resolved
+ * via realpath, sharing check, FADV applied).  *mode receives the
+ * file's st_mode.  Caller still holds the ref returned. */
+static struct fd *nspa_finalise_opened_fd( struct fd *fd, struct closed_fd *closed_fd,
+                                           struct fd *root, const char *name,
+                                           struct unicode_str nt_name,
+                                           int flags, mode_t *mode, unsigned int access,
+                                           unsigned int sharing, unsigned int options )
+{
+    struct stat st;
+    char *path;
+
+    fd->nt_name = dup_nt_name( root, nt_name, &fd->nt_namelen );
+    fd->unix_name = NULL;
+    fstat( fd->unix_fd, &st );
+    *mode = st.st_mode;
+
+    /* only bother with an inode for normal files and directories */
+    if (S_ISREG(st.st_mode) || S_ISDIR(st.st_mode))
+    {
+        unsigned int err;
+        struct inode *inode = get_inode( st.st_dev, st.st_ino, fd->unix_fd );
+
+        if (!inode)
+        {
+            /* we can close the fd because there are no others open on the same file,
+             * otherwise we wouldn't have failed to allocate a new inode
+             */
+            goto error;
+        }
+
+        if ((path = dup_fd_name( root, name )))
+        {
+            fd->unix_name = realpath( path, NULL );
+            free( path );
+        }
+
+        closed_fd->unix_fd = fd->unix_fd;
+        closed_fd->unix_name = fd->unix_name;
+        closed_fd->disp_flags = 0;
+        fd->inode = inode;
+        fd->closed = closed_fd;
+        fd->cacheable = !inode->device->removable;
+        list_add_head( &inode->open, &fd->inode_entry );
+        /* NSPA local-file: publish post-add aggregate.  If a later check
+         * in this function fails, fd is goto error → fd_destroy →
+         * republishes with this fd removed. */
+        nspa_publish_inode_state( inode );
+        closed_fd = NULL;  /* now owned by inode list / fd->closed */
+
+        /* check directory options */
+        if ((options & FILE_DIRECTORY_FILE) && !S_ISDIR(st.st_mode))
+        {
+            set_error( STATUS_NOT_A_DIRECTORY );
+            goto error;
+        }
+        if ((options & FILE_NON_DIRECTORY_FILE) && S_ISDIR(st.st_mode))
+        {
+            set_error( STATUS_FILE_IS_A_DIRECTORY );
+            goto error;
+        }
+        if ((err = check_sharing( fd, access, sharing, flags, options )))
+        {
+            set_error( err );
+            goto error;
+        }
+
+        /* can't unlink files if we don't have permission to access */
+        if ((options & FILE_DELETE_ON_CLOSE) && !(flags & O_CREAT) &&
+            !(st.st_mode & (S_IWUSR | S_IWGRP | S_IWOTH)))
+        {
+            set_error( STATUS_CANNOT_DELETE );
+            goto error;
+        }
+
+        fd->closed->disp_flags = (options & FILE_DELETE_ON_CLOSE) ?
+            FILE_DISPOSITION_DELETE : 0;
+        if (flags & O_TRUNC)
+        {
+            if (S_ISDIR(st.st_mode))
+            {
+                set_error( STATUS_OBJECT_NAME_COLLISION );
+                goto error;
+            }
+            ftruncate( fd->unix_fd, 0 );
+        }
+    }
+    else  /* special file */
+    {
+        if (options & FILE_DELETE_ON_CLOSE)  /* we can't unlink special files */
+        {
+            set_error( STATUS_INVALID_PARAMETER );
+            goto error;
+        }
+        free( closed_fd );
+        closed_fd = NULL;
+        fd->cacheable = 1;
+    }
+
+#ifdef HAVE_POSIX_FADVISE
+    switch (options & (FILE_SEQUENTIAL_ONLY | FILE_RANDOM_ACCESS))
+    {
+    case FILE_SEQUENTIAL_ONLY:
+        posix_fadvise( fd->unix_fd, 0, 0, POSIX_FADV_SEQUENTIAL );
+        break;
+    case FILE_RANDOM_ACCESS:
+        posix_fadvise( fd->unix_fd, 0, 0, POSIX_FADV_RANDOM );
+        break;
+    }
+#endif
+
+    return fd;
+
+error:
+    release_object( fd );
+    free( closed_fd );
+    return NULL;
+}
+
+/* NSPA Phase 4 public API — given an already-opened unix fd (e.g. from
+ * IORING_OP_OPENAT), allocate fd + closed_fd, call nspa_finalise_opened_fd.
+ * Returns a struct fd with full NT-handle state, equivalent to what
+ * open_fd would have produced for the same (root, name, flags, ...).
+ * On failure, error is set and unix_fd is closed.
+ *
+ * Note: this REPLACES create_inode_fd_from_unix_fd for the async
+ * server-openat path.  create_inode_fd_from_unix_fd stays for the
+ * LF-bypass path where the *client* opened the file (different
+ * contract). */
+struct fd *nspa_create_fd_from_async_unix_fd( int unix_fd, struct fd *root,
+                                              const char *name,
+                                              struct unicode_str nt_name,
+                                              int flags, mode_t *mode_out,
+                                              unsigned int access,
+                                              unsigned int sharing,
+                                              unsigned int options )
+{
+    struct closed_fd *closed_fd;
+    struct fd *fd;
+
+    if (!(fd = alloc_fd_object()))
+    {
+        close( unix_fd );
+        return NULL;
+    }
+    fd->options = options;
+    fd->unix_fd = unix_fd;
+
+    if (!(closed_fd = mem_alloc( sizeof(*closed_fd) )))
+    {
+        release_object( fd );  /* fd_destroy closes unix_fd via fd->unix_fd */
+        return NULL;
+    }
+
+    return nspa_finalise_opened_fd( fd, closed_fd, root, name, nt_name,
+                                     flags, mode_out, access, sharing, options );
+}
+
 /* open() wrapper that returns a struct fd with no fd user set */
 struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_name,
                     int flags, mode_t *mode, unsigned int access,
                     unsigned int sharing, unsigned int options )
 {
-    struct stat st;
     struct closed_fd *closed_fd;
     struct fd *fd;
     int root_fd = -1;
     int dirfd;
     int rw_mode;
-    char *path;
 
     if (((options & FILE_DELETE_ON_CLOSE) && !(access & DELETE)) ||
         ((options & FILE_DIRECTORY_FILE) && (flags & O_TRUNC)))
@@ -2167,106 +2339,11 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
         goto error;
     }
 
-    fd->nt_name = dup_nt_name( root, nt_name, &fd->nt_namelen );
-    fd->unix_name = NULL;
-    fstat( fd->unix_fd, &st );
-    *mode = st.st_mode;
-
-    /* only bother with an inode for normal files and directories */
-    if (S_ISREG(st.st_mode) || S_ISDIR(st.st_mode))
-    {
-        unsigned int err;
-        struct inode *inode = get_inode( st.st_dev, st.st_ino, fd->unix_fd );
-
-        if (!inode)
-        {
-            /* we can close the fd because there are no others open on the same file,
-             * otherwise we wouldn't have failed to allocate a new inode
-             */
-            goto error;
-        }
-
-        if ((path = dup_fd_name( root, name )))
-        {
-            fd->unix_name = realpath( path, NULL );
-            free( path );
-        }
-
-        closed_fd->unix_fd = fd->unix_fd;
-        closed_fd->unix_name = fd->unix_name;
-        closed_fd->disp_flags = 0;
-        fd->inode = inode;
-        fd->closed = closed_fd;
-        fd->cacheable = !inode->device->removable;
-        list_add_head( &inode->open, &fd->inode_entry );
-        /* NSPA local-file: publish post-add aggregate.  If a later check
-         * in this function fails, fd is goto error → fd_destroy →
-         * republishes with this fd removed. */
-        nspa_publish_inode_state( inode );
-        closed_fd = NULL;
-
-        /* check directory options */
-        if ((options & FILE_DIRECTORY_FILE) && !S_ISDIR(st.st_mode))
-        {
-            set_error( STATUS_NOT_A_DIRECTORY );
-            goto error;
-        }
-        if ((options & FILE_NON_DIRECTORY_FILE) && S_ISDIR(st.st_mode))
-        {
-            set_error( STATUS_FILE_IS_A_DIRECTORY );
-            goto error;
-        }
-        if ((err = check_sharing( fd, access, sharing, flags, options )))
-        {
-            set_error( err );
-            goto error;
-        }
-
-        /* can't unlink files if we don't have permission to access */
-        if ((options & FILE_DELETE_ON_CLOSE) && !(flags & O_CREAT) &&
-            !(st.st_mode & (S_IWUSR | S_IWGRP | S_IWOTH)))
-        {
-            set_error( STATUS_CANNOT_DELETE );
-            goto error;
-        }
-
-        fd->closed->disp_flags = (options & FILE_DELETE_ON_CLOSE) ?
-            FILE_DISPOSITION_DELETE : 0;
-        if (flags & O_TRUNC)
-        {
-            if (S_ISDIR(st.st_mode))
-            {
-                set_error( STATUS_OBJECT_NAME_COLLISION );
-                goto error;
-            }
-            ftruncate( fd->unix_fd, 0 );
-        }
-    }
-    else  /* special file */
-    {
-        if (options & FILE_DELETE_ON_CLOSE)  /* we can't unlink special files */
-        {
-            set_error( STATUS_INVALID_PARAMETER );
-            goto error;
-        }
-        free( closed_fd );
-        fd->cacheable = 1;
-    }
-
-#ifdef HAVE_POSIX_FADVISE
-    switch (options & (FILE_SEQUENTIAL_ONLY | FILE_RANDOM_ACCESS))
-    {
-    case FILE_SEQUENTIAL_ONLY:
-        posix_fadvise( fd->unix_fd, 0, 0, POSIX_FADV_SEQUENTIAL );
-        break;
-    case FILE_RANDOM_ACCESS:
-        posix_fadvise( fd->unix_fd, 0, 0, POSIX_FADV_RANDOM );
-        break;
-    }
-#endif
-
-    /* NSPA Phase A — no fchdir to undo; openat above did not change cwd. */
-    return fd;
+    /* NSPA Phase 4: post-openat work factored into shared helper so the
+     * async create_file CQE callback produces an fd with identical
+     * NT-handle state.  Helper takes ownership of fd + closed_fd. */
+    return nspa_finalise_opened_fd( fd, closed_fd, root, name, nt_name,
+                                     flags, mode, access, sharing, options );
 
 error:
     release_object( fd );

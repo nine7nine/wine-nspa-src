@@ -34,6 +34,7 @@ SOURCES = \
 	nspa/rt.c \
 	nspa/shmem_channel.c \
 	nspa/uring.c \
+	nspa/uring_create_file.c \
 	object.c \
 	process.c \
 	procfs.c \

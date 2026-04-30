@@ -42,6 +42,8 @@
 #endif
 
 struct nspa_uring_pending;
+struct thread;
+struct request_shm;
 
 /* CQE callback signature.  ctx is whatever the submitter passed via
  * nspa_uring_pending_alloc; result is cqe->res (negative errno on
@@ -135,6 +137,28 @@ extern int  nspa_uring_submit( struct nspa_uring_instance *u );
  * NTSYNC_IOC_AGGREGATE_WAIT as an FD source — the eventfd fires when
  * io_uring posts CQEs. */
 extern int  nspa_uring_get_eventfd( struct nspa_uring_instance *u );
+
+/* ---------------------------------------------------------------- */
+/* Phase 4: deferred-reply helpers (called from request handlers     */
+/* that submit to the ring + their CQE callbacks).                   */
+
+/* Mark this thread's reply as deferred — the request handler is
+ * about to (or has just) submitted an io_uring SQE and the CQE
+ * callback will own the reply path.  call_req_handler_shm sees
+ * the flag and skips send_reply_shm; the dispatcher likewise skips
+ * NTSYNC_IOC_CHANNEL_REPLY.  Both will be issued by signal_reply
+ * below when the CQE arrives. */
+extern void nspa_uring_defer_reply( struct thread *thread );
+
+/* Complete a deferred reply from a CQE callback.  Saves/restores
+ * `current` around send_reply_shm + nspa_shmem_channel_reply, clears
+ * the deferred flag.  Caller is responsible for filling the reply
+ * payload in request_shm->u.reply BEFORE calling this. */
+extern void nspa_uring_signal_reply( struct thread *thread,
+                                     struct request_shm *request_shm,
+                                     unsigned int data_size,
+                                     int channel_fd,
+                                     unsigned long long entry_id );
 
 #else  /* !HAVE_LIBURING_H */
 

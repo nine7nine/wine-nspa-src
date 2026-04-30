@@ -391,7 +391,16 @@ static void call_req_handler_shm( struct thread *thread, struct request_shm *req
 
     if (current)
     {
-        if (current->reply_fd)
+        if (current->nspa_async_reply_deferred)
+        {
+            /* NSPA Phase 4: handler submitted an io_uring op and will
+             * complete the reply later from a CQE callback.  Skip
+             * send_reply_shm; the callback writes the reply to shmem
+             * + signals CHANNEL_REPLY itself.  The dispatcher in
+             * shmem_channel.c also notices the deferred flag and
+             * skips its CHANNEL_REPLY ioctl. */
+        }
+        else if (current->reply_fd)
         {
             request_shm->u.reply.reply_header.error = current->error;
             request_shm->u.reply.reply_header.reply_size = current->reply_size;

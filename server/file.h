@@ -257,6 +257,7 @@ extern struct object *create_unix_device( struct object *root, const struct unic
 extern void do_change_notify( int unix_fd );
 extern void sigio_callback(void);
 extern struct object *create_dir_obj( struct fd *fd, unsigned int access, mode_t mode );
+extern struct object *create_file_obj( struct fd *fd, unsigned int access, mode_t mode ); /* NSPA Phase 4: callable from io_uring CQE callback */
 extern struct dir *get_dir_obj( struct process *process, obj_handle_t handle, unsigned int access );
 
 /* completion */

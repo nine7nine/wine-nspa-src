@@ -453,6 +453,8 @@ static inline void init_thread_structure( struct thread *thread )
     thread->req_toread      = 0;
     thread->reply_data      = NULL;
     thread->reply_towrite   = 0;
+    thread->nspa_async_reply_deferred = 0;
+    thread->nspa_channel_entry_id     = 0;
     thread->request_fd      = NULL;
     thread->reply_fd        = NULL;
     thread->wait_fd         = NULL;

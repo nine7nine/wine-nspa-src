@@ -55,6 +55,7 @@ extern int send_client_fd( struct process *process, int fd, obj_handle_t handle 
 extern void read_request( struct thread *thread );
 #ifdef __linux__
 extern void read_request_shm( struct thread *thread, struct request_shm *request_shm ); /* NSPA v1.5 */
+extern void send_reply_shm( union generic_reply *reply, struct request_shm *request_shm, data_size_t req_data_size ); /* NSPA Phase 4: callable from io_uring CQE callbacks */
 #endif
 extern void write_reply( struct thread *thread );
 extern timeout_t monotonic_counter(void);

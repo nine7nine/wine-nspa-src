@@ -26,7 +26,16 @@
 
 #include <liburing.h>
 
+#include "ntstatus.h"
+#define WIN32_NO_STATUS
+#include "windef.h"
+#include "winternl.h"
+
+#include "../object.h"   /* current */
+#include "../thread.h"
+#include "../request.h"
 #include "uring.h"
+#include "shmem_channel.h"
 
 /* Pool init: thread the array through ->next, head -> [0] -> [1] -> ... -> [N-1] -> NULL. */
 static void pool_init( struct nspa_uring_instance *u )
@@ -224,6 +233,50 @@ int nspa_uring_get_eventfd( struct nspa_uring_instance *u )
 {
     if (!u || !u->active) return -1;
     return u->eventfd;
+}
+
+/* ---------------------------------------------------------------- */
+/* Phase 4: deferred-reply helpers                                   */
+
+void nspa_uring_defer_reply( struct thread *thread )
+{
+    if (thread)
+        thread->nspa_async_reply_deferred = 1;
+}
+
+void nspa_uring_signal_reply( struct thread *thread, struct request_shm *request_shm,
+                              unsigned int data_size, int channel_fd,
+                              unsigned long long entry_id )
+{
+    struct thread *saved_current;
+
+    if (!thread || !request_shm) return;
+
+    /* Run the reply path with `current` bound to the requesting thread,
+     * matching what call_req_handler_shm does for the synchronous path
+     * (so trace_reply, send_reply_shm internals, etc. see the right
+     * thread state). */
+    saved_current = current;
+    current = thread;
+
+    /* Fill in the reply header from the thread's error/reply_size that
+     * the handler set before deferring (or that the CQE callback set
+     * before calling us). */
+    request_shm->u.reply.reply_header.error = thread->error;
+    request_shm->u.reply.reply_header.reply_size = thread->reply_size;
+
+    send_reply_shm( (union generic_reply *)&request_shm->u.reply, request_shm, data_size );
+
+    /* Clear the deferred flag BEFORE issuing CHANNEL_REPLY: once the
+     * sender wakes (via REPLY) the request lifecycle is complete and
+     * the next request on this thread must start with the flag clear. */
+    thread->nspa_async_reply_deferred = 0;
+
+    /* Wake the sender + drain our PI boost in one ioctl.  Same ioctl
+     * the dispatcher would have issued in the sync path. */
+    nspa_shmem_channel_reply( channel_fd, entry_id );
+
+    current = saved_current;
 }
 
 #endif /* HAVE_LIBURING_H */

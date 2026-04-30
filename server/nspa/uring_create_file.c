@@ -245,11 +245,22 @@ static void create_file_cqe_callback( void *ctx_ptr, int result )
                                                  ctx->options );
         if (!fd) goto reply;  /* error already set; unix_fd already closed */
 
-        /* Wrap fd in struct file with the real st_mode so
-         * file_get_fd_type returns FD_TYPE_FILE.  Phase 4 eligibility
-         * excludes directories/specials so we always route through
-         * file_obj. */
-        file_obj = create_file_obj( fd, ctx->access, out_mode );
+        /* Mirror create_file()'s dispatch (server/file.c lines 277-282):
+         * directories → create_dir_obj, char devices that are serial
+         * ports → create_serial, everything else → create_file_obj.
+         * Phase 4 eligibility doesn't gate on FILE_DIRECTORY_FILE in
+         * options because Win32 lets you open a directory handle
+         * without that flag (e.g. wineboot opens /windows/system32/
+         * with FILE_LIST_DIRECTORY only).  Calling create_file_obj on
+         * an S_ISDIR fd produces a wrong-type handle: subsequent
+         * NtQueryDirectoryFile, NtSetInformation, etc. behave
+         * incorrectly. */
+        if (S_ISDIR(out_mode))
+            file_obj = create_dir_obj( fd, ctx->access, out_mode );
+        else if (S_ISCHR(out_mode) && is_serial_fd(fd))
+            file_obj = create_serial( fd );
+        else
+            file_obj = create_file_obj( fd, ctx->access, out_mode );
         release_object( fd );
         if (!file_obj) goto reply;  /* error already set */
     }

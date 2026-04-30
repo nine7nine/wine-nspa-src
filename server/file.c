@@ -748,6 +748,15 @@ DECL_HANDLER(nspa_create_file_from_unix_fd)
          * minted via this LF-bypass path.  Resolve via /proc/self/fd
          * and set explicitly so dir-handle path queries work. */
         nspa_fd_set_unix_name_from_proc( fd );
+        /* Sync-parity with open_fd: open_fd → nspa_finalise_opened_fd
+         * populates fd->nt_name via dup_nt_name(root, nt_name).  The LF
+         * dir branch previously skipped this step, leaving fd->nt_name
+         * NULL on every promoted directory handle.  That made
+         * default_fd_get_full_name return NULL and NtQueryObject(
+         * ObjectNameInformation) yield STATUS_SUCCESS with
+         * Name.Buffer=NULL — the latent crash band-aided in
+         * dlls/ntdll/path.c:560 (start.exe NULL-Name). */
+        nspa_fd_set_nt_name( fd, nt_name );
 
         if ((file_obj = create_dir_obj( fd, access, 0 )))
         {

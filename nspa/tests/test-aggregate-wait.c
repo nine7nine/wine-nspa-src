@@ -772,55 +772,165 @@ static int test_cancel_via_signal(int dev_fd)
 }
 
 /* ============================================================
- *  Sub-test 7: kitchen-sink stress — covers ALL aggregate-wait
- *  source types under concurrent multi-thread load.  Modeled on
- *  test-mixed-load-stress.c.
+ *  Sub-test 7: channel source single-waiter — covers the NEW
+ *  try_wake_any_channel_notify hook in patch 1010.
  *
- *  Path coverage this exercises that 1-6 do NOT:
- *    - sem source agg_setup + try_wake_any_sem from aggregate-wait
- *    - mutex source agg_setup + try_wake_any_mutex with PI propagation
- *      via aggregate-wait + mutex-unqueue pi_recalc
- *    - channel source agg_setup + try_wake_any_channel_notify (the
- *      NEW 1010 hook, completely untouched by sub-tests 1-6)
- *    - concurrent multi-waiter wake races (UAF surface)
- *    - wake-vs-cancel races (UAF surface)
+ *  Single-waiter only: CHANNEL_RECV2 blocks if pending is empty,
+ *  so multi-waiter contention on a channel deadlocks losers when
+ *  one drains the queue.  This sub-test serializes
+ *  notify→RECV2→REPLY end-to-end in one thread.
  *
- *  Workload: NB_WAITERS=3 aggregate-waiter threads each loop
- *  AGGREGATE_WAIT over (sem, event, channel, eventfd) with short
- *  timeout.  NB_FIRERS=3 firer threads each loop random source
- *  signals (sem release / event SET-or-SET_PI / channel SEND_PI /
- *  eventfd write).  Mutex is excluded from the wait set because
- *  acquiring on every wake would force serialization that hides the
- *  parallelism KASAN cares about; mutex source is covered by a
- *  separate single-iter assertion below.
- *
- *  Per-path counters confirm each path was actually exercised.  If
- *  any counter is 0 at end, the test FAILS — ensures we don't
- *  silently miss coverage.
+ *  Worker thread:
+ *    1. AGGREGATE_WAIT on (channel, eventfd) — channel src is index 0
+ *    2. on fire: CHANNEL_RECV2 (we know depth>=1, won't block)
+ *    3. CHANNEL_REPLY to wake the sender
+ *    4. loop until N entries drained
+ *  Sender thread:
+ *    1. CHANNEL_SEND_PI (blocks until REPLY)
+ *    2. loop N times
  * ============================================================ */
-struct ks_send_helper {
+struct chan_ctx {
+    int dev_fd;
     int chan_fd;
-    struct ntsync_channel_send_args sa;
+    int evfd;
+    int n_iters;
+    atomic_int sender_done;
+    atomic_int waiter_drained;
+    atomic_int waiter_errors;
 };
 
-/* Detached thread: SEND_PI blocks until REPLY (or the channel fd is
- * closed at test cleanup, which returns -EBADF and unwinds). */
-static void *ks_send_thread(void *arg)
+static void *chan_sender_fn(void *arg)
 {
-    struct ks_send_helper *h = arg;
-    (void)ioctl(h->chan_fd, NTSYNC_IOC_CHANNEL_SEND_PI, &h->sa);
-    free(h);
+    struct chan_ctx *c = arg;
+    int i;
+    for (i = 0; i < c->n_iters; i++) {
+        struct ntsync_channel_send_args sa = {
+            .policy = SCHED_FIFO,
+            .prio = 1,
+            .payload_off = 0xc0ffee00ULL | (__u64)i,
+            .reply_off = 0,
+        };
+        if (ioctl(c->chan_fd, NTSYNC_IOC_CHANNEL_SEND_PI, &sa) < 0) {
+            if (errno != EBADF && errno != EINTR)
+                fprintf(stderr, "[chan-notify] sender SEND_PI failed: %s\n",
+                        strerror(errno));
+            break;
+        }
+    }
+    atomic_store(&c->sender_done, 1);
     return NULL;
 }
 
+static int test_channel_notify(int dev_fd)
+{
+    struct chan_ctx c = {0};
+    pthread_t sender;
+    struct ntsync_channel_create_args ch_args = { .max_depth = 4, .__pad = 0 };
+    struct ntsync_aggregate_source srcs[2];
+    struct ntsync_aggregate_wait_args args;
+    int fail = 0;
+    int N = 100;
+
+    c.dev_fd = dev_fd;
+    c.n_iters = N;
+    c.chan_fd = ioctl(dev_fd, NTSYNC_IOC_CREATE_CHANNEL, &ch_args);
+    c.evfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (c.chan_fd < 0 || c.evfd < 0) {
+        fprintf(stderr, "[chan-notify] create resources failed: %s\n", strerror(errno));
+        fail = 1; goto cleanup;
+    }
+    atomic_init(&c.sender_done, 0);
+    atomic_init(&c.waiter_drained, 0);
+    atomic_init(&c.waiter_errors, 0);
+
+    if (pthread_create(&sender, NULL, chan_sender_fn, &c) != 0) {
+        fprintf(stderr, "[chan-notify] pthread_create failed\n");
+        fail = 1; goto cleanup;
+    }
+
+    srcs[0].type = NTSYNC_AGG_OBJECT; srcs[0].events = 0;      srcs[0].fd = c.chan_fd; srcs[0].__pad = 0;
+    srcs[1].type = NTSYNC_AGG_FD;     srcs[1].events = POLLIN; srcs[1].fd = c.evfd;    srcs[1].__pad = 0;
+
+    /* Drain N entries via aggregate-wait + RECV2 + REPLY.  Single-
+     * threaded so every wake corresponds to a poppable entry. */
+    while (atomic_load(&c.waiter_drained) < N) {
+        memset(&args, 0, sizeof(args));
+        args.timeout = abs_deadline_ns(2ULL * 1000000000ULL);  /* 2s */
+        args.sources = (uintptr_t)srcs;
+        args.nb_sources = 2;
+        args.owner = gettid_compat();
+
+        if (ioctl(dev_fd, NTSYNC_IOC_AGGREGATE_WAIT, &args) < 0) {
+            fprintf(stderr, "[chan-notify] AGGREGATE_WAIT failed: %s\n", strerror(errno));
+            atomic_fetch_add(&c.waiter_errors, 1);
+            break;
+        }
+        if (args.fired_index != 0) {
+            fprintf(stderr, "[chan-notify] unexpected fired_index=%u\n", args.fired_index);
+            atomic_fetch_add(&c.waiter_errors, 1);
+            break;
+        }
+        {
+            struct ntsync_channel_recv2_args r;
+            memset(&r, 0, sizeof(r));
+            if (ioctl(c.chan_fd, NTSYNC_IOC_CHANNEL_RECV2, &r) < 0) {
+                fprintf(stderr, "[chan-notify] CHANNEL_RECV2 failed: %s\n", strerror(errno));
+                atomic_fetch_add(&c.waiter_errors, 1);
+                break;
+            }
+            {
+                __u64 eid = r.entry_id;
+                if (ioctl(c.chan_fd, NTSYNC_IOC_CHANNEL_REPLY, &eid) < 0) {
+                    fprintf(stderr, "[chan-notify] CHANNEL_REPLY failed: %s\n", strerror(errno));
+                    atomic_fetch_add(&c.waiter_errors, 1);
+                    break;
+                }
+            }
+            atomic_fetch_add(&c.waiter_drained, 1);
+        }
+    }
+    pthread_join(sender, NULL);
+
+    if (atomic_load(&c.waiter_errors) > 0) fail = 1;
+    if (atomic_load(&c.waiter_drained) != N) {
+        fprintf(stderr, "[chan-notify] drained %d/%d entries\n",
+                atomic_load(&c.waiter_drained), N);
+        fail = 1;
+    }
+
+    if (!fail) NOTE("[channel-notify (1010 hook)]  PASS  (drained %d entries)\n", N);
+
+cleanup:
+    if (c.chan_fd >= 0) close(c.chan_fd);
+    if (c.evfd >= 0) close(c.evfd);
+    return fail;
+}
+
+/* ============================================================
+ *  Sub-test 8: kitchen-sink stress (sem + event + eventfd) —
+ *  multi-waiter / multi-firer concurrent contention.  Channel
+ *  EXCLUDED — it requires single-waiter discipline (RECV2 blocks),
+ *  covered separately by test_channel_notify.
+ *
+ *  Path coverage this exercises that 1-7 do NOT:
+ *    - sem source agg_setup + try_wake_any_sem from aggregate-wait
+ *    - concurrent multi-waiter wake races (UAF surface)
+ *    - cross-source wake interleaving (one waiter fires on event,
+ *      another on sem, etc. — exercises the unqueue path under
+ *      contention)
+ *
+ *  Per-path counters confirm each path was actually exercised.
+ *  If any counter is 0 at end, the test FAILS — ensures we don't
+ *  silently miss coverage.
+ * ============================================================ */
 struct ks_state {
     int dev_fd;
-    int sem_fd, event_fd, chan_fd, evfd;
+    int sem_fd, event_fd, evfd;
     volatile int stop;
     /* Per-path coverage counters (atomic) */
-    atomic_int sem_fires, event_fires, channel_fires, fd_fires;
+    atomic_int sem_fires, event_fires, fd_fires;
     /* Per-source signaling counters (informational) */
-    atomic_int sem_releases, event_sets, chan_sends, evfd_writes;
+    atomic_int sem_releases, event_sets, evfd_writes;
     /* Wake counters */
     atomic_int waiter_wakes, waiter_timeouts, waiter_errors;
 };
@@ -828,22 +938,21 @@ struct ks_state {
 static void *ks_waiter_fn(void *arg)
 {
     struct ks_state *s = arg;
-    struct ntsync_aggregate_source srcs[4];
+    struct ntsync_aggregate_source srcs[3];
     struct ntsync_aggregate_wait_args args;
     __u32 prev;
     int ret;
 
-    /* Source layout: 0=sem 1=event 2=channel 3=eventfd */
+    /* Source layout: 0=sem 1=event 2=eventfd */
     srcs[0].type = NTSYNC_AGG_OBJECT; srcs[0].events = 0;      srcs[0].fd = s->sem_fd;   srcs[0].__pad = 0;
     srcs[1].type = NTSYNC_AGG_OBJECT; srcs[1].events = 0;      srcs[1].fd = s->event_fd; srcs[1].__pad = 0;
-    srcs[2].type = NTSYNC_AGG_OBJECT; srcs[2].events = 0;      srcs[2].fd = s->chan_fd;  srcs[2].__pad = 0;
-    srcs[3].type = NTSYNC_AGG_FD;     srcs[3].events = POLLIN; srcs[3].fd = s->evfd;     srcs[3].__pad = 0;
+    srcs[2].type = NTSYNC_AGG_FD;     srcs[2].events = POLLIN; srcs[2].fd = s->evfd;     srcs[2].__pad = 0;
 
     while (!__atomic_load_n(&s->stop, __ATOMIC_ACQUIRE)) {
         memset(&args, 0, sizeof(args));
         args.timeout = abs_deadline_ns(50000000ULL);  /* 50ms */
         args.sources = (uintptr_t)srcs;
-        args.nb_sources = 4;
+        args.nb_sources = 3;
         args.owner = gettid_compat();
 
         ret = ioctl(s->dev_fd, NTSYNC_IOC_AGGREGATE_WAIT, &args);
@@ -852,7 +961,7 @@ static void *ks_waiter_fn(void *arg)
                 atomic_fetch_add(&s->waiter_timeouts, 1);
                 continue;
             }
-            if (errno == EINTR) continue;  /* benign */
+            if (errno == EINTR) continue;
             atomic_fetch_add(&s->waiter_errors, 1);
             fprintf(stderr, "[kitchen-sink] waiter ioctl failed: %s\n", strerror(errno));
             break;
@@ -861,28 +970,14 @@ static void *ks_waiter_fn(void *arg)
         atomic_fetch_add(&s->waiter_wakes, 1);
 
         switch (args.fired_index) {
-        case 0: /* sem */
+        case 0: /* sem — already decremented by try_wake_any_sem */
             atomic_fetch_add(&s->sem_fires, 1);
-            /* sem was decremented by try_wake_any_sem; nothing to drain */
             break;
-        case 1: /* event */
+        case 1: /* event (manual-reset, stays signaled — reset for next loop) */
             atomic_fetch_add(&s->event_fires, 1);
-            /* manual-reset event stays signaled — reset so future iters
-             * start clean (otherwise we'd just spin on the event) */
             (void)ioctl(s->event_fd, NTSYNC_IOC_EVENT_RESET, &prev);
             break;
-        case 2: /* channel — notify-only.  Drain via CHANNEL_RECV2 + REPLY. */
-            atomic_fetch_add(&s->channel_fires, 1);
-            {
-                struct ntsync_channel_recv2_args r;
-                memset(&r, 0, sizeof(r));
-                if (ioctl(s->chan_fd, NTSYNC_IOC_CHANNEL_RECV2, &r) >= 0) {
-                    __u64 eid = r.entry_id;
-                    (void)ioctl(s->chan_fd, NTSYNC_IOC_CHANNEL_REPLY, &eid);
-                }
-            }
-            break;
-        case 3: /* eventfd */
+        case 2: /* eventfd — drain */
             atomic_fetch_add(&s->fd_fires, 1);
             {
                 uint64_t drain;
@@ -907,60 +1002,35 @@ static void *ks_firer_fn(void *arg)
     uint64_t one = 1;
 
     while (!__atomic_load_n(&s->stop, __ATOMIC_ACQUIRE)) {
-        unsigned pick = rand_r(&seed) % 4;
-
+        unsigned pick = rand_r(&seed) % 3;
         switch (pick) {
-        case 0: /* sem release */
+        case 0:
             if (ioctl(s->sem_fd, NTSYNC_IOC_SEM_RELEASE, &prev) >= 0)
                 atomic_fetch_add(&s->sem_releases, 1);
             break;
-        case 1: /* event SET (mix of SET and SET_PI) */
+        case 1:
             if ((rand_r(&seed) & 1) == 0) {
                 if (ioctl(s->event_fd, NTSYNC_IOC_EVENT_SET, &prev) >= 0)
                     atomic_fetch_add(&s->event_sets, 1);
             } else {
                 struct ntsync_event_set_pi_args pi = {
                     .flags = 0, .policy = SCHED_FIFO,
-                    .prio = 1 + (rand_r(&seed) % 10),  /* 1..10, low boost */
+                    .prio = 1 + (rand_r(&seed) % 10),
                     .__pad = 0,
                 };
                 if (ioctl(s->event_fd, NTSYNC_IOC_EVENT_SET_PI, &pi) >= 0)
                     atomic_fetch_add(&s->event_sets, 1);
             }
             break;
-        case 2: /* channel SEND_PI in a detached helper thread (SEND_PI
-                 * blocks until REPLY; we don't want to block the firer). */
-            {
-                struct ks_send_helper *h = malloc(sizeof(*h));
-                pthread_t t;
-
-                if (!h) break;
-                h->chan_fd = s->chan_fd;
-                h->sa.policy = SCHED_FIFO;
-                h->sa.prio = 1 + (rand_r(&seed) % 10);
-                h->sa.payload_off = 0xdead0000ULL | (rand_r(&seed) & 0xffff);
-                h->sa.reply_off = 0;
-                if (pthread_create(&t, NULL, ks_send_thread, h) == 0) {
-                    pthread_detach(t);
-                    atomic_fetch_add(&s->chan_sends, 1);
-                } else {
-                    free(h);
-                }
-            }
-            usleep(1000);  /* throttle channel sends — heavy */
-            break;
-        case 3: /* eventfd write */
+        case 2:
             if (write(s->evfd, &one, sizeof(one)) == sizeof(one))
                 atomic_fetch_add(&s->evfd_writes, 1);
             break;
         }
-        usleep(100);  /* 100us inter-fire delay — keep contention high but not pegged */
+        usleep(100);  /* 100us inter-fire */
     }
     return NULL;
 }
-
-/* Note: ks_send_helper + ks_send_thread are defined above the firer (see top
- * of kitchen-sink section). */
 
 static int test_kitchen_sink_stress(int dev_fd, int duration_sec)
 {
@@ -970,27 +1040,24 @@ static int test_kitchen_sink_stress(int dev_fd, int duration_sec)
     pthread_t firers[NB_FIRERS];
     struct ntsync_event_args ev_args = { .manual = 1, .signaled = 0 };
     struct ntsync_sem_args sem_args = { .count = 0, .max = 100 };
-    struct ntsync_channel_create_args ch_args = { .max_depth = 16, .__pad = 0 };
     int i, fail = 0;
+    int sem_f, evt_f, fd_f;
 
     s.dev_fd = dev_fd;
     s.sem_fd = ioctl(dev_fd, NTSYNC_IOC_CREATE_SEM, &sem_args);
     s.event_fd = ioctl(dev_fd, NTSYNC_IOC_CREATE_EVENT, &ev_args);
-    s.chan_fd = ioctl(dev_fd, NTSYNC_IOC_CREATE_CHANNEL, &ch_args);
     s.evfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
 
-    if (s.sem_fd < 0 || s.event_fd < 0 || s.chan_fd < 0 || s.evfd < 0) {
+    if (s.sem_fd < 0 || s.event_fd < 0 || s.evfd < 0) {
         fprintf(stderr, "[kitchen-sink] create resources failed: %s\n", strerror(errno));
         fail = 1; goto cleanup;
     }
 
     atomic_init(&s.sem_fires, 0);
     atomic_init(&s.event_fires, 0);
-    atomic_init(&s.channel_fires, 0);
     atomic_init(&s.fd_fires, 0);
     atomic_init(&s.sem_releases, 0);
     atomic_init(&s.event_sets, 0);
-    atomic_init(&s.chan_sends, 0);
     atomic_init(&s.evfd_writes, 0);
     atomic_init(&s.waiter_wakes, 0);
     atomic_init(&s.waiter_timeouts, 0);
@@ -1009,28 +1076,24 @@ static int test_kitchen_sink_stress(int dev_fd, int duration_sec)
         }
     }
 
-    NOTE("[kitchen-sink] running for %ds (%d waiters, %d firers, all source types)\n",
+    NOTE("[kitchen-sink] running for %ds (%d waiters, %d firers — sem+event+fd)\n",
          duration_sec, NB_WAITERS, NB_FIRERS);
     sleep(duration_sec);
     __atomic_store_n(&s.stop, 1, __ATOMIC_RELEASE);
 
-    /* Join — give waiters one extra timeout cycle to exit cleanly. */
     for (i = 0; i < NB_FIRERS; i++) pthread_join(firers[i], NULL);
     for (i = 0; i < NB_WAITERS; i++) pthread_join(waiters[i], NULL);
 
-    /* Verify path coverage: each source type fired at least once.
-     * If any path counter is 0, the test FAILED to exercise that path. */
-    int sem_f = atomic_load(&s.sem_fires);
-    int evt_f = atomic_load(&s.event_fires);
-    int chan_f = atomic_load(&s.channel_fires);
-    int fd_f = atomic_load(&s.fd_fires);
+    sem_f = atomic_load(&s.sem_fires);
+    evt_f = atomic_load(&s.event_fires);
+    fd_f  = atomic_load(&s.fd_fires);
 
-    NOTE("[kitchen-sink] coverage: sem=%d event=%d channel=%d fd=%d  "
-         "(sigs: sem=%d ev=%d chan=%d evfd=%d)  "
+    NOTE("[kitchen-sink] coverage: sem=%d event=%d fd=%d  "
+         "(sigs: sem=%d ev=%d evfd=%d)  "
          "(wakes=%d timeouts=%d errors=%d)\n",
-         sem_f, evt_f, chan_f, fd_f,
+         sem_f, evt_f, fd_f,
          atomic_load(&s.sem_releases), atomic_load(&s.event_sets),
-         atomic_load(&s.chan_sends), atomic_load(&s.evfd_writes),
+         atomic_load(&s.evfd_writes),
          atomic_load(&s.waiter_wakes), atomic_load(&s.waiter_timeouts),
          atomic_load(&s.waiter_errors));
 
@@ -1039,20 +1102,19 @@ static int test_kitchen_sink_stress(int dev_fd, int duration_sec)
                 atomic_load(&s.waiter_errors));
         fail = 1;
     }
-    if (sem_f == 0 || evt_f == 0 || chan_f == 0 || fd_f == 0) {
+    if (sem_f == 0 || evt_f == 0 || fd_f == 0) {
         fprintf(stderr, "[kitchen-sink] FAIL: path coverage gap "
-                "(sem=%d evt=%d chan=%d fd=%d) — at least one source type "
-                "never fired through aggregate-wait\n",
-                sem_f, evt_f, chan_f, fd_f);
+                "(sem=%d evt=%d fd=%d) — at least one source type "
+                "never fired\n",
+                sem_f, evt_f, fd_f);
         fail = 1;
     }
 
-    if (!fail) NOTE("[kitchen-sink stress]        PASS  (all 4 paths exercised)\n");
+    if (!fail) NOTE("[kitchen-sink stress]        PASS  (3 paths × 3 waiters × 3 firers)\n");
 
 cleanup:
     if (s.sem_fd >= 0) close(s.sem_fd);
     if (s.event_fd >= 0) close(s.event_fd);
-    if (s.chan_fd >= 0) close(s.chan_fd);
     if (s.evfd >= 0) close(s.evfd);
     return fail;
 }
@@ -1077,7 +1139,8 @@ static int run_smoke(int dev_fd)
     fail |= test_32_source_stress(dev_fd);
     fail |= test_mixed_obj_fd(dev_fd);
     fail |= test_cancel_via_signal(dev_fd);
-    fail |= test_kitchen_sink_stress(dev_fd, 3);  /* 3s smoke */
+    fail |= test_channel_notify(dev_fd);             /* sub-test 7: NEW 1010 hook */
+    fail |= test_kitchen_sink_stress(dev_fd, 3);     /* sub-test 8: 3s multi-thread */
     return fail;
 }
 
@@ -1116,12 +1179,15 @@ static int run_stress(int dev_fd, long iters)
             return 1;
         }
 
-        /* Every 1000 iters of single-threaded sub-tests, run a 2s
-         * kitchen-sink round.  Concurrency-class bug coverage. */
+        /* Every 1000 iters of single-threaded sub-tests, run a
+         * channel-notify (sub-test 7) round + 2s kitchen-sink round.
+         * Hits the new 1010 hook + multi-thread concurrency surface. */
         if (i > 0 && (i % 1000) == 0) {
-            int ks_fail = test_kitchen_sink_stress(dev_fd, ks_seconds_per_round);
+            int ks_fail = test_channel_notify(dev_fd);
+            if (!ks_fail)
+                ks_fail = test_kitchen_sink_stress(dev_fd, ks_seconds_per_round);
             if (ks_fail) {
-                fprintf(stderr, "\n[stress] FAIL at iter %ld in kitchen-sink round\n", i);
+                fprintf(stderr, "\n[stress] FAIL at iter %ld in concurrency round\n", i);
                 return 1;
             }
         }
@@ -1131,15 +1197,17 @@ static int run_stress(int dev_fd, long iters)
             fflush(stdout);
         }
     }
-    /* Final kitchen-sink round so even a small iter count gets concurrency coverage. */
+    /* Final concurrency round so even a small iter count gets coverage. */
     {
-        int ks_fail = test_kitchen_sink_stress(dev_fd, ks_seconds_per_round);
+        int ks_fail = test_channel_notify(dev_fd);
+        if (!ks_fail)
+            ks_fail = test_kitchen_sink_stress(dev_fd, ks_seconds_per_round);
         if (ks_fail) {
-            fprintf(stderr, "\n[stress] FAIL in final kitchen-sink round\n");
+            fprintf(stderr, "\n[stress] FAIL in final concurrency round\n");
             return 1;
         }
     }
-    printf("[stress] %ld iters + kitchen-sink rounds PASS\n", iters);
+    printf("[stress] %ld iters + concurrency rounds PASS\n", iters);
     return 0;
 }
 
@@ -1172,7 +1240,7 @@ int main(int argc, char **argv)
         printf("== NTSYNC_IOC_AGGREGATE_WAIT smoke test (patch 1010) ==\n");
         rc = run_smoke(dev_fd);
         if (rc == 0)
-            printf("\nRESULT: PASS  (6/6)\n");
+            printf("\nRESULT: PASS  (8/8)\n");
         else
             printf("\nRESULT: FAIL\n");
     }

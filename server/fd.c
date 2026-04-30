@@ -2388,6 +2388,19 @@ void nspa_fd_set_unix_name_from_proc( struct fd *fd )
     }
 }
 
+/* NSPA: copy a UNICODE_STRING NT path onto fd->nt_name / fd->nt_namelen.
+ * Used by LF promotion / anonymous-fd paths that bypass open_fd but
+ * still need the fd to carry an NT name — without it,
+ * default_fd_get_full_name returns NULL, NtQueryObject(ObjectNameInformation)
+ * yields STATUS_SUCCESS with Name.Buffer=NULL, and helpers like
+ * get_unix_full_path (dlls/ntdll/path.c) crash on the unguarded write.
+ * Idempotent — skips if fd->nt_name is already set or name is empty. */
+void nspa_fd_set_nt_name( struct fd *fd, struct unicode_str nt_name )
+{
+    if (!fd || fd->nt_name || !nt_name.len) return;
+    fd->nt_name = dup_nt_name( NULL, nt_name, &fd->nt_namelen );
+}
+
 struct fd *create_inode_fd_from_unix_fd( int unix_fd, unsigned int access,
                                          unsigned int sharing, unsigned int options,
                                          struct unicode_str nt_name )

@@ -401,11 +401,16 @@ int nspa_uring_create_file_try_async(
     }
 
     /* Compute open flags the same way create_file()/open_fd() does
-     * for FILE_OPEN.  Eligibility excluded write access, but keep the
-     * generic shape for clarity (rw_mode collapses to O_RDONLY here). */
-    if ((req->access & FILE_UNIX_WRITE_ACCESS) && !(req->options & FILE_DIRECTORY_FILE))
+     * for FILE_OPEN.  Use ctx->access (MAPPED) — never raw req->access
+     * — because GENERIC_READ/WRITE/ALL bits live in the high range and
+     * don't match FILE_UNIX_*_ACCESS until map_access() expands them.
+     * Eligibility now rejects all write-class opens (see the
+     * mapped_access check in eligible()) so rw_mode collapses to
+     * O_RDONLY here in practice; the conditional structure is kept
+     * for forward-compatibility if eligibility ever widens. */
+    if ((ctx->access & FILE_UNIX_WRITE_ACCESS) && !(req->options & FILE_DIRECTORY_FILE))
     {
-        if (req->access & FILE_UNIX_READ_ACCESS) rw_mode = O_RDWR;
+        if (ctx->access & FILE_UNIX_READ_ACCESS) rw_mode = O_RDWR;
         else rw_mode = O_WRONLY;
     }
     else rw_mode = O_RDONLY;

@@ -36,12 +36,19 @@ extern void nspa_shmem_channel_register_thread( struct process *process, struct 
  * they retain the token they were stamped with at SEND_PI. */
 extern void nspa_shmem_channel_deregister_thread( struct process *process, struct thread *thread );
 
+/* NSPA Phase 4: signal CHANNEL_REPLY from an io_uring CQE callback.
+ * Used by async-completing handlers (e.g. uring_create_file) when the
+ * syscall completes — the dispatcher has already skipped its own
+ * REPLY because thread->nspa_async_reply_deferred was set. */
+extern void nspa_shmem_channel_reply( int channel_fd, unsigned long long entry_id );
+
 #else
 
 static inline void nspa_shmem_channel_init( struct process *process ) {}
 static inline void nspa_shmem_channel_destroy( struct process *process ) {}
 static inline void nspa_shmem_channel_register_thread( struct process *process, struct thread *thread ) {}
 static inline void nspa_shmem_channel_deregister_thread( struct process *process, struct thread *thread ) {}
+static inline void nspa_shmem_channel_reply( int channel_fd, unsigned long long entry_id ) {}
 
 #endif
 

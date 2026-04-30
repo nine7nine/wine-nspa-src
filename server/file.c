@@ -48,6 +48,7 @@
 #include "process.h"
 #include "security.h"
 #include "nspa/local_file.h"
+#include "nspa/uring_create_file.h"
 
 static const WCHAR file_name[] = {'F','i','l','e'};
 
@@ -187,7 +188,10 @@ struct file *create_file_for_fd_obj( struct fd *fd, unsigned int access, unsigne
     return file;
 }
 
-static struct object *create_file_obj( struct fd *fd, unsigned int access, mode_t mode )
+/* NSPA Phase 4: non-static so the io_uring CQE callback in
+ * nspa/uring_create_file.c can wrap fds the same way the synchronous
+ * path does.  Declared in file.h. */
+struct object *create_file_obj( struct fd *fd, unsigned int access, mode_t mode )
 {
     struct file *file = alloc_object( &file_ops );
 
@@ -651,6 +655,16 @@ DECL_HANDLER(create_file)
 
     if (!objattr) return;
 
+    name = get_req_data_after_objattr( objattr, &name_len );
+
+    /* NSPA Phase 4: try async dispatch first.  Returns 1 if the
+     * request was dispatched via io_uring + IOSQE_ASYNC; in that case
+     * the CQE callback owns reply completion and we must return
+     * without touching reply->handle.  Returns 0 if not dispatched
+     * (gate off, ineligible, pool full) — fall through to sync. */
+    if (nspa_uring_create_file_try_async( req, objattr, sd, nt_name, name, name_len ))
+        return;
+
     if (objattr->rootdir)
     {
         struct dir *root;
@@ -660,8 +674,6 @@ DECL_HANDLER(create_file)
         release_object( root );
         if (!root_fd) return;
     }
-
-    name = get_req_data_after_objattr( objattr, &name_len );
 
     reply->handle = 0;
     if ((file = create_file( root_fd, name, name_len, nt_name, req->access, req->sharing,

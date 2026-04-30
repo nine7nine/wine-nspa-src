@@ -22,6 +22,7 @@ LDFLAGS=${LDFLAGS:--lpthread}
 NATIVE_TESTS=(
     test-event-set-pi
     test-channel-recv-exclusive
+    test-aggregate-wait
 )
 
 # Tests skipped by design (assert ntsync 1007 behaviour we rolled back —

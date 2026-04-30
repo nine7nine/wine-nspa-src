@@ -712,6 +712,18 @@ static void nspa_lf_aggregate_from_slot( const nspa_inode_slot_t *slot,
     *agg_sharing = sh;
 }
 
+/* Server-internal "magic" access bit for writable shared mappings.
+ * Mirrors server/file.h::FILE_MAPPING_WRITE — duplicated here to avoid
+ * pulling server headers into ntdll.  The server's nspa_publish_inode_state
+ * walks inode->open and OR's every fd's access into agg_access, so a
+ * writable section mapping on the inode causes this bit to land in
+ * subentry[0] (server's published view).  LF's algorithm must check it
+ * to match server/fd.c::check_sharing's mapping-aware sharing
+ * arbitration.  The bit overlaps GENERIC_WRITE in raw client access,
+ * but try_bypass strips GENERIC_* before storage so the only way this
+ * bit appears in existing_access is via the server's publish. */
+#define NSPA_LF_FILE_MAPPING_WRITE 0x40000000u
+
 /* Apply the same algorithm as server/fd.c:check_sharing on aggregated
  * existing state.  Returns STATUS_SHARING_VIOLATION on conflict. */
 static NTSTATUS nspa_lf_check_sharing_algorithm( unsigned int existing_access,
@@ -726,6 +738,17 @@ static NTSTATUS nspa_lf_check_sharing_algorithm( unsigned int existing_access,
     if (((my_access & read_access)  && !(existing_sharing & FILE_SHARE_READ)) ||
         ((my_access & write_access) && !(existing_sharing & FILE_SHARE_WRITE)) ||
         ((my_access & DELETE)       && !(existing_sharing & FILE_SHARE_DELETE)))
+        return STATUS_SHARING_VIOLATION;
+
+    /* Sync-parity with server/fd.c::check_sharing — a writable section
+     * mapping on this inode (FILE_MAPPING_WRITE in existing_access via
+     * server's subentry[0] publish) requires the new open to allow
+     * FILE_SHARE_WRITE.  The other server-side mapping checks
+     * (FILE_MAPPING_IMAGE && FILE_WRITE_DATA, FILE_MAPPING_IMAGE &&
+     * FILE_DELETE_ON_CLOSE, FILE_MAPPING_ACCESS && O_TRUNC) are moot
+     * here: LF eligibility excludes FILE_WRITE_DATA, FILE_DELETE_ON_CLOSE,
+     * and any disposition that produces O_TRUNC. */
+    if ((existing_access & NSPA_LF_FILE_MAPPING_WRITE) && !(my_sharing & FILE_SHARE_WRITE))
         return STATUS_SHARING_VIOLATION;
 
     if (!(my_access & all_access))

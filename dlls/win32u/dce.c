@@ -750,15 +750,37 @@ void register_window_surface( struct window_surface *old, struct window_surface 
  */
 void flush_window_surfaces( BOOL idle )
 {
-    static DWORD last_idle;
+    static DWORD last_idle, last_flush;
+    /* NSPA: throttle every flush_window_surfaces invocation when
+     * NSPA_FLUSH_THROTTLE_MS=N is set.  Apps that poll peek_message at
+     * high frequency (e.g. Ableton's MainThread pump, ~8% CPU in
+     * x11drv_surface_flush in profile) trigger flush + per-surface
+     * XFlush() round-trip on every idle call; throttling caps the rate
+     * at which the actual surface flush walk happens.  Suggested
+     * values: 4-16ms.  Default 0 = upstream behaviour (no throttle). */
+    static int throttle_ms = -1;
     DWORD now;
     struct window_surface *surface;
+
+    if (throttle_ms < 0)
+    {
+        const char *v = getenv( "NSPA_FLUSH_THROTTLE_MS" );
+        int n = (v && *v) ? atoi( v ) : 0;
+        throttle_ms = n > 0 ? n : 0;
+    }
 
     pi_mutex_lock( &surfaces_lock );
     now = NtGetTickCount();
     if (idle) last_idle = now;
     /* if not idle, we only flush if there's evidence that the app never goes idle */
     else if ((int)(now - last_idle) < 50) goto done;
+
+    /* NSPA throttle gate: skip the surface walk if the previous walk
+     * happened within `throttle_ms`.  Per-surface dirty-bounds checks
+     * still run when the walk does happen (intersect_rect at line 630
+     * skips clean surfaces). */
+    if (throttle_ms > 0 && (int)(now - last_flush) < throttle_ms) goto done;
+    last_flush = now;
 
     LIST_FOR_EACH_ENTRY( surface, &window_surfaces, struct window_surface, entry )
         window_surface_flush( surface );

@@ -107,6 +107,8 @@ struct thread
     void                  *reply_data;    /* variable-size data for reply */
     unsigned int           reply_size;    /* size of reply data */
     unsigned int           reply_towrite; /* amount of data still to write in reply */
+    int                    nspa_async_reply_deferred; /* NSPA Phase 4: handler submitted io_uring op; skip send_reply_shm + CHANNEL_REPLY (CQE callback owns reply) */
+    unsigned long long     nspa_channel_entry_id;     /* NSPA Phase 4: gamma channel entry_id, set by dispatcher before read_request_shm; valid only during handler dispatch */
     struct fd             *request_fd;    /* fd for receiving client requests */
     struct fd             *reply_fd;      /* fd to send a reply to a client */
     struct fd             *wait_fd;       /* fd to use to wake a sleeping client */

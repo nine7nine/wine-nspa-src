@@ -50,6 +50,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/eventfd.h>
@@ -323,7 +324,17 @@ static void *channel_dispatcher( void *param )
                 if (read( uring_efd, &evfd_val, sizeof(evfd_val) ) < 0
                     && errno != EAGAIN)
                     break;     /* fatal eventfd error — exit cleanly */
+                /* Phase 4: drain runs CQE callbacks which mutate
+                 * per-thread state (current, request_shm reply,
+                 * thread->error, etc.) and call send_reply_shm /
+                 * nspa_shmem_channel_reply.  Take global_lock to
+                 * serialize with other handlers + main thread state.
+                 * Phase 3 left this unlocked because there were no
+                 * submitters; Phase 4's create_file handler is the
+                 * first. */
+                pi_mutex_lock( &global_lock );
                 nspa_uring_drain( &ctx->uring );
+                pi_mutex_unlock( &global_lock );
                 continue;
             }
 
@@ -410,6 +421,12 @@ static void dispatch_channel_entry( int channel_fd, int use_token,
          * process would corrupt unrelated state. */
         if (thread->process->request_channel_fd == channel_fd && thread->request_shm)
         {
+            /* NSPA Phase 4: stash entry_id BEFORE the handler runs so
+             * an async-completing handler (e.g. nspa_uring_create_file)
+             * can copy it into its CQE context.  Cleared at the end of
+             * dispatch (not strictly necessary — only valid during
+             * handler dispatch — but keeps state hygienic). */
+            thread->nspa_channel_entry_id = recv->entry_id;
             __atomic_thread_fence( __ATOMIC_SEQ_CST );
             read_request_shm( thread, (struct request_shm *)thread->request_shm );
             __atomic_thread_fence( __ATOMIC_SEQ_CST );
@@ -418,12 +435,25 @@ static void dispatch_channel_entry( int channel_fd, int use_token,
             release_object( thread );
     }
 
-    pi_mutex_unlock( &global_lock );
-
-    /* Wake the sender + drain our PI boost in one ioctl. */
+    /* NSPA Phase 4: detect deferred reply BEFORE dropping global_lock.
+     * If the handler submitted an io_uring op and deferred its reply
+     * (set thread->nspa_async_reply_deferred = 1), the CQE callback
+     * owns the reply path — both send_reply_shm AND CHANNEL_REPLY.
+     * Skip our own CHANNEL_REPLY ioctl in that case.
+     *
+     * Reading the flag must be inside the lock — the field is on
+     * thread state which the CQE callback (running under global_lock
+     * later) will clear before it issues its own CHANNEL_REPLY. */
     {
-        __u64 entry_id = recv->entry_id;
-        ioctl( channel_fd, NTSYNC_IOC_CHANNEL_REPLY, &entry_id );
+        int deferred = (thread && thread->nspa_async_reply_deferred);
+
+        pi_mutex_unlock( &global_lock );
+
+        if (!deferred)
+        {
+            __u64 entry_id = recv->entry_id;
+            ioctl( channel_fd, NTSYNC_IOC_CHANNEL_REPLY, &entry_id );
+        }
     }
 
     /* Read poll_generation outside the lock — RELAXED is intentional.
@@ -592,6 +622,24 @@ void nspa_shmem_channel_deregister_thread( struct process *process, struct threa
 
     tid = (__u32)thread->unix_tid;
     (void)ioctl( process->request_channel_fd, NTSYNC_IOC_CHANNEL_DEREGISTER_THREAD, &tid );
+}
+
+/* NSPA Phase 4: signal CHANNEL_REPLY for an in-flight channel entry
+ * from an io_uring CQE-completion path.  The kernel walks the channel's
+ * dispatched list, marks the entry replied, wakes the sender, and
+ * drains our PI boost.  Failure (e.g. stale entry_id) is logged at
+ * debug_level only — caller has nothing useful to do with the error. */
+void nspa_shmem_channel_reply( int channel_fd, unsigned long long entry_id )
+{
+    __u64 ent = (__u64)entry_id;
+
+    if (channel_fd < 0) return;
+    if (ioctl( channel_fd, NTSYNC_IOC_CHANNEL_REPLY, &ent ) < 0)
+    {
+        if (debug_level)
+            fprintf( stderr, "nspa_shmem_channel_reply: ioctl failed: %s\n",
+                     strerror( errno ) );
+    }
 }
 
 #endif /* __linux__ */

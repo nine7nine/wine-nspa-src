@@ -547,8 +547,14 @@ static BOOL get_unix_full_path( LPCWSTR name, LPWSTR buffer, ULONG size, ULONG *
         ULONG retsize, bufsize = sizeof(OBJECT_NAME_INFORMATION) + size + 4 * sizeof(WCHAR);
         OBJECT_NAME_INFORMATION *info = RtlAllocateHeap( GetProcessHeap(), 0, bufsize );
 
-        if (!(status = NtQueryObject( handle, ObjectNameInformation, info, bufsize, &retsize )))
+        if (!(status = NtQueryObject( handle, ObjectNameInformation, info, bufsize, &retsize ))
+            && info->Name.Buffer && info->Name.Length >= 2 * sizeof(WCHAR))
         {
+            /* NSPA: guard the !name / len<2 case.  NtQueryObject can return
+             * STATUS_SUCCESS with an empty Name for certain bypass-opened
+             * handles; without the guard the `else name[1] = '\\'` below
+             * crashes on NULL+1 write.  Falling out of the success block
+             * lets caller try other resolution paths. */
             ULONG len = info->Name.Length;
             WCHAR *name = info->Name.Buffer;
 

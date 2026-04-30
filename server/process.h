@@ -94,7 +94,8 @@ struct process
     int                  request_channel_fd;    /* NSPA gamma: ntsync channel for shm-IPC */
     pthread_t            channel_dispatcher;    /* NSPA gamma: 1 pthread per process */
     int                  channel_dispatcher_running; /* NSPA gamma: lifecycle gate */
-    struct nspa_uring_instance nspa_uring;      /* NSPA 1010: per-process server-side io_uring (Phase 2) */
+    struct nspa_uring_instance *nspa_uring;     /* NSPA 1010 Phase 3: pts into dispatcher_ctx->uring; NULL if no ring */
+    void                *nspa_dispatcher_ctx;   /* NSPA 1010 Phase 3: opaque ctx ptr (struct nspa_dispatcher_ctx) */
 #endif
 };
 

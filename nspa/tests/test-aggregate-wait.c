@@ -907,7 +907,174 @@ cleanup:
 }
 
 /* ============================================================
- *  Sub-test 8: kitchen-sink stress (sem + event + eventfd) —
+ *  Sub-test 8: channel-PI propagation — load-bearing for the
+ *  Phase 3 dispatcher use case (audio threads SEND_PI'ing into
+ *  the channel that the dispatcher is aggregate-waiting on).
+ *
+ *  Aggregate-waiter at default prio (SCHED_OTHER) on (channel, fd).
+ *  Sender does CHANNEL_SEND_PI with FIFO/80.  After wake, waiter
+ *  must show its sched_attr boosted to FIFO/80 — proves
+ *  ntsync_channel_send_pi found the agg-waiter via the any_waiters
+ *  fallback (recv_wq is empty in this scenario).
+ *
+ *  Without the any_waiters fallback in send_pi, the kernel finds
+ *  no boost target and skips PI propagation — dispatcher stays at
+ *  default prio while the high-prio sender waits = priority
+ *  inversion in the audio path.
+ * ============================================================ */
+struct chan_pi_ctx {
+    int dev_fd;
+    int chan_fd;
+    int evfd;
+    volatile int ready;
+    volatile int woke;
+    int last_errno;
+    struct local_sched_attr attr_after_wake;
+    __u32 fired_index_out;
+};
+
+static void *chan_pi_waiter_fn(void *arg)
+{
+    struct chan_pi_ctx *c = arg;
+    struct ntsync_aggregate_source srcs[2];
+    struct ntsync_aggregate_wait_args args;
+    int ret;
+
+    srcs[0].type = NTSYNC_AGG_OBJECT;
+    srcs[0].events = 0;
+    srcs[0].fd = c->chan_fd;
+    srcs[0].__pad = 0;
+    srcs[1].type = NTSYNC_AGG_FD;
+    srcs[1].events = POLLIN;
+    srcs[1].fd = c->evfd;
+    srcs[1].__pad = 0;
+
+    memset(&args, 0, sizeof(args));
+    args.timeout = abs_deadline_ns(5ULL * 1000000000ULL);
+    args.sources = (uintptr_t)srcs;
+    args.nb_sources = 2;
+    args.owner = gettid_compat();
+
+    __atomic_store_n(&c->ready, 1, __ATOMIC_RELEASE);
+
+    ret = ioctl(c->dev_fd, NTSYNC_IOC_AGGREGATE_WAIT, &args);
+    if (ret < 0) {
+        c->last_errno = errno;
+        c->woke = -1;
+        return NULL;
+    }
+    c->woke = 1;
+    c->fired_index_out = args.fired_index;
+
+    /* Capture sched attrs WHILE BOOSTED (drain happens at next wait
+     * entry — don't re-enter wait before reading). */
+    c->attr_after_wake.size = sizeof(c->attr_after_wake);
+    sys_sched_getattr(0, &c->attr_after_wake, sizeof(c->attr_after_wake), 0);
+
+    /* Drain the channel so SEND_PI can return: RECV2 + REPLY. */
+    if (args.fired_index == 0) {
+        struct ntsync_channel_recv2_args r;
+        memset(&r, 0, sizeof(r));
+        if (ioctl(c->chan_fd, NTSYNC_IOC_CHANNEL_RECV2, &r) >= 0) {
+            __u64 eid = r.entry_id;
+            (void)ioctl(c->chan_fd, NTSYNC_IOC_CHANNEL_REPLY, &eid);
+        }
+    }
+    return NULL;
+}
+
+static int test_channel_pi_propagation(int dev_fd)
+{
+    struct chan_pi_ctx ctx = {0};
+    pthread_t waiter;
+    struct ntsync_channel_create_args ch_args = { .max_depth = 4, .__pad = 0 };
+    struct ntsync_channel_send_args sa = {
+        .policy = SCHED_FIFO,
+        .prio = 80,
+        .payload_off = 0xc0ffeebabeULL,
+        .reply_off = 0,
+    };
+    int spins, fail = 0;
+
+    ctx.dev_fd = dev_fd;
+    ctx.chan_fd = ioctl(dev_fd, NTSYNC_IOC_CREATE_CHANNEL, &ch_args);
+    ctx.evfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (ctx.chan_fd < 0 || ctx.evfd < 0) {
+        fprintf(stderr, "[chan-pi] create resources failed: %s\n", strerror(errno));
+        if (ctx.chan_fd >= 0) close(ctx.chan_fd);
+        if (ctx.evfd >= 0) close(ctx.evfd);
+        return 1;
+    }
+
+    if (pthread_create(&waiter, NULL, chan_pi_waiter_fn, &ctx) != 0) {
+        fprintf(stderr, "[chan-pi] pthread_create failed\n");
+        close(ctx.chan_fd); close(ctx.evfd);
+        return 1;
+    }
+
+    /* Wait for waiter to arm, then small grace period for the ioctl
+     * to actually queue on channel->any_waiters before SEND_PI fires.
+     * Same shape as test-event-set-pi's rendezvous. */
+    for (spins = 0; spins < 10000; spins++) {
+        if (__atomic_load_n(&ctx.ready, __ATOMIC_ACQUIRE)) break;
+        usleep(100);
+    }
+    if (!__atomic_load_n(&ctx.ready, __ATOMIC_ACQUIRE)) {
+        fprintf(stderr, "[chan-pi] waiter never armed\n");
+        pthread_join(waiter, NULL);
+        close(ctx.chan_fd); close(ctx.evfd);
+        return 1;
+    }
+    usleep(20 * 1000);  /* 20ms grace */
+
+    /* SEND_PI from main (default SCHED_OTHER) with FIFO/80 boost.
+     * SEND_PI BLOCKS until REPLY — waiter wakes, drains, replies,
+     * we return.  Waiter MUST be boosted via the any_waiters
+     * fallback (recv_wq is empty since waiter is on AGG_WAIT path). */
+    if (ioctl(ctx.chan_fd, NTSYNC_IOC_CHANNEL_SEND_PI, &sa) < 0) {
+        fprintf(stderr, "[chan-pi] SEND_PI failed: %s\n", strerror(errno));
+        fail = 1;
+    }
+
+    pthread_join(waiter, NULL);
+
+    if (ctx.woke != 1) {
+        fprintf(stderr, "[chan-pi] waiter did not wake (woke=%d errno=%d)\n",
+                ctx.woke, ctx.last_errno);
+        fail = 1;
+        goto cleanup;
+    }
+    if (ctx.fired_index_out != 0) {
+        fprintf(stderr, "[chan-pi] fired_index=%u, expected 0 (channel)\n",
+                ctx.fired_index_out);
+        fail = 1;
+    }
+
+    /* The load-bearing assertion: was the agg-waiter boosted to FIFO/80? */
+    if (ctx.attr_after_wake.sched_policy != SCHED_FIFO ||
+        ctx.attr_after_wake.sched_priority != 80) {
+        fprintf(stderr, "[chan-pi] FAIL: agg-waiter NOT boosted via channel "
+                "SEND_PI.  Got policy=%s prio=%u, expected FIFO 80.\n"
+                "       This means ntsync_channel_send_pi is not walking "
+                "any_waiters when recv_wq is empty — kernel-side PI fix "
+                "is missing.\n",
+                policy_name(ctx.attr_after_wake.sched_policy),
+                ctx.attr_after_wake.sched_priority);
+        fail = 1;
+    }
+
+    if (!fail) NOTE("[channel-PI propagation]      PASS  (boost %s prio=%u)\n",
+                    policy_name(ctx.attr_after_wake.sched_policy),
+                    ctx.attr_after_wake.sched_priority);
+
+cleanup:
+    close(ctx.chan_fd);
+    close(ctx.evfd);
+    return fail;
+}
+
+/* ============================================================
+ *  Sub-test 9: kitchen-sink stress (sem + event + eventfd) —
  *  multi-waiter / multi-firer concurrent contention.  Channel
  *  EXCLUDED — it requires single-waiter discipline (RECV2 blocks),
  *  covered separately by test_channel_notify.
@@ -1140,7 +1307,8 @@ static int run_smoke(int dev_fd)
     fail |= test_mixed_obj_fd(dev_fd);
     fail |= test_cancel_via_signal(dev_fd);
     fail |= test_channel_notify(dev_fd);             /* sub-test 7: NEW 1010 hook */
-    fail |= test_kitchen_sink_stress(dev_fd, 3);     /* sub-test 8: 3s multi-thread */
+    fail |= test_channel_pi_propagation(dev_fd);     /* sub-test 8: SEND_PI -> any_waiters */
+    fail |= test_kitchen_sink_stress(dev_fd, 3);     /* sub-test 9: 3s multi-thread */
     return fail;
 }
 
@@ -1240,7 +1408,7 @@ int main(int argc, char **argv)
         printf("== NTSYNC_IOC_AGGREGATE_WAIT smoke test (patch 1010) ==\n");
         rc = run_smoke(dev_fd);
         if (rc == 0)
-            printf("\nRESULT: PASS  (8/8)\n");
+            printf("\nRESULT: PASS  (9/9)\n");
         else
             printf("\nRESULT: FAIL\n");
     }

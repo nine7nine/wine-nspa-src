@@ -292,22 +292,40 @@ static int eligible(
     struct unicode_str nt_name,
     unsigned int name_len )
 {
+    unsigned int mapped_access;
+
     if (!gate_enabled()) return 0;
     if (objattr->rootdir) return 0;       /* AT_FDCWD only */
     if (sd) return 0;                      /* no custom SD */
     if (req->create != FILE_OPEN) return 0;
     if (req->options & FILE_DIRECTORY_FILE) return 0;
     if (req->options & FILE_DELETE_ON_CLOSE) return 0;
-    /* Read-only first cut.  Write-access opens hit Ableton's
-     * atomic-write-then-rename + delete-disposition flows that have
-     * subtle interactions with the async fd lifecycle (cf.
-     * project_phase_c_iouring_in_flight.md residual investigation).
-     * Until those are isolated, restrict to read-only.
+
+    /* CRITICAL: the access check MUST run on MAPPED access.  req->access
+     * is the raw value from the client and may carry GENERIC_READ /
+     * GENERIC_WRITE / GENERIC_ALL bits that don't expand into
+     * FILE_UNIX_WRITE_ACCESS until map_access() runs against the file
+     * type's generic-mapping table.  Before this fix Phase 4 would
+     * accept GENERIC_READ|GENERIC_WRITE opens (req->access & WRITE_BITS
+     * == 0 since GENERIC_* are in 0x4000000-range), open the file
+     * O_RDONLY, hand back a handle that LOOKS like it has write access
+     * (post-map ctx->access has WRITE_DATA bits), then writes through
+     * that handle would fail with EBADF.  Ableton's Undo journal hit
+     * exactly this — observed in nspa-logs/ableton_phase4_debug_*.log
+     * with access=0x12019f for Undo.lock and 0.band.
      *
-     * Phase 3 dispatcher's correct timing should make the residual go
-     * away in principle, but we keep the narrow gate until validation
-     * confirms it. */
-    if (req->access & FILE_UNIX_WRITE_ACCESS) return 0;
+     * Read-only first cut.  Eventually we'll widen to write opens, but
+     * not until we have a story for FILE_DELETE_ON_CLOSE temp files
+     * + atomic-write-then-rename (Ableton's pattern). */
+    mapped_access = map_access( req->access, &file_type.mapping );
+    /* Reject ALL write-class access bits, not just FILE_UNIX_WRITE_ACCESS.
+     * DELETE alone is enough to drive Ableton's atomic-write-then-rename
+     * flow on Undo/AbletonTmp-* — observed in the debug log.  Until we
+     * understand the full close-time delete + rename semantics under
+     * async, exclude every bit that would normally exercise those paths. */
+    if (mapped_access & (FILE_UNIX_WRITE_ACCESS | DELETE | WRITE_DAC | WRITE_OWNER))
+        return 0;
+
     if (name_len == 0 || name_len >= NSPA_ACF_NAME_MAX) return 0;
     if (nt_name.len > sizeof(((struct create_file_async_ctx *)0)->nt_name_buf)) return 0;
     /* per-process uring must be active for this process */

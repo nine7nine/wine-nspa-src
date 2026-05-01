@@ -54,8 +54,36 @@ extern int receive_fd( struct process *process );
 extern int send_client_fd( struct process *process, int fd, obj_handle_t handle );
 extern void read_request( struct thread *thread );
 #ifdef __linux__
-extern void read_request_shm( struct thread *thread, struct request_shm *request_shm ); /* NSPA v1.5 */
 extern void send_reply_shm( union generic_reply *reply, struct request_shm *request_shm, data_size_t req_data_size ); /* NSPA Phase 4: callable from io_uring CQE callbacks */
+
+/* NSPA v1.5: shmem request dispatch.  Inlined at the dispatcher
+ * call site (server/nspa/shmem_channel.c::dispatch_channel_entry)
+ * to retire the function-call overhead — sampled at 3.55%
+ * wineserver-relative under burst CreateFile/CloseHandle workloads
+ * (dispatcher-burst, 2026-04-30).  Body merges into the dispatcher
+ * frame; the heavy work (req handler dispatch) stays in
+ * call_req_handler_shm. */
+extern int reply_in_shm;
+extern void call_req_handler_shm( struct thread *thread, struct request_shm *request_shm );
+
+static inline void read_request_shm( struct thread *thread, struct request_shm *request_shm )
+{
+    void *orig_req_data = thread->req_data;
+    data_size_t data_size;
+
+    memcpy( &thread->req, (void *)&request_shm->u.req, sizeof(thread->req) );
+    data_size = thread->req.request_header.request_size;
+    if (data_size)
+        thread->req_data = (void *)(request_shm + 1);
+    reply_in_shm = 1;
+
+    call_req_handler_shm( thread, request_shm );
+
+    reply_in_shm = 0;
+    /* Only restore req_data if the handler didn't swap it out. */
+    if (data_size && thread->req_data == (void *)(request_shm + 1))
+        thread->req_data = orig_req_data;
+}
 #endif
 extern void write_reply( struct thread *thread );
 extern timeout_t monotonic_counter(void);

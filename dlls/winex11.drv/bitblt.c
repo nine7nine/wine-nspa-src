@@ -30,6 +30,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+# include <immintrin.h>
+# define NSPA_HAVE_X86_AVX2_TARGET 1
+#endif
+
 #include <X11/Xlib.h>
 #include <X11/Xresource.h>
 #include <X11/Xutil.h>
@@ -1786,6 +1791,61 @@ static void x11drv_surface_set_clip( struct window_surface *window_surface, cons
 }
 
 /***********************************************************************
+ *           apply_alpha_bits_row
+ *
+ * Inline ARGB alpha-bit OR over a contiguous range of 32bpp pixels.
+ * Hot path inside x11drv_surface_flush when the surface uses XShm
+ * (src == dst) and the visual carries alpha bits that need stamping
+ * into every blitted pixel.  Profile 2026-05-01 showed the original
+ * scalar `ptr[x] |= alpha_bits` loop as the single largest userspace
+ * symbol in Ableton's PE process (~6.7 % of total samples), entirely
+ * concentrated in three instructions: the OR, the index increment,
+ * and the inner-loop branch.
+ *
+ * AVX2 path processes 8 ULONG (32 bytes) per iteration via vpor on
+ * unaligned loads; modern Intel/AMD have no penalty for unaligned
+ * 256-bit loads.  Scalar tail handles the residual 0-7 pixels.
+ * The runtime CPUID check is one-shot per process (cached).
+ */
+#ifdef NSPA_HAVE_X86_AVX2_TARGET
+__attribute__((target("avx2")))
+static void apply_alpha_bits_avx2( ULONG *row, int x_lo, int x_hi, ULONG alpha_bits )
+{
+    __m256i va = _mm256_set1_epi32( (int)alpha_bits );
+    ULONG *p = row + x_lo;
+    ULONG *end = row + x_hi;
+    while ((end - p) >= 8)
+    {
+        __m256i v = _mm256_loadu_si256( (const __m256i *)p );
+        v = _mm256_or_si256( v, va );
+        _mm256_storeu_si256( (__m256i *)p, v );
+        p += 8;
+    }
+    while (p < end) { *p |= alpha_bits; p++; }
+    _mm256_zeroupper();
+}
+#endif
+
+static inline void apply_alpha_bits_row( ULONG *row, int x_lo, int x_hi, ULONG alpha_bits )
+{
+#ifdef NSPA_HAVE_X86_AVX2_TARGET
+    static int has_avx2 = -1;
+    if (__builtin_expect( has_avx2 < 0, 0 ))
+        has_avx2 = __builtin_cpu_supports( "avx2" );
+    if (__builtin_expect( has_avx2 != 0, 1 ))
+    {
+        apply_alpha_bits_avx2( row, x_lo, x_hi, alpha_bits );
+        return;
+    }
+#endif
+    {
+        int x;
+        for (x = x_lo; x < x_hi; x++)
+            row[x] |= alpha_bits;
+    }
+}
+
+/***********************************************************************
  *           x11drv_surface_flush
  */
 static BOOL x11drv_surface_flush( struct window_surface *window_surface, const RECT *rect, const RECT *dirty,
@@ -1821,12 +1881,11 @@ static BOOL x11drv_surface_flush( struct window_surface *window_surface, const R
     }
     else if (alpha_bits)
     {
-        int x, y, stride = ximage->bytes_per_line / sizeof(ULONG);
+        int y, stride = ximage->bytes_per_line / sizeof(ULONG);
         ULONG *ptr = (ULONG *)dst + dirty->top * stride;
 
         for (y = dirty->top; y < dirty->bottom; y++, ptr += stride)
-            for (x = dirty->left; x < dirty->right; x++)
-                ptr[x] |= alpha_bits;
+            apply_alpha_bits_row( ptr, dirty->left, dirty->right, alpha_bits );
     }
 
     if (shape_changed)

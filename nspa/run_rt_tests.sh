@@ -65,6 +65,10 @@ tests=(
     "ntsync-d12 ntsync 12 8 50000 3 16"
     "socket-io socket-io"
     "condvar-pi condvar-pi"
+    # gamma channel dispatcher A/B (only PE test that exercises the
+    # dispatcher path — inproc_wait tests above bypass it entirely).
+    # Verdict is failure-count only; latency is observational.
+    "dispatcher-burst dispatcher-burst"
 )
 if [[ "$INCLUDE_PRIORITY" == "1" ]]; then
     tests+=("priority")

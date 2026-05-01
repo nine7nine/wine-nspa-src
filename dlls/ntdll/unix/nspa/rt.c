@@ -33,7 +33,9 @@
 
 #include <errno.h>
 #include <sched.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -63,6 +65,9 @@ WINE_DEFAULT_DEBUG_CHANNEL(thread);
 # define PROCESS_PRIOCLASS_BELOW_NORMAL 5
 # define PROCESS_PRIOCLASS_ABOVE_NORMAL 6
 #endif
+
+/* Forward declaration: defined further down so nspa_rt_apply_tid can call it. */
+static void nspa_rt_pin_for_role( int tid, int nt_band );
 
 /* Cached env state. -2 = unprobed, -1 = disabled, >=0 = base FIFO prio. */
 int nspa_rt_prio_base = -2;
@@ -261,7 +266,171 @@ int nspa_rt_apply_tid( int tid, int nt_band )
         data->nspa_rt_cached_policy = policy;
         data->nspa_rt_cached_prio   = fifo;
     }
+
+    /* NSPA Step 1 (default-OFF behind NSPA_PIN_AFFINITY=1): pin to a
+     * topology-derived physical-core partition.  No-op when env disables
+     * or topology too small. */
+    nspa_rt_pin_for_role( tid, nt_band );
+
     return 1;
+}
+
+/* ---------------------------------------------------------------------
+ * NSPA thread placement (Step 1 / Case B — uniform-with-SMT)
+ *
+ * Default-OFF behind NSPA_PIN_AFFINITY=1 .  When enabled, audio
+ * threads (NT 31) are pinned to the back half of physical cores and
+ * wineserver-RT-class threads (NT 24-30) to the front half — separated
+ * at the physical-core boundary so SMT siblings don't share L1/L2
+ * between the two classes.  Non-RT threads stay unrestricted; the
+ * kernel scheduler handles them.
+ *
+ * Topology source: /sys/devices/system/cpu/cpuN/topology/thread_siblings_list .
+ * Logical CPUs whose siblings_list overlaps share a physical core.
+ *
+ * Gates the partition on >= 3 physical cores so two-core machines
+ * (which have no headroom to spare) get a no-op.
+ *
+ * Hybrid (Case A) and server-side mirror are deferred to a later
+ * session per nspa/docs/jit-and-thread-placement-investigation-20260501.md .
+ * ---------------------------------------------------------------------
+ */
+
+/* -1 unprobed, 0 disabled, 1 enabled */
+static int nspa_pin_enabled = -1;
+/* 0 unprobed, 1 ok, -1 unavailable / too small */
+static int nspa_topology_state = 0;
+static int nspa_n_physical_cores = 0;
+static cpu_set_t nspa_audio_mask;
+static cpu_set_t nspa_srv_mask;
+
+static void nspa_pin_probe_env(void)
+{
+    const char *v;
+    if (nspa_pin_enabled >= 0) return;
+    v = getenv( "NSPA_PIN_AFFINITY" );
+    nspa_pin_enabled = (v && *v == '1') ? 1 : 0;
+}
+
+/* Parse a sysfs-style range list "0,4" or "0-1" or "0,4,8,12" into
+ * the given cpu_set.  Returns the highest CPU id seen, or -1 on error. */
+static int nspa_parse_siblings_list( const char *buf, cpu_set_t *out )
+{
+    const char *p = buf;
+    int max_cpu = -1;
+    CPU_ZERO( out );
+    while (*p && *p != '\n')
+    {
+        char *end;
+        long start = strtol( p, &end, 10 );
+        long stop;
+        if (end == p) return -1;
+        p = end;
+        stop = start;
+        if (*p == '-')
+        {
+            p++;
+            stop = strtol( p, &end, 10 );
+            if (end == p) return -1;
+            p = end;
+        }
+        for (long c = start; c <= stop && c < CPU_SETSIZE; c++)
+        {
+            CPU_SET( c, out );
+            if ((int)c > max_cpu) max_cpu = (int)c;
+        }
+        if (*p == ',') p++;
+        else break;
+    }
+    return max_cpu;
+}
+
+/* Walk /sys/devices/system/cpu/cpuN/topology/thread_siblings_list and
+ * group logical CPUs by physical core.  Builds nspa_audio_mask /
+ * nspa_srv_mask.  Returns 1 on success, 0 if topology unavailable
+ * or insufficient (<3 physical cores). */
+static int nspa_topology_probe(void)
+{
+    cpu_set_t per_phys[64];
+    int per_phys_count = 0;
+    int seen[CPU_SETSIZE] = {0};
+    int half;
+
+    for (int cpu = 0; cpu < CPU_SETSIZE; cpu++)
+    {
+        char path[128];
+        FILE *f;
+        char buf[256];
+        cpu_set_t siblings;
+
+        snprintf( path, sizeof(path),
+                  "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", cpu );
+        f = fopen( path, "r" );
+        if (!f)
+        {
+            if (cpu == 0) return 0;  /* no sysfs at all */
+            break;                    /* end of online CPUs */
+        }
+        if (!fgets( buf, sizeof(buf), f )) { fclose(f); continue; }
+        fclose(f);
+
+        if (seen[cpu]) continue;  /* already grouped */
+        if (per_phys_count >= 64) break;
+        if (nspa_parse_siblings_list( buf, &siblings ) < 0) continue;
+
+        per_phys[per_phys_count] = siblings;
+        for (int i = 0; i < CPU_SETSIZE; i++)
+            if (CPU_ISSET( i, &siblings )) seen[i] = 1;
+        per_phys_count++;
+    }
+
+    nspa_n_physical_cores = per_phys_count;
+
+    if (per_phys_count < 3)
+    {
+        WARN( "NSPA pin: only %d physical core(s) — disabling pin (need >= 3)\n",
+              per_phys_count );
+        return 0;
+    }
+
+    /* Partition: front half -> srv, back half -> audio */
+    half = per_phys_count / 2;
+    CPU_ZERO( &nspa_srv_mask );
+    CPU_ZERO( &nspa_audio_mask );
+    for (int i = 0; i < half; i++)
+        for (int c = 0; c < CPU_SETSIZE; c++)
+            if (CPU_ISSET( c, &per_phys[i] )) CPU_SET( c, &nspa_srv_mask );
+    for (int i = half; i < per_phys_count; i++)
+        for (int c = 0; c < CPU_SETSIZE; c++)
+            if (CPU_ISSET( c, &per_phys[i] )) CPU_SET( c, &nspa_audio_mask );
+
+    TRACE( "NSPA pin: topology probed — %d physical cores, srv=front %d phys, audio=back %d phys\n",
+           per_phys_count, half, per_phys_count - half );
+    return 1;
+}
+
+static void nspa_rt_pin_for_role( int tid, int nt_band )
+{
+    cpu_set_t *mask;
+
+    nspa_pin_probe_env();
+    if (!nspa_pin_enabled) return;
+
+    if (nspa_topology_state == 0)
+        nspa_topology_state = nspa_topology_probe() ? 1 : -1;
+    if (nspa_topology_state != 1) return;
+
+    if (nt_band >= 31)        mask = &nspa_audio_mask;
+    else if (nt_band >= 24)   mask = &nspa_srv_mask;
+    else                      return;  /* not RT-class enough to pin */
+
+    if (sched_setaffinity( tid, sizeof(*mask), mask ) == -1)
+    {
+        static int warned;
+        if (!warned++)
+            WARN( "NSPA pin: sched_setaffinity(tid=%d, nt_band=%d) failed: %s\n",
+                  tid, nt_band, strerror(errno) );
+    }
 }
 
 /* Deliberately no nspa_rt_map_reapply_all function: on SetPriorityClass,

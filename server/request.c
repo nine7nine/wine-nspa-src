@@ -362,8 +362,10 @@ void send_reply_shm( union generic_reply *reply, struct request_shm *request_shm
         fatal_protocol_error( current, "nspa shmem reply write: %s\n", strerror( errno ));
 }
 
-/* call a request handler via the shm path */
-static void call_req_handler_shm( struct thread *thread, struct request_shm *request_shm )
+/* call a request handler via the shm path.
+ * NSPA: not static — read_request_shm in server/request.h is now a
+ * static inline that calls into us at the dispatcher's frame. */
+void call_req_handler_shm( struct thread *thread, struct request_shm *request_shm )
 {
     enum request req = thread->req.request_header.req;
     data_size_t data_size = thread->req.request_header.request_size;
@@ -416,25 +418,9 @@ static void call_req_handler_shm( struct thread *thread, struct request_shm *req
     current = NULL;
 }
 
-/* read a request from shared memory and dispatch it */
-void read_request_shm( struct thread *thread, struct request_shm *request_shm )
-{
-    void *orig_req_data = thread->req_data;
-    data_size_t data_size;
-
-    memcpy( &thread->req, (void *)&request_shm->u.req, sizeof(thread->req) );
-    data_size = thread->req.request_header.request_size;
-    if (data_size)
-        thread->req_data = (void *)(request_shm + 1);
-    reply_in_shm = 1;
-
-    call_req_handler_shm( thread, request_shm );
-
-    reply_in_shm = 0;
-    /* Only restore req_data if the handler didn't swap it out. */
-    if (data_size && thread->req_data == (void *)(request_shm + 1))
-        thread->req_data = orig_req_data;
-}
+/* read_request_shm body now lives in server/request.h as a static inline
+ * so it inlines into the dispatcher's frame at every call site —
+ * see the comment there for the perf rationale. */
 #endif /* __linux__ */
 
 /* call a request handler */

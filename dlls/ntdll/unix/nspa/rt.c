@@ -386,9 +386,29 @@ static int nspa_topology_probe(void)
 
     nspa_n_physical_cores = per_phys_count;
 
-    if (per_phys_count < 3)
+    /* Empirical threshold: Ableton-style DAWs spawn an audio worker
+     * pool sized to the machine's logical CPU count.  On a 4-physical-
+     * core laptop (i7-1065G7 case), the worker pool is 14+ threads.
+     * Pinning all 14 to 2 physical cores (back half = 4 logical CPUs)
+     * over-concentrates RT threads, causing kernel runqueue contention
+     * and `cpupri_find_fitness` overhead that outweighs the cache-
+     * locality benefit (validated 2026-05-01: net +0.5 pp regression on
+     * the user's i7-1065G7 vs no-pin).
+     *
+     * The minimum 6-physical-core threshold ensures audio_half has at
+     * least 3 physical cores worth of headroom.  This enables on
+     * Alder/Raptor Lake hybrid (typically 6 P + N E), Zen 5 hybrid
+     * (typically 4 P + 8 c), and larger uniform CPUs.  No-op on
+     * mainstream laptops.
+     *
+     * Future work: smarter heuristic that compares actual audio thread
+     * count vs audio CPU count; for now this shape is conservative-
+     * safe.  See nspa/docs/jit-and-thread-placement-investigation-20260501.md
+     */
+    if (per_phys_count < 6)
     {
-        WARN( "NSPA pin: only %d physical core(s) — disabling pin (need >= 3)\n",
+        WARN( "NSPA pin: only %d physical core(s) — disabling pin "
+              "(need >= 6 to avoid RT runqueue oversubscription)\n",
               per_phys_count );
         return 0;
     }

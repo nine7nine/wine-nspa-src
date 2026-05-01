@@ -190,10 +190,25 @@ void close_objects(void)
 
 /*****************************************************************/
 
-/* mark a block of memory as not accessible for debugging purposes */
+/* mark a block of memory as not accessible for debugging purposes.
+ *
+ * NSPA: the per-byte memset is a 0x34% wineserver-relative cost under
+ * burst CreateFile/CloseHandle workloads (sampled via dispatcher-burst,
+ * 2026-04-30).  It exists purely as a debugging aid that makes
+ * use-after-free reads return obvious garbage (0xfe).  We don't use
+ * valgrind in normal NSPA development, and the 0xfe poison is not
+ * load-bearing for correctness.  Skip the memset by default; restore
+ * via -DNSPA_DEBUG_POISON_ALLOCS=1 when chasing UAF bugs.
+ *
+ * Valgrind annotations stay unconditional — they're zero-cost when
+ * the valgrind macros aren't defined at compile time. */
 void mark_block_noaccess( void *ptr, size_t size )
 {
+#ifdef NSPA_DEBUG_POISON_ALLOCS
     memset( ptr, 0xfe, size );
+#else
+    (void)ptr; (void)size;
+#endif
 #if defined(VALGRIND_MAKE_MEM_NOACCESS)
     VALGRIND_DISCARD( VALGRIND_MAKE_MEM_NOACCESS( ptr, size ) );
 #elif defined(VALGRIND_MAKE_NOACCESS)
@@ -201,7 +216,8 @@ void mark_block_noaccess( void *ptr, size_t size )
 #endif
 }
 
-/* mark a block of memory as uninitialized for debugging purposes */
+/* mark a block of memory as uninitialized for debugging purposes.
+ * See mark_block_noaccess above for the NSPA gating rationale. */
 void mark_block_uninitialized( void *ptr, size_t size )
 {
 #if defined(VALGRIND_MAKE_MEM_UNDEFINED)
@@ -209,7 +225,11 @@ void mark_block_uninitialized( void *ptr, size_t size )
 #elif defined(VALGRIND_MAKE_WRITABLE)
     VALGRIND_DISCARD( VALGRIND_MAKE_WRITABLE( ptr, size ));
 #endif
+#ifdef NSPA_DEBUG_POISON_ALLOCS
     memset( ptr, 0x55, size );
+#else
+    (void)ptr; (void)size;
+#endif
 #if defined(VALGRIND_MAKE_MEM_UNDEFINED)
     VALGRIND_DISCARD( VALGRIND_MAKE_MEM_UNDEFINED( ptr, size ));
 #elif defined(VALGRIND_MAKE_WRITABLE)

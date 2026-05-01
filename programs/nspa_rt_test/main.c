@@ -5449,6 +5449,340 @@ static int cmd_seqlock_bound(int argc, char **argv)
 
 
 /* ════════════════════════════════════════════════════════════════════════
+ *   Subcommand: dispatcher-burst  (gamma channel dispatcher A/B harness)
+ *
+ *   Why this exists:
+ *     The existing PE matrix exercises NTSync primitives via inproc_wait
+ *     directly to ntsync ioctls (rapidmutex, philosophers, ntsync-d*, etc).
+ *     None of those touch the gamma channel dispatcher in wineserver.
+ *     Without a workload that hits the dispatcher, perf changes to
+ *     server/nspa/shmem_channel.c::channel_dispatcher (TRY_RECV2 burst-
+ *     drain, ACQ_REL fences, inline nspa_queue_bypass_shm) can't be
+ *     A/B'd reproducibly — only Ableton can see them, which is slow,
+ *     manual, and noisy.
+ *
+ *   Workload: tight loops of CreateFile + CloseHandle on `\\??\NUL`.
+ *   Every open is a server-bound RPC that flows through the dispatcher
+ *   (post-Phase 4: through io_uring create_file then back via the
+ *   gamma channel completion edge).
+ *
+ *   Two sub-tests:
+ *     A) steady-state — 1 thread, N iters of single CreateFile/CloseHandle.
+ *                       Measures per-RPC dispatcher cost (inline accessor
+ *                       + ACQ_REL fence wins should show in p50/avg).
+ *     B) burst         — M threads, each does outer iters of
+ *                       (open K handles fanout, close K handles).
+ *                       Multiple entries land in the channel pending
+ *                       list at the same time, exercising the
+ *                       TRY_RECV2 drain-after-dispatch path.
+ *
+ *   A/B against TRY_RECV2:
+ *     NSPA_TRY_RECV2 is read by wineserver at startup (not per-syscall),
+ *     so flipping it requires `wineserver -k` between runs.  See
+ *     nspa/tests/run-dispatcher-ab.sh for the full A/B recipe.  This
+ *     subcommand only measures; it doesn't try to flip server flags.
+ *
+ *   Output:
+ *     metric          value
+ *     min/p50/p99/max ns per call
+ *     ops/sec wall-clock + total elapsed
+ *     burst: per-thread breakdown + worst p99/max
+ *
+ *   Verdict: PASS if all opens succeed (fail count = 0).  Latency numbers
+ *   are observational, not pass/fail — they're for human comparison
+ *   between A/B runs.  This keeps the test robust to noise on the
+ *   automated matrix.
+ *
+ *   Usage:
+ *     nspa_rt_test.exe dispatcher-burst [steady_iters] [burst_threads] [burst_depth] [burst_outer]
+ *     Default: 100000 steady, 8 threads × 64 depth × 1000 outer
+ * ════════════════════════════════════════════════════════════════════════ */
+
+struct disp_burst_result {
+    LONGLONG min_ns, max_ns, sum_ns;
+    LONGLONG p50_ns, p99_ns;
+    DWORD count;
+    DWORD failures;
+};
+
+static volatile LONG disp_burst_ready = 0;
+static volatile LONG disp_burst_go = 0;
+
+struct disp_burst_args {
+    DWORD iters;
+    DWORD depth;
+    struct disp_burst_result *res;
+};
+
+/* Insertion sort — fine for <= 100k samples, avoids qsort comparator overhead. */
+static void disp_burst_sort(LONGLONG *a, DWORD n)
+{
+    DWORD i, j;
+    for (i = 1; i < n; i++)
+    {
+        LONGLONG key = a[i];
+        j = i;
+        while (j > 0 && a[j - 1] > key) { a[j] = a[j - 1]; j--; }
+        a[j] = key;
+    }
+}
+
+static DWORD WINAPI disp_burst_steady_thread(LPVOID arg)
+{
+    struct disp_burst_args *a = (struct disp_burst_args *)arg;
+    struct disp_burst_result *res = a->res;
+    LARGE_INTEGER freq, t0, t1;
+    LONGLONG *samples;
+    DWORD iters = a->iters;
+    DWORD i, fails = 0;
+
+    QueryPerformanceFrequency(&freq);
+    samples = (LONGLONG *)malloc(iters * sizeof(LONGLONG));
+    if (!samples) { printf("  [steady] malloc failed\n"); return 1; }
+
+    InterlockedIncrement(&disp_burst_ready);
+    while (!disp_burst_go) YieldProcessor();
+
+    for (i = 0; i < iters; i++)
+    {
+        HANDLE h;
+        QueryPerformanceCounter(&t0);
+        h = CreateFileW(L"NUL", GENERIC_READ,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        NULL, OPEN_EXISTING, 0, NULL);
+        if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+        else fails++;
+        QueryPerformanceCounter(&t1);
+        samples[i] = (t1.QuadPart - t0.QuadPart) * 1000000000LL / freq.QuadPart;
+    }
+
+    disp_burst_sort(samples, iters);
+
+    res->min_ns  = samples[0];
+    res->max_ns  = samples[iters - 1];
+    res->p50_ns  = samples[iters / 2];
+    res->p99_ns  = samples[(DWORD)(iters * 0.99)];
+    res->sum_ns  = 0;
+    for (i = 0; i < iters; i++) res->sum_ns += samples[i];
+    res->count    = iters;
+    res->failures = fails;
+
+    free(samples);
+    return 0;
+}
+
+static DWORD WINAPI disp_burst_burst_thread(LPVOID arg)
+{
+    struct disp_burst_args *a = (struct disp_burst_args *)arg;
+    struct disp_burst_result *res = a->res;
+    LARGE_INTEGER freq, t0, t1;
+    DWORD outer = a->iters;
+    DWORD depth = a->depth;
+    DWORD i, j, fails = 0;
+    HANDLE *handles;
+    LONGLONG *samples;
+
+    QueryPerformanceFrequency(&freq);
+    handles = (HANDLE *)malloc(depth * sizeof(HANDLE));
+    samples = (LONGLONG *)malloc(outer * sizeof(LONGLONG));
+    if (!handles || !samples)
+    {
+        printf("  [burst] malloc failed\n");
+        free(handles); free(samples); return 1;
+    }
+
+    InterlockedIncrement(&disp_burst_ready);
+    while (!disp_burst_go) YieldProcessor();
+
+    for (i = 0; i < outer; i++)
+    {
+        QueryPerformanceCounter(&t0);
+        for (j = 0; j < depth; j++)
+        {
+            handles[j] = CreateFileW(L"NUL", GENERIC_READ,
+                                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                     NULL, OPEN_EXISTING, 0, NULL);
+            if (handles[j] == INVALID_HANDLE_VALUE) fails++;
+        }
+        for (j = 0; j < depth; j++)
+        {
+            if (handles[j] != INVALID_HANDLE_VALUE) CloseHandle(handles[j]);
+        }
+        QueryPerformanceCounter(&t1);
+        samples[i] = (t1.QuadPart - t0.QuadPart) * 1000000000LL / freq.QuadPart;
+    }
+
+    disp_burst_sort(samples, outer);
+
+    res->min_ns  = samples[0];
+    res->max_ns  = samples[outer - 1];
+    res->p50_ns  = samples[outer / 2];
+    res->p99_ns  = samples[(DWORD)(outer * 0.99)];
+    res->sum_ns  = 0;
+    for (i = 0; i < outer; i++) res->sum_ns += samples[i];
+    res->count    = outer;
+    res->failures = fails;
+
+    free(handles);
+    free(samples);
+    return 0;
+}
+
+static int cmd_dispatcher_burst(int argc, char **argv)
+{
+    DWORD steady_iters = 100000;
+    DWORD burst_threads = 8;
+    DWORD burst_depth = 64;
+    DWORD burst_outer = 1000;
+    struct disp_burst_result steady_res = {0};
+    struct disp_burst_result *burst_res = NULL;
+    HANDLE *threads = NULL;
+    struct disp_burst_args *args = NULL;
+    LARGE_INTEGER freq, wall_t0, wall_t1;
+    LONGLONG steady_wall_ns = 0, burst_wall_ns = 0;
+    DWORD i;
+    const char *try_recv2 = getenv("NSPA_TRY_RECV2");
+    DWORD total_failures = 0;
+
+    if (argc > 1) steady_iters  = (DWORD)atoi(argv[1]);
+    if (argc > 2) burst_threads = (DWORD)atoi(argv[2]);
+    if (argc > 3) burst_depth   = (DWORD)atoi(argv[3]);
+    if (argc > 4) burst_outer   = (DWORD)atoi(argv[4]);
+    if (steady_iters  < 100)   steady_iters  = 100;
+    if (burst_threads < 1)     burst_threads = 1;
+    if (burst_threads > 64)    burst_threads = 64;
+    if (burst_depth   < 1)     burst_depth   = 1;
+    if (burst_depth   > 256)   burst_depth   = 256;
+    if (burst_outer   < 10)    burst_outer   = 10;
+
+    QueryPerformanceFrequency(&freq);
+
+    print_banner("dispatcher-burst",
+        "gamma channel dispatcher A/B harness (TRY_RECV2 + inline accessor)");
+    print_section("parameters");
+    print_kv("steady iters",     "%lu  (1 thread, CreateFile+CloseHandle on NUL)", steady_iters);
+    print_kv("burst threads",    "%lu", burst_threads);
+    print_kv("burst depth",      "%lu  (handles opened then closed in fanout)", burst_depth);
+    print_kv("burst outer",      "%lu  (per-thread outer iterations)", burst_outer);
+    print_kv("NSPA_TRY_RECV2",   "%s  (wineserver-side env; restart wineserver to flip)",
+             try_recv2 ? try_recv2 : "(unset, default 1)");
+
+    /* ── Sub-test A: steady-state ───────────────────────────────────── */
+    print_section("A: steady-state");
+    {
+        struct disp_burst_args a = { steady_iters, 0, &steady_res };
+        HANDLE h;
+        DWORD tid;
+
+        disp_burst_ready = 0;
+        disp_burst_go    = 0;
+        h = CreateThread(NULL, 0, disp_burst_steady_thread, &a, 0, &tid);
+        if (!h) { print_verdict(0, "steady thread spawn failed"); return 1; }
+
+        while (!disp_burst_ready) Sleep(0);
+        QueryPerformanceCounter(&wall_t0);
+        InterlockedExchange(&disp_burst_go, 1);
+        WaitForSingleObject(h, INFINITE);
+        QueryPerformanceCounter(&wall_t1);
+        steady_wall_ns = (wall_t1.QuadPart - wall_t0.QuadPart) * 1000000000LL / freq.QuadPart;
+        CloseHandle(h);
+
+        printf("\n  metric        value\n");
+        printf("  ----------    ---------------\n");
+        printf("  iters         %14lu\n", steady_res.count);
+        printf("  failures      %14lu\n", steady_res.failures);
+        printf("  min ns        %14lld\n", steady_res.min_ns);
+        printf("  p50 ns        %14lld\n", steady_res.p50_ns);
+        printf("  p99 ns        %14lld\n", steady_res.p99_ns);
+        printf("  max ns        %14lld\n", steady_res.max_ns);
+        printf("  avg ns        %14lld\n",
+               steady_res.count ? steady_res.sum_ns / steady_res.count : 0);
+        printf("  ops/sec       %14lld\n",
+               steady_wall_ns ? (LONGLONG)steady_res.count * 1000000000LL / steady_wall_ns : 0);
+        printf("  wall ms       %14lld\n", steady_wall_ns / 1000000);
+        fflush(stdout);
+        total_failures += steady_res.failures;
+    }
+
+    /* ── Sub-test B: burst ──────────────────────────────────────────── */
+    print_section("B: burst");
+    burst_res = (struct disp_burst_result *)calloc(burst_threads, sizeof(*burst_res));
+    threads  = (HANDLE *)calloc(burst_threads, sizeof(HANDLE));
+    args     = (struct disp_burst_args *)calloc(burst_threads, sizeof(*args));
+    if (!burst_res || !threads || !args)
+    {
+        free(burst_res); free(threads); free(args);
+        print_verdict(0, "alloc failed");
+        return 1;
+    }
+
+    disp_burst_ready = 0;
+    disp_burst_go    = 0;
+    for (i = 0; i < burst_threads; i++)
+    {
+        DWORD tid;
+        args[i].iters = burst_outer;
+        args[i].depth = burst_depth;
+        args[i].res   = &burst_res[i];
+        threads[i] = CreateThread(NULL, 0, disp_burst_burst_thread, &args[i], 0, &tid);
+    }
+    while ((DWORD)disp_burst_ready < burst_threads) Sleep(0);
+    QueryPerformanceCounter(&wall_t0);
+    InterlockedExchange(&disp_burst_go, 1);
+    WaitForMultipleObjects(burst_threads, threads, TRUE, INFINITE);
+    QueryPerformanceCounter(&wall_t1);
+    burst_wall_ns = (wall_t1.QuadPart - wall_t0.QuadPart) * 1000000000LL / freq.QuadPart;
+
+    {
+        LONGLONG total_ops = (LONGLONG)burst_outer * burst_depth * burst_threads;
+        LONGLONG max_p99 = 0, max_max = 0;
+        DWORD total_thread_fails = 0;
+
+        printf("\n  Thread   outer    p50_ns    p99_ns      max_ns  fails\n");
+        printf("  ------   -----    ------    ------    --------  -----\n");
+        for (i = 0; i < burst_threads; i++)
+        {
+            struct disp_burst_result *r = &burst_res[i];
+            printf("  T%-4lu   %5lu  %8lld  %8lld  %10lld  %5lu\n",
+                   i, r->count, r->p50_ns, r->p99_ns, r->max_ns, r->failures);
+            total_thread_fails += r->failures;
+            if (r->p99_ns > max_p99) max_p99 = r->p99_ns;
+            if (r->max_ns > max_max) max_max = r->max_ns;
+            CloseHandle(threads[i]);
+        }
+        printf("\n");
+        printf("  total ops        %14lld  (%lu thr * %lu outer * %lu depth)\n",
+               total_ops, burst_threads, burst_outer, burst_depth);
+        printf("  total failures   %14lu\n", total_thread_fails);
+        printf("  worst p99 ns     %14lld\n", max_p99);
+        printf("  worst max ns     %14lld\n", max_max);
+        printf("  wall ms          %14lld\n", burst_wall_ns / 1000000);
+        printf("  ops/sec (wall)   %14lld\n",
+               burst_wall_ns ? total_ops * 1000000000LL / burst_wall_ns : 0);
+        fflush(stdout);
+        total_failures += total_thread_fails;
+    }
+
+    free(burst_res);
+    free(threads);
+    free(args);
+
+    print_section("verdict");
+    if (total_failures > 0)
+    {
+        char reason[160];
+        snprintf(reason, sizeof(reason),
+                 "%lu CreateFile failure(s) — dispatcher path is broken or NUL device unreachable",
+                 total_failures);
+        print_verdict(0, reason);
+        return 1;
+    }
+    print_verdict(1, NULL);
+    return 0;
+}
+
+
+/* ════════════════════════════════════════════════════════════════════════
  *   Command dispatch
  * ════════════════════════════════════════════════════════════════════════ */
 
@@ -5478,6 +5812,7 @@ static struct command commands[] = {
     { "rpc-bypass",      "NSPA Phase 1.A irpcss bypass functional parity (5 sub-tests)",   cmd_rpc_bypass    },
     { "irot-bypass",     "NSPA Phase 1.B irot bypass functional parity (5 sub-tests)",     cmd_irot_bypass   },
     { "seqlock-bound",   "audit §4.1 retry-loop hardening canary (paint fastpath bound)",  cmd_seqlock_bound },
+    { "dispatcher-burst","gamma channel dispatcher A/B harness (steady + burst)",          cmd_dispatcher_burst },
     { "help",            "show this help",                                                  cmd_help          },
     { NULL, NULL, NULL }
 };

@@ -119,7 +119,24 @@ extern void set_queue_hooks( struct thread *thread, struct hook_table *hooks );
 extern void add_queue_hook_count( struct thread *thread, unsigned int index, int count );
 extern int  nspa_queue_hook_tier1_active( struct thread *thread );
 extern int  nspa_queue_hook_chain_busy_tier1( struct thread *thread, int index );
-extern nspa_queue_bypass_shm_t *nspa_queue_bypass_shm( struct thread *thread );
+/* Slow path: looks up thread->queue->nspa_shared and populates
+ * thread->nspa_cached_bypass_shm.  Definition in queue.c (struct
+ * msg_queue is private there).  Callers should use the inline
+ * fast path below — it short-circuits on the cached value. */
+extern nspa_queue_bypass_shm_t *nspa_queue_bypass_shm_slow( struct thread *thread );
+
+/* Fast-path inline: read the cached pointer.  After the first
+ * non-NULL slow-path lookup, every subsequent call returns from
+ * a single field load — no function call, no per-RPC accessor
+ * overhead.  Pre-alloc / pre-cache the slow path runs once per
+ * thread; post-alloc steady-state is the inlined branch. */
+#include "thread.h"
+static inline nspa_queue_bypass_shm_t *nspa_queue_bypass_shm( struct thread *thread )
+{
+    if (!thread) return NULL;
+    if (thread->nspa_cached_bypass_shm) return thread->nspa_cached_bypass_shm;
+    return nspa_queue_bypass_shm_slow( thread );
+}
 /* Tier 2 hook cache API lives in server/nspa/hook_cache.h. */
 /* msg-ring v2 Phase A: redraw_window push ring drain seam. */
 extern void nspa_redraw_apply( struct thread *thread, user_handle_t window_handle,

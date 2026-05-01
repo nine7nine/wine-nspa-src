@@ -109,6 +109,7 @@ struct thread
     unsigned int           reply_towrite; /* amount of data still to write in reply */
     int                    nspa_async_reply_deferred; /* NSPA Phase 4: handler submitted io_uring op; skip send_reply_shm + CHANNEL_REPLY (CQE callback owns reply) */
     unsigned long long     nspa_channel_entry_id;     /* NSPA Phase 4: gamma channel entry_id, set by dispatcher before read_request_shm; valid only during handler dispatch */
+    nspa_queue_bypass_shm_t *nspa_cached_bypass_shm;  /* NSPA: lazy cache of thread->queue->nspa_shared for inlining nspa_queue_bypass_shm() — populated by slow path on first non-NULL dereference, never invalidated (queue->nspa_shared is set-once-per-queue-lifetime). NULL pre-alloc; stale only briefly during thread teardown when thread->queue is also NULL. */
     struct fd             *request_fd;    /* fd for receiving client requests */
     struct fd             *reply_fd;      /* fd to send a reply to a client */
     struct fd             *wait_fd;       /* fd to use to wake a sleeping client */

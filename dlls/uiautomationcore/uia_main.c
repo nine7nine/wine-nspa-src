@@ -303,7 +303,8 @@ HRESULT WINAPI UiaGetReservedNotSupportedValue(IUnknown **value)
  */
 HRESULT WINAPI UiaRaiseAutomationPropertyChangedEvent(IRawElementProviderSimple *provider, PROPERTYID id, VARIANT old, VARIANT new)
 {
-    FIXME("(%p, %d, %s, %s): stub\n", provider, id, debugstr_variant(&old), debugstr_variant(&new));
+    static int once;
+    if (!once++) FIXME("(%p, %d, %s, %s): stub\n", provider, id, debugstr_variant(&old), debugstr_variant(&new));
     return S_OK;
 }
 

@@ -140,6 +140,17 @@ struct ntsync_aggregate_wait_args {
             _IOWR('N', 0x97, struct ntsync_aggregate_wait_args)
 #endif
 
+/* NSPA 1011: NTSYNC_IOC_CHANNEL_TRY_RECV2 — non-blocking RECV2.
+ * Same args struct as RECV2 but returns -EAGAIN instead of blocking
+ * when the channel pending queue is empty.  Pre-1011 kernels return
+ * -ENOTTY → runtime detect, sticky fallback to legacy blocking
+ * RECV2.  Independent #ifndef so this builds against headers up to
+ * 1010. */
+#ifndef NTSYNC_IOC_CHANNEL_TRY_RECV2
+# define NTSYNC_IOC_CHANNEL_TRY_RECV2 \
+            _IOWR('N', 0x98, struct ntsync_channel_recv2_args)
+#endif
+
 #include "process.h"
 #include "thread.h"
 #include "request.h"
@@ -223,8 +234,10 @@ static void *channel_dispatcher( void *param )
     int cached_use_token;
     int recv2_state;
     int agg_supported;
+    int try_recv2_supported;
     const char *v;
     const char *agg_v;
+    const char *try_v;
 
     /* recv2_state: 1 = try RECV2 first, 0 = legacy RECV.  Set once. */
     v = getenv( "NSPA_DISPATCHER_USE_TOKEN" );
@@ -246,6 +259,18 @@ static void *channel_dispatcher( void *param )
      *   error (we break out — no infinite-retry loop). */
     agg_v = getenv( "NSPA_AGG_WAIT" );
     agg_supported = (dev_fd >= 0 && !(agg_v && *agg_v == '0')) ? -1 : 0;
+
+    /* NSPA 1011 burst-drain: after a successful CHANNEL_RECV2 + dispatch,
+     * try non-blocking TRY_RECV2 in a loop to drain additional pending
+     * entries without paying another AGG_WAIT round-trip per entry.
+     * Saves N×AGG_WAIT under burst (N entries queued at the moment of
+     * channel-fired).  -1 unknown (try once); 1 supported; 0 sticky
+     * fallback after ENOTTY (pre-1011 kernel).
+     *
+     * Set NSPA_TRY_RECV2=0 to opt out — falls back to one entry per
+     * AGG_WAIT cycle (today's pre-1011 behaviour). */
+    try_v = getenv( "NSPA_TRY_RECV2" );
+    try_recv2_supported = !(try_v && *try_v == '0') ? -1 : 0;
 
     for (;;)
     {
@@ -379,6 +404,36 @@ static void *channel_dispatcher( void *param )
         }
 
         dispatch_channel_entry( channel_fd, cached_use_token, &recv, &generation );
+
+        /* NSPA 1011 burst-drain: after a successful dispatch, try
+         * non-blocking TRY_RECV2 in a tight loop.  If pending depth
+         * is >0 we save the AGG_WAIT round-trip and dispatch
+         * immediately; on -EAGAIN we return to the AGG_WAIT loop
+         * (current state is "no more queued, wait for next fire").
+         *
+         * Pre-1011 kernel returns -ENOTTY → sticky fallback to the
+         * single-entry-per-AGG_WAIT pattern (existing behaviour).
+         * Other unexpected errors → break out of the drain (next
+         * AGG_WAIT iteration handles cleanup). */
+        while (try_recv2_supported != 0)
+        {
+            struct ntsync_channel_recv2_args drain_recv;
+            int drain_ret = ioctl( channel_fd, NTSYNC_IOC_CHANNEL_TRY_RECV2, &drain_recv );
+            if (drain_ret == 0)
+            {
+                if (try_recv2_supported < 0) try_recv2_supported = 1;
+                dispatch_channel_entry( channel_fd, cached_use_token, &drain_recv, &generation );
+                continue;
+            }
+            if (errno == EAGAIN) break;          /* drained */
+            if (errno == EINTR)  continue;       /* signal — retry */
+            if (errno == ENOTTY)
+            {
+                try_recv2_supported = 0;         /* pre-1011 kernel; sticky fallback */
+                break;
+            }
+            break;                               /* unexpected — back to AGG_WAIT */
+        }
     }
 
     /* ---- Cleanup: drain in-flight CQEs (Phase 4 may have submitted),

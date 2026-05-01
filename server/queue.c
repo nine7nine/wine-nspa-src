@@ -776,10 +776,21 @@ int nspa_queue_hook_tier1_active( struct thread *thread )
 /* NSPA Tier 2: hand the per-queue bypass shm pointer to callers outside
  * server/queue.c (notably server/hook.c, which writes the Tier 2 hook
  * chain cache).  Returns NULL if the queue or shm isn't allocated yet. */
-nspa_queue_bypass_shm_t *nspa_queue_bypass_shm( struct thread *thread )
+/* Slow path for nspa_queue_bypass_shm.  See user.h for the inline
+ * fast path.  Walks thread->queue->nspa_shared and caches the
+ * non-NULL result on thread->nspa_cached_bypass_shm so subsequent
+ * calls return from the inline check without re-entering this
+ * function.  queue->nspa_shared is set-once-per-queue-lifetime
+ * (allocated lazily in nspa_alloc_bypass_shm; freed at queue
+ * destroy when the thread is also being torn down), so the cache
+ * never goes stale during the thread's productive lifetime. */
+nspa_queue_bypass_shm_t *nspa_queue_bypass_shm_slow( struct thread *thread )
 {
+    nspa_queue_bypass_shm_t *shm;
     if (!thread || !thread->queue) return NULL;
-    return thread->queue->nspa_shared;
+    shm = thread->queue->nspa_shared;
+    if (shm) thread->nspa_cached_bypass_shm = shm;
+    return shm;
 }
 
 /* NSPA Tier 1: is a walker currently pinning the queue-local hook chain at

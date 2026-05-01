@@ -425,11 +425,23 @@ static void dispatch_channel_entry( int channel_fd, int use_token,
              * an async-completing handler (e.g. nspa_uring_create_file)
              * can copy it into its CQE context.  Cleared at the end of
              * dispatch (not strictly necessary — only valid during
-             * handler dispatch — but keeps state hygienic). */
+             * handler dispatch — but keeps state hygienic).
+             *
+             * Fences are ACQ_REL, not SEQ_CST: writer (this dispatcher
+             * pthread) and consumer (the handler's read at line
+             * uring_create_file.c:384, then later the CQE callback via
+             * nspa_uring_drain) all run on the SAME pthread.  Same-thread
+             * ordering only needs a compiler barrier — release before
+             * the call ensures the entry_id write isn't reordered past
+             * read_request_shm; acquire after ensures any writes the
+             * handler made are visible.  On x86-TSO ACQ_REL fences emit
+             * no instructions; SEQ_CST emits mfence (~1-3 cycles +
+             * pipeline serialization).  Per-RPC saving is small but the
+             * dispatcher loop runs hot. */
             thread->nspa_channel_entry_id = recv->entry_id;
-            __atomic_thread_fence( __ATOMIC_SEQ_CST );
+            __atomic_thread_fence( __ATOMIC_RELEASE );
             read_request_shm( thread, (struct request_shm *)thread->request_shm );
-            __atomic_thread_fence( __ATOMIC_SEQ_CST );
+            __atomic_thread_fence( __ATOMIC_ACQUIRE );
         }
         if (!recv->thread_token)
             release_object( thread );

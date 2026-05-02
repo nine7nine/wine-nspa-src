@@ -221,6 +221,27 @@ NTSTATUS ntdll_sched_async( async_callback callback, void *private )
     return STATUS_SUCCESS;
 }
 
+/* NSPA Phase 2.5: macOS not a target — stubs satisfy unixlib symbol resolution. */
+NTSTATUS ntdll_sched_register_poll( int fd, int events, poll_callback callback,
+                                    void *private, sched_handle_t *handle )
+{
+    ERR( "not implemented on macOS\n" );
+    return STATUS_NOT_IMPLEMENTED;
+}
+
+NTSTATUS ntdll_sched_register_timer( const LARGE_INTEGER *timeout, async_callback callback,
+                                     void *private, sched_handle_t *handle )
+{
+    ERR( "not implemented on macOS\n" );
+    return STATUS_NOT_IMPLEMENTED;
+}
+
+NTSTATUS ntdll_sched_cancel( sched_handle_t handle )
+{
+    ERR( "not implemented on macOS\n" );
+    return STATUS_NOT_IMPLEMENTED;
+}
+
 void sched_run(void)
 {
 /*
@@ -317,6 +338,7 @@ struct timer_user
     LONGLONG        when;       /* absolute timeout expiry */
     async_callback  callback;   /* callback function */
     void           *private;    /* callback private data */
+    int             canceled;   /* NSPA Phase 2.5: set by ntdll_sched_cancel; skip dispatch + free in next sweep */
 };
 
 static struct timer_user *alloc_timer_user( const LARGE_INTEGER *timeout, async_callback callback, void *private )
@@ -335,6 +357,7 @@ static struct timer_user *alloc_timer_user( const LARGE_INTEGER *timeout, async_
     user->when     = timeout->QuadPart;
     user->callback = callback;
     user->private  = private;
+    user->canceled = 0;
 
     return user;
 }
@@ -390,6 +413,15 @@ static int get_next_timeout(void)
     pthread_mutex_lock( &sched_lock );
     LIST_FOR_EACH_ENTRY_SAFE( user, next, &timer_users, struct timer_user, entry )
     {
+        /* NSPA Phase 2.5: drop canceled timers without dispatch.  We can
+         * see them at the head of the list (when < cutoff) or interleaved
+         * with non-canceled later entries; only the head ones matter for
+         * the timeout calculation, but we may as well clean a head run. */
+        if (user->canceled)
+        {
+            free_timer_user( user );
+            continue;
+        }
         if ((ret = user->when - now.QuadPart) > 0) break;
         list_remove( &user->entry );
         list_add_tail( &expired, &user->entry );
@@ -486,26 +518,86 @@ void sched_run(void)
     }
 }
 
-NTSTATUS ntdll_sched_poll( int fd, int events, poll_callback callback, void *private )
+NTSTATUS ntdll_sched_register_poll( int fd, int events, poll_callback callback,
+                                    void *private, sched_handle_t *handle )
 {
     struct poll_user *user;
 
-    TRACE( "fd %d, events %d, callback %p, private %p\n", fd, events, callback, private );
+    TRACE( "fd %d, events %d, callback %p, private %p, handle %p\n",
+           fd, events, callback, private, handle );
 
     if (!(user = alloc_poll_user( fd, events, callback, private ))) return STATUS_NO_MEMORY;
     add_poll_user( user );
+    if (handle) *handle = user;
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS ntdll_sched_poll( int fd, int events, poll_callback callback, void *private )
+{
+    return ntdll_sched_register_poll( fd, events, callback, private, NULL );
+}
+
+NTSTATUS ntdll_sched_register_timer( const LARGE_INTEGER *timeout, async_callback callback,
+                                     void *private, sched_handle_t *handle )
+{
+    struct timer_user *user;
+
+    TRACE( "timeout %jd, callback %p, private %p, handle %p\n",
+           (intmax_t)timeout->QuadPart, callback, private, handle );
+
+    if (!(user = alloc_timer_user( timeout, callback, private ))) return STATUS_NO_MEMORY;
+    add_timer_user( user );
+    if (handle) *handle = user;
     return STATUS_SUCCESS;
 }
 
 NTSTATUS ntdll_sched_timer( const LARGE_INTEGER *timeout, async_callback callback, void *private )
 {
-    struct timer_user *user;
+    return ntdll_sched_register_timer( timeout, callback, private, NULL );
+}
 
-    TRACE( "timeout %jd, callback %p, private %p\n", (intmax_t)timeout->QuadPart, callback, private );
+/* NSPA Phase 2.5: cancel a previously-registered poll or timer.
+ *
+ * Walks both poll_users and timer_users under sched_lock; matches by
+ * pointer.  For polls: invalidates fd to -1 (existing
+ * "free on next iteration" pattern).  For timers: marks canceled flag
+ * (skip-and-free in get_next_timeout's next sweep).
+ *
+ * Caller MUST observe the lifetime contract documented in
+ * include/wine/unixlib.h — handle is single-use; double-cancel or
+ * cancel-after-callback may STATUS_NOT_FOUND OR may erroneously cancel
+ * a different registration if the same allocator slot has been reused
+ * (ABA).  This API is for consumers that own their handle's lifecycle. */
+NTSTATUS ntdll_sched_cancel( sched_handle_t handle )
+{
+    static int64_t value = 1;
+    struct poll_user *poll_u, *poll_next;
+    struct timer_user *timer_u, *timer_next;
+    int found = 0;
 
-    if (!(user = alloc_timer_user( timeout, callback, private ))) return STATUS_NO_MEMORY;
-    add_timer_user( user );
-    return STATUS_SUCCESS;
+    TRACE( "handle %p\n", handle );
+
+    if (!handle) return STATUS_INVALID_PARAMETER;
+
+    pthread_mutex_lock( &sched_lock );
+    LIST_FOR_EACH_ENTRY_SAFE( poll_u, poll_next, &poll_users, struct poll_user, entry )
+    {
+        if (poll_u != handle) continue;
+        poll_u->fd = -1;
+        found = 1;
+        break;
+    }
+    if (!found) LIST_FOR_EACH_ENTRY_SAFE( timer_u, timer_next, &timer_users, struct timer_user, entry )
+    {
+        if (timer_u != handle) continue;
+        timer_u->canceled = 1;
+        found = 1;
+        break;
+    }
+    pthread_mutex_unlock( &sched_lock );
+
+    if (found) write( signal_fd, &value, sizeof(value) );  /* wake sched thread to process the cancel */
+    return found ? STATUS_SUCCESS : STATUS_NOT_FOUND;
 }
 
 NTSTATUS ntdll_sched_async( async_callback callback, void *private )

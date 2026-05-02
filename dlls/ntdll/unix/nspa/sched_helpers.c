@@ -22,6 +22,8 @@
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
 #include "windef.h"
+#include "winternl.h"
+#include "wine/unixlib.h"
 
 #include "sched_helpers.h"
 
@@ -40,4 +42,12 @@ BOOL nspa_sched_enabled(void)
         __atomic_store_n( &nspa_sched_enabled_cached, v, __ATOMIC_RELEASE );
     }
     return v == 2;
+}
+
+int nspa_sched_submit_async( void (*cb)( void *arg ), void *arg )
+{
+    /* Adapt to ntdll_sched_async signature: it takes async_callback which
+     * is `void (*)(void *private)`.  Same type — pass through. */
+    NTSTATUS status = ntdll_sched_async( (async_callback)cb, arg );
+    return status != STATUS_SUCCESS;
 }

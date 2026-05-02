@@ -95,6 +95,37 @@ NTSYSAPI NTSTATUS ntdll_sched_register_timer( const LARGE_INTEGER *timeout,
                                               sched_handle_t *handle );
 NTSYSAPI NTSTATUS ntdll_sched_cancel( sched_handle_t handle );
 
+/* NSPA Phase 3 multi-class sched.  Class selects which sched thread
+ * hosts the registration:
+ *
+ *   NTDLL_SCHED_CLASS_DEFAULT  bootstrap-derived sched, SCHED_OTHER.
+ *                              Identical to the non-_class APIs.
+ *                              For non-precision background work
+ *                              (cleanup, observability, async cleanup
+ *                              like Phase 3 lf_close_queue).
+ *   NTDLL_SCHED_CLASS_RT       NSPA-spawned sched, SCHED_FIFO at
+ *                              NSPA_RT_PRIO-1, lazy-spawned on first
+ *                              RT registration.  For consumers that
+ *                              need timing precision (NT timer fire,
+ *                              WM_TIMER dispatch, etc.).  Returns
+ *                              STATUS_NOT_SUPPORTED if NSPA RT is
+ *                              not available (caller's
+ *                              responsibility to fall back). */
+typedef enum
+{
+    NTDLL_SCHED_CLASS_DEFAULT = 0,
+    NTDLL_SCHED_CLASS_RT      = 1,
+} sched_class_t;
+
+NTSYSAPI NTSTATUS ntdll_sched_register_poll_class(  sched_class_t cls,
+                                                    int fd, int events,
+                                                    poll_callback callback, void *private,
+                                                    sched_handle_t *handle );
+NTSYSAPI NTSTATUS ntdll_sched_register_timer_class( sched_class_t cls,
+                                                    const LARGE_INTEGER *timeout,
+                                                    async_callback callback, void *private,
+                                                    sched_handle_t *handle );
+
 /* exception handling */
 
 #include <setjmp.h>

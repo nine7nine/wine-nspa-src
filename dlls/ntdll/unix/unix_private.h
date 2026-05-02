@@ -538,6 +538,13 @@ extern NTSTATUS wow64_wine_spawnvp( void *args );
 
 extern void sched_run(void);
 
+/* NSPA Phase 3 multi-class sched.  Forward-decl + helpers to let NSPA
+ * spawn additional sched threads (currently the RT class).  The
+ * struct definition stays private to sched.c. */
+struct sched_instance;
+extern struct sched_instance *sched_instance_alloc( void );
+extern void sched_run_inst( struct sched_instance *inst );
+
 extern void dbg_init(void);
 
 /* io_uring integration (io_uring.c) — all return -ENOSYS if unavailable */

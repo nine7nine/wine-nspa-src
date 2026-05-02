@@ -48,4 +48,10 @@ extern BOOL nspa_sched_enabled( void );
  * decide. */
 extern int nspa_sched_submit_async( void (*cb)( void *arg ), void *arg );
 
+/* NSPA Phase 3 multi-class: returns TRUE if NSPA RT support is
+ * available in this process.  Cheap (single env-cache read).  RT
+ * consumers (wm_timer migration, future precision dispatchers) check
+ * this before requesting NTDLL_SCHED_CLASS_RT. */
+extern BOOL nspa_sched_rt_available( void );
+
 #endif /* __NSPA_SCHED_HELPERS_H */

@@ -36,4 +36,16 @@
  * Default OFF.  Set NSPA_USE_SCHED_THREAD=1 to opt in. */
 extern BOOL nspa_sched_enabled( void );
 
+/* NSPA-shaped thin wrapper around ntdll_sched_async.  Enqueues `cb(arg)`
+ * to run on the per-process sched thread (SCHED_OTHER).  Fire-and-forget
+ * — caller cannot wait for completion.  cb runs without holding any
+ * NSPA lock; if cb needs to lock NSPA state, use PI mutexes (the sched
+ * thread inherits priority via PI when an RT thread waits on it).
+ *
+ * Returns non-zero on failure (e.g. malloc failed inside the underlying
+ * sched layer); caller should fall back to inline execution.  No
+ * fallback is performed by this helper — it is up to the consumer to
+ * decide. */
+extern int nspa_sched_submit_async( void (*cb)( void *arg ), void *arg );
+
 #endif /* __NSPA_SCHED_HELPERS_H */

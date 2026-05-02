@@ -57,6 +57,33 @@ NTSYSAPI NTSTATUS ntdll_sched_async( async_callback callback, void *private );
 typedef NTSTATUS (*call_callback)( void *private );
 NTSYSAPI NTSTATUS ntdll_sched_call( call_callback callback, void *private );
 
+/* NSPA Phase 2.5 — cancelable variants of register_poll/register_timer.
+ *
+ * sched_handle_t is an opaque pointer to internal sched state.  Caller
+ * must NOT dereference it.
+ *
+ * Lifetime contract:
+ *   - register_* succeeds → handle valid for cancel
+ *   - cancel succeeds → handle invalid; do not cancel again
+ *   - callback fires → handle invalid for register_poll if callback
+ *     returned 0 events (registration freed); for register_timer the
+ *     handle is always invalid after the single dispatch (one-shot)
+ *   - poll callbacks that return non-zero events keep the registration
+ *     active; handle remains valid until cancel or POLLHUP/POLLERR
+ *
+ * Caller MUST not double-cancel.  Cancel-after-callback or
+ * double-cancel may return STATUS_NOT_FOUND OR may erroneously cancel
+ * a different registration if the same memory has been reused for a
+ * later allocation (ABA).  Caller owns the lifecycle. */
+typedef void *sched_handle_t;
+NTSYSAPI NTSTATUS ntdll_sched_register_poll( int fd, int events,
+                                             poll_callback callback, void *private,
+                                             sched_handle_t *handle );
+NTSYSAPI NTSTATUS ntdll_sched_register_timer( const LARGE_INTEGER *timeout,
+                                              async_callback callback, void *private,
+                                              sched_handle_t *handle );
+NTSYSAPI NTSTATUS ntdll_sched_cancel( sched_handle_t handle );
+
 /* exception handling */
 
 #include <setjmp.h>

@@ -526,11 +526,26 @@ static void init_context_fds( int *wait, int *signal )
     *signal = fds[1];
 }
 
+/* Allocate + zero-init a sched_instance.  Caller (NSPA RT lazy spawn,
+ * future class instances) is responsible for then arming a pthread to
+ * call sched_run_inst on it.  Lock + lists are initialized by
+ * sched_register_instance() on first run. */
+struct sched_instance *sched_instance_alloc( void )
+{
+    struct sched_instance *inst = calloc( 1, sizeof(*inst) );
+    if (!inst) return NULL;
+    list_init( &inst->poll_users );
+    list_init( &inst->timer_users );
+    inst->signal_fd = -1;
+    return inst;
+}
+
 /* sched_run_inst: the actual dispatch loop, parameterized by instance.
  * sched_run() (the upstream entry point from server_start_main_thread)
- * dispatches via the default instance.  Future RT instance gets its
- * own pthread that calls sched_run_inst with the rt_inst pointer. */
-static void sched_run_inst( struct sched_instance *inst )
+ * dispatches via the default instance.  NSPA-spawned RT instance has
+ * its own pthread that calls sched_run_inst with the rt_inst pointer
+ * — see dlls/ntdll/unix/nspa/sched_helpers.c. */
+void sched_run_inst( struct sched_instance *inst )
 {
     struct array users = ARRAY_INIT( users, struct poll_user * );
     struct array pfds = ARRAY_INIT( pfds, struct pollfd );
@@ -605,18 +620,43 @@ void sched_run( void )
     sched_run_inst( &default_inst );
 }
 
+/* NSPA Phase 3 multi-class: hook for the RT-class instance.  Defined
+ * in dlls/ntdll/unix/nspa/sched_helpers.c — lazy-spawns the RT sched
+ * thread (SCHED_FIFO at NSPA_RT_PRIO-1) on first RT registration.
+ * Returns NULL if NSPA RT is not configured. */
+extern struct sched_instance *nspa_sched_get_rt_instance( void );
+
+static struct sched_instance *get_instance_for_class( sched_class_t cls )
+{
+    switch (cls)
+    {
+    case NTDLL_SCHED_CLASS_DEFAULT: return &default_inst;
+    case NTDLL_SCHED_CLASS_RT:      return nspa_sched_get_rt_instance();
+    }
+    return NULL;
+}
+
+NTSTATUS ntdll_sched_register_poll_class( sched_class_t cls, int fd, int events,
+                                          poll_callback callback, void *private,
+                                          sched_handle_t *handle )
+{
+    struct sched_instance *inst = get_instance_for_class( cls );
+    struct poll_user *user;
+
+    TRACE( "cls %d fd %d events %d cb %p priv %p\n", cls, fd, events, callback, private );
+
+    if (!inst) return STATUS_NOT_SUPPORTED;
+    if (!(user = alloc_poll_user( fd, events, callback, private ))) return STATUS_NO_MEMORY;
+    add_poll_user( inst, user );
+    if (handle) { handle->priv = user; handle->gen = user->gen; }
+    return STATUS_SUCCESS;
+}
+
 NTSTATUS ntdll_sched_register_poll( int fd, int events, poll_callback callback,
                                     void *private, sched_handle_t *handle )
 {
-    struct poll_user *user;
-
-    TRACE( "fd %d, events %d, callback %p, private %p, handle %p\n",
-           fd, events, callback, private, handle );
-
-    if (!(user = alloc_poll_user( fd, events, callback, private ))) return STATUS_NO_MEMORY;
-    add_poll_user( &default_inst, user );
-    if (handle) { handle->priv = user; handle->gen = user->gen; }
-    return STATUS_SUCCESS;
+    return ntdll_sched_register_poll_class( NTDLL_SCHED_CLASS_DEFAULT, fd, events,
+                                            callback, private, handle );
 }
 
 NTSTATUS ntdll_sched_poll( int fd, int events, poll_callback callback, void *private )
@@ -624,18 +664,27 @@ NTSTATUS ntdll_sched_poll( int fd, int events, poll_callback callback, void *pri
     return ntdll_sched_register_poll( fd, events, callback, private, NULL );
 }
 
+NTSTATUS ntdll_sched_register_timer_class( sched_class_t cls, const LARGE_INTEGER *timeout,
+                                           async_callback callback, void *private,
+                                           sched_handle_t *handle )
+{
+    struct sched_instance *inst = get_instance_for_class( cls );
+    struct timer_user *user;
+
+    TRACE( "cls %d timeout %jd cb %p priv %p\n", cls, (intmax_t)timeout->QuadPart, callback, private );
+
+    if (!inst) return STATUS_NOT_SUPPORTED;
+    if (!(user = alloc_timer_user( timeout, callback, private ))) return STATUS_NO_MEMORY;
+    add_timer_user( inst, user );
+    if (handle) { handle->priv = user; handle->gen = user->gen; }
+    return STATUS_SUCCESS;
+}
+
 NTSTATUS ntdll_sched_register_timer( const LARGE_INTEGER *timeout, async_callback callback,
                                      void *private, sched_handle_t *handle )
 {
-    struct timer_user *user;
-
-    TRACE( "timeout %jd, callback %p, private %p, handle %p\n",
-           (intmax_t)timeout->QuadPart, callback, private, handle );
-
-    if (!(user = alloc_timer_user( timeout, callback, private ))) return STATUS_NO_MEMORY;
-    add_timer_user( &default_inst, user );
-    if (handle) { handle->priv = user; handle->gen = user->gen; }
-    return STATUS_SUCCESS;
+    return ntdll_sched_register_timer_class( NTDLL_SCHED_CLASS_DEFAULT, timeout,
+                                             callback, private, handle );
 }
 
 NTSTATUS ntdll_sched_timer( const LARGE_INTEGER *timeout, async_callback callback, void *private )

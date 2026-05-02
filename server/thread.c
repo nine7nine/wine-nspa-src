@@ -269,6 +269,17 @@ static void apply_thread_priority( struct thread *thread )
     int min = -nice_limit, max = nice_limit, range = max - min, niceness;
     int effective_priority = get_effective_thread_priority( thread );
 
+    /* NSPA spawn-main RT invariant: the sched (unix bootstrap) thread
+     * must stay SCHED_OTHER regardless of process priority class.
+     * Without this guard, set_process_base_priority/affinity/disable_boost
+     * (all of which now also touch process->sched_thread) would walk
+     * through this function and let the regular NSPA RT path RT-promote
+     * the sched thread when the process is bumped to REALTIME class.
+     * The placeholder sched_run does nothing today (for(;;) poll(NULL,0,-1)),
+     * but Phase 2+ registers real callbacks on this thread; an RT-promoted
+     * scheduler running arbitrary callback work could starve audio. */
+    if (thread->is_sched) return;
+
     /* NSPA RT: if enabled and the thread is in the NT realtime band, use
      * SCHED_FIFO/RR via sched_setscheduler and return. Otherwise fall through
      * to the existing nice-based path, demoting first if needed.

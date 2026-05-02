@@ -1462,7 +1462,8 @@ static HRESULT WINAPI IShellBrowser_fnOnViewWindowActive(IShellBrowser *iface,
                                                          IShellView *pshv)
 {
     ExplorerBrowserImpl *This = impl_from_IShellBrowser(iface);
-    FIXME("stub, %p (%p)\n", This, pshv);
+    static int once;
+    if (!once++) FIXME("stub, %p (%p)\n", This, pshv);
 
     return E_NOTIMPL;
 }

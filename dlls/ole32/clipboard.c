@@ -1205,8 +1205,11 @@ static DWORD get_tymed_from_nonole_cf(UINT cf)
     case CF_BITMAP:
         return TYMED_GDI;
     default:
-        FIXME("returning TYMED_NULL for cf %04x\n", cf);
+    {
+        static int once;
+        if (!once++) FIXME("returning TYMED_NULL for cf %04x\n", cf);
         return TYMED_NULL;
+    }
     }
 }
 

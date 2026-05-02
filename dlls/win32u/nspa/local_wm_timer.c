@@ -67,12 +67,15 @@
 #define SCHED_RESET_ON_FORK 0x40000000
 #endif
 
+#include <limits.h>
+
 #include <ntstatus.h>
 #define WIN32_NO_STATUS
 #include "../win32u_private.h"
 #include "wine/debug.h"
 #include "wine/list.h"
 #include "wine/server_protocol.h"
+#include "wine/unixlib.h"     /* NSPA Phase 3: ntdll_sched_*_class + sched_handle_t */
 #include <rtpi.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(timer);
@@ -121,6 +124,32 @@ static pi_cond_t  wm_timer_wake = PI_COND_INIT(0);
 static pthread_t  wm_timer_thread;
 static int        wm_timer_thread_started;
 static int        wm_timer_shutdown;
+
+/*--------------------------------------------------------------------------
+ * NSPA Phase 3 sched-RT migration state (default-OFF gate).
+ *
+ * When NSPA_SCHED_USE_FOR_WM_TIMER=1 AND nspa_sched_rt_available(),
+ * the wm_timer dispatcher work runs on the per-process RT sched thread
+ * (SCHED_FIFO at NSPA_RT_PRIO-1) instead of on its own dedicated
+ * pthread.  Same priority class as the legacy dispatcher; saves one
+ * pthread per process and consolidates RT helpers.
+ *
+ * Lifecycle invariant: wm_timer_pending_dispatch is the handle of the
+ * currently-armed sched timer (may be SCHED_HANDLE_NULL when nothing
+ * is pending).  Protected by wm_timer_lock — every read/write must
+ * hold the lock OR be in the dispatch callback (which acquires the
+ * lock at entry).
+ *
+ * Lock order: wm_timer_lock OUTER, sched per-instance lock INNER.
+ * sched code never calls into wm_timer; wm_timer calls into sched
+ * while holding wm_timer_lock — safe (no inversion).  signal_fd write
+ * is non-blocking (sched.c) so the producer can never block on a full
+ * pipe while sched waits for wm_timer_lock.
+ *--------------------------------------------------------------------------*/
+
+static int             wm_timer_use_sched = -1;          /* tri-state cache */
+static sched_handle_t  wm_timer_pending_dispatch;        /* protected by wm_timer_lock */
+static pthread_once_t  wm_timer_atexit_once = PTHREAD_ONCE_INIT;
 
 static int              nspa_wm_timers_enabled = -1;
 static pthread_once_t   gate_once = PTHREAD_ONCE_INIT;
@@ -425,9 +454,241 @@ static void *wm_timer_dispatcher_main( void *arg )
     return NULL;
 }
 
+/*--------------------------------------------------------------------------
+ * NSPA Phase 3 sched-RT path
+ *
+ * Replaces wm_timer_dispatcher_main + pthread + pi_cond_timedwait with
+ * an event-driven sched-timer chain hosted on the per-process RT sched
+ * thread.  Each fire of the dispatch callback runs ONE logical iteration
+ * of the legacy loop body (clear in_ring, publish expired, re-arm
+ * periodic) and then registers the next deadline.
+ *
+ * SetTimer / KillTimer call wm_timer_sched_rearm_locked() after
+ * mutating the wheel, which cancels the current pending registration
+ * (gen-checked, so an already-firing timer is harmless) and registers
+ * a new one for the new earliest deadline.
+ *--------------------------------------------------------------------------*/
+
+static BOOL nspa_wm_timer_sched_active(void)
+{
+    if (wm_timer_use_sched == -1)
+    {
+        const char *env = getenv( "NSPA_SCHED_USE_FOR_WM_TIMER" );
+        if (env && env[0] == '1' && env[1] == 0 && nspa_sched_rt_available())
+            wm_timer_use_sched = 1;
+        else
+            wm_timer_use_sched = 0;
+    }
+    return wm_timer_use_sched == 1;
+}
+
+/* Caller holds wm_timer_lock.  Returns the next absolute deadline
+ * (mono ns) that the dispatcher needs to wake at, or LLONG_MAX if
+ * there is nothing to do.  Combines:
+ *   - earliest deadline in the wheel
+ *   - 1ms-from-now if any entry is in_ring (re-check coalescing) */
+static LONGLONG wm_timer_next_deadline_locked(void)
+{
+    struct nspa_wm_timer *t;
+    LONGLONG next = LLONG_MAX;
+
+    /* Wheel is sorted: head is earliest. */
+    LIST_FOR_EACH_ENTRY( t, &wm_timer_wheel, struct nspa_wm_timer, wheel_entry )
+    {
+        next = t->deadline_mono_ns;
+        break;
+    }
+
+    /* If any entry is waiting on a slot drain, schedule a 1ms recheck
+     * (matches the legacy dispatcher's poll loop interval). */
+    LIST_FOR_EACH_ENTRY( t, &wm_timer_wheel, struct nspa_wm_timer, wheel_entry )
+    {
+        if (t->in_ring)
+        {
+            LONGLONG poll_at = mono_now_ns() + 1000000LL;   /* 1ms */
+            if (poll_at < next) next = poll_at;
+            break;
+        }
+    }
+    return next;
+}
+
+/* Forward decl — registered as the sched-timer callback. */
+static void wm_timer_sched_dispatch_cb( void *arg );
+
+/* Caller holds wm_timer_lock.  Cancels the current pending sched
+ * registration (if any) and registers a new one for the next deadline.
+ * Both cancel + register go through the per-instance sched lock; the
+ * pi_mutex order is wm_timer_lock OUTER, sched_lock INNER (no
+ * inversion possible since sched code never reaches into wm_timer). */
+static void wm_timer_sched_rearm_locked(void)
+{
+    sched_handle_t old, new = SCHED_HANDLE_NULL;
+    LONGLONG next_ns, now_ns, rel_ns;
+    LARGE_INTEGER timeout;
+    NTSTATUS status;
+
+    /* Atomically replace the stored handle so a racing cancel /
+     * dispatch sees a coherent before/after.  Cancel of the old
+     * handle is gen-checked: if it has already fired, returns
+     * STATUS_NOT_FOUND harmlessly. */
+    old = wm_timer_pending_dispatch;
+    wm_timer_pending_dispatch = SCHED_HANDLE_NULL;
+    if (old.priv) ntdll_sched_cancel( old );
+
+    if (wm_timer_shutdown) return;     /* no rearm during teardown */
+
+    next_ns = wm_timer_next_deadline_locked();
+    if (next_ns == LLONG_MAX) return;  /* nothing to do — wheel empty */
+
+    now_ns = mono_now_ns();
+    rel_ns = next_ns - now_ns;
+    if (rel_ns < 0) rel_ns = 0;        /* deadline already passed — fire now */
+
+    /* NT 100ns units, negative = relative timeout. */
+    timeout.QuadPart = -(rel_ns / 100);
+    if (timeout.QuadPart == 0) timeout.QuadPart = -1;   /* min representable */
+
+    status = ntdll_sched_register_timer_class( NTDLL_SCHED_CLASS_RT, &timeout,
+                                               wm_timer_sched_dispatch_cb, NULL, &new );
+    if (status == STATUS_SUCCESS)
+    {
+        wm_timer_pending_dispatch = new;
+    }
+    else
+    {
+        WARN( "wm_timer sched rearm failed status=%#x — dispatcher stalls until next SetTimer\n",
+              (unsigned int)status );
+        /* No retry; next SetTimer / KillTimer will trigger another
+         * rearm attempt. */
+    }
+}
+
+/* Sched-RT thread callback.  Runs one logical iteration of the legacy
+ * dispatcher loop body, then re-arms for the next deadline. */
+static void wm_timer_sched_dispatch_cb( void *arg )
+{
+    LONGLONG now_ns;
+    struct nspa_wm_timer *t, *next;
+
+    (void)arg;
+
+    pi_mutex_lock( &wm_timer_lock );
+
+    if (wm_timer_shutdown)
+    {
+        wm_timer_pending_dispatch = SCHED_HANDLE_NULL;
+        pi_mutex_unlock( &wm_timer_lock );
+        return;
+    }
+
+    now_ns = mono_now_ns();
+
+    /* Step 1: clear in_ring for any entry whose slot has been drained. */
+    LIST_FOR_EACH_ENTRY_SAFE( t, next, &wm_timer_wheel, struct nspa_wm_timer, wheel_entry )
+    {
+        if (t->in_ring && slot_was_drained( t )) t->in_ring = FALSE;
+    }
+
+    /* Step 2: for each expired wheel entry, publish (or coalesce) and
+     * re-arm if periodic.  Identical to the legacy dispatcher_main
+     * Step 2; deliberately copied not factored to keep behavioral
+     * parity verifiable line-by-line. */
+    LIST_FOR_EACH_ENTRY_SAFE( t, next, &wm_timer_wheel, struct nspa_wm_timer, wheel_entry )
+    {
+        if (t->deadline_mono_ns > now_ns) break;
+
+        if (!t->cancelled && !t->in_ring)
+        {
+            unsigned int slot_idx;
+            if (publish_timer_slot( t, &slot_idx ))
+            {
+                t->in_ring = TRUE;
+                t->last_slot_idx = slot_idx;
+            }
+            /* If publish failed (ring full) we fall through to re-arm
+             * anyway; the lost event is the coalesced one. */
+        }
+
+        wheel_remove( t );
+        if (t->rate_ms && !t->cancelled)
+        {
+            t->deadline_mono_ns += (LONGLONG)t->rate_ms * 1000000LL;
+            if (t->deadline_mono_ns < now_ns)
+                t->deadline_mono_ns = now_ns + (LONGLONG)t->rate_ms * 1000000LL;
+            wheel_insert_sorted( t );
+        }
+    }
+
+    /* Mark the just-fired registration as consumed (rearm handles the
+     * actual cancel/register dance; the sched-side struct is already
+     * freed by sched.c after invoking us, so we just clear our copy of
+     * the handle to avoid trying to cancel it). */
+    wm_timer_pending_dispatch = SCHED_HANDLE_NULL;
+
+    /* Re-arm for the next deadline (or 1ms recheck if any in_ring). */
+    wm_timer_sched_rearm_locked();
+
+    pi_mutex_unlock( &wm_timer_lock );
+}
+
+/* atexit handler: signal shutdown, cancel pending dispatch, no
+ * post-exit fires.  In-flight callbacks (if any) finish under the
+ * lock and observe wm_timer_shutdown=1 on their next iteration. */
+static void wm_timer_sched_atexit_cb(void)
+{
+    sched_handle_t h = SCHED_HANDLE_NULL;
+
+    pi_mutex_lock( &wm_timer_lock );
+    wm_timer_shutdown = 1;
+    h = wm_timer_pending_dispatch;
+    wm_timer_pending_dispatch = SCHED_HANDLE_NULL;
+    pi_mutex_unlock( &wm_timer_lock );
+
+    if (h.priv) ntdll_sched_cancel( h );
+    /* Any in-flight cb is either:
+     *   - blocked on wm_timer_lock (acquired after we released): will
+     *     see shutdown=1 first thing and return without rearm
+     *   - currently doing work (we never see this state because we'd
+     *     be blocked on the lock waiting for it): on exit it calls
+     *     rearm which checks shutdown and returns
+     *   - already returned: no further action
+     * Memory leaks in the wheel/table at exit are intentional — the
+     * OS reaps everything; explicit teardown would risk freeing under
+     * an in-flight callback. */
+}
+
+/* pthread_once wrapper that registers the atexit cleanup.  Separate
+ * from the cleanup itself because pthread_once invokes its function
+ * EXACTLY once at first ensure-call time, while atexit is what we
+ * want at process exit. */
+static void wm_timer_sched_atexit_register(void)
+{
+    atexit( wm_timer_sched_atexit_cb );
+}
+
+static void wm_timer_sched_arm_atexit_once(void)
+{
+    pthread_once( &wm_timer_atexit_once, wm_timer_sched_atexit_register );
+}
+
 static NTSTATUS ensure_dispatcher_started(void)
 {
     int err;
+
+    if (nspa_wm_timer_sched_active())
+    {
+        /* Sched path: registrations are made on demand from
+         * SetTimer/KillTimer/dispatch_cb itself.  Just ensure the
+         * atexit cleanup is armed.  Caller MUST already hold
+         * wm_timer_lock (per existing contract); the rearm below
+         * runs under it. */
+        wm_timer_sched_arm_atexit_once();
+        if (!wm_timer_pending_dispatch.priv && !wm_timer_shutdown)
+            wm_timer_sched_rearm_locked();
+        return STATUS_SUCCESS;
+    }
+
     if (wm_timer_thread_started) return STATUS_SUCCESS;
     /* Pure pthread is fine: the dispatcher only touches shared memory
      * (ring slots) and pthread/futex primitives — no wineserver session
@@ -542,8 +803,20 @@ NTSTATUS nspa_local_wm_timer_set( HWND hwnd, UINT_PTR id, UINT timeout,
         return ret;
     }
 
-    pi_mutex_unlock( &wm_timer_lock );
-    pi_cond_signal( &wm_timer_wake, &wm_timer_lock );
+    if (nspa_wm_timer_sched_active())
+    {
+        /* Sched path: re-evaluate the next deadline and re-arm the
+         * pending sched-timer.  Done while holding the lock — sched
+         * write end is non-blocking so we can't deadlock on a full
+         * pipe waiting for sched to drain. */
+        wm_timer_sched_rearm_locked();
+        pi_mutex_unlock( &wm_timer_lock );
+    }
+    else
+    {
+        pi_mutex_unlock( &wm_timer_lock );
+        pi_cond_signal( &wm_timer_wake, &wm_timer_lock );
+    }
 
     *out_id = id;
     return STATUS_SUCCESS;
@@ -573,6 +846,16 @@ NTSTATUS nspa_local_wm_timer_kill( HWND hwnd, UINT_PTR id, UINT msg )
     /* entry->in_ring slot (if any) stays READY in the ring; pump
      * will drain it and peek_message will deliver WM_TIMER as
      * NT semantics require. */
+
+    if (nspa_wm_timer_sched_active())
+    {
+        /* Sched path: removing this entry may have changed the head
+         * deadline.  Rearm so the pending sched-timer reflects the
+         * new earliest deadline (correctness-neutral but avoids a
+         * spurious wake at the old head's deadline). */
+        wm_timer_sched_rearm_locked();
+    }
+
     pi_mutex_unlock( &wm_timer_lock );
 
     free( entry );

@@ -627,9 +627,15 @@ BOOL WINAPI CopyFileExW( const WCHAR *source, const WCHAR *dest, LPPROGRESS_ROUT
     COPYFILE2_EXTENDED_PARAMETERS params;
 
     if (progress)
-        FIXME("LPPROGRESS_ROUTINE is not supported\n");
+    {
+        static int once;
+        if (!once++) FIXME("LPPROGRESS_ROUTINE is not supported\n");
+    }
     if (cancel_ptr)
-        FIXME("cancel_ptr is not supported\n");
+    {
+        static int once;
+        if (!once++) FIXME("cancel_ptr is not supported\n");
+    }
 
     params.dwSize = sizeof(params);
     params.dwCopyFlags = flags;
@@ -2744,7 +2750,11 @@ BOOL WINAPI DECLSPEC_HOTPATCH ReplaceFileW( const WCHAR *replaced, const WCHAR *
     TRACE( "%s %s %s 0x%08lx %p %p\n", debugstr_w(replaced), debugstr_w(replacement), debugstr_w(backup),
            flags, exclude, reserved );
 
-    if (flags) FIXME("Ignoring flags %lx\n", flags);
+    if (flags)
+    {
+        static int once;
+        if (!once++) FIXME("Ignoring flags %lx\n", flags);
+    }
 
     /* First two arguments are mandatory */
     if (!replaced || !replacement)

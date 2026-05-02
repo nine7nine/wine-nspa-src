@@ -3607,8 +3607,11 @@ static HRESULT WINAPI IServiceProvider_fnQueryService(IServiceProvider *iface,
         hr = IExplorerBrowser_GetCurrentView(This->peb, riid, ppv);
     }
     else
-        FIXME("Interface %s requested from unknown service %s\n",
-              debugstr_guid(riid), debugstr_guid(guidService));
+    {
+        static int once;
+        if (!once++) FIXME("Interface %s requested from unknown service %s\n",
+                            debugstr_guid(riid), debugstr_guid(guidService));
+    }
 
     return hr;
 }

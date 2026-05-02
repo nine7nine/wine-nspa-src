@@ -46,6 +46,8 @@
 #include "wine/list.h"
 #include "wine/debug.h"
 
+#include <rtpi.h>     /* NSPA: PI mutex for sched_instance.lock */
+
 /* NSPA: dedicated debug channel so WINEDEBUG=+sched selectively enables
  * dispatch traces without the broader ntdll firehose. */
 WINE_DEFAULT_DEBUG_CHANNEL(sched);
@@ -382,40 +384,82 @@ static void free_timer_user( struct timer_user *user )
     free( user );
 }
 
-static pthread_mutex_t sched_lock = PTHREAD_MUTEX_INITIALIZER;
-static struct list poll_users = LIST_INIT( poll_users );
-static struct list timer_users = LIST_INIT( timer_users );
-static int signal_fd;
+/* NSPA Phase 3 multi-class refactor: extract sched state into an
+ * instance struct so we can run multiple sched threads at different
+ * priority classes (DEFAULT = SCHED_OTHER bootstrap thread; RT =
+ * lazy-spawned SCHED_FIFO thread for timing-precision consumers).
+ *
+ * The default instance is initialized inline and corresponds to the
+ * bootstrap-derived sched thread (Phase 1).  Additional instances
+ * are registered via sched_register_instance() at lazy-spawn time so
+ * cancel can walk all live instances regardless of the consumer's
+ * class. */
+struct sched_instance
+{
+    pi_mutex_t       lock;            /* NSPA: PI for cross-priority register/cancel */
+    struct list      poll_users;
+    struct list      timer_users;
+    int              signal_fd;
+    int              lock_inited;     /* runtime pi_mutex_init guard */
+};
 
-static void add_poll_user( struct poll_user *user )
+#define SCHED_MAX_INSTANCES 4
+static struct sched_instance *sched_instances[ SCHED_MAX_INSTANCES ];
+static unsigned int sched_instance_count;
+/* Instance registration is one-time at init; no lock needed since
+ * lookup happens after all instances are registered.  RT instance
+ * registration uses a pthread_once gate. */
+
+static struct sched_instance default_inst = {
+    .poll_users  = LIST_INIT( default_inst.poll_users ),
+    .timer_users = LIST_INIT( default_inst.timer_users ),
+    .signal_fd   = -1,
+};
+
+static void sched_register_instance( struct sched_instance *inst )
+{
+    /* Caller-serialized.  default_inst is registered at sched_run
+     * entry; future RT inst is registered under its own pthread_once.
+     * Initializes the PI mutex lazily here so static initializers
+     * stay simple (PI_MUTEX_INITIALIZER is awkward for struct fields). */
+    if (!inst->lock_inited)
+    {
+        pi_mutex_init( &inst->lock, 0 );
+        inst->lock_inited = 1;
+    }
+    if (sched_instance_count >= SCHED_MAX_INSTANCES) return;
+    sched_instances[ sched_instance_count++ ] = inst;
+}
+
+static void add_poll_user( struct sched_instance *inst, struct poll_user *user )
 {
     static int64_t value = 1;
     struct poll_user *other;
 
-    pthread_mutex_lock( &sched_lock );
-    LIST_FOR_EACH_ENTRY( other, &poll_users, struct poll_user, entry )
+    pi_mutex_lock( &inst->lock );
+    LIST_FOR_EACH_ENTRY( other, &inst->poll_users, struct poll_user, entry )
         if (other->fd == user->fd) other->fd = -1; /* invalidate previous user */
-    list_add_tail( &poll_users, &user->entry );
-    pthread_mutex_unlock( &sched_lock );
+    list_add_tail( &inst->poll_users, &user->entry );
+    pi_mutex_unlock( &inst->lock );
 
-    write( signal_fd, &value, sizeof(value) );
+    write( inst->signal_fd, &value, sizeof(value) );
 }
 
-static void add_timer_user( struct timer_user *user )
+static void add_timer_user( struct sched_instance *inst, struct timer_user *user )
 {
     static int64_t value = 1;
     struct timer_user *next;
 
-    pthread_mutex_lock( &sched_lock );
-    LIST_FOR_EACH_ENTRY( next, &timer_users, struct timer_user, entry )
+    pi_mutex_lock( &inst->lock );
+    LIST_FOR_EACH_ENTRY( next, &inst->timer_users, struct timer_user, entry )
         if (next->when >= user->when) break;
     list_add_before( &next->entry, &user->entry );
-    pthread_mutex_unlock( &sched_lock );
+    pi_mutex_unlock( &inst->lock );
 
-    write( signal_fd, &value, sizeof(value) );
+    write( inst->signal_fd, &value, sizeof(value) );
 }
 
-static int get_next_timeout(void)
+static int get_next_timeout( struct sched_instance *inst )
 {
     struct list expired = LIST_INIT(expired);
     struct timer_user *user, *next;
@@ -424,8 +468,8 @@ static int get_next_timeout(void)
 
     NtQueryPerformanceCounter( &now, NULL );
 
-    pthread_mutex_lock( &sched_lock );
-    LIST_FOR_EACH_ENTRY_SAFE( user, next, &timer_users, struct timer_user, entry )
+    pi_mutex_lock( &inst->lock );
+    LIST_FOR_EACH_ENTRY_SAFE( user, next, &inst->timer_users, struct timer_user, entry )
     {
         /* NSPA Phase 2.5: drop canceled timers without dispatch.  We can
          * see them at the head of the list (when < cutoff) or interleaved
@@ -440,7 +484,7 @@ static int get_next_timeout(void)
         list_remove( &user->entry );
         list_add_tail( &expired, &user->entry );
     }
-    pthread_mutex_unlock( &sched_lock );
+    pi_mutex_unlock( &inst->lock );
 
     LIST_FOR_EACH_ENTRY_SAFE( user, next, &expired, struct timer_user, entry )
     {
@@ -482,46 +526,42 @@ static void init_context_fds( int *wait, int *signal )
     *signal = fds[1];
 }
 
-void sched_run(void)
+/* sched_run_inst: the actual dispatch loop, parameterized by instance.
+ * sched_run() (the upstream entry point from server_start_main_thread)
+ * dispatches via the default instance.  Future RT instance gets its
+ * own pthread that calls sched_run_inst with the rt_inst pointer. */
+static void sched_run_inst( struct sched_instance *inst )
 {
     struct array users = ARRAY_INIT( users, struct poll_user * );
     struct array pfds = ARRAY_INIT( pfds, struct pollfd );
     struct poll_user *user, *next;
     int ret, wait_fd;
 
-    /* NSPA: name the sched thread for debugability + record identity so
-     * ntdll_sched_call can detect self-call.  Order matters: identity
-     * must be visible before sched_thread_alive is set. */
-    sched_pthread_id = pthread_self();
-    pthread_setname_np( sched_pthread_id, "wine-sched" );
-    __atomic_store_n( &sched_thread_alive, 1, __ATOMIC_RELEASE );
+    sched_register_instance( inst );
 
-    init_context_fds( &wait_fd, &signal_fd );
-    ntdll_sched_poll( wait_fd, POLLIN, signal_cb, &wait_fd );
-
-    /* NSPA Phase 3 consumer #2: queue the periodic observability
-     * sampler.  No-op unless NSPA_SCHED_OBS_INTERVAL_MS is set.
-     * Registered after init_context_fds so the signal_fd is wired
-     * for cross-thread submissions. */
+    init_context_fds( &wait_fd, &inst->signal_fd );
+    /* Register the wake-fd on this instance.  Goes through the
+     * non-class API which routes to default_inst — so for non-default
+     * instances we need to bypass that.  Direct alloc + add_poll_user. */
     {
-        extern void nspa_sched_obs_init( void );
-        nspa_sched_obs_init();
+        struct poll_user *u = alloc_poll_user( wait_fd, POLLIN, signal_cb, &wait_fd );
+        if (u) add_poll_user( inst, u );
     }
 
     for (;;)
     {
         users.count = pfds.count = 0;
-        pthread_mutex_lock( &sched_lock );
-        LIST_FOR_EACH_ENTRY_SAFE( user, next, &poll_users, struct poll_user, entry )
+        pi_mutex_lock( &inst->lock );
+        LIST_FOR_EACH_ENTRY_SAFE( user, next, &inst->poll_users, struct poll_user, entry )
         {
             struct pollfd pfd = { user->fd, user->events };
             if (user->fd == -1 || !user->events) free_poll_user( user );
             else if (!array_append( &users, &user )) ERR( "user pointer allocation failed\n" );
             else if (!array_append( &pfds, &pfd )) ERR( "pollfd allocation failed\n" );
         }
-        pthread_mutex_unlock( &sched_lock );
+        pi_mutex_unlock( &inst->lock );
 
-        if ((ret = poll( pfds.data, pfds.count, get_next_timeout() )) < 0)
+        if ((ret = poll( pfds.data, pfds.count, get_next_timeout( inst ) )) < 0)
         {
             WARN( "poll returned %d, error %d\n", ret, errno );
             continue;
@@ -541,6 +581,30 @@ void sched_run(void)
     }
 }
 
+/* Upstream entry point — bootstrap thread becomes the default sched
+ * thread per Phase 1 spawn-main.  NSPA additions (thread name, self-
+ * call detection, observability sampler) live here. */
+void sched_run( void )
+{
+    /* NSPA: name the sched thread for debugability + record identity so
+     * ntdll_sched_call can detect self-call.  Order matters: identity
+     * must be visible before sched_thread_alive is set. */
+    sched_pthread_id = pthread_self();
+    pthread_setname_np( sched_pthread_id, "wine-sched" );
+    __atomic_store_n( &sched_thread_alive, 1, __ATOMIC_RELEASE );
+
+    /* NSPA Phase 3 consumer #2: queue the periodic observability
+     * sampler (no-op unless NSPA_SCHED_OBS_INTERVAL_MS is set).
+     * Registered before the dispatch loop spins so the timer goes onto
+     * a primed queue. */
+    {
+        extern void nspa_sched_obs_init( void );
+        nspa_sched_obs_init();
+    }
+
+    sched_run_inst( &default_inst );
+}
+
 NTSTATUS ntdll_sched_register_poll( int fd, int events, poll_callback callback,
                                     void *private, sched_handle_t *handle )
 {
@@ -550,7 +614,7 @@ NTSTATUS ntdll_sched_register_poll( int fd, int events, poll_callback callback,
            fd, events, callback, private, handle );
 
     if (!(user = alloc_poll_user( fd, events, callback, private ))) return STATUS_NO_MEMORY;
-    add_poll_user( user );
+    add_poll_user( &default_inst, user );
     if (handle) { handle->priv = user; handle->gen = user->gen; }
     return STATUS_SUCCESS;
 }
@@ -569,7 +633,7 @@ NTSTATUS ntdll_sched_register_timer( const LARGE_INTEGER *timeout, async_callbac
            (intmax_t)timeout->QuadPart, callback, private, handle );
 
     if (!(user = alloc_timer_user( timeout, callback, private ))) return STATUS_NO_MEMORY;
-    add_timer_user( user );
+    add_timer_user( &default_inst, user );
     if (handle) { handle->priv = user; handle->gen = user->gen; }
     return STATUS_SUCCESS;
 }
@@ -595,38 +659,60 @@ NTSTATUS ntdll_sched_timer( const LARGE_INTEGER *timeout, async_callback callbac
  * Lifetime contract per include/wine/unixlib.h — handle is single-use,
  * but double-cancel is now a benign STATUS_NOT_FOUND (was an ABA risk
  * before Phase 3). */
-NTSTATUS ntdll_sched_cancel( sched_handle_t handle )
+/* Cancel walks all live sched instances since the handle does not
+ * carry instance/class info.  ABA-safe via gen check.  At most one
+ * instance match by pointer (each instance has its own malloc'd
+ * structs, pointers don't alias across instances). */
+static NTSTATUS cancel_in_instance( struct sched_instance *inst, sched_handle_t handle )
 {
-    static int64_t value = 1;
     struct poll_user *poll_u, *poll_next;
     struct timer_user *timer_u, *timer_next;
     int found = 0;
+
+    pi_mutex_lock( &inst->lock );
+    LIST_FOR_EACH_ENTRY_SAFE( poll_u, poll_next, &inst->poll_users, struct poll_user, entry )
+    {
+        if ((void *)poll_u != handle.priv) continue;
+        if (poll_u->gen != handle.gen) break;   /* ABA: slot recycled — stop */
+        poll_u->fd = -1;
+        found = 1;
+        break;
+    }
+    if (!found) LIST_FOR_EACH_ENTRY_SAFE( timer_u, timer_next, &inst->timer_users, struct timer_user, entry )
+    {
+        if ((void *)timer_u != handle.priv) continue;
+        if (timer_u->gen != handle.gen) break;  /* ABA: slot recycled — stop */
+        timer_u->canceled = 1;
+        found = 1;
+        break;
+    }
+    pi_mutex_unlock( &inst->lock );
+
+    if (found)
+    {
+        static int64_t value = 1;
+        write( inst->signal_fd, &value, sizeof(value) );
+    }
+    return found ? STATUS_SUCCESS : STATUS_NOT_FOUND;
+}
+
+NTSTATUS ntdll_sched_cancel( sched_handle_t handle )
+{
+    unsigned int i, n;
 
     TRACE( "handle priv=%p gen=%lu\n", handle.priv, handle.gen );
 
     if (!handle.priv) return STATUS_INVALID_PARAMETER;
 
-    pthread_mutex_lock( &sched_lock );
-    LIST_FOR_EACH_ENTRY_SAFE( poll_u, poll_next, &poll_users, struct poll_user, entry )
+    /* Snapshot count once; instance registration is monotonic so we
+     * never miss an instance that existed at call time. */
+    n = sched_instance_count;
+    for (i = 0; i < n; i++)
     {
-        if ((void *)poll_u != handle.priv) continue;
-        if (poll_u->gen != handle.gen) break;   /* ABA: slot recycled — stop, don't cancel new entry */
-        poll_u->fd = -1;
-        found = 1;
-        break;
+        if (cancel_in_instance( sched_instances[i], handle ) == STATUS_SUCCESS)
+            return STATUS_SUCCESS;
     }
-    if (!found) LIST_FOR_EACH_ENTRY_SAFE( timer_u, timer_next, &timer_users, struct timer_user, entry )
-    {
-        if ((void *)timer_u != handle.priv) continue;
-        if (timer_u->gen != handle.gen) break;  /* ABA: slot recycled — stop, don't cancel new entry */
-        timer_u->canceled = 1;
-        found = 1;
-        break;
-    }
-    pthread_mutex_unlock( &sched_lock );
-
-    if (found) write( signal_fd, &value, sizeof(value) );  /* wake sched thread to process the cancel */
-    return found ? STATUS_SUCCESS : STATUS_NOT_FOUND;
+    return STATUS_NOT_FOUND;
 }
 
 NTSTATUS ntdll_sched_async( async_callback callback, void *private )

@@ -1372,20 +1372,23 @@ struct new_process_request
     obj_handle_t token;
     obj_handle_t debug;
     obj_handle_t parent_process;
-    unsigned int flags;
+    unsigned int process_flags;
+    unsigned int thread_flags;
     int          socket_fd;
     unsigned int access;
     unsigned short machine;
-    char __pad_38[2];
+    char __pad_42[2];
     data_size_t  info_size;
     data_size_t  handles_size;
     data_size_t  jobs_size;
+    data_size_t  sd_len;
     /* VARARG(objattr,object_attributes); */
     /* VARARG(handles,uints,handles_size); */
     /* VARARG(jobs,uints,jobs_size); */
+    /* VARARG(sd,security_descriptor,sd_len); */
     /* VARARG(info,startup_info,info_size); */
     /* VARARG(env,unicode_str); */
-    char __pad_52[4];
+    char __pad_60[4];
 };
 struct new_process_reply
 {
@@ -1402,10 +1405,14 @@ struct get_new_process_info_request
 {
     struct request_header __header;
     obj_handle_t info;
+    unsigned int access;
+    unsigned int attributes;
 };
 struct get_new_process_info_reply
 {
     struct reply_header __header;
+    thread_id_t  tid;
+    obj_handle_t handle;
     int          success;
     int          exit_code;
 };
@@ -1435,6 +1442,8 @@ struct get_startup_info_request
 {
     struct request_header __header;
     char __pad_12[4];
+    client_ptr_t teb;
+    client_ptr_t peb;
 };
 struct get_startup_info_reply
 {
@@ -1448,23 +1457,7 @@ struct get_startup_info_reply
 
 
 
-struct init_process_done_request
-{
-    struct request_header __header;
-    char __pad_12[4];
-    client_ptr_t teb;
-    client_ptr_t peb;
-};
-struct init_process_done_reply
-{
-    struct reply_header __header;
-    int          suspend;
-    char __pad_12[4];
-};
-
-
-
-struct init_first_thread_request
+struct init_process_request
 {
     struct request_header __header;
     int          unix_pid;
@@ -1473,7 +1466,7 @@ struct init_first_thread_request
     int          reply_fd;
     int          wait_fd;
 };
-struct init_first_thread_reply
+struct init_process_reply
 {
     struct reply_header __header;
     process_id_t pid;
@@ -6781,8 +6774,7 @@ enum request
     REQ_get_new_process_info,
     REQ_new_thread,
     REQ_get_startup_info,
-    REQ_init_process_done,
-    REQ_init_first_thread,
+    REQ_init_process,
     REQ_init_thread,
     REQ_terminate_process,
     REQ_terminate_thread,
@@ -7110,8 +7102,7 @@ union generic_request
     struct get_new_process_info_request get_new_process_info_request;
     struct new_thread_request new_thread_request;
     struct get_startup_info_request get_startup_info_request;
-    struct init_process_done_request init_process_done_request;
-    struct init_first_thread_request init_first_thread_request;
+    struct init_process_request init_process_request;
     struct init_thread_request init_thread_request;
     struct terminate_process_request terminate_process_request;
     struct terminate_thread_request terminate_thread_request;
@@ -7437,8 +7428,7 @@ union generic_reply
     struct get_new_process_info_reply get_new_process_info_reply;
     struct new_thread_reply new_thread_reply;
     struct get_startup_info_reply get_startup_info_reply;
-    struct init_process_done_reply init_process_done_reply;
-    struct init_first_thread_reply init_first_thread_reply;
+    struct init_process_reply init_process_reply;
     struct init_thread_reply init_thread_reply;
     struct terminate_process_reply terminate_process_reply;
     struct terminate_thread_reply terminate_thread_reply;
@@ -7757,6 +7747,6 @@ union generic_reply
     struct nspa_irot_enum_running_reply nspa_irot_enum_running_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 956
+#define SERVER_PROTOCOL_VERSION 961
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

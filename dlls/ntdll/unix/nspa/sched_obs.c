@@ -58,7 +58,7 @@
 
 #include "sched_helpers.h"
 #include "sched_obs.h"
-#include "lf_close_queue.h"
+#include "close_queue.h"
 
 #define NSPA_SCHED_OBS_MAX_COLLECTORS 16
 
@@ -174,11 +174,11 @@ void nspa_sched_obs_register_collector( nspa_obs_collector_t cb )
     collectors[ collector_count++ ] = cb;
 }
 
-/* Built-in collector: lf_close_queue depth — exercises the
+/* Built-in collector: nspa_close_queue depth — exercises the
  * cross-subsystem wiring within ntdll. */
-static void collect_lf_close_queue( FILE *out )
+static void collect_close_queue( FILE *out )
 {
-    fprintf( out, "lf_close_queue.pending %u\n", nspa_lf_close_queue_pending() );
+    fprintf( out, "close_queue.pending %u\n", nspa_close_queue_pending() );
 }
 
 void nspa_sched_obs_init( void )
@@ -203,7 +203,7 @@ void nspa_sched_obs_init( void )
     /* Register built-in collectors.  Future PE-migrated services can
      * call nspa_sched_obs_register_collector() at static-init time to
      * plug their stats in. */
-    nspa_sched_obs_register_collector( collect_lf_close_queue );
+    nspa_sched_obs_register_collector( collect_close_queue );
 
     obs_active = 1;
     obs_arm_locked();

@@ -38,7 +38,7 @@
 #include "wine/debug.h"
 #include "../unix_private.h"
 #include "debug.h"
-#include "lf_close_queue.h"
+#include "close_queue.h"
 #include <rtpi.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(nspa_lfile);
@@ -590,7 +590,7 @@ NTSTATUS nspa_local_file_table_add( HANDLE handle, int unix_fd,
      * a new LF entry.  This eliminates the "close-then-reopen-same-path"
      * race window — by the time we allocate, no deferred close still
      * holds the file open.  Cheap (no-op) when queue is empty. */
-    nspa_lf_close_queue_flush();
+    nspa_close_queue_flush();
 
     o = malloc( sizeof(*o) );
     if (!o) return STATUS_NO_MEMORY;
@@ -1521,8 +1521,8 @@ int nspa_local_file_close( HANDLE handle )
     {
         BOOL deferred = FALSE;
         if ((server_handle || unix_fd >= 0) &&
-            sharing == NSPA_LF_CLOSE_QUEUE_SHARE_ALL &&
-            nspa_lf_close_queue_push( server_handle, unix_fd ))
+            sharing == NSPA_CLOSE_QUEUE_LF_SHARE_ALL &&
+            nspa_close_queue_push( server_handle, unix_fd ))
             deferred = TRUE;
 
         if (!deferred)

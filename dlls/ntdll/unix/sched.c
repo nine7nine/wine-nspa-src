@@ -485,6 +485,15 @@ void sched_run(void)
     init_context_fds( &wait_fd, &signal_fd );
     ntdll_sched_poll( wait_fd, POLLIN, signal_cb, &wait_fd );
 
+    /* NSPA Phase 3 consumer #2: queue the periodic observability
+     * sampler.  No-op unless NSPA_SCHED_OBS_INTERVAL_MS is set.
+     * Registered after init_context_fds so the signal_fd is wired
+     * for cross-thread submissions. */
+    {
+        extern void nspa_sched_obs_init( void );
+        nspa_sched_obs_init();
+    }
+
     for (;;)
     {
         users.count = pfds.count = 0;

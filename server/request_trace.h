@@ -63,16 +63,19 @@ static void dump_new_process_request( const struct new_process_request *req )
     fprintf( stderr, " token=%04x", req->token );
     fprintf( stderr, ", debug=%04x", req->debug );
     fprintf( stderr, ", parent_process=%04x", req->parent_process );
-    fprintf( stderr, ", flags=%08x", req->flags );
+    fprintf( stderr, ", process_flags=%08x", req->process_flags );
+    fprintf( stderr, ", thread_flags=%08x", req->thread_flags );
     fprintf( stderr, ", socket_fd=%d", req->socket_fd );
     fprintf( stderr, ", access=%08x", req->access );
     fprintf( stderr, ", machine=%04x", req->machine );
     fprintf( stderr, ", info_size=%u", req->info_size );
     fprintf( stderr, ", handles_size=%u", req->handles_size );
     fprintf( stderr, ", jobs_size=%u", req->jobs_size );
+    fprintf( stderr, ", sd_len=%u", req->sd_len );
     dump_varargs_object_attributes( ", objattr=", cur_size );
     dump_varargs_uints( ", handles=", min( cur_size, req->handles_size ));
     dump_varargs_uints( ", jobs=", min( cur_size, req->jobs_size ));
+    dump_varargs_security_descriptor( ", sd=", min( cur_size, req->sd_len ));
     dump_varargs_startup_info( ", info=", min( cur_size, req->info_size ));
     dump_varargs_unicode_str( ", env=", cur_size );
 }
@@ -87,11 +90,15 @@ static void dump_new_process_reply( const struct new_process_reply *req )
 static void dump_get_new_process_info_request( const struct get_new_process_info_request *req )
 {
     fprintf( stderr, " info=%04x", req->info );
+    fprintf( stderr, ", access=%08x", req->access );
+    fprintf( stderr, ", attributes=%08x", req->attributes );
 }
 
 static void dump_get_new_process_info_reply( const struct get_new_process_info_reply *req )
 {
-    fprintf( stderr, " success=%d", req->success );
+    fprintf( stderr, " tid=%04x", req->tid );
+    fprintf( stderr, ", handle=%04x", req->handle );
+    fprintf( stderr, ", success=%d", req->success );
     fprintf( stderr, ", exit_code=%d", req->exit_code );
 }
 
@@ -112,6 +119,8 @@ static void dump_new_thread_reply( const struct new_thread_reply *req )
 
 static void dump_get_startup_info_request( const struct get_startup_info_request *req )
 {
+    dump_uint64( " teb=", &req->teb );
+    dump_uint64( ", peb=", &req->peb );
 }
 
 static void dump_get_startup_info_reply( const struct get_startup_info_reply *req )
@@ -122,18 +131,7 @@ static void dump_get_startup_info_reply( const struct get_startup_info_reply *re
     dump_varargs_unicode_str( ", env=", cur_size );
 }
 
-static void dump_init_process_done_request( const struct init_process_done_request *req )
-{
-    dump_uint64( " teb=", &req->teb );
-    dump_uint64( ", peb=", &req->peb );
-}
-
-static void dump_init_process_done_reply( const struct init_process_done_reply *req )
-{
-    fprintf( stderr, " suspend=%d", req->suspend );
-}
-
-static void dump_init_first_thread_request( const struct init_first_thread_request *req )
+static void dump_init_process_request( const struct init_process_request *req )
 {
     fprintf( stderr, " unix_pid=%d", req->unix_pid );
     fprintf( stderr, ", unix_tid=%d", req->unix_tid );
@@ -142,7 +140,7 @@ static void dump_init_first_thread_request( const struct init_first_thread_reque
     fprintf( stderr, ", wait_fd=%d", req->wait_fd );
 }
 
-static void dump_init_first_thread_reply( const struct init_first_thread_reply *req )
+static void dump_init_process_reply( const struct init_process_reply *req )
 {
     fprintf( stderr, " pid=%04x", req->pid );
     fprintf( stderr, ", tid=%04x", req->tid );
@@ -3700,8 +3698,7 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_get_new_process_info_request,
     (dump_func)dump_new_thread_request,
     (dump_func)dump_get_startup_info_request,
-    (dump_func)dump_init_process_done_request,
-    (dump_func)dump_init_first_thread_request,
+    (dump_func)dump_init_process_request,
     (dump_func)dump_init_thread_request,
     (dump_func)dump_terminate_process_request,
     (dump_func)dump_terminate_thread_request,
@@ -4026,8 +4023,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_get_new_process_info_reply,
     (dump_func)dump_new_thread_reply,
     (dump_func)dump_get_startup_info_reply,
-    (dump_func)dump_init_process_done_reply,
-    (dump_func)dump_init_first_thread_reply,
+    (dump_func)dump_init_process_reply,
     (dump_func)dump_init_thread_reply,
     (dump_func)dump_terminate_process_reply,
     (dump_func)dump_terminate_thread_reply,
@@ -4352,8 +4348,7 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "get_new_process_info",
     "new_thread",
     "get_startup_info",
-    "init_process_done",
-    "init_first_thread",
+    "init_process",
     "init_thread",
     "terminate_process",
     "terminate_thread",

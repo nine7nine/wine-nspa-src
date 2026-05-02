@@ -54,6 +54,8 @@
 #include "winternl.h"
 #include "wine/unixlib.h"
 
+#include <rtpi.h>
+
 #include "sched_helpers.h"
 #include "sched_obs.h"
 #include "lf_close_queue.h"
@@ -69,8 +71,14 @@ static unsigned int collector_count;
 
 static FILE *obs_file;
 static LONGLONG obs_interval_ns;
-static volatile sched_handle_t obs_handle;     /* atomic for atexit/race */
+static sched_handle_t obs_handle;               /* protected by obs_handle_lock */
+static DEFINE_PI_MUTEX( obs_handle_lock, 0 );   /* contention is process-exit only */
 static int obs_active;                          /* set after first arm */
+
+/* ABA-safe cancel makes the {priv, gen} pair safe even under torn
+ * reads — gen mismatch returns STATUS_NOT_FOUND harmlessly.  We use a
+ * mutex anyway for a tidy snapshot value (cleaner than reasoning
+ * about partial-struct reads). */
 
 static void obs_dump_locked( void )
 {
@@ -102,23 +110,30 @@ static void obs_tick_cb( void *arg )
 {
     (void)arg;
     obs_dump_locked();
-    /* Clear the handle BEFORE re-arming so an atexit that races sees
-     * either the old (stale) handle or the new one — never a half-
-     * updated state.  cancel of a stale handle returns STATUS_NOT_FOUND
-     * harmlessly. */
-    __atomic_store_n( &obs_handle, NULL, __ATOMIC_RELEASE );
+    /* The single tick we just dispatched is now invalid (timer is
+     * one-shot and the underlying registration was freed).  Clear our
+     * stored handle BEFORE re-arming so atexit observes a coherent
+     * value — either the old (stale, gen-mismatch on cancel = harmless
+     * NOT_FOUND) or the new one. */
+    pi_mutex_lock( &obs_handle_lock );
+    obs_handle = SCHED_HANDLE_NULL;
+    pi_mutex_unlock( &obs_handle_lock );
     obs_arm_locked();
 }
 
 static void obs_arm_locked( void )
 {
     LARGE_INTEGER t;
-    sched_handle_t h = NULL;
+    sched_handle_t h = SCHED_HANDLE_NULL;
 
     /* Negative = relative timeout in NT 100ns units. */
     t.QuadPart = -(obs_interval_ns / 100);
     if (ntdll_sched_register_timer( &t, obs_tick_cb, NULL, &h ) == STATUS_SUCCESS)
-        __atomic_store_n( &obs_handle, h, __ATOMIC_RELEASE );
+    {
+        pi_mutex_lock( &obs_handle_lock );
+        obs_handle = h;
+        pi_mutex_unlock( &obs_handle_lock );
+    }
     /* Else: failed to schedule.  No retry; obs effectively stops.
      * atexit will still do a final dump. */
 }
@@ -127,11 +142,16 @@ static void obs_atexit( void )
 {
     sched_handle_t h;
 
-    /* Cancel current pending timer registration if any.  Best-effort:
-     * if the timer fired right before this call, cancel returns
-     * STATUS_NOT_FOUND.  Either way, do a final synchronous dump. */
-    h = __atomic_exchange_n( &obs_handle, NULL, __ATOMIC_ACQ_REL );
-    if (h) ntdll_sched_cancel( h );
+    /* Snapshot + clear the handle.  If the sched thread is mid-tick
+     * (handle is SCHED_HANDLE_NULL between clear and re-arm), we have
+     * nothing to cancel here; the in-flight tick will fire and try to
+     * re-arm but won't have time before exit. */
+    pi_mutex_lock( &obs_handle_lock );
+    h = obs_handle;
+    obs_handle = SCHED_HANDLE_NULL;
+    pi_mutex_unlock( &obs_handle_lock );
+
+    if (h.priv) ntdll_sched_cancel( h );  /* gen-checked; stale = NOT_FOUND, harmless */
 
     obs_dump_locked();
 

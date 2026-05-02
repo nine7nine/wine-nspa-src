@@ -46,7 +46,15 @@
 #include "wine/list.h"
 #include "wine/debug.h"
 
-WINE_DEFAULT_DEBUG_CHANNEL(ntdll);
+/* NSPA: dedicated debug channel so WINEDEBUG=+sched selectively enables
+ * dispatch traces without the broader ntdll firehose. */
+WINE_DEFAULT_DEBUG_CHANNEL(sched);
+
+/* NSPA: track sched thread identity so ntdll_sched_call can detect a
+ * self-call (which would deadlock — the sched thread can't dispatch
+ * its own pending work while blocked on its own alert). */
+static pthread_t sched_pthread_id;
+static volatile int sched_thread_alive;
 
 #ifdef __APPLE__
 
@@ -244,7 +252,12 @@ static void *array_get( struct array *array, size_t index )
 
 static void *array_append( struct array *array, void *data )
 {
-    if (array->count == array->alloc ? array->alloc : sizeof(array->buf) / array->size)
+    /* NSPA: parens fix.  Without them, operator precedence parses this as
+     * `(count == alloc) ? alloc : initial_cap`, which evaluates to a truthy
+     * `initial_cap` whenever count != alloc and alloc == 0 — forcing a
+     * realloc on every append after the first while the inline buffer is
+     * still completely unused.  Reported upstream-WIP. */
+    if (array->count == (array->alloc ? array->alloc : sizeof(array->buf) / array->size))
     {
         void *ptr = array->data == array->buf ? NULL : array->data;
         size_t alloc = max( 64, array->count * 3 / 2 );
@@ -430,6 +443,13 @@ void sched_run(void)
     struct poll_user *user, *next;
     int ret, wait_fd;
 
+    /* NSPA: name the sched thread for debugability + record identity so
+     * ntdll_sched_call can detect self-call.  Order matters: identity
+     * must be visible before sched_thread_alive is set. */
+    sched_pthread_id = pthread_self();
+    pthread_setname_np( sched_pthread_id, "wine-sched" );
+    __atomic_store_n( &sched_thread_alive, 1, __ATOMIC_RELEASE );
+
     init_context_fds( &wait_fd, &signal_fd );
     ntdll_sched_poll( wait_fd, POLLIN, signal_cb, &wait_fd );
 
@@ -519,6 +539,15 @@ NTSTATUS ntdll_sched_call( call_callback callback, void *private )
     NTSTATUS status;
 
     TRACE( "callback %p, private %p\n", callback, private );
+
+    /* NSPA: detect self-call from the sched thread itself.  Without this
+     * fast path, async dispatch would post the callback to the sched
+     * thread and the same thread would block in NtWaitForAlertByThreadId
+     * waiting for itself to dispatch — guaranteed deadlock since the
+     * sched thread is the dispatcher.  Run inline instead. */
+    if (__atomic_load_n( &sched_thread_alive, __ATOMIC_ACQUIRE ) &&
+        pthread_equal( pthread_self(), sched_pthread_id ))
+        return callback( private );
 
     if (!(params = malloc( sizeof(*params) ))) return STATUS_NO_MEMORY;
     params->callback = callback;

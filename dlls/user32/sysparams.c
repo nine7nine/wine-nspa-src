@@ -784,7 +784,8 @@ BOOL WINAPI IsProcessDPIAware(void)
  */
 BOOL WINAPI EnableNonClientDpiScaling( HWND hwnd )
 {
-    FIXME("(%p): stub\n", hwnd);
+    static int once;
+    if (!once++) FIXME("(%p): stub\n", hwnd);
     SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
     return FALSE;
 }

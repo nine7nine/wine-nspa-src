@@ -315,22 +315,31 @@ int WINAPI RegisterServicesProcess(DWORD ServicesProcessId)
 
 /***********************************************************************
  *		ShutdownBlockReasonCreate (USER32.@)
+ *
+ * Wine has no shutdown-protocol integration to surface a block reason
+ * to the user, so we don't actually retain the reason string.  But the
+ * MSDN contract is "TRUE on success" — and apps reasonably expect that
+ * registering their reason succeeds without side effects when no
+ * shutdown is in progress.  Returning TRUE matches Wine's general
+ * "we accepted, we do nothing" stance for unsupported features and
+ * stops apps from treating this as a hard error path.
  */
 BOOL WINAPI ShutdownBlockReasonCreate(HWND hwnd, LPCWSTR reason)
 {
-    FIXME("(%p, %s): stub\n", hwnd, debugstr_w(reason));
-    SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
-    return FALSE;
+    TRACE("(%p, %s)\n", hwnd, debugstr_w(reason));
+    return TRUE;
 }
 
 /***********************************************************************
  *		ShutdownBlockReasonDestroy (USER32.@)
+ *
+ * Symmetric with ShutdownBlockReasonCreate above.  We don't track any
+ * registered reasons, so destroying nothing is success.
  */
 BOOL WINAPI ShutdownBlockReasonDestroy(HWND hwnd)
 {
-    FIXME("(%p): stub\n", hwnd);
-    SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
-    return FALSE;
+    TRACE("(%p)\n", hwnd);
+    return TRUE;
 }
 
 const char *SPY_GetMsgName( UINT msg, HWND hwnd )

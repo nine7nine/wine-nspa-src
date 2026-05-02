@@ -56,7 +56,7 @@ SOURCES = \
 	unix/io_uring.c \
 	unix/loader.c \
 	unix/loadorder.c \
-	unix/nspa/lf_close_queue.c \
+	unix/nspa/close_queue.c \
 	unix/nspa/local_file.c \
 	unix/nspa/rt.c \
 	unix/nspa/local_timer.c \

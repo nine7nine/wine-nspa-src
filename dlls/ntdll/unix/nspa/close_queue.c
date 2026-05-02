@@ -1,8 +1,10 @@
 /*
- * NSPA local-file async close queue — implementation.
+ * NSPA async close queue — implementation.
  *
- * Phase 3 first real consumer of the sched infrastructure.  See
- * lf_close_queue.h for the NT-semantic preservation contract.
+ * Phase 3 first real consumer of the sched infrastructure.  Originally
+ * named lf_close_queue (LF-only); generalized in Phase 4 (renamed
+ * 2026-05-02 night).  See close_queue.h for the NT-semantic
+ * preservation contract.
  *
  * Design:
  *
@@ -57,14 +59,14 @@
 #include <rtpi.h>
 
 #include "sched_helpers.h"
-#include "lf_close_queue.h"
+#include "close_queue.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(file);
 
 /* Queue capacity.  64 was chosen as a balance between batching benefit
  * (deeper = more amortization) and FD-exhaustion risk (deeper = longer
  * lingering FDs).  Tunable later if profiling motivates. */
-#define NSPA_LF_CLOSE_QUEUE_CAP 64
+#define NSPA_CLOSE_QUEUE_CAP 64
 
 struct close_entry
 {
@@ -133,7 +135,7 @@ static void drain_async_cb( void *arg )
     }
 }
 
-BOOL nspa_lf_close_queue_push( HANDLE server_handle, int unix_fd )
+BOOL nspa_close_queue_push( HANDLE server_handle, int unix_fd )
 {
     struct close_entry *e;
     int need_arm = 0;
@@ -143,7 +145,7 @@ BOOL nspa_lf_close_queue_push( HANDLE server_handle, int unix_fd )
 
     /* Check current depth without holding the lock first — fast bailout
      * for the common full-queue case.  Re-check under the lock below. */
-    if (__atomic_load_n( &queue_count, __ATOMIC_ACQUIRE ) >= NSPA_LF_CLOSE_QUEUE_CAP)
+    if (__atomic_load_n( &queue_count, __ATOMIC_ACQUIRE ) >= NSPA_CLOSE_QUEUE_CAP)
         return FALSE;
 
     if (!(e = malloc( sizeof(*e) ))) return FALSE;      /* caller falls back to inline */
@@ -151,7 +153,7 @@ BOOL nspa_lf_close_queue_push( HANDLE server_handle, int unix_fd )
     e->unix_fd       = unix_fd;
 
     pi_mutex_lock( &queue_lock );
-    if (queue_count >= NSPA_LF_CLOSE_QUEUE_CAP)
+    if (queue_count >= NSPA_CLOSE_QUEUE_CAP)
     {
         pi_mutex_unlock( &queue_lock );
         free( e );
@@ -177,13 +179,13 @@ BOOL nspa_lf_close_queue_push( HANDLE server_handle, int unix_fd )
              * isn't lost. */
             __atomic_store_n( &drain_armed, 0, __ATOMIC_RELEASE );
             ERR( "sched submit failed; flushing inline\n" );
-            nspa_lf_close_queue_flush();
+            nspa_close_queue_flush();
         }
     }
     return TRUE;
 }
 
-void nspa_lf_close_queue_flush( void )
+void nspa_close_queue_flush( void )
 {
     struct list snapshot = LIST_INIT( snapshot );
     struct close_entry *e, *next;
@@ -211,7 +213,7 @@ void nspa_lf_close_queue_flush( void )
     }
 }
 
-unsigned int nspa_lf_close_queue_pending( void )
+unsigned int nspa_close_queue_pending( void )
 {
     return __atomic_load_n( &queue_count, __ATOMIC_ACQUIRE );
 }

@@ -521,6 +521,18 @@ static void init_context_fds( int *wait, int *signal )
         fcntl( fds[1], F_SETFD, FD_CLOEXEC );
     }
     fcntl( fds[0], F_SETFL, O_NONBLOCK );
+    /* NSPA Phase 3: write end also O_NONBLOCK.  Defensive against a
+     * theoretical deadlock where a producer (e.g. wm_timer SetTimer
+     * holding wm_timer_lock) calls register-or-cancel which writes
+     * the wake byte, while the sched thread is blocked in a callback
+     * waiting on the SAME producer-side lock.  With BLOCKING write,
+     * the producer would block on a full pipe (64KB / 8B = 8192
+     * unread wakes); with NONBLOCK, write returns EAGAIN harmlessly
+     * — the next sched-thread iteration drains all pending bytes
+     * + rebuilds the user list, so a single lost wake byte just
+     * means we wake on the next timer/poll event instead of right
+     * away. */
+    fcntl( fds[1], F_SETFL, O_NONBLOCK );
 
     *wait = fds[0];
     *signal = fds[1];

@@ -59,23 +59,34 @@ NTSYSAPI NTSTATUS ntdll_sched_call( call_callback callback, void *private );
 
 /* NSPA Phase 2.5 — cancelable variants of register_poll/register_timer.
  *
- * sched_handle_t is an opaque pointer to internal sched state.  Caller
- * must NOT dereference it.
+ * sched_handle_t is an opaque value type carrying a pointer to internal
+ * sched state plus a generation counter.  Caller must NOT dereference
+ * `priv`; treat the entire struct as opaque.  Pass by value.
  *
  * Lifetime contract:
  *   - register_* succeeds → handle valid for cancel
- *   - cancel succeeds → handle invalid; do not cancel again
+ *   - cancel succeeds → handle invalid; future cancel returns
+ *     STATUS_NOT_FOUND (gen check makes this safe — see ABA below)
  *   - callback fires → handle invalid for register_poll if callback
  *     returned 0 events (registration freed); for register_timer the
  *     handle is always invalid after the single dispatch (one-shot)
  *   - poll callbacks that return non-zero events keep the registration
  *     active; handle remains valid until cancel or POLLHUP/POLLERR
  *
- * Caller MUST not double-cancel.  Cancel-after-callback or
- * double-cancel may return STATUS_NOT_FOUND OR may erroneously cancel
- * a different registration if the same memory has been reused for a
- * later allocation (ABA).  Caller owns the lifecycle. */
-typedef void *sched_handle_t;
+ * ABA safety: a cancel of a stale handle whose memory slot has been
+ * reused for a different registration returns STATUS_NOT_FOUND
+ * harmlessly.  The generation field embedded in the handle is matched
+ * against the live registration's generation; mismatch = stale.
+ * Caller may double-cancel without corrupting unrelated registrations,
+ * though it is still a programming error to do so. */
+typedef struct sched_handle
+{
+    void          *priv;    /* opaque pointer to internal sched_user */
+    unsigned long  gen;     /* generation counter; matched on cancel */
+} sched_handle_t;
+
+#define SCHED_HANDLE_NULL ((sched_handle_t){ NULL, 0 })
+
 NTSYSAPI NTSTATUS ntdll_sched_register_poll( int fd, int events,
                                              poll_callback callback, void *private,
                                              sched_handle_t *handle );

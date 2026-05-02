@@ -304,6 +304,16 @@ static inline void array_remove( struct array *array, size_t index )
     for (type *__p = (array)->data, *cursor = NULL; \
          __p - (type *)(array)->data < (array)->count && (cursor = __p, 1); __p++)
 
+/* NSPA Phase 3 ABA-safe cancel: every alloc bumps a process-wide
+ * generation counter and embeds the value in the user struct.  The
+ * sched_handle_t carries the same gen at register_* time.  On cancel,
+ * we compare both pointer AND gen — if the slot has been freed and
+ * recycled for a new registration, the stale cancel sees a gen
+ * mismatch and returns STATUS_NOT_FOUND instead of incorrectly
+ * canceling the new registration.  Counter overflow is benign: the
+ * cancel-during-window probability after 4G allocations is vanishing. */
+static unsigned long sched_user_gen;     /* atomic; bumped per alloc */
+
 struct poll_user
 {
     struct list     entry;      /* entry in queue / polls list */
@@ -311,6 +321,7 @@ struct poll_user
     int             events;     /* events to poll */
     poll_callback   callback;   /* callback function */
     void           *private;    /* callback private data */
+    unsigned long   gen;        /* NSPA Phase 3: ABA-safe cancel gen */
 };
 
 static struct poll_user *alloc_poll_user( int fd, int events, poll_callback callback, void *private )
@@ -322,6 +333,7 @@ static struct poll_user *alloc_poll_user( int fd, int events, poll_callback call
     user->events   = events;
     user->callback = callback;
     user->private  = private;
+    user->gen      = __atomic_add_fetch( &sched_user_gen, 1, __ATOMIC_RELAXED );
 
     return user;
 }
@@ -339,6 +351,7 @@ struct timer_user
     async_callback  callback;   /* callback function */
     void           *private;    /* callback private data */
     int             canceled;   /* NSPA Phase 2.5: set by ntdll_sched_cancel; skip dispatch + free in next sweep */
+    unsigned long   gen;        /* NSPA Phase 3: ABA-safe cancel gen */
 };
 
 static struct timer_user *alloc_timer_user( const LARGE_INTEGER *timeout, async_callback callback, void *private )
@@ -358,6 +371,7 @@ static struct timer_user *alloc_timer_user( const LARGE_INTEGER *timeout, async_
     user->callback = callback;
     user->private  = private;
     user->canceled = 0;
+    user->gen      = __atomic_add_fetch( &sched_user_gen, 1, __ATOMIC_RELAXED );
 
     return user;
 }
@@ -537,7 +551,7 @@ NTSTATUS ntdll_sched_register_poll( int fd, int events, poll_callback callback,
 
     if (!(user = alloc_poll_user( fd, events, callback, private ))) return STATUS_NO_MEMORY;
     add_poll_user( user );
-    if (handle) *handle = user;
+    if (handle) { handle->priv = user; handle->gen = user->gen; }
     return STATUS_SUCCESS;
 }
 
@@ -556,7 +570,7 @@ NTSTATUS ntdll_sched_register_timer( const LARGE_INTEGER *timeout, async_callbac
 
     if (!(user = alloc_timer_user( timeout, callback, private ))) return STATUS_NO_MEMORY;
     add_timer_user( user );
-    if (handle) *handle = user;
+    if (handle) { handle->priv = user; handle->gen = user->gen; }
     return STATUS_SUCCESS;
 }
 
@@ -565,18 +579,22 @@ NTSTATUS ntdll_sched_timer( const LARGE_INTEGER *timeout, async_callback callbac
     return ntdll_sched_register_timer( timeout, callback, private, NULL );
 }
 
-/* NSPA Phase 2.5: cancel a previously-registered poll or timer.
+/* NSPA Phase 2.5/3: cancel a previously-registered poll or timer.
  *
  * Walks both poll_users and timer_users under sched_lock; matches by
- * pointer.  For polls: invalidates fd to -1 (existing
- * "free on next iteration" pattern).  For timers: marks canceled flag
- * (skip-and-free in get_next_timeout's next sweep).
+ * (pointer, generation).  Generation match is the ABA-safe element:
+ * if the slot has been freed and recycled for a new registration, the
+ * stale cancel sees gen mismatch and returns STATUS_NOT_FOUND
+ * harmlessly instead of incorrectly canceling the new registration.
  *
- * Caller MUST observe the lifetime contract documented in
- * include/wine/unixlib.h — handle is single-use; double-cancel or
- * cancel-after-callback may STATUS_NOT_FOUND OR may erroneously cancel
- * a different registration if the same allocator slot has been reused
- * (ABA).  This API is for consumers that own their handle's lifecycle. */
+ * For polls: invalidates fd to -1 (existing "free on next iteration"
+ * pattern).
+ * For timers: marks canceled flag (skip-and-free in get_next_timeout's
+ * next sweep).
+ *
+ * Lifetime contract per include/wine/unixlib.h — handle is single-use,
+ * but double-cancel is now a benign STATUS_NOT_FOUND (was an ABA risk
+ * before Phase 3). */
 NTSTATUS ntdll_sched_cancel( sched_handle_t handle )
 {
     static int64_t value = 1;
@@ -584,21 +602,23 @@ NTSTATUS ntdll_sched_cancel( sched_handle_t handle )
     struct timer_user *timer_u, *timer_next;
     int found = 0;
 
-    TRACE( "handle %p\n", handle );
+    TRACE( "handle priv=%p gen=%lu\n", handle.priv, handle.gen );
 
-    if (!handle) return STATUS_INVALID_PARAMETER;
+    if (!handle.priv) return STATUS_INVALID_PARAMETER;
 
     pthread_mutex_lock( &sched_lock );
     LIST_FOR_EACH_ENTRY_SAFE( poll_u, poll_next, &poll_users, struct poll_user, entry )
     {
-        if (poll_u != handle) continue;
+        if ((void *)poll_u != handle.priv) continue;
+        if (poll_u->gen != handle.gen) break;   /* ABA: slot recycled — stop, don't cancel new entry */
         poll_u->fd = -1;
         found = 1;
         break;
     }
     if (!found) LIST_FOR_EACH_ENTRY_SAFE( timer_u, timer_next, &timer_users, struct timer_user, entry )
     {
-        if (timer_u != handle) continue;
+        if ((void *)timer_u != handle.priv) continue;
+        if (timer_u->gen != handle.gen) break;  /* ABA: slot recycled — stop, don't cancel new entry */
         timer_u->canceled = 1;
         found = 1;
         break;

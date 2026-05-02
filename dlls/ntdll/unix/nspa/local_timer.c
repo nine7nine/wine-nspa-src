@@ -486,11 +486,18 @@ static BOOL nspa_local_timer_sched_active(void)
 {
     if (local_timer_use_sched == -1)
     {
+        /* Default ON since 2026-05-02 night — local_timer migration
+         * Ableton-validated alongside wm_timer (both timer dispatchers
+         * now consolidated onto the shared wine-sched-rt thread).
+         * Set NSPA_SCHED_USE_FOR_LOCAL_TIMER=0 to force OFF (legacy
+         * pthread path) for diagnostic A/B. */
         const char *env = getenv( "NSPA_SCHED_USE_FOR_LOCAL_TIMER" );
-        if (env && env[0] == '1' && env[1] == 0 && nspa_sched_rt_available())
+        if (env && env[0] == '0' && env[1] == 0)
+            local_timer_use_sched = 0;
+        else if (nspa_sched_rt_available())
             local_timer_use_sched = 1;
         else
-            local_timer_use_sched = 0;
+            local_timer_use_sched = 0;  /* RT not available → fall back */
     }
     return local_timer_use_sched == 1;
 }

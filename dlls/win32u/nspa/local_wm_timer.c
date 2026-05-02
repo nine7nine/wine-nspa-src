@@ -473,11 +473,17 @@ static BOOL nspa_wm_timer_sched_active(void)
 {
     if (wm_timer_use_sched == -1)
     {
+        /* Default ON since 2026-05-02 night — wm_timer migration
+         * Ableton-validated under both standalone and combined-with-
+         * local_timer engagement.  Set NSPA_SCHED_USE_FOR_WM_TIMER=0
+         * to force OFF (legacy pthread path) for diagnostic A/B. */
         const char *env = getenv( "NSPA_SCHED_USE_FOR_WM_TIMER" );
-        if (env && env[0] == '1' && env[1] == 0 && nspa_sched_rt_available())
+        if (env && env[0] == '0' && env[1] == 0)
+            wm_timer_use_sched = 0;
+        else if (nspa_sched_rt_available())
             wm_timer_use_sched = 1;
         else
-            wm_timer_use_sched = 0;
+            wm_timer_use_sched = 0;     /* RT not available → fall back */
     }
     return wm_timer_use_sched == 1;
 }

@@ -617,6 +617,15 @@ void sched_run( void )
         nspa_sched_obs_init();
     }
 
+    /* NSPA Phase 3 RT-class validation probe — synthetic consumer that
+     * exercises NTDLL_SCHED_CLASS_RT end-to-end (lazy-spawn + dispatch
+     * + cancel) before any production RT consumer (wm_timer migration)
+     * routes onto the path.  No-op unless NSPA_SCHED_RT_PROBE is set. */
+    {
+        extern void nspa_sched_rt_probe_init( void );
+        nspa_sched_rt_probe_init();
+    }
+
     sched_run_inst( &default_inst );
 }
 

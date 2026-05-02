@@ -62,6 +62,7 @@ SOURCES = \
 	unix/nspa/local_timer.c \
 	unix/nspa/sched_helpers.c \
 	unix/nspa/sched_obs.c \
+	unix/nspa/sched_rt_probe.c \
 	unix/process.c \
 	unix/registry.c \
 	unix/sched.c \

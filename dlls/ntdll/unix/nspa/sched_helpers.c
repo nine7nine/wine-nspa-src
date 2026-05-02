@@ -106,6 +106,10 @@ static void rt_init_once_fn( void )
         rt_unavailable = 1;
         return;
     }
+    /* NSPA RT probe runs lazily on first SetThreadPriority — but our
+     * caller may need RT BEFORE any app code has run.  Trigger the
+     * probe explicitly so nspa_rt_prio_base reflects the env. */
+    nspa_rt_probe();
     if (nspa_rt_prio_base < 1)
     {
         /* NSPA_RT_PRIO not set or too low to derive a useful sched

@@ -131,6 +131,36 @@ static pthread_once_t gate_once = PTHREAD_ONCE_INIT;
 static pthread_once_t table_once = PTHREAD_ONCE_INIT;
 
 /*--------------------------------------------------------------------------
+ * NSPA Phase 3 sched-RT migration state (default-OFF gate).
+ *
+ * Same pattern as wm_timer migration: when NSPA_SCHED_USE_FOR_LOCAL_TIMER=1
+ * AND nspa_sched_rt_available(), the NT timer dispatcher work runs on
+ * the per-process RT sched thread (NTDLL_SCHED_CLASS_RT) instead of on
+ * its own dedicated pthread.  Same priority class (FIFO at NSPA_RT_PRIO-1).
+ *
+ * When both wm_timer AND local_timer migrate, both legacy pthreads
+ * disappear and the work consolidates onto a shared wine-sched-rt
+ * thread → net -1 thread per process.
+ *
+ * Lock order: timer_lock OUTER, sched per-instance lock INNER.  sched
+ * code never reaches into local_timer; local_timer calls into sched
+ * while holding timer_lock — no inversion possible.  signal_fd write
+ * is non-blocking (Phase 3 sched.c change), so the producer can never
+ * deadlock on a full pipe waiting for sched to drain.
+ *
+ * Fire-outside-lock pattern (legacy dispatcher_main: drop timer_lock
+ * before NtSetEvent/NtQueueApcThread, re-acquire for periodic re-arm)
+ * is preserved in the sched dispatch callback so callbacks that
+ * re-enter via NtSetTimer/NtCancelTimer don't deadlock.
+ *--------------------------------------------------------------------------*/
+
+#include "wine/unixlib.h"   /* sched_handle_t + ntdll_sched_*_class */
+
+static int             local_timer_use_sched = -1;       /* tri-state cache */
+static sched_handle_t  local_timer_pending_dispatch;     /* protected by timer_lock */
+static pthread_once_t  local_timer_atexit_once = PTHREAD_ONCE_INIT;
+
+/*--------------------------------------------------------------------------
  * Feature gate
  *--------------------------------------------------------------------------*/
 
@@ -436,9 +466,240 @@ static void *dispatcher_main( void *arg )
     return NULL;
 }
 
+/*--------------------------------------------------------------------------
+ * NSPA Phase 3 sched-RT path
+ *
+ * Replaces dispatcher_main + pthread + pi_cond_timedwait with an
+ * event-driven sched-timer chain hosted on the per-process RT sched
+ * thread.  Each fire of the dispatch callback runs ONE iteration of the
+ * legacy loop body (pop expired into fire_batch, fire OUTSIDE the lock,
+ * periodic re-arm + refcount under the lock) and then registers the
+ * next deadline.
+ *
+ * RT-safety: dispatch callback runs on wine-sched-rt at SCHED_FIFO,
+ * NSPA_RT_PRIO-1 — same priority class as the legacy dispatcher.  No
+ * RT downgrade.  PI mutex on timer_lock handles cross-priority lock
+ * contention correctness.
+ *--------------------------------------------------------------------------*/
+
+static BOOL nspa_local_timer_sched_active(void)
+{
+    if (local_timer_use_sched == -1)
+    {
+        const char *env = getenv( "NSPA_SCHED_USE_FOR_LOCAL_TIMER" );
+        if (env && env[0] == '1' && env[1] == 0 && nspa_sched_rt_available())
+            local_timer_use_sched = 1;
+        else
+            local_timer_use_sched = 0;
+    }
+    return local_timer_use_sched == 1;
+}
+
+/* Caller holds timer_lock.  Returns the next absolute CLOCK_MONOTONIC
+ * deadline (ns) that the dispatcher needs to wake at, or LLONG_MAX if
+ * the queue is empty. */
+static LONGLONG local_timer_next_deadline_locked(void)
+{
+    struct nspa_local_timer *t;
+
+    if (list_empty( &timer_queue )) return LLONG_MAX;
+    t = LIST_ENTRY( list_head( &timer_queue ), struct nspa_local_timer, queue_entry );
+    return t->deadline_mono_ns;
+}
+
+/* Forward decl — the sched-timer callback. */
+static void local_timer_sched_dispatch_cb( void *arg );
+
+/* Caller holds timer_lock.  Cancels the current pending sched
+ * registration (if any) and registers a new one for the next deadline.
+ * Called from NtSetTimer/NtCancelTimer wake paths and from the dispatch
+ * callback itself for re-arm.
+ *
+ * Safe under timer_lock: the cancel and register both go through the
+ * sched per-instance lock (INNER); signal_fd write is non-blocking so
+ * we can never deadlock on a full pipe waiting for sched to drain
+ * while sched is waiting for timer_lock. */
+static void local_timer_sched_rearm_locked(void)
+{
+    sched_handle_t old, new = SCHED_HANDLE_NULL;
+    LONGLONG next_ns, now_ns, rel_ns;
+    LARGE_INTEGER timeout;
+    NTSTATUS status;
+
+    /* Atomically swap out the stored handle so a racing cancel /
+     * dispatch sees a coherent before/after.  Cancel of the old is
+     * gen-checked: if it has already fired, returns STATUS_NOT_FOUND
+     * harmlessly. */
+    old = local_timer_pending_dispatch;
+    local_timer_pending_dispatch = SCHED_HANDLE_NULL;
+    if (old.priv) ntdll_sched_cancel( old );
+
+    if (timer_shutdown) return;        /* no rearm during teardown */
+
+    next_ns = local_timer_next_deadline_locked();
+    if (next_ns == LLONG_MAX) return;  /* queue empty */
+
+    now_ns = mono_now_ns();
+    rel_ns = next_ns - now_ns;
+    if (rel_ns < 0) rel_ns = 0;        /* deadline already passed — fire ASAP */
+
+    /* NT 100ns units, negative = relative timeout. */
+    timeout.QuadPart = -(rel_ns / 100);
+    if (timeout.QuadPart == 0) timeout.QuadPart = -1;   /* min representable */
+
+    status = ntdll_sched_register_timer_class( NTDLL_SCHED_CLASS_RT, &timeout,
+                                               local_timer_sched_dispatch_cb, NULL, &new );
+    if (status == STATUS_SUCCESS)
+    {
+        local_timer_pending_dispatch = new;
+    }
+    else
+    {
+        WARN( "local_timer sched rearm failed status=%#x — dispatch stalls until next NtSetTimer\n",
+              (unsigned int)status );
+        /* No retry; next NtSetTimer/NtCancelTimer triggers another rearm. */
+    }
+}
+
+/* Sched-RT thread callback.  Runs ONE iteration of the legacy
+ * dispatcher loop body (pop expired, fire outside lock, periodic
+ * re-arm under lock, refcount dec/free), then re-arms for the next
+ * deadline. */
+static void local_timer_sched_dispatch_cb( void *arg )
+{
+    struct nspa_local_timer *t, *next;
+    struct list fire_batch = LIST_INIT( fire_batch );
+    LONGLONG now_ns;
+
+    (void)arg;
+
+    pi_mutex_lock( &timer_lock );
+
+    if (timer_shutdown)
+    {
+        local_timer_pending_dispatch = SCHED_HANDLE_NULL;
+        pi_mutex_unlock( &timer_lock );
+        return;
+    }
+
+    now_ns = mono_now_ns();
+
+    /* Pop expired into fire_batch (deliberately copied line-for-line
+     * from dispatcher_main for behavioral parity). */
+    LIST_FOR_EACH_ENTRY_SAFE( t, next, &timer_queue, struct nspa_local_timer, queue_entry )
+    {
+        if (t->deadline_mono_ns > now_ns) break;
+        list_remove( &t->queue_entry );
+        t->armed = FALSE;
+        t->was_signaled = TRUE;
+        t->refcount++;          /* hold across unlocked fire */
+        list_add_tail( &fire_batch, &t->queue_entry );
+    }
+
+    /* Fire OUTSIDE the lock.  This is critical: callbacks/APCs may
+     * call NtSetTimer/NtCancelTimer which re-acquire timer_lock — if
+     * we held the lock during fire, every such re-entrant call would
+     * deadlock.  Matches legacy dispatcher_main exactly. */
+    if (!list_empty( &fire_batch ))
+    {
+        pi_mutex_unlock( &timer_lock );
+
+        LIST_FOR_EACH_ENTRY_SAFE( t, next, &fire_batch, struct nspa_local_timer, queue_entry )
+        {
+            list_remove( &t->queue_entry );
+
+            if (!t->cancelled) fire_timer( t );
+
+            pi_mutex_lock( &timer_lock );
+
+            /* Periodic re-arm, but only if nothing else (concurrent
+             * NtSetTimer) has already armed this entry while we were
+             * firing outside the lock.  Re-inserting an already-armed
+             * entry would corrupt the queue with a double link. */
+            if (t->period_ms && !t->cancelled && !t->armed)
+            {
+                t->deadline_mono_ns += (LONGLONG)t->period_ms * 1000000LL;
+                {
+                    LONGLONG now2 = mono_now_ns();
+                    if (t->deadline_mono_ns < now2)
+                        t->deadline_mono_ns = now2 + (LONGLONG)t->period_ms * 1000000LL;
+                }
+                queue_insert_sorted( t );
+            }
+
+            /* Drop the fire refcount.  If the user closed the handle
+             * while we were firing, we may be the last holder; free. */
+            if (--t->refcount == 0)
+            {
+                pi_mutex_unlock( &timer_lock );
+                free( t );
+                pi_mutex_lock( &timer_lock );
+                continue;
+            }
+
+            pi_mutex_unlock( &timer_lock );
+        }
+
+        pi_mutex_lock( &timer_lock );
+    }
+
+    /* The just-fired sched registration is consumed; clear our cached
+     * handle (the underlying timer_user was freed by sched.c after
+     * invoking our callback, so a stale gen-checked cancel of it would
+     * NOT_FOUND harmlessly anyway). */
+    local_timer_pending_dispatch = SCHED_HANDLE_NULL;
+
+    /* Re-arm for the next deadline (or no-op if queue empty / shutdown). */
+    local_timer_sched_rearm_locked();
+
+    pi_mutex_unlock( &timer_lock );
+}
+
+/* atexit: signal shutdown, cancel pending dispatch, no post-exit
+ * fires.  In-flight callbacks finish under the lock and observe
+ * shutdown=1 on their next iteration (won't re-arm). */
+static void local_timer_sched_atexit_cb(void)
+{
+    sched_handle_t h = SCHED_HANDLE_NULL;
+
+    pi_mutex_lock( &timer_lock );
+    timer_shutdown = 1;
+    h = local_timer_pending_dispatch;
+    local_timer_pending_dispatch = SCHED_HANDLE_NULL;
+    pi_mutex_unlock( &timer_lock );
+
+    if (h.priv) ntdll_sched_cancel( h );
+    /* In-flight callbacks finish naturally without rearm.  Memory in
+     * the queue/table is intentionally leaked at exit — OS reaps;
+     * explicit teardown would risk freeing under a callback running
+     * outside the lock during fire. */
+}
+
+static void local_timer_sched_atexit_register(void)
+{
+    atexit( local_timer_sched_atexit_cb );
+}
+
+static void local_timer_sched_arm_atexit_once(void)
+{
+    pthread_once( &local_timer_atexit_once, local_timer_sched_atexit_register );
+}
+
 static NTSTATUS ensure_dispatcher_started(void)
 {
     int err;
+
+    if (nspa_local_timer_sched_active())
+    {
+        /* Sched path: registrations are made on demand from
+         * NtSetTimer/NtCancelTimer/dispatch_cb.  Just arm atexit
+         * and trigger an initial rearm if nothing is pending.
+         * Caller MUST already hold timer_lock per existing contract. */
+        local_timer_sched_arm_atexit_once();
+        if (!local_timer_pending_dispatch.priv && !timer_shutdown)
+            local_timer_sched_rearm_locked();
+        return STATUS_SUCCESS;
+    }
 
     if (timer_thread_started) return STATUS_SUCCESS;
     if ((err = pthread_create( &timer_thread, NULL, dispatcher_main, NULL )))
@@ -558,8 +819,19 @@ NTSTATUS nspa_local_timer_set( HANDLE handle, const LARGE_INTEGER *when,
 
     if (previous_state) *previous_state = prev_state ? TRUE : FALSE;
 
-    pi_mutex_unlock( &timer_lock );
-    pi_cond_signal( &timer_wake, &timer_lock );
+    if (nspa_local_timer_sched_active())
+    {
+        /* Sched path: re-evaluate next deadline + re-arm pending
+         * sched-timer.  Done while holding the lock — sched write end
+         * is non-blocking so no deadlock risk. */
+        local_timer_sched_rearm_locked();
+        pi_mutex_unlock( &timer_lock );
+    }
+    else
+    {
+        pi_mutex_unlock( &timer_lock );
+        pi_cond_signal( &timer_wake, &timer_lock );
+    }
     return STATUS_SUCCESS;
 }
 
@@ -586,9 +858,15 @@ NTSTATUS nspa_local_timer_cancel( HANDLE handle, BOOLEAN *previous_state )
 
     if (previous_state) *previous_state = was_armed;
 
+    /* Sched path: removing an entry can only push the next deadline
+     * later (head may have changed).  Rearm so we don't wake at the
+     * old head's deadline only to find nothing.  Correctness-neutral
+     * but saves one spurious wake.  Legacy path doesn't need this — it
+     * just lets pi_cond_timedwait expire on the stale deadline. */
+    if (nspa_local_timer_sched_active())
+        local_timer_sched_rearm_locked();
+
     pi_mutex_unlock( &timer_lock );
-    /* No wake needed: removing an entry can only make the next-wake later
-     * or leave it unchanged; the dispatcher will recompute on its next pass. */
     return STATUS_SUCCESS;
 }
 

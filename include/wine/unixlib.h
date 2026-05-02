@@ -126,6 +126,13 @@ NTSYSAPI NTSTATUS ntdll_sched_register_timer_class( sched_class_t cls,
                                                     async_callback callback, void *private,
                                                     sched_handle_t *handle );
 
+/* NSPA cross-unixlib probe: returns TRUE if NTDLL_SCHED_CLASS_RT is
+ * available in this process (NSPA RT configured + sched enabled).
+ * Cross-unixlib consumers (e.g. win32u's wm_timer migration) call
+ * this at gate-init time to decide between sched-RT and the legacy
+ * dedicated-pthread path. */
+NTSYSAPI BOOL nspa_sched_rt_available( void );
+
 /* exception handling */
 
 #include <setjmp.h>

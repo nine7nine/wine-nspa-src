@@ -38,6 +38,7 @@
 #include "wine/debug.h"
 #include "../unix_private.h"
 #include "debug.h"
+#include "lf_close_queue.h"
 #include <rtpi.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(nspa_lfile);
@@ -583,7 +584,15 @@ NTSTATUS nspa_local_file_table_add( HANDLE handle, int unix_fd,
                                     enum server_fd_type kind,
                                     const UNICODE_STRING *nt_name )
 {
-    struct nspa_local_open *o = malloc( sizeof(*o) );
+    struct nspa_local_open *o;
+
+    /* NSPA Phase 3: pre-flush any pending async closes before allocating
+     * a new LF entry.  This eliminates the "close-then-reopen-same-path"
+     * race window — by the time we allocate, no deferred close still
+     * holds the file open.  Cheap (no-op) when queue is empty. */
+    nspa_lf_close_queue_flush();
+
+    o = malloc( sizeof(*o) );
     if (!o) return STATUS_NO_MEMORY;
     o->handle        = handle;
     o->server_handle = 0;          /* lazy-promoted on first server-needing op */
@@ -1459,6 +1468,7 @@ int nspa_local_file_close( HANDLE handle )
     int unix_fd = -1;
     unsigned long long dev = 0, ino = 0;
     HANDLE server_handle = 0;
+    unsigned int sharing = 0;
     struct nspa_local_open *o, *next;
     int found = 0;
 
@@ -1466,7 +1476,8 @@ int nspa_local_file_close( HANDLE handle )
     NSPA_TRACE( LF_TRACE, "NSPA-LF close h=%p\n", handle );
 
     /* Inline-extended remove that also captures server_handle for
-     * 1A.4 lazy-promotion cleanup. */
+     * 1A.4 lazy-promotion cleanup, and sharing for Phase 3 async close
+     * eligibility predicate. */
     pi_mutex_lock( &nspa_lf_opens_mutex );
     LIST_FOR_EACH_ENTRY_SAFE( o, next, &nspa_lf_opens, struct nspa_local_open, entry )
     {
@@ -1476,6 +1487,7 @@ int nspa_local_file_close( HANDLE handle )
             dev           = o->device;
             ino           = o->inode;
             server_handle = o->server_handle;
+            sharing       = o->sharing;
             list_remove( &o->entry );
             free( o->nt_name );
             free( o );
@@ -1494,17 +1506,38 @@ int nspa_local_file_close( HANDLE handle )
     }
 
     nspa_local_file_publish_close( dev, ino );
-    if (unix_fd >= 0) close( unix_fd );
 
-    /* If we lazily promoted to a server handle, close that too. */
-    if (server_handle)
+    /* NSPA Phase 3: defer the actual unix_fd close + server close_handle
+     * RPC to the per-process sched thread when ALL of:
+     *   1. NSPA_USE_SCHED_THREAD=1 (queue push checks gate)
+     *   2. there is real cleanup to do (unix_fd or server_handle present)
+     *   3. handle's sharing == FULL — no exclusive lock to release, so
+     *      no observable side effect for other openers if our actual
+     *      close is delayed.  Restrictive sharing closes always go
+     *      inline so any waiting opener unblocks immediately.
+     *
+     * Otherwise close inline as before.  Push returns FALSE when the
+     * queue is full or the gate is OFF; caller falls back. */
     {
-        SERVER_START_REQ( close_handle )
+        BOOL deferred = FALSE;
+        if ((server_handle || unix_fd >= 0) &&
+            sharing == NSPA_LF_CLOSE_QUEUE_SHARE_ALL &&
+            nspa_lf_close_queue_push( server_handle, unix_fd ))
+            deferred = TRUE;
+
+        if (!deferred)
         {
-            req->handle = wine_server_obj_handle( server_handle );
-            wine_server_call( req );
+            if (unix_fd >= 0) close( unix_fd );
+            if (server_handle)
+            {
+                SERVER_START_REQ( close_handle )
+                {
+                    req->handle = wine_server_obj_handle( server_handle );
+                    wine_server_call( req );
+                }
+                SERVER_END_REQ;
+            }
         }
-        SERVER_END_REQ;
     }
 
     /* Free the slot LAST — ordering invariant for ABA-safety.  See the

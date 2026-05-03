@@ -1154,41 +1154,50 @@ NTSTATUS sock_read( HANDLE handle, int fd, HANDLE event, PIO_APC_ROUTINE apc,
 }
 
 
-static NTSTATUS try_send( int fd, struct async_send_ioctl *async )
+/* Setup msghdr for an async_send_ioctl sendmsg call.  Caller owns
+ * lifetime of hdr / unix_addr — typically on stack for try_send, or
+ * embedded in uring_async_op for the io_uring SENDMSG path.
+ *
+ * Performs the WS_sockaddr -> unix_sockaddr conversion (incl. port-0
+ * substitution and IPX type retrieval).  Requires fd because we
+ * getsockopt(SO_TYPE) to distinguish STREAM (no msg_name) vs DGRAM.
+ *
+ * Returns STATUS_SUCCESS on success; STATUS_ACCESS_VIOLATION if
+ * address conversion fails.  On success, hdr is fully populated and
+ * ready to pass to sendmsg() / IORING_OP_SENDMSG. */
+static NTSTATUS try_send_setup_msghdr( int fd, struct async_send_ioctl *async,
+                                       struct msghdr *hdr,
+                                       union unix_sockaddr *unix_addr )
 {
-    union unix_sockaddr unix_addr;
-    struct msghdr hdr;
-    int attempt = 0;
     int sock_type;
     socklen_t len = sizeof(sock_type);
-    ssize_t ret;
 
-    getsockopt(fd, SOL_SOCKET, SO_TYPE, &sock_type, &len);
+    getsockopt( fd, SOL_SOCKET, SO_TYPE, &sock_type, &len );
 
-    memset( &hdr, 0, sizeof(hdr) );
+    memset( hdr, 0, sizeof(*hdr) );
     if (async->addr && sock_type != SOCK_STREAM)
     {
-        hdr.msg_name = &unix_addr;
-        hdr.msg_namelen = sockaddr_to_unix( async->addr, async->addr_len, &unix_addr );
-        if (!hdr.msg_namelen)
+        hdr->msg_name = unix_addr;
+        hdr->msg_namelen = sockaddr_to_unix( async->addr, async->addr_len, unix_addr );
+        if (!hdr->msg_namelen)
         {
             ERR( "failed to convert address\n" );
             return STATUS_ACCESS_VIOLATION;
         }
-        if (sock_type == SOCK_DGRAM && ((unix_addr.addr.sa_family == AF_INET && !unix_addr.in.sin_port)
-            || (unix_addr.addr.sa_family == AF_INET6 && !unix_addr.in6.sin6_port)))
+        if (sock_type == SOCK_DGRAM && ((unix_addr->addr.sa_family == AF_INET && !unix_addr->in.sin_port)
+            || (unix_addr->addr.sa_family == AF_INET6 && !unix_addr->in6.sin6_port)))
         {
             /* Sending to port 0 succeeds on Windows. Use 'discard' service instead so sendmsg() works on Unix
              * while still goes through other parameters validation. */
             WARN( "Trying to use destination port 0, substituing 9.\n" );
-            unix_addr.in.sin_port = htons( 9 );
+            unix_addr->in.sin_port = htons( 9 );
         }
 
 #if defined(HAS_IPX) && defined(SOL_IPX)
         if (async->addr->sa_family == WS_AF_IPX)
         {
             int type;
-            socklen_t len = sizeof(type);
+            socklen_t ipx_len = sizeof(type);
 
             /* The packet type is stored at the IPX socket level. At least the
              * linux kernel seems to do something with it in case hdr.msg_name
@@ -1196,38 +1205,35 @@ static NTSTATUS try_send( int fd, struct async_send_ioctl *async )
              * then we can retrieve it using getsockopt. After that we can set
              * the IPX type in the sockaddr_ipx structure with the stored value.
              */
-            if (getsockopt(fd, SOL_IPX, IPX_TYPE, &type, &len) >= 0)
-                unix_addr.ipx.sipx_type = type;
+            if (getsockopt( fd, SOL_IPX, IPX_TYPE, &type, &ipx_len ) >= 0)
+                unix_addr->ipx.sipx_type = type;
         }
 #endif
     }
 
-    hdr.msg_iov = async->iov + async->iov_cursor;
-    hdr.msg_iovlen = async->count - async->iov_cursor;
+    hdr->msg_iov = async->iov + async->iov_cursor;
+    hdr->msg_iovlen = async->count - async->iov_cursor;
+    return STATUS_SUCCESS;
+}
 
-    while ((ret = sendmsg( fd, &hdr, async->unix_flags )) == -1)
+/* Post-process the result of a sendmsg.  Called from try_send (sync
+ * loop) after each sendmsg attempt, and from the io_uring CQE handler
+ * after IORING_OP_SENDMSG completion.
+ *
+ * On entry: ret = bytes sent (>=0) or -1 on error with saved_errno set.
+ * On success-side: updates async->sent_len, advances iov_cursor for
+ *   partial sends, returns STATUS_SUCCESS (full send) or
+ *   STATUS_DEVICE_NOT_READY (partial — caller should re-submit).
+ * On error-side: returns sock_errno_to_status(saved_errno).  EISCONN
+ *   and ECONNREFUSED are NOT retried here; callers handle re-submit
+ *   (try_send loops in-place; io_uring CQE falls back to sync try_send). */
+static NTSTATUS try_send_post_process( struct async_send_ioctl *async,
+                                       ssize_t ret, int saved_errno )
+{
+    if (ret < 0)
     {
-        if (errno == EISCONN)
-        {
-            hdr.msg_name = NULL;
-            hdr.msg_namelen = 0;
-        }
-        else if (errno != EINTR)
-        {
-            if (errno != EWOULDBLOCK) WARN( "sendmsg: %s\n", strerror( errno ) );
-
-            /* ECONNREFUSED may be returned if this is connected datagram socket and the system received
-             * ICMP "destination port unreachable" message from the peer. That is ignored
-             * on Windows. The first sendmsg() will clear the error in this case and the next
-             * call should succeed. */
-            if (!attempt && errno == ECONNREFUSED)
-            {
-                ++attempt;
-                continue;
-            }
-
-            return sock_errno_to_status( errno );
-        }
+        if (saved_errno != EWOULDBLOCK) WARN( "sendmsg: %s\n", strerror( saved_errno ) );
+        return sock_errno_to_status( saved_errno );
     }
 
     async->sent_len += ret;
@@ -1241,6 +1247,59 @@ static NTSTATUS try_send( int fd, struct async_send_ioctl *async )
         return STATUS_DEVICE_NOT_READY;
     }
     return STATUS_SUCCESS;
+}
+
+static NTSTATUS try_send( int fd, struct async_send_ioctl *async )
+{
+    union unix_sockaddr unix_addr;
+    struct msghdr hdr;
+    int attempt = 0;
+    NTSTATUS status;
+    ssize_t ret;
+
+    if ((status = try_send_setup_msghdr( fd, async, &hdr, &unix_addr ))) return status;
+
+    while ((ret = sendmsg( fd, &hdr, async->unix_flags )) == -1)
+    {
+        if (errno == EISCONN)
+        {
+            hdr.msg_name = NULL;
+            hdr.msg_namelen = 0;
+        }
+        else if (errno != EINTR)
+        {
+            /* ECONNREFUSED may be returned if this is connected datagram socket and the system received
+             * ICMP "destination port unreachable" message from the peer. That is ignored
+             * on Windows. The first sendmsg() will clear the error in this case and the next
+             * call should succeed. */
+            if (!attempt && errno == ECONNREFUSED)
+            {
+                ++attempt;
+                continue;
+            }
+
+            return try_send_post_process( async, -1, errno );
+        }
+    }
+
+    return try_send_post_process( async, ret, 0 );
+}
+
+/* Phase 4.8.B: populate an io_uring op slot's msghdr / address storage
+ * from an async_send_ioctl.  Called from io_uring.c at submit time —
+ * lives here because async_send_ioctl is socket.c-private.
+ *
+ * Lifetime: hdr / addr_storage MUST outlive the in-flight SQE — they're
+ * embedded in the uring_async_op slot which the op_pool keeps allocated
+ * until CQE completion. */
+NTSTATUS try_send_setup_op_msghdr( int fd, void *sock_async,
+                                   struct msghdr *hdr,
+                                   void *addr_storage )
+{
+    struct async_send_ioctl *async = sock_async;
+    union unix_sockaddr *unix_addr = addr_storage;
+
+    return try_send_setup_msghdr( fd, async, hdr, unix_addr );
 }
 
 

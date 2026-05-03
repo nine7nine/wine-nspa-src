@@ -4786,3 +4786,31 @@ enum inproc_sync_type
     unsigned int    count;            /* number of entries in the list */
     VARARG(list,bytes);               /* TLV stream: for each entry, u32 size + size bytes */
 @END
+
+
+/* NSPA Phase 4.6.A: register a PE-side client-range event ntsync fd with
+ * the server.  When server-side async I/O completion needs to signal an
+ * event whose handle is in the client range (PE-side allocated, not in
+ * the server's handle table), the server uses the registered fd to call
+ * NTSYNC_IOC_EVENT_SET directly.  Without this registration, async paths
+ * that pass a client-range event handle return STATUS_INVALID_HANDLE
+ * synchronously (the chokepoint at server/async.c:create_async).
+ *
+ * Client passes the handle value + the inflight ntsync fd via the usual
+ * fd-passing protocol (wine_server_send_fd then thread_get_inflight_fd).
+ * Server stashes (handle → fd) in a per-process table.  Process exit
+ * walks the table and closes all fds.  See
+ * wine/nspa/docs/events-option-a-plan-20260502.md. */
+@REQ(nspa_register_inproc_event)
+    obj_handle_t    handle;       /* PE-side client-range event handle */
+    int             fd;           /* inflight ntsync fd id (client-assigned) */
+@END
+
+
+/* NSPA Phase 4.6.A: unregister a previously-registered client-range event.
+ * Called from the PE-side close path (NtClose for client-range handles)
+ * BEFORE the PE-side closes its fd ref, so server-side fd is closed first.
+ * No-op if the handle is not registered. */
+@REQ(nspa_unregister_inproc_event)
+    obj_handle_t    handle;       /* PE-side client-range event handle */
+@END

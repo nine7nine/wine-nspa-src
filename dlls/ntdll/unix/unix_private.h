@@ -597,6 +597,18 @@ extern int  ntdll_io_uring_submit_socket_recvmsg( int unix_fd, HANDLE handle,
                                                   PIO_APC_ROUTINE apc, void *apc_user,
                                                   IO_STATUS_BLOCK *io, unsigned int options,
                                                   void *sock_async, int unix_flags );
+/* Phase 4.8.B: socket-specific SENDMSG submission.  Sets up msghdr from
+ * async_send_ioctl (incl. address conversion / port-0 / IPX); submits
+ * IORING_OP_SENDMSG; CQE handler runs try_send_post_process for
+ * sent_len + iov_cursor accounting.  EISCONN/ECONNREFUSED retry cases
+ * fall back to sync try_send from the CQE handler (mirrors existing
+ * socket_poll path).  Returns 0 on submit success, -errno on failure
+ * (caller falls back to socket_poll path or server async). */
+extern int  ntdll_io_uring_submit_socket_sendmsg( int unix_fd, HANDLE handle,
+                                                  HANDLE wait_handle, HANDLE event,
+                                                  PIO_APC_ROUTINE apc, void *apc_user,
+                                                  IO_STATUS_BLOCK *io, unsigned int options,
+                                                  void *sock_async, int unix_flags );
 
 extern void close_inproc_sync( HANDLE handle );
 extern BOOL is_client_handle( HANDLE handle );

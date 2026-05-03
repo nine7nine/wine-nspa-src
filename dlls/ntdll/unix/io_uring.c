@@ -381,6 +381,8 @@ static int dup_fd_for_ring( int unix_fd )
 extern void ntdll_complete_socket_poll( struct uring_async_op *op, int poll_revents );
 /* Phase 4.8.A: socket-specific RECVMSG completion handler in socket.c. */
 extern void ntdll_complete_socket_recvmsg( struct uring_async_op *op, int result );
+/* Phase 4.8.B: socket-specific SENDMSG completion handler in socket.c. */
+extern void ntdll_complete_socket_sendmsg( struct uring_async_op *op, int result );
 
 /* Field accessors for socket.c — avoids exposing uring_async_op struct */
 void *ntdll_uring_op_sock_async( struct uring_async_op *op ) { return op->sock_async; }
@@ -426,6 +428,18 @@ static void complete_uring_op( struct uring_async_op *op, int result )
     if (op->type == URING_OP_SOCKET_RECVMSG)
     {
         ntdll_complete_socket_recvmsg( op, result );
+        op_pool_free( op );
+        return;
+    }
+
+    /* Phase 4.8.B: full SENDMSG completion.  CQE handler runs
+     * try_send_post_process to update sent_len + advance iov_cursor.
+     * EISCONN / ECONNREFUSED / EINTR retry conditions fall back to
+     * sync try_send from inside the handler (rare-path; mirrors
+     * existing socket_poll fallback shape). */
+    if (op->type == URING_OP_SOCKET_SENDMSG)
+    {
+        ntdll_complete_socket_sendmsg( op, result );
         op_pool_free( op );
         return;
     }
@@ -583,6 +597,14 @@ extern void try_recv_setup_op_msghdr( void *sock_async,
                                       size_t control_size,
                                       void *addr_storage );
 
+/* Phase 4.8.B: setup helper for SENDMSG — populates msghdr + addr
+ * storage in the op slot from the async_send_ioctl.  Needs fd to
+ * getsockopt(SO_TYPE).  Returns NTSTATUS (STATUS_ACCESS_VIOLATION on
+ * address-conversion failure). */
+extern NTSTATUS try_send_setup_op_msghdr( int fd, void *sock_async,
+                                          struct msghdr *hdr,
+                                          void *addr_storage );
+
 int ntdll_io_uring_submit_socket_recvmsg( int unix_fd, HANDLE handle,
                                           HANDLE wait_handle, HANDLE event,
                                           PIO_APC_ROUTINE apc, void *apc_user,
@@ -638,6 +660,72 @@ int ntdll_io_uring_submit_socket_recvmsg( int unix_fd, HANDLE handle,
     io_uring_submit( &thread_ring );
 
     TRACE( "submitted socket RECVMSG: handle=%p fd=%d(%d) sock_async=%p flags=%#x\n",
+           handle, unix_fd, ring_fd, sock_async, unix_flags );
+    return 0;
+}
+
+int ntdll_io_uring_submit_socket_sendmsg( int unix_fd, HANDLE handle,
+                                          HANDLE wait_handle, HANDLE event,
+                                          PIO_APC_ROUTINE apc, void *apc_user,
+                                          IO_STATUS_BLOCK *io, unsigned int options,
+                                          void *sock_async, int unix_flags )
+{
+    struct uring_async_op *op;
+    struct io_uring_sqe *sqe;
+    int ring_fd;
+    NTSTATUS setup_status;
+
+    if (!ensure_ring()) return -ENOSYS;
+
+    /* dup the fd so we own a stable reference for the in-flight SQE.
+     * Setup uses the original fd because getsockopt(SO_TYPE) and
+     * getsockopt(IPX_TYPE) need the original socket — both fds refer
+     * to the same kernel object so the result is identical. */
+    ring_fd = dup_fd_for_ring( unix_fd );
+    if (ring_fd < 0) return -errno;
+
+    op = op_pool_alloc();
+    if (!op) { close( ring_fd ); return -ENOMEM; }
+
+    op->type         = URING_OP_SOCKET_SENDMSG;
+    op->handle       = handle;
+    op->event        = event;
+    op->apc          = apc;
+    op->apc_user     = apc_user;
+    op->io           = io;
+    op->options      = options;
+    op->dup_fd       = ring_fd;
+    op->sock_async   = sock_async;
+    op->wait_handle  = wait_handle;
+    op->poll_unix_fd = unix_fd;        /* for ntdll_client_poll_clear at completion */
+    op->event_sync_fd = -1;
+
+    /* Populate msghdr + address from async_send_ioctl.  Failure here means
+     * the address couldn't be converted — surface to caller so it can fall
+     * back (rather than submit an SQE that would fault inside the kernel). */
+    setup_status = try_send_setup_op_msghdr( unix_fd, sock_async, &op->sock_msghdr,
+                                              &op->sock_addr_storage );
+    if (setup_status)
+    {
+        close( ring_fd );
+        op_pool_free( op );
+        return -EINVAL;   /* generic submit failure; caller falls back */
+    }
+
+    sqe = io_uring_get_sqe( &thread_ring );
+    if (!sqe)
+    {
+        io_uring_submit( &thread_ring );
+        ntdll_io_uring_process_completions();
+        sqe = io_uring_get_sqe( &thread_ring );
+        if (!sqe) { close( ring_fd ); op_pool_free( op ); return -ENOMEM; }
+    }
+
+    io_uring_prep_sendmsg( sqe, ring_fd, &op->sock_msghdr, unix_flags );
+    io_uring_sqe_set_data( sqe, op );
+    io_uring_submit( &thread_ring );
+
+    TRACE( "submitted socket SENDMSG: handle=%p fd=%d(%d) sock_async=%p flags=%#x\n",
            handle, unix_fd, ring_fd, sock_async, unix_flags );
     return 0;
 }
@@ -799,6 +887,12 @@ int ntdll_io_uring_submit_file_write( int unix_fd, int needs_close, const void *
 { return -ENOSYS; }
 
 int ntdll_io_uring_submit_socket_recvmsg( int unix_fd, HANDLE handle, HANDLE wait_handle,
+                                          HANDLE event, PIO_APC_ROUTINE apc, void *apc_user,
+                                          IO_STATUS_BLOCK *io, unsigned int options,
+                                          void *sock_async, int unix_flags )
+{ return -ENOSYS; }
+
+int ntdll_io_uring_submit_socket_sendmsg( int unix_fd, HANDLE handle, HANDLE wait_handle,
                                           HANDLE event, PIO_APC_ROUTINE apc, void *apc_user,
                                           IO_STATUS_BLOCK *io, unsigned int options,
                                           void *sock_async, int unix_flags )

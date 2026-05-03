@@ -5,7 +5,7 @@
 #
 # Two tables, in this order:
 #   1. Full stats table — every STATS_KEY metric for every test, baseline
-#      and rt side-by-side (so you can scan correctness + perf in one view).
+#      (NSPA defaults, no RT promotion) and rt (NSPA + RT promotion) side-by-side.
 #   2. Deltas table — for each metric, baseline-vs-prior and rt-vs-prior
 #      percentage deltas with color coding (green = ok, yellow = warn,
 #      red = fail).  Skipped if no prior archive exists.
@@ -114,7 +114,7 @@ list_tests() {
 #
 # Each test renders as a self-contained box.  Layout:
 #   ┌─ <test name> ────────────────────────────────────────┐
-#   │   metric                       baseline           rt │
+#   │   metric                        baseline           rt │
 #   │   ──────                       ────────           ── │
 #   │   foo_us                            123          110 │
 #   │   bar_ops_per_sec                 45000        47000 │

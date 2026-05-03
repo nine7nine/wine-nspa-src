@@ -149,18 +149,35 @@ run_one() {
     local name="$display_name"
 
     local log_file="$LOG_DIR/${mode}_${name}.log"
+
+    # Build `-u VAR` args for every NSPA_* var currently exported in the
+    # caller's shell.  Without this, a developer who has e.g.
+    # NSPA_NT_LOCAL_EVENT=1 in their shell would leak that into vanilla
+    # mode and contaminate the comparison.  Defensive: clean slate.
+    local unset_args=()
+    while IFS= read -r v; do
+        [[ -z "$v" ]] && continue
+        unset_args+=("-u" "$v")
+    done < <(env | grep -oE '^NSPA_[A-Z_]+(=|$)' | sed 's/=$//' | sort -u)
+
     local env_extra=()
     if [[ "$mode" == "rt" ]]; then
+        # RT mode = full NSPA stack + RT priority promotion + vDSO remap.
         env_extra=("NSPA_RT_PRIO=$RT_PRIO" "NSPA_RT_POLICY=$RT_POLICY" "WINEPRELOADREMAPVDSO=force")
     fi
+    # baseline mode adds nothing — same NSPA default-on stack as rt, just
+    # without RT promotion.  See feedback_vanilla_mode_bitrotted for why
+    # we don't disable NSPA gates here (bit-rot in default-off code paths).
 
     printf '  %-16s  ' "$name"
 
-    # Build the env + timeout command. `env VAR=val ...` is the clean way
-    # to pass env vars without polluting the current shell's environment.
-    # --kill-after=5 ensures we SIGKILL if SIGTERM isn't honored.
+    # Build the env + timeout command.  The `env -u VAR` flags strip any
+    # NSPA_* vars leaked from the caller's shell (so we get a clean slate)
+    # before applying our mode-specific overrides.  --kill-after=5 ensures
+    # we SIGKILL if SIGTERM isn't honored.
     timeout --kill-after=5 "$TIMEOUT_SECS" \
-        env WINEDEBUG=-all WINEPREFIX="$WINEPREFIX" "${env_extra[@]}" \
+        env "${unset_args[@]}" \
+            WINEDEBUG=-all WINEPREFIX="$WINEPREFIX" "${env_extra[@]}" \
         "$WINE" "$TEST_EXE" "$subcmd" "${args[@]}" \
         > "$log_file" 2>&1
     local rc=$?

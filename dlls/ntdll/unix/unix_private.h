@@ -302,18 +302,6 @@ extern NTSTATUS nspa_local_timer_check_duplicate( HANDLE source_handle, HANDLE s
                                                   HANDLE target_process );
 extern NTSTATUS nspa_local_timer_register_duplicate( HANDLE source_handle, HANDLE new_handle );
 
-/* NSPA internal event creation (dlls/ntdll/unix/sync.c).  Used by callers
- * that guarantee the event handle is never passed to async I/O completion
- * (the server_async chokepoint at unix_private.h:server_async).  Bypasses
- * the events workaround in allow_client_sync_creation and routes anonymous
- * events through the client-range allocator + ntsync direct ioctl, so
- * create+wait+set+close run entirely PE-side.  Falls back to NtCreateEvent
- * (server path) when the gate is off or ntsync is unavailable.  See
- * wine/nspa/docs/events-fully-local-handoff-20260502.md for why ordinary
- * NtCreateEvent cannot use this path. */
-extern NTSTATUS nspa_create_internal_event( HANDLE *handle, ACCESS_MASK access,
-                                            EVENT_TYPE type, BOOLEAN state );
-
 /* NSPA Phase 4.6.A: register a client-range event ntsync fd with the
  * wineserver.  Required for client-range events that may be passed to
  * server-side async I/O completion (the chokepoint at server_async).

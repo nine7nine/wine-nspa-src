@@ -3370,6 +3370,55 @@ static void output_source_desktop( struct makefile *make, struct incl_file *sour
 
 
 /*******************************************************************
+ *         output_source_sh
+ *
+ *  NSPA: install shell scripts in nspa/ tree to $(datadir)/wine-nspa/tests/
+ *  with executable mode.  Two specific scripts also get $(bindir) symlinks
+ *  so the user-facing entry points are on PATH:
+ *    run-rt-suite.sh     -> $(bindir)/wine-nspa-rt-suite
+ *    compare-rt-suite.sh -> $(bindir)/wine-nspa-compare
+ */
+static void output_source_sh( struct makefile *make, struct incl_file *source, const char *obj )
+{
+    struct strarray args = empty_strarray;
+    struct install_command *cmd;
+    const char *base;
+
+    /* Defensive: only handle .sh files in the nspa/ subtree.  Avoids
+     * collateral damage if Wine ever ships a .sh somewhere else. */
+    if (!make->obj_dir || strncmp( make->obj_dir, "nspa", 4 )) return;
+
+    /* Install the script itself to the wine-nspa tests data dir, mode 755. */
+    strarray_add( &args, "-m 755" );
+    strarray_add( &args, "$(INSTALL_PROGRAM_FLAGS)" );
+    if ((cmd = add_install_command( make, source->name, args,
+                                    "$(datadir)/wine-nspa/tests", NULL )))
+        strarray_add( &cmd->files, src_dir_path( make, source->name ) );
+
+    /* basename(source->name) for symlink decision. */
+    base = strrchr( source->name, '/' );
+    base = base ? base + 1 : source->name;
+
+    if (!strcmp( base, "run-rt-suite.sh" ))
+        install_data_symlink( make, source->name,
+                              "$(datadir)/wine-nspa/tests/run-rt-suite.sh",
+                              "$(datadir)/wine-nspa/tests/run-rt-suite.sh",
+                              "$(bindir)", "wine-nspa-rt-suite" );
+    else if (!strcmp( base, "compare-rt-suite.sh" ))
+        install_data_symlink( make, source->name,
+                              "$(datadir)/wine-nspa/tests/compare-rt-suite.sh",
+                              "$(datadir)/wine-nspa/tests/compare-rt-suite.sh",
+                              "$(bindir)", "wine-nspa-compare" );
+
+    output_srcdir_symlink( make, source->name );
+}
+
+
+/* output_source_nspa_c removed — handled inline in output_source_default
+ * via the nspa subdir check (no FLAG_INSTALL pragma needed in test sources). */
+
+
+/*******************************************************************
  *         output_source_po
  */
 static void output_source_po( struct makefile *make, struct incl_file *source, const char *obj )
@@ -3708,6 +3757,20 @@ static void output_source_default( struct makefile *make, struct incl_file *sour
     struct strarray targets = empty_strarray;
     unsigned int arch;
 
+    /* NSPA: .c files in nspa/ are TEST sources installed as data — the
+     * runner compiles them on first use against the live kernel headers,
+     * so Wine itself doesn't compile them.  Skip the compile machinery
+     * entirely.  Install to $(datadir)/wine-nspa/tests/ regardless of
+     * FLAG_INSTALL since nspa/ has no compile target. */
+    if (make->obj_dir && !strncmp( make->obj_dir, "nspa", 4 ) &&
+        strendswith( source->name, ".c" ))
+    {
+        install_data_file_src( make, source->name, source->name,
+                               "$(datadir)/wine-nspa/tests" );
+        output_srcdir_symlink( make, source->name );
+        return;
+    }
+
     for (arch = 0; arch < archs.count; arch++)
         if (!source->arch || source->arch == arch)
             output_source_one_arch( make, source, obj, defines, &targets, arch );
@@ -3765,6 +3828,7 @@ static const struct
     { "spec", output_source_spec },
     { "xml", output_source_xml },
     { "winmd", output_source_winmd },
+    { "sh", output_source_sh },                    /* NSPA: install scripts */
     { NULL, output_source_default }
 };
 

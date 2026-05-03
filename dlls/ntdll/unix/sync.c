@@ -935,8 +935,11 @@ static BOOL nspa_nt_local_event_enabled(void)
     int v = __atomic_load_n( &nspa_nt_local_event_cached, __ATOMIC_ACQUIRE );
     if (!v)
     {
+        /* Default-ON since 2026-05-02 night — Phase 4.6 events Option A
+         * Ableton-validated.  Set NSPA_NT_LOCAL_EVENT=0 to force OFF
+         * (kept as an env switch for diagnostic A/B). */
         const char *env = getenv( "NSPA_NT_LOCAL_EVENT" );
-        v = (env && env[0] == '1' && env[1] == 0) ? 2 : 1;
+        v = (env && env[0] == '0' && env[1] == 0) ? 1 : 2;
         __atomic_store_n( &nspa_nt_local_event_cached, v, __ATOMIC_RELEASE );
     }
     return v == 2;
@@ -1206,47 +1209,10 @@ static NTSTATUS create_inproc_mutex_local( HANDLE *handle, ACCESS_MASK access,
 
 #endif /* NTSYNC_IOC_EVENT_READ */
 
-/* NSPA: feature gate for fully-local timer (Phase 4.5).  The backing event
- * for nspa_local_timer entries is set/reset by the local-timer dispatcher
- * thread and waited on by app threads — both PE-side via inproc-sync.  It
- * is never passed to server_async, so the cross-context client-range event
- * issue does not apply.  See events handoff doc for the wider context. */
-static int nspa_nt_local_timer_cached;
-
-static BOOL nspa_nt_local_timer_enabled(void)
-{
-    int v = __atomic_load_n( &nspa_nt_local_timer_cached, __ATOMIC_ACQUIRE );
-    if (!v)
-    {
-        /* Default-ON since 2026-05-02 night — Phase 4.5 Ableton-validated.
-         * Set NSPA_NT_LOCAL_TIMER=0 to force OFF (kept as an env switch
-         * for diagnostic A/B). */
-        const char *env = getenv( "NSPA_NT_LOCAL_TIMER" );
-        v = (env && env[0] == '0' && env[1] == 0) ? 1 : 2;
-        __atomic_store_n( &nspa_nt_local_timer_cached, v, __ATOMIC_RELEASE );
-    }
-    return v == 2;
-}
-
-NTSTATUS nspa_create_internal_event( HANDLE *handle, ACCESS_MASK access,
-                                     EVENT_TYPE type, BOOLEAN state )
-{
-#ifdef NTSYNC_IOC_EVENT_READ
-    if (inproc_device_fd >= 0 && nspa_nt_local_timer_enabled())
-    {
-        NTSTATUS ret = create_inproc_event_local( handle, access, type, state );
-        if (ret != STATUS_NOT_IMPLEMENTED) return ret;
-    }
-#endif
-    return NtCreateEvent( handle, access, NULL, type, state );
-}
-
 /*
  * NSPA Phase 4.6.A: client-side wrappers that push the (handle, fd) pair to
- * the wineserver via the protocol RPCs added in this phase.  No call sites
- * yet — they'll be wired into create_inproc_event_local + close_client_inproc_sync
- * in Phase D.  Defined here in Phase A so the wineserver protocol round-trip
- * can be smoke-tested in isolation if needed.
+ * the wineserver via the protocol RPCs added in this phase.  Wired into
+ * create_inproc_event_local + close_client_inproc_sync in Phase D.
  *
  * The fd is sent via SCM_RIGHTS using wine_server_send_fd, then the server
  * picks it up with thread_get_inflight_fd matching the slot we pass in

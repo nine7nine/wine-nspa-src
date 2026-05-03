@@ -19,6 +19,7 @@
 
 #include <pthread.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdlib.h>
 
 #include "ntstatus.h"
@@ -90,6 +91,19 @@ static void *rt_thread_main( void *arg )
 {
     struct sched_instance *inst = arg;
     pthread_setname_np( pthread_self(), "wine-sched-rt" );
+
+    /* NSPA shutdown fix (project_sched_thread_no_shutdown_20260503):
+     * inherited sigmask from spawning thread blocks SIGQUIT.  Without
+     * this, `wineserver -k` cannot tear down our process — see the
+     * matching comment in sched_run() above. */
+    if (!getenv( "NSPA_SCHED_NO_QUIT_UNBLOCK" ))
+    {
+        sigset_t unblock;
+        sigemptyset( &unblock );
+        sigaddset( &unblock, SIGQUIT );
+        pthread_sigmask( SIG_UNBLOCK, &unblock, NULL );
+    }
+
     sched_run_inst( inst );
     return NULL;
 }

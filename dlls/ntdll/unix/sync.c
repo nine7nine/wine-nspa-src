@@ -922,27 +922,36 @@ static inline BOOL is_anonymous_attr( const OBJECT_ATTRIBUTES *attr )
     return attr->ObjectName->Length == 0;
 }
 
+/* NSPA Phase 4.6.E: gate for the client-range event fast path.  When ON,
+ * anonymous NtCreateEvent routes to create_inproc_event_local (Phase D),
+ * which registers the event with the server (Phase A) so async-I/O
+ * completion can signal it via direct ntsync ioctl (Phase B+C).  When OFF,
+ * anonymous events stay on the legacy wineserver path.  Default-OFF this
+ * commit; flip to default-ON in Phase F after Ableton soak validates. */
+static int nspa_nt_local_event_cached;
+
+static BOOL nspa_nt_local_event_enabled(void)
+{
+    int v = __atomic_load_n( &nspa_nt_local_event_cached, __ATOMIC_ACQUIRE );
+    if (!v)
+    {
+        const char *env = getenv( "NSPA_NT_LOCAL_EVENT" );
+        v = (env && env[0] == '1' && env[1] == 0) ? 2 : 1;
+        __atomic_store_n( &nspa_nt_local_event_cached, v, __ATOMIC_RELEASE );
+    }
+    return v == 2;
+}
+
 static inline BOOL allow_client_sync_creation( enum inproc_sync_type type, const OBJECT_ATTRIBUTES *attr )
 {
-    /* Workaround: keep anonymous events on wineserver; semaphores/mutexes are
-     * stable, but client-created event handles still destabilize Ableton.
-     *
-     * Phase 4 reproduction 2026-05-02: enabled events behind
-     * NSPA_NT_LOCAL_EVENT=1 to gather data; confirmed the historical
-     * failure mode is still present.  Surface symptoms with events ON:
-     *   err:rpc:rpcrt4_protseq_np_get_wait_array pipe listen error c0000008
-     *   err:service:process_send_start_message pipe connect failed (×many)
-     *   err:d3d:wined3d_cs_destroy Closing present event failed.
-     *   Eventlog service fails to start (cascades from RPC).
-     * Pattern: client-range event handles work for direct creator-thread
-     * use, but break when used in cross-context paths (named-pipe wait
-     * arrays in rpcrt4, wined3d cross-thread present completion close,
-     * SCM-via-pipes).  Status STATUS_INVALID_HANDLE (c0000008) appears
-     * at handle-validity check sites.  Root cause not localized.
-     * Decision: keep events on wineserver (legacy default) until we
-     * crack the client-range cross-context handle-validity issue.  See
-     * memory entry plan_nt_local_stub_phase4 for current state. */
-    if (type == INPROC_SYNC_EVENT) return FALSE;
+    /* Phase 4.6: client-range events are now signaled correctly across
+     * server-async paths via the Option A fix (server-side fd registration
+     * + completion-via-direct-ntsync-ioctl).  See plan doc
+     * wine/nspa/docs/events-option-a-plan-20260502.md and the historical
+     * handoff doc events-fully-local-handoff-20260502.md.  Gate the event
+     * fast path behind NSPA_NT_LOCAL_EVENT until soak validates; legacy
+     * server-event path stays the safe default. */
+    if (type == INPROC_SYNC_EVENT && !nspa_nt_local_event_enabled()) return FALSE;
     return is_anonymous_attr( attr );
 }
 

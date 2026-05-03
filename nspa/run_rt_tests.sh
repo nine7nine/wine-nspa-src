@@ -22,6 +22,11 @@
 #   INCLUDE_PRIORITY    Set to 1 to include the `priority` subcommand
 #                       (skipped by default because it sleeps 10 s for
 #                       external ps/chrt observation)
+#   WITH_BENCH          Set to 1 to include CPU-bound benchmarks
+#                       (srw-bench, seqlock-bound).  Default off — these
+#                       measure perf headroom, not validate contracts,
+#                       and they saturate cores.  Use only when you
+#                       specifically want a perf snapshot.
 #
 # Usage:
 #   nspa/run_rt_tests.sh                    # full matrix, default settings
@@ -37,7 +42,8 @@ set -u
 
 # ─── configuration ───────────────────────────────────────────────────────
 
-script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+script_self=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")
+script_dir=$(cd "$(dirname "$script_self")" && pwd)
 WINE=${WINE:-/usr/bin/wine}
 WINEPREFIX=${WINEPREFIX:-/home/ninez/Winebox/winebox-master}
 export WINEPREFIX
@@ -48,10 +54,13 @@ RT_PRIO=${RT_PRIO:-80}
 RT_POLICY=${RT_POLICY:-FF}
 INCLUDE_PRIORITY=${INCLUDE_PRIORITY:-0}
 
-# Test list. Each line is: "name arg1 arg2 ..." — args passed verbatim
-# to the subcommand. Add new tests here as they're implemented.
+# Default test list — VALIDATION ONLY.  No CPU-cooking benchmarks.
+# These match the v7 default suite shape: per-test runtime is bounded
+# (a few seconds), the workload validates correctness/contracts rather
+# than measuring perf headroom.  Adding a new test here means: it should
+# pass in <30s on a quiet machine without saturating any core.
+#
 # Format: "display_name subcmd [args...]"
-# display_name is used for log filenames and summary; subcmd is passed to wine.
 tests=(
     "rapidmutex rapidmutex 4 500000"
     "philosophers philosophers 50 4"
@@ -65,13 +74,36 @@ tests=(
     "ntsync-d12 ntsync 12 8 50000 3 16"
     "socket-io socket-io"
     "condvar-pi condvar-pi"
+    # NSPA Phase 1.A/B + NT timer + WM_TIMER validation — fast, no CPU
+    # pressure, just exercise the bypass/dispatch contracts.
+    "nt-timer nt-timer"
+    "wm-timer wm-timer"
+    "rpc-bypass rpc-bypass"
+    "irot-bypass irot-bypass"
     # gamma channel dispatcher A/B (only PE test that exercises the
     # dispatcher path — inproc_wait tests above bypass it entirely).
     # Verdict is failure-count only; latency is observational.
     "dispatcher-burst dispatcher-burst"
 )
+
+# `priority` sleeps 10s for external chrt/ps observation; opt-in.
 if [[ "$INCLUDE_PRIORITY" == "1" ]]; then
-    tests+=("priority")
+    tests+=("priority priority")
+fi
+
+# WITH_BENCH=1 adds the perf-y benchmarks (CPU-bound).  Off by default
+# because they measure perf headroom, not contract validation:
+#   - srw-bench      4 RT threads × N AcquireSRWLockExclusive iters
+#                    → pegs cores under SCHED_FIFO; suitable for
+#                    perf comparisons, NOT for routine validation
+#   - seqlock-bound  triggers explorer.exe paint loop in a tight cycle
+#                    → 90%+ explorer CPU; validates seqlock retry bound
+#                    but heats things up
+if [[ "${WITH_BENCH:-0}" == "1" ]]; then
+    tests+=(
+        "srw-bench srw-bench 4 100000"
+        "seqlock-bound seqlock-bound"
+    )
 fi
 
 # ─── helpers ─────────────────────────────────────────────────────────────

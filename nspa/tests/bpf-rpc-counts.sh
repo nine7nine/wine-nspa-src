@@ -83,7 +83,7 @@ uprobe:'"$WINESERVER"':req_*
 
 interval:s:5
 {
-    printf("[5s tick: %d req] ", @total);
+    printf("[5s tick] top-5 since last tick:\n");
     print(@counts, 5);
     clear(@counts);
     clear(@total);

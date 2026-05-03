@@ -752,8 +752,12 @@ NTSTATUS nspa_local_timer_create( HANDLE *handle, ACCESS_MASK access,
      * a SynchronizationTimer auto-resets after a single successful wait. */
     event_type = (timer_type == NotificationTimer) ? NotificationEvent : SynchronizationEvent;
 
-    if ((ret = NtCreateEvent( &event, access, NULL /* suppress name */,
-                              event_type, FALSE /* initial state */ )))
+    /* Use nspa_create_internal_event so the backing event is client-range
+     * when NSPA_NT_LOCAL_TIMER=1 (Phase 4.5).  The dispatcher signals + the
+     * app waits PE-side via inproc-sync — the event handle never traverses
+     * the server_async chokepoint that breaks ordinary client-range events.
+     * Falls back to NtCreateEvent (server path) when the gate is off. */
+    if ((ret = nspa_create_internal_event( &event, access, event_type, FALSE /* initial state */ )))
         return ret;
 
     if (!(entry = calloc( 1, sizeof(*entry) )))
@@ -954,6 +958,14 @@ NTSTATUS nspa_local_timer_check_duplicate( HANDLE source_handle, HANDLE source_p
     NTSTATUS ret;
 
     if (!nspa_local_timers_active()) return STATUS_NOT_IMPLEMENTED;
+
+    /* Phase 4.5: when the backing event is client-range, the wineserver-routed
+     * "normal dup" path would fail (the handle isn't in the server's table).
+     * Reject dup in that case; apps that need to dup a timer should not be
+     * using the fully-local fast path.  Same-process dup of a server-backed
+     * timer continues to work as before. */
+    if (is_client_handle( source_handle ))
+        return STATUS_ACCESS_DENIED;
 
     pi_mutex_lock( &timer_lock );
     entry = find_entry( source_handle );

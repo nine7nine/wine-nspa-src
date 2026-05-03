@@ -24082,6 +24082,7 @@ wine_fn_config_makefile libs/xslt enable_xslt
 wine_fn_config_makefile libs/zlib enable_zlib
 wine_fn_config_makefile loader enable_loader
 wine_fn_config_makefile nls enable_nls
+wine_fn_config_makefile nspa enable_nspa
 wine_fn_config_makefile po enable_po
 wine_fn_config_makefile programs/arp enable_arp
 wine_fn_config_makefile programs/aspnet_regiis enable_aspnet_regiis

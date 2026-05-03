@@ -64,6 +64,7 @@
 #include "request.h"
 #include "user.h"
 #include "security.h"
+#include "nspa/inproc_event_table.h"
 #include "nspa/rpc_state.h"
 #include "nspa/shmem_channel.h"
 
@@ -709,6 +710,7 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
     process->client_poll_bitmap = NULL;
     process->request_channel_fd = -1;
     process->channel_dispatcher_running = 0;
+    process->nspa_inproc_event_table = NULL;
     nspa_shmem_channel_init( process );
 #endif
     list_init( &process->rawinput_entry );
@@ -808,6 +810,7 @@ static void process_destroy( struct object *obj )
     set_process_startup_state( process, STARTUP_ABORTED );
 #ifdef __linux__
     nspa_shmem_channel_destroy( process );
+    nspa_inproc_event_table_destroy( process );
 #endif
 
     if (process->job)

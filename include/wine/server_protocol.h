@@ -6768,6 +6768,47 @@ struct nspa_irot_enum_running_reply
 };
 
 
+/* NSPA Phase 4.6.A: register a PE-side client-range event ntsync fd with
+ * the server.  When server-side async I/O completion needs to signal an
+ * event whose handle is in the client range (PE-side allocated, not in
+ * the server's handle table), the server uses the registered fd to call
+ * NTSYNC_IOC_EVENT_SET directly.  Without this registration, async paths
+ * that pass a client-range event handle return STATUS_INVALID_HANDLE
+ * synchronously (the chokepoint at server/async.c:create_async).
+ *
+ * Client passes the handle value + the inflight ntsync fd via the usual
+ * fd-passing protocol (wine_server_send_fd then thread_get_inflight_fd).
+ * Server stashes (handle → fd) in a per-process table.  Process exit
+ * walks the table and closes all fds.  See
+ * wine/nspa/docs/events-option-a-plan-20260502.md. */
+struct nspa_register_inproc_event_request
+{
+    struct request_header __header;
+    obj_handle_t    handle;
+    int             fd;
+    char __pad_20[4];
+};
+struct nspa_register_inproc_event_reply
+{
+    struct reply_header __header;
+};
+
+
+/* NSPA Phase 4.6.A: unregister a previously-registered client-range event.
+ * Called from the PE-side close path (NtClose for client-range handles)
+ * BEFORE the PE-side closes its fd ref, so server-side fd is closed first.
+ * No-op if the handle is not registered. */
+struct nspa_unregister_inproc_event_request
+{
+    struct request_header __header;
+    obj_handle_t    handle;
+};
+struct nspa_unregister_inproc_event_reply
+{
+    struct reply_header __header;
+};
+
+
 enum request
 {
     REQ_new_process,
@@ -7091,6 +7132,8 @@ enum request
     REQ_nspa_irot_note_change_time,
     REQ_nspa_irot_get_time_of_last_change,
     REQ_nspa_irot_enum_running,
+    REQ_nspa_register_inproc_event,
+    REQ_nspa_unregister_inproc_event,
     REQ_NB_REQUESTS
 };
 
@@ -7419,6 +7462,8 @@ union generic_request
     struct nspa_irot_note_change_time_request nspa_irot_note_change_time_request;
     struct nspa_irot_get_time_of_last_change_request nspa_irot_get_time_of_last_change_request;
     struct nspa_irot_enum_running_request nspa_irot_enum_running_request;
+    struct nspa_register_inproc_event_request nspa_register_inproc_event_request;
+    struct nspa_unregister_inproc_event_request nspa_unregister_inproc_event_request;
 };
 union generic_reply
 {
@@ -7745,8 +7790,10 @@ union generic_reply
     struct nspa_irot_note_change_time_reply nspa_irot_note_change_time_reply;
     struct nspa_irot_get_time_of_last_change_reply nspa_irot_get_time_of_last_change_reply;
     struct nspa_irot_enum_running_reply nspa_irot_enum_running_reply;
+    struct nspa_register_inproc_event_reply nspa_register_inproc_event_reply;
+    struct nspa_unregister_inproc_event_reply nspa_unregister_inproc_event_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 961
+#define SERVER_PROTOCOL_VERSION 962
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

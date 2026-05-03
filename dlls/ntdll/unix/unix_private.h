@@ -313,6 +313,19 @@ extern NTSTATUS nspa_local_timer_register_duplicate( HANDLE source_handle, HANDL
  * NtCreateEvent cannot use this path. */
 extern NTSTATUS nspa_create_internal_event( HANDLE *handle, ACCESS_MASK access,
                                             EVENT_TYPE type, BOOLEAN state );
+
+/* NSPA Phase 4.6.A: register a client-range event ntsync fd with the
+ * wineserver.  Required for client-range events that may be passed to
+ * server-side async I/O completion (the chokepoint at server_async).
+ * Without registration, the server returns STATUS_INVALID_HANDLE when
+ * create_async tries to look up the event handle.  Returns NTSTATUS;
+ * STATUS_SUCCESS on register. */
+extern NTSTATUS nspa_register_inproc_event_with_server( HANDLE handle, int fd );
+
+/* Counterpart unregister.  Called BEFORE PE-side fd close so the server's
+ * fd ref is dropped first.  Best-effort; logs but doesn't propagate
+ * errors (the PE-side close happens regardless). */
+extern void     nspa_unregister_inproc_event_with_server( HANDLE handle );
 extern BOOL     nspa_local_file_disp_categorize( BOOL loader_open,
                                                  const OBJECT_ATTRIBUTES *attr,
                                                  ACCESS_MASK access,

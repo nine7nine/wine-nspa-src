@@ -451,6 +451,7 @@ static inline void init_thread_structure( struct thread *thread )
 
     thread->sync            = NULL;
     thread->alert_sync      = NULL;
+    thread->queue_sync      = NULL;
     thread->unix_pid        = -1;  /* not known yet */
     thread->unix_tid        = -1;  /* not known yet */
     thread->context         = NULL;
@@ -645,6 +646,22 @@ struct thread *create_thread( int fd, struct process *process, unsigned int flag
     if (!(thread->request_fd = create_anonymous_fd( &thread_fd_ops, fd, &thread->obj, 0 ))) goto error;
     if (!(thread->sync = create_internal_sync( 1, 0 ))) goto error;
     if (get_inproc_device_fd() >= 0 && !(thread->alert_sync = create_inproc_internal_sync( 1, 0 ))) goto error;
+    /* NSPA Phase 4.7.A: per-thread queue_sync for kernel-direct queue waits.
+     * Auto-reset (manual=0) so a single waiter wake clears the signal —
+     * matches NT's auto-reset event semantics on the queue side.  Gated by
+     * NSPA_QUEUE_INPROC=1; alloc skipped when gate off so non-Linux / opt-out
+     * builds carry no per-thread cost.  Soft failure: if alloc fails the
+     * thread still works, queue waits just fall through to the legacy
+     * server-select path (Phase B will check queue_sync before using). */
+    if (get_inproc_device_fd() >= 0)
+    {
+        const char *env = getenv( "NSPA_QUEUE_INPROC" );
+        if (env && env[0] == '1' && env[1] == 0)
+        {
+            if (!(thread->queue_sync = create_inproc_internal_sync( 0, 0 )))
+                clear_error();   /* soft fail */
+        }
+    }
 
 #ifdef __linux__
     /* NSPA: allocate the per-thread request_shm region used as the
@@ -784,6 +801,7 @@ static void destroy_thread( struct object *obj )
     if (thread->id) free_ptid( thread->id );
     if (thread->token) release_object( thread->token );
     if (thread->alert_sync) release_object( thread->alert_sync );
+    if (thread->queue_sync) release_object( thread->queue_sync );
     if (thread->sync) release_object( thread->sync );
 }
 
@@ -1928,6 +1946,14 @@ DECL_HANDLER(init_process)
         send_client_fd( current->process, current->process->request_channel_fd,
                         get_process_id( current->process ) | 2 );
 
+    /* NSPA Phase 4.7.A: pass the per-thread queue inproc-sync fd to the client.
+     * Token = tid | 1 (request_shm uses plain tid above; the |1 disambiguates
+     * fd ordering on the client side).  Sent only when alloc succeeded
+     * (gated by NSPA_QUEUE_INPROC at create_thread time). */
+    if ((reply->has_queue_sync = current->queue_sync != NULL))
+        send_client_fd( current->process, get_inproc_sync_fd( current->queue_sync ),
+                        reply->tid | 1 );
+
     /* NSPA gamma thread-token: register the first thread BEFORE the
      * client receives the channel fd, so its first SEND_PI on the
      * channel finds a populated (tid -> thread) mapping. */
@@ -1970,6 +1996,11 @@ DECL_HANDLER(init_thread)
     /* NSPA v1.5: pass per-thread shmem fd (fd handle token = current's tid). */
     if ((reply->has_request_shm = current->request_shm_fd != -1))
         send_client_fd( current->process, current->request_shm_fd, get_thread_id( current ) );
+
+    /* NSPA Phase 4.7.A: pass per-thread queue inproc-sync fd (token = tid|1). */
+    if ((reply->has_queue_sync = current->queue_sync != NULL))
+        send_client_fd( current->process, get_inproc_sync_fd( current->queue_sync ),
+                        get_thread_id( current ) | 1 );
 
     /* NSPA gamma thread-token: register this thread with the per-process
      * channel so future SEND_PIs from this tid get stamped with the

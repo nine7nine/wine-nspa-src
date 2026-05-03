@@ -149,6 +149,7 @@ static void dump_init_process_reply( const struct init_process_reply *req )
     fprintf( stderr, ", inproc_device=%04x", req->inproc_device );
     fprintf( stderr, ", has_request_shm=%d", req->has_request_shm );
     fprintf( stderr, ", has_request_channel=%d", req->has_request_channel );
+    fprintf( stderr, ", has_queue_sync=%d", req->has_queue_sync );
     fprintf( stderr, ", info_size=%u", req->info_size );
     dump_varargs_ushorts( ", machines=", cur_size );
 }
@@ -166,6 +167,7 @@ static void dump_init_thread_reply( const struct init_thread_reply *req )
 {
     fprintf( stderr, " suspend=%d", req->suspend );
     fprintf( stderr, ", has_request_shm=%d", req->has_request_shm );
+    fprintf( stderr, ", has_queue_sync=%d", req->has_queue_sync );
 }
 
 static void dump_terminate_process_request( const struct terminate_process_request *req )

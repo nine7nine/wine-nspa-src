@@ -1461,6 +1461,7 @@ typedef volatile struct
     obj_handle_t inproc_device;/* inproc device fd in flight with this handle */
     int          has_request_shm; /* NSPA v1.5: request shared memory fd in flight with reply->tid */
     int          has_request_channel; /* NSPA gamma: ntsync channel fd in flight with reply->pid|2 */
+    int          has_queue_sync;  /* NSPA Phase 4.7: per-thread queue inproc-sync ntsync fd in flight with reply->tid|1 */
     data_size_t  info_size;    /* total size of startup info */
     VARARG(machines,ushorts);  /* array of supported machines */
 @END
@@ -1476,6 +1477,7 @@ typedef volatile struct
 @REPLY
     int          suspend;      /* is thread suspended? */
     int          has_request_shm; /* NSPA v1.5: request shared memory fd in flight with current thread id */
+    int          has_queue_sync;  /* NSPA Phase 4.7: per-thread queue inproc-sync ntsync fd in flight with current thread id|1 */
 @END
 
 

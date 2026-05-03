@@ -605,14 +605,17 @@ extern int  ntdll_io_uring_submit_file_write( int unix_fd, int needs_close, cons
                                               ULONG already, ULONG count, HANDLE handle,
                                               HANDLE event, PIO_APC_ROUTINE apc, void *apc_user,
                                               IO_STATUS_BLOCK *io, unsigned int options );
-extern int  ntdll_io_uring_submit_recv( int unix_fd, int needs_close, struct msghdr *hdr,
-                                        int flags, HANDLE handle, HANDLE event,
-                                        PIO_APC_ROUTINE apc, void *apc_user,
-                                        IO_STATUS_BLOCK *io, unsigned int options );
-extern int  ntdll_io_uring_submit_send( int unix_fd, int needs_close, struct msghdr *hdr,
-                                        int flags, HANDLE handle, HANDLE event,
-                                        PIO_APC_ROUTINE apc, void *apc_user,
-                                        IO_STATUS_BLOCK *io, unsigned int options );
+/* Phase 4.8.A: socket-specific RECVMSG submission.  Submits IORING_OP_RECVMSG;
+ * CQE handler runs try_recv_post_process (Wine-specific recvmsg post-processing
+ * for MSG_TRUNC, ICMP, control conversion, sockaddr translation) — same NT
+ * semantics as the synchronous try_recv path.  Returns 0 on submit success
+ * (CQE will fire later); negative errno on submit failure (caller falls back
+ * to socket_poll path or server async). */
+extern int  ntdll_io_uring_submit_socket_recvmsg( int unix_fd, HANDLE handle,
+                                                  HANDLE wait_handle, HANDLE event,
+                                                  PIO_APC_ROUTINE apc, void *apc_user,
+                                                  IO_STATUS_BLOCK *io, unsigned int options,
+                                                  void *sock_async, int unix_flags );
 
 extern void close_inproc_sync( HANDLE handle );
 extern BOOL is_client_handle( HANDLE handle );

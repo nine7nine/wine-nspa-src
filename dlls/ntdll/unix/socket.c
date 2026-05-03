@@ -911,6 +911,45 @@ static NTSTATUS try_recv( int fd, struct async_recv_ioctl *async, ULONG_PTR *siz
     return try_recv_post_process( async, &hdr, &unix_addr, ret, saved_errno, size );
 }
 
+/* Phase 4.8.A: feature gate for the io_uring RECVMSG fast path.  When ON,
+ * recv_socket submits IORING_OP_RECVMSG via io_uring instead of the legacy
+ * poll-then-syscall path.  Default-OFF this commit; flip after Ableton
+ * soak validation.  Set NSPA_URING_RECV=0 to force OFF for diagnostic A/B. */
+static int nspa_uring_recv_cached;
+
+static BOOL nspa_uring_recv_enabled(void)
+{
+    int v = __atomic_load_n( &nspa_uring_recv_cached, __ATOMIC_ACQUIRE );
+    if (!v)
+    {
+        const char *env = getenv( "NSPA_URING_RECV" );
+        v = (env && env[0] == '1' && env[1] == 0) ? 2 : 1;
+        __atomic_store_n( &nspa_uring_recv_cached, v, __ATOMIC_RELEASE );
+    }
+    return v == 2;
+}
+
+/* Phase 4.8.A: populate an io_uring op slot's msghdr / control / address
+ * storage from an async_recv_ioctl.  Called from io_uring.c at submit time —
+ * lives here because async_recv_ioctl is socket.c-private.  The
+ * addr_storage parameter is opaque to io_uring.c but must be at least
+ * sizeof(union unix_sockaddr) in size; we cast through it locally.
+ *
+ * Lifetime: hdr / control_buffer / addr_storage MUST outlive the in-flight
+ * SQE — they're embedded in the uring_async_op slot which the op_pool
+ * keeps allocated until CQE completion. */
+void try_recv_setup_op_msghdr( void *sock_async,
+                               struct msghdr *hdr,
+                               char *control_buffer,
+                               size_t control_size,
+                               void *addr_storage )
+{
+    struct async_recv_ioctl *async = sock_async;
+    union unix_sockaddr *unix_addr = addr_storage;
+
+    try_recv_setup_msghdr( async, hdr, control_buffer, control_size, unix_addr );
+}
+
 static BOOL async_recv_proc( void *user, ULONG_PTR *info, unsigned int *status )
 {
     struct async_recv_ioctl *async = user;
@@ -997,6 +1036,24 @@ static NTSTATUS sock_recv( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, voi
              * result — the server accepts it because the ALERTED state is preserved
              * (unknown_status=1, terminated=1, alerted=1). */
             ntdll_client_poll_set( fd );
+
+            /* Phase 4.8.A: full RECVMSG via io_uring (preferred when gate on).
+             * Saves the poll-then-syscall round trip — kernel does the data
+             * move + CQE delivers the result.  CQE handler runs
+             * try_recv_post_process for Wine-specific post-recvmsg work,
+             * preserving NT semantics by construction (sync try_recv calls
+             * the same helper).  Falls back to the socket_poll fast path
+             * below if submit fails (gate off / ring exhausted / no liburing). */
+            if (nspa_uring_recv_enabled() &&
+                !ntdll_io_uring_submit_socket_recvmsg( fd, handle, wait_handle,
+                                                       event, apc, apc_user, io, options,
+                                                       async, async->unix_flags ))
+            {
+                if (options & (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT))
+                    return wait_async( wait_handle, options & FILE_SYNCHRONOUS_IO_ALERT );
+                return STATUS_PENDING;
+            }
+
             if (!ntdll_io_uring_submit_socket_poll( fd, POLLIN, handle, wait_handle,
                                                      event, apc, apc_user, io, options,
                                                      async, FALSE ))
@@ -1215,6 +1272,9 @@ extern PIO_APC_ROUTINE ntdll_uring_op_apc( struct uring_async_op *op );
 extern void *ntdll_uring_op_apc_user( struct uring_async_op *op );
 extern int ntdll_uring_op_event_sync_fd( struct uring_async_op *op );
 extern int ntdll_uring_op_dup_fd( struct uring_async_op *op );
+/* Phase 4.8.A: populated msghdr / addr storage from the op slot. */
+extern struct msghdr *ntdll_uring_op_sock_msghdr( struct uring_async_op *op );
+extern void *ntdll_uring_op_sock_addr_storage( struct uring_async_op *op );
 
 /* Complete a socket poll via set_async_direct_result.
  * With the ALERTED-state approach, wait_handle is always valid (the async was
@@ -1355,8 +1415,49 @@ void ntdll_complete_socket_poll( struct uring_async_op *op, int poll_revents )
         if (status != STATUS_PENDING)
             release_fileio( &async->io );
         if (dup_fd >= 0) close( dup_fd );
-        /* If STATUS_PENDING, same as send — server re-queues via epoll. */
+        /* If STATUS_PENDING, same as send — send_socket re-queues via epoll. */
     }
+}
+
+/* Phase 4.8.A: io_uring SOCKET_RECVMSG completion handler.
+ *
+ * Called from complete_uring_op (io_uring.c) when a RECVMSG CQE fires.
+ * Unlike the POLL fast path, the data is ALREADY moved by the kernel —
+ * msghdr in the op slot has been updated in place with msg_namelen,
+ * msg_flags, msg_controllen.  We just run try_recv_post_process to apply
+ * Wine-specific post-recvmsg work (MSG_TRUNC, ICMP fixup, control / addr
+ * conversion, OOB quirk) — same NT semantics as the synchronous try_recv
+ * path by construction (both call try_recv_post_process). */
+void ntdll_complete_socket_recvmsg( struct uring_async_op *op, int result )
+{
+    struct async_recv_ioctl *async = ntdll_uring_op_sock_async( op );
+    HANDLE wait_handle = ntdll_uring_op_wait_handle( op );
+    int poll_fd = ntdll_uring_op_poll_unix_fd( op );
+    int dup_fd = ntdll_uring_op_dup_fd( op );
+    struct msghdr *hdr = ntdll_uring_op_sock_msghdr( op );
+    union unix_sockaddr *unix_addr = ntdll_uring_op_sock_addr_storage( op );
+    NTSTATUS status;
+    ULONG_PTR information = 0;
+
+    /* NSPA E2: clear the client-poll bitmap bit now that we're handling it. */
+    ntdll_client_poll_clear( poll_fd );
+
+    /* CQE result: bytes received (>=0) or -errno (<0).  Pass to
+     * try_recv_post_process the same way the sync try_recv does (saved_errno
+     * only meaningful when ret < 0). */
+    if (result < 0)
+        status = try_recv_post_process( async, hdr, unix_addr, -1, -result, &information );
+    else
+        status = try_recv_post_process( async, hdr, unix_addr, result, 0, &information );
+
+    if (status == STATUS_DEVICE_NOT_READY)
+        status = STATUS_PENDING;
+
+    complete_socket_poll_result( op, wait_handle, status, information );
+
+    if (status != STATUS_PENDING)
+        release_fileio( &async->io );
+    if (dup_fd >= 0) close( dup_fd );
 }
 
 

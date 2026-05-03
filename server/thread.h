@@ -87,7 +87,6 @@ struct thread
     struct object          obj;           /* object header */
     struct object         *sync;          /* sync object for wait/signal */
     struct inproc_sync    *alert_sync;    /* inproc sync for user apc alerts */
-    struct inproc_sync    *queue_sync;    /* NSPA Phase 4.7: inproc sync representing the message queue's wake state — fd sent to client at init so wait_message can kernel-direct ntsync wait instead of blocking in the wineserver select loop */
     struct list            entry;         /* entry in system-wide thread list */
     struct list            proc_entry;    /* entry in per-process thread list */
     struct list            desktop_entry; /* entry in per-desktop thread list */

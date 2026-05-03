@@ -1889,19 +1889,6 @@ size_t server_init_process(void)
                     nspa_request_channel_fd = wine_server_receive_fd( &handle );
                     assert( handle == (obj_handle_t)(pid | 2) );
                 }
-                if (reply->has_queue_sync)
-                {
-                    int qfd = wine_server_receive_fd( &handle );
-                    assert( handle == (obj_handle_t)(tid | 1) );
-                    /* Defer storing into thread data until after this section
-                     * so we don't touch TEB-side state under fd_cache_mutex.
-                     * Stash on the local for now. */
-                    data->queue_sync_fd = qfd;
-                }
-                else
-                {
-                    data->queue_sync_fd = -1;
-                }
                 /* NSPA E2: client_poll_bitmap is in the tail of request_shm.
                  * Set up the pointer after mmap below. */
             }
@@ -2070,15 +2057,6 @@ void server_init_thread( void *entry_point, BOOL *suspend )
             obj_handle_t handle;
             shm_fd_local = wine_server_receive_fd( &handle );
             received_shm = TRUE;
-        }
-        if (reply->has_queue_sync)
-        {
-            obj_handle_t handle;
-            data->queue_sync_fd = wine_server_receive_fd( &handle );
-        }
-        else
-        {
-            data->queue_sync_fd = -1;
         }
 #else
         wine_server_call( req );

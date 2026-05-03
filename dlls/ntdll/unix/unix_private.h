@@ -149,15 +149,6 @@ struct ntdll_thread_data
                                                            * nspa_rt_apply_tid on self (tid==0). */
     int                           nspa_rt_cached_prio;    /* NSPA v2.5: cached sched_priority.
                                                            * 0 = not RT / uninitialized. */
-#ifdef __linux__
-    int                           queue_sync_fd;          /* NSPA Phase 4.7: ntsync fd for
-                                                           * the per-thread message queue
-                                                           * inproc-sync; -1 if server didn't
-                                                           * allocate one (gate off / pre-Phase B).
-                                                           * Placed at the end so the
-                                                           * NSPA_UNIX_TID_OFFSET layout
-                                                           * assertion stays satisfied. */
-#endif
 };
 
 C_ASSERT( sizeof(struct ntdll_thread_data) <= sizeof(((TEB *)0)->GdiTebBatch) );

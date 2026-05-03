@@ -1476,9 +1476,9 @@ struct init_process_reply
     obj_handle_t inproc_device;
     int          has_request_shm;
     int          has_request_channel;
-    int          has_queue_sync;
     data_size_t  info_size;
     /* VARARG(machines,ushorts); */
+    char __pad_44[4];
 };
 
 
@@ -1497,8 +1497,6 @@ struct init_thread_reply
     struct reply_header __header;
     int          suspend;
     int          has_request_shm;
-    int          has_queue_sync;
-    char __pad_20[4];
 };
 
 
@@ -7796,6 +7794,6 @@ union generic_reply
     struct nspa_unregister_inproc_event_reply nspa_unregister_inproc_event_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 963
+#define SERVER_PROTOCOL_VERSION 962
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

@@ -396,6 +396,18 @@ struct async *create_async( struct fd *fd, struct thread *thread, const struct a
 
     list_add_head( &thread->process->asyncs, &async->process_entry );
     if (event) reset_event( event );
+#ifdef __linux__
+    /* NSPA Phase 4.6.B/C: client-range events also need reset before the
+     * async queues — PE-side rpcrt4 reuses cached events across listens
+     * and the manual-reset event stays signaled across uses.  Without
+     * reset, WaitForMultipleObjects returns immediately with the previous
+     * io_status, breaking new pipe-listen waits. */
+    else if (async->client_event_fd >= 0)
+    {
+        __u32 count;
+        ioctl( async->client_event_fd, NTSYNC_IOC_EVENT_RESET, &count );
+    }
+#endif
 
     if (async->completion && data->apc)
     {

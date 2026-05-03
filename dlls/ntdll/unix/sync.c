@@ -1170,6 +1170,38 @@ static NTSTATUS create_inproc_mutex_local( HANDLE *handle, ACCESS_MASK access,
 
 #endif /* NTSYNC_IOC_EVENT_READ */
 
+/* NSPA: feature gate for fully-local timer (Phase 4.5).  The backing event
+ * for nspa_local_timer entries is set/reset by the local-timer dispatcher
+ * thread and waited on by app threads — both PE-side via inproc-sync.  It
+ * is never passed to server_async, so the cross-context client-range event
+ * issue does not apply.  See events handoff doc for the wider context. */
+static int nspa_nt_local_timer_cached;
+
+static BOOL nspa_nt_local_timer_enabled(void)
+{
+    int v = __atomic_load_n( &nspa_nt_local_timer_cached, __ATOMIC_ACQUIRE );
+    if (!v)
+    {
+        const char *env = getenv( "NSPA_NT_LOCAL_TIMER" );
+        v = (env && env[0] == '1' && env[1] == 0) ? 2 : 1;
+        __atomic_store_n( &nspa_nt_local_timer_cached, v, __ATOMIC_RELEASE );
+    }
+    return v == 2;
+}
+
+NTSTATUS nspa_create_internal_event( HANDLE *handle, ACCESS_MASK access,
+                                     EVENT_TYPE type, BOOLEAN state )
+{
+#ifdef NTSYNC_IOC_EVENT_READ
+    if (inproc_device_fd >= 0 && nspa_nt_local_timer_enabled())
+    {
+        NTSTATUS ret = create_inproc_event_local( handle, access, type, state );
+        if (ret != STATUS_NOT_IMPLEMENTED) return ret;
+    }
+#endif
+    return NtCreateEvent( handle, access, NULL, type, state );
+}
+
 static NTSTATUS inproc_release_semaphore( HANDLE handle, ULONG count, ULONG *prev_count )
 {
     struct inproc_sync stack, *sync;

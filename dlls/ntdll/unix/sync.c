@@ -659,7 +659,21 @@ struct inproc_sync
  * server usage of <10K handles, collision is effectively impossible.
  */
 #define CLIENT_HANDLE_BASE  (INPROC_SYNC_CACHE_TOTAL - 256)
-static LONG client_handle_next = CLIENT_HANDLE_BASE;
+/* Initialised to INPROC_SYNC_CACHE_TOTAL (one above the highest valid idx)
+ * so the first InterlockedDecrement returns INPROC_SYNC_CACHE_TOTAL - 1,
+ * yielding handle ((INPROC_SYNC_CACHE_TOTAL - 1) + 1) << 2 = the highest
+ * valid client-range handle.  is_client_handle's check
+ * `idx >= CLIENT_HANDLE_BASE && idx < INPROC_SYNC_CACHE_TOTAL` then matches.
+ *
+ * Old code initialised this to CLIENT_HANDLE_BASE — caused the first
+ * Decrement to return CLIENT_HANDLE_BASE - 1, putting every allocated
+ * handle's idx one step BELOW CLIENT_HANDLE_BASE, so is_client_handle
+ * returned FALSE for every client-range handle ever allocated.  Silently
+ * routed mutex/sem/event closes through the server close_handle RPC,
+ * which always returned STATUS_INVALID_HANDLE.  Latent because mutex/sem
+ * close paths don't check CloseHandle's return; surfaced via wined3d_cs_destroy
+ * (events Phase 4.6.F default-ON) which does check it. */
+static LONG client_handle_next = INPROC_SYNC_CACHE_TOTAL;
 
 /* NSPA: Track client-created mutexes for thread-death abandonment.
  * Protected by fd_cache_mutex. */
@@ -962,7 +976,12 @@ static HANDLE alloc_client_handle(void)
 {
     LONG idx = InterlockedDecrement( &client_handle_next );
 
-    if (idx < 0)
+    /* Stop at CLIENT_HANDLE_BASE — handles below would fail is_client_handle's
+     * lower-bound check.  The 256-slot cap (INPROC_SYNC_CACHE_TOTAL -
+     * CLIENT_HANDLE_BASE) bounds total active client-range handles per
+     * process.  Returns NULL to fall back to the legacy server-allocated
+     * handle path when the pool is exhausted. */
+    if (idx < CLIENT_HANDLE_BASE)
     {
         InterlockedIncrement( &client_handle_next );
         return NULL;

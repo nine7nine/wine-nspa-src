@@ -5081,30 +5081,34 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
     unsigned int reparse_tag;
     unsigned int options;
     unsigned int status;
-    HANDLE srv_handle = handle;
 
     TRACE( "(%p,%p,%p,0x%08x,0x%08x)\n", handle, io, ptr, len, class);
 
     io->Information = 0;
 
-    /* NSPA local-file: lazy-promote before any server_get_file_info
-     * call.  server_get_unix_fd below stays on the original (local)
-     * handle for the local-fd fast path. */
-    srv_handle = nspa_promote_if_local_traced( handle, "QIF", class );
-
+    /* NSPA local-file: deferred promote.  Only the server_get_file_info
+     * fall-through branches need a server-side handle; the local-fd
+     * switch arms below operate on `handle` directly via
+     * server_get_unix_fd's LF-aware fast path.  Inline the promote in
+     * each branch that actually passes a handle to the server, so info
+     * classes like FileBasic/FileStandard/FilePosition/FileNetworkOpen
+     * (the bulk of library-browse/sample-load traffic) skip it. */
     if (class == WineFileUnixNameInformation)
-        return server_get_file_info( srv_handle, io, ptr, len, class );
+        return server_get_file_info( nspa_promote_if_local_traced( handle, "QIF", class ),
+                                     io, ptr, len, class );
     if (class <= 0 || class >= FileMaximumInformation)
         return io->Status = STATUS_INVALID_INFO_CLASS;
     if (!info_sizes[class])
-        return server_get_file_info( srv_handle, io, ptr, len, class );
+        return server_get_file_info( nspa_promote_if_local_traced( handle, "QIF", class ),
+                                     io, ptr, len, class );
     if (len < info_sizes[class])
         return io->Status = STATUS_INFO_LENGTH_MISMATCH;
 
     if ((status = server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, &options )))
     {
         if (status != STATUS_BAD_DEVICE_TYPE) return io->Status = status;
-        return server_get_file_info( srv_handle, io, ptr, len, class );
+        return server_get_file_info( nspa_promote_if_local_traced( handle, "QIF", class ),
+                                     io, ptr, len, class );
     }
 
     switch (class)
@@ -5266,10 +5270,13 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
 
     TRACE( "(%p,%p,%p,0x%08x,0x%08x)\n", handle, io, ptr, len, class );
 
-    /* NSPA local-file Phase 1A.4.d: lazy-promote local handles before
-     * any SERVER_START_REQ.  server_get_unix_fd below stays on the
-     * original (local) handle for the local-fd fast path. */
-    srv_handle = nspa_promote_if_local( handle );
+    /* NSPA local-file Phase 1A.4.d (deferred): promote happens only in
+     * the case-arms that pass `srv_handle` to a SERVER_START_REQ or
+     * server_get_unix_name.  Local-fd-only arms (FilePosition,
+     * IoPriorityHint, FileAllInformation rejection, ValidDataLength,
+     * default) skip the promote entirely.  server_get_unix_fd's
+     * LF-aware fast path means `handle` is the right argument there.
+     * srv_handle remains the original handle until reassigned. */
 
     switch (class)
     {
@@ -5283,6 +5290,7 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
             if ((status = server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, NULL )))
                 return io->Status = status;
 
+            srv_handle = nspa_promote_if_local( handle );
             if (server_get_unix_name( srv_handle, &unix_name )) unix_name = NULL;
 
             mtime.QuadPart = info->LastWriteTime.QuadPart == -1 ? 0 : info->LastWriteTime.QuadPart;
@@ -5322,6 +5330,7 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
         {
             const FILE_END_OF_FILE_INFORMATION *info = ptr;
 
+            srv_handle = nspa_promote_if_local( handle );
             SERVER_START_REQ( set_fd_eof_info )
             {
                 req->handle   = wine_server_obj_handle( srv_handle );
@@ -5344,6 +5353,7 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
                 break;
             }
 
+            srv_handle = nspa_promote_if_local( handle );
             SERVER_START_REQ( set_named_pipe_info )
             {
                 req->handle = wine_server_obj_handle( srv_handle );
@@ -5360,6 +5370,7 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
         {
             FILE_MAILSLOT_SET_INFORMATION *info = ptr;
 
+            srv_handle = nspa_promote_if_local( handle );
             SERVER_START_REQ( set_mailslot_info )
             {
                 req->handle = wine_server_obj_handle( srv_handle );
@@ -5376,6 +5387,7 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
         {
             FILE_COMPLETION_INFORMATION *info = ptr;
 
+            srv_handle = nspa_promote_if_local( handle );
             SERVER_START_REQ( set_completion_info )
             {
                 req->handle   = wine_server_obj_handle( srv_handle );
@@ -5396,6 +5408,7 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
             if (info->Flags & FILE_SKIP_SET_USER_EVENT_ON_FAST_IO)
                 FIXME( "FILE_SKIP_SET_USER_EVENT_ON_FAST_IO not supported\n" );
 
+            srv_handle = nspa_promote_if_local( handle );
             SERVER_START_REQ( set_fd_completion_mode )
             {
                 req->handle   = wine_server_obj_handle( srv_handle );
@@ -5458,6 +5471,7 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
         {
             FILE_DISPOSITION_INFORMATION *info = ptr;
 
+            srv_handle = nspa_promote_if_local( handle );
             SERVER_START_REQ( set_fd_disp_info )
             {
                 req->handle   = wine_server_obj_handle( srv_handle );
@@ -5477,6 +5491,7 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
             if (info->Flags & FILE_DISPOSITION_FORCE_IMAGE_SECTION_CHECK)
                 FIXME( "FILE_DISPOSITION_FORCE_IMAGE_SECTION_CHECK not supported\n" );
 
+            srv_handle = nspa_promote_if_local( handle );
             SERVER_START_REQ( set_fd_disp_info )
             {
                 req->handle   = wine_server_obj_handle( srv_handle );
@@ -5513,6 +5528,7 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
             status = get_nt_and_unix_names( &attr, &nt_name, &unix_name, FILE_OPEN_IF, TRUE );
             if (status == STATUS_SUCCESS || status == STATUS_NO_SUCH_FILE)
             {
+                srv_handle = nspa_promote_if_local( handle );
                 SERVER_START_REQ( set_fd_name_info )
                 {
                     req->handle   = wine_server_obj_handle( srv_handle );
@@ -5558,6 +5574,7 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
             status = get_nt_and_unix_names( &attr, &nt_name, &unix_name, FILE_OPEN_IF, TRUE );
             if (status == STATUS_SUCCESS || status == STATUS_NO_SUCH_FILE)
             {
+                srv_handle = nspa_promote_if_local( handle );
                 SERVER_START_REQ( set_fd_name_info )
                 {
                     req->handle   = wine_server_obj_handle( srv_handle );

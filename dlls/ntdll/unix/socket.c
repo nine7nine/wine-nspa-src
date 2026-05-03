@@ -1478,6 +1478,22 @@ void ntdll_complete_socket_poll( struct uring_async_op *op, int poll_revents )
     }
 }
 
+/* Phase 4.8.B: feature gate for the io_uring SENDMSG fast path.  Default-OFF;
+ * NSPA_URING_SEND=1 to engage. */
+static int nspa_uring_send_cached;
+
+static BOOL nspa_uring_send_enabled(void)
+{
+    int v = __atomic_load_n( &nspa_uring_send_cached, __ATOMIC_ACQUIRE );
+    if (!v)
+    {
+        const char *env = getenv( "NSPA_URING_SEND" );
+        v = (env && env[0] == '1' && env[1] == 0) ? 2 : 1;
+        __atomic_store_n( &nspa_uring_send_cached, v, __ATOMIC_RELEASE );
+    }
+    return v == 2;
+}
+
 /* Phase 4.8.A: io_uring SOCKET_RECVMSG completion handler.
  *
  * Called from complete_uring_op (io_uring.c) when a RECVMSG CQE fires.
@@ -1516,6 +1532,85 @@ void ntdll_complete_socket_recvmsg( struct uring_async_op *op, int result )
 
     if (status != STATUS_PENDING)
         release_fileio( &async->io );
+    if (dup_fd >= 0) close( dup_fd );
+}
+
+/* Phase 4.8.B: io_uring SOCKET_SENDMSG completion handler.
+ *
+ * Called from complete_uring_op (io_uring.c) when a SENDMSG CQE fires.
+ * The data has been moved by the kernel — result = bytes sent (>=0)
+ * or -errno on error.  We run try_send_post_process to update sent_len
+ * and advance iov_cursor for partial sends.
+ *
+ * Retry conditions (EISCONN/ECONNREFUSED) fall back to sync try_send.
+ * try_send has the in-loop retry semantics; calling it here from CQE
+ * drain context mirrors the existing socket_poll fallback for the
+ * is_send branch — same rare-path behavior, no new code shape needed. */
+void ntdll_complete_socket_sendmsg( struct uring_async_op *op, int result )
+{
+    struct async_send_ioctl *async = ntdll_uring_op_sock_async( op );
+    HANDLE wait_handle = ntdll_uring_op_wait_handle( op );
+    int poll_fd = ntdll_uring_op_poll_unix_fd( op );
+    int dup_fd = ntdll_uring_op_dup_fd( op );
+    NTSTATUS status;
+    ULONG_PTR information;
+    int retry_via_sync = 0;
+
+    /* NSPA E2: clear the client-poll bitmap bit now that we're handling it. */
+    ntdll_client_poll_clear( poll_fd );
+
+    /* Detect rare-path errors that the sync try_send retry loop handles
+     * but our submit path doesn't (yet).  Fall back to sync try_send via
+     * server_get_unix_fd — same shape as ntdll_complete_socket_poll's
+     * is_send branch. */
+    if (result == -EISCONN || result == -ECONNREFUSED || result == -EINTR)
+        retry_via_sync = 1;
+
+    if (retry_via_sync)
+    {
+        int fd, needs_close = FALSE;
+
+        if (dup_fd >= 0)
+        {
+            fd = dup_fd;
+            status = STATUS_SUCCESS;
+        }
+        else
+        {
+            if ((fd = async->fd) == -1)
+                status = server_get_unix_fd( async->io.handle, 0, &fd, &needs_close, NULL, NULL );
+            else
+                status = STATUS_SUCCESS;
+        }
+
+        if (!status)
+        {
+            status = try_send( fd, async );
+            if (needs_close) close( fd );
+        }
+        information = async->sent_len;
+    }
+    else if (result < 0)
+    {
+        status = try_send_post_process( async, -1, -result );
+        information = async->sent_len;
+    }
+    else
+    {
+        status = try_send_post_process( async, result, 0 );
+        information = async->sent_len;
+    }
+
+    if (status == STATUS_DEVICE_NOT_READY)
+        status = STATUS_PENDING;
+
+    complete_socket_poll_result( op, wait_handle, status, information );
+
+    if (status != STATUS_PENDING)
+    {
+        if (async->fd >= 0) close( async->fd );
+        release_fileio( &async->io );
+    }
     if (dup_fd >= 0) close( dup_fd );
 }
 
@@ -1607,6 +1702,23 @@ static NTSTATUS sock_send( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, voi
             if (!async->sent_len)
             {
                 ntdll_client_poll_set( fd );
+
+                /* Phase 4.8.B: full SENDMSG via io_uring (preferred when gate on).
+                 * Saves the poll-then-syscall round trip — kernel does the data
+                 * move + CQE delivers the result.  CQE handler runs
+                 * try_send_post_process for sent_len + iov_cursor, with sync
+                 * try_send fallback for EISCONN/ECONNREFUSED/EINTR retry cases.
+                 * Falls back to socket_poll path below if submit fails. */
+                if (nspa_uring_send_enabled() &&
+                    !ntdll_io_uring_submit_socket_sendmsg( fd, handle, wait_handle,
+                                                           event, apc, apc_user, io, options,
+                                                           async, async->unix_flags ))
+                {
+                    if (options & (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT))
+                        return wait_async( wait_handle, options & FILE_SYNCHRONOUS_IO_ALERT );
+                    return STATUS_PENDING;
+                }
+
                 if (!ntdll_io_uring_submit_socket_poll( fd, POLLOUT, handle, wait_handle,
                                                          event, apc, apc_user, io, options,
                                                          async, TRUE ))

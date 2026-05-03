@@ -925,7 +925,23 @@ static inline BOOL is_anonymous_attr( const OBJECT_ATTRIBUTES *attr )
 static inline BOOL allow_client_sync_creation( enum inproc_sync_type type, const OBJECT_ATTRIBUTES *attr )
 {
     /* Workaround: keep anonymous events on wineserver; semaphores/mutexes are
-     * stable, but client-created event handles still destabilize Ableton. */
+     * stable, but client-created event handles still destabilize Ableton.
+     *
+     * Phase 4 reproduction 2026-05-02: enabled events behind
+     * NSPA_NT_LOCAL_EVENT=1 to gather data; confirmed the historical
+     * failure mode is still present.  Surface symptoms with events ON:
+     *   err:rpc:rpcrt4_protseq_np_get_wait_array pipe listen error c0000008
+     *   err:service:process_send_start_message pipe connect failed (×many)
+     *   err:d3d:wined3d_cs_destroy Closing present event failed.
+     *   Eventlog service fails to start (cascades from RPC).
+     * Pattern: client-range event handles work for direct creator-thread
+     * use, but break when used in cross-context paths (named-pipe wait
+     * arrays in rpcrt4, wined3d cross-thread present completion close,
+     * SCM-via-pipes).  Status STATUS_INVALID_HANDLE (c0000008) appears
+     * at handle-validity check sites.  Root cause not localized.
+     * Decision: keep events on wineserver (legacy default) until we
+     * crack the client-range cross-context handle-validity issue.  See
+     * memory entry plan_nt_local_stub_phase4 for current state. */
     if (type == INPROC_SYNC_EVENT) return FALSE;
     return is_anonymous_attr( attr );
 }

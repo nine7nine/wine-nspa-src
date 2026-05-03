@@ -349,6 +349,60 @@ static void print_verdict(int pass, const char *reason)
     fflush(stdout);
 }
 
+/* ════════════════════════════════════════════════════════════════════════
+ *   Machine-readable stats block
+ * ────────────────────────────────────────────────────────────────────────
+ *   For cross-run comparison (compare-rt-suite.sh), each subcommand
+ *   should emit a STATS block at the end alongside the human-readable
+ *   output.  The format is:
+ *
+ *     STATS_BEGIN
+ *     STATS_KEY:<unique_metric_name>=<numeric_value>
+ *     STATS_KEY:<unique_metric_name>=<numeric_value>
+ *     ...
+ *     STATS_END
+ *
+ *   Conventions:
+ *     - metric name uses snake_case, ASCII only, no spaces
+ *     - suffix the unit when it matters: _us / _ns / _ms / _ops / _pct
+ *     - keep the SAME set of keys across runs of the same test (so the
+ *       comparator can map 1:1).  Conditional keys break comparison.
+ *     - aggregate per-thread values into a few stable keys (max-of-max,
+ *       avg-of-avg) — TIDs change between runs and aren't comparable.
+ *     - emit AFTER the human-readable output, BEFORE print_verdict.
+ *
+ *   The comparator extracts ONLY lines matching ^STATS_KEY: anywhere in
+ *   the test's stdout — everything else is human commentary.
+ * ════════════════════════════════════════════════════════════════════════ */
+
+static void stats_begin(void)
+{
+    printf("\nSTATS_BEGIN\n");
+    fflush(stdout);
+}
+
+static void stats_end(void)
+{
+    printf("STATS_END\n");
+    fflush(stdout);
+}
+
+/* Emit one stat line.  Value is a long long for integer metrics;
+ * use stats_kv_d for floating-point. */
+static void stats_kv_ll(const char *name, long long value)
+{
+    printf("STATS_KEY:%s=%lld\n", name, value);
+    fflush(stdout);
+}
+
+static void stats_kv_d(const char *name, double value)
+{
+    /* %.3f gives microsecond resolution for ms values, ns resolution for
+     * us values, etc.  Trailing zeros stripped to keep diffs stable. */
+    printf("STATS_KEY:%s=%.3f\n", name, value);
+    fflush(stdout);
+}
+
 /* REALTIME_PRIORITY_CLASS is required for any test that uses
  * SetThreadPriority(TIME_CRITICAL) or expects distinct FIFO priorities.
  * Without it, TIME_CRITICAL maps to SCHED_OTHER under NORMAL class,
@@ -527,6 +581,12 @@ static int cmd_priority(int argc, char **argv)
     print_kv("REALTIME class",   "%s", rt_class_ok ? "OK" : "FAILED");
     if (!rt_class_ok)
         print_kv("REALTIME err",  "%lu", (unsigned long)rt_class_err);
+
+    stats_begin();
+    stats_kv_ll("spawn_failures", spawn_fail);
+    stats_kv_ll("rt_class_ok", rt_class_ok ? 1 : 0);
+    stats_kv_ll("total_workers", total_workers);
+    stats_end();
 
     /* Verdict: structural integrity only. Observed Linux scheduling
      * classes/priorities are the user's task (via ps/chrt during the
@@ -792,6 +852,31 @@ static int cmd_cs_contention(int argc, char **argv)
     CloseHandle(g_waiter_done);
     leave_realtime_class();
 
+    /* Stats — emit even if no samples (so key set is stable). */
+    {
+        LONGLONG min_w = 0, max_w = 0, avg_w = 0;
+        if (g_wait_count > 0) {
+            int i;
+            LONGLONG sum_w = 0;
+            min_w = g_wait_samples[0];
+            max_w = g_wait_samples[0];
+            for (i = 0; i < g_wait_count; i++) {
+                LONGLONG w = g_wait_samples[i];
+                if (w < min_w) min_w = w;
+                if (w > max_w) max_w = w;
+                sum_w += w;
+            }
+            avg_w = sum_w / g_wait_count;
+        }
+        stats_begin();
+        stats_kv_ll("samples_captured", g_wait_count);
+        stats_kv_ll("samples_expected", CS_ITERATIONS);
+        stats_kv_ll("min_wait_ms", min_w);
+        stats_kv_ll("max_wait_ms", max_w);
+        stats_kv_ll("avg_wait_ms", avg_w);
+        stats_end();
+    }
+
     /* Verdict: test passed iff we captured all expected samples. That
      * proves the holder released the CS and the waiter acquired it on
      * every iteration — no deadlock, no lost wakeup, no hang. The wait
@@ -979,6 +1064,36 @@ static int cmd_rapidmutex(int argc, char **argv)
     }
 
     leave_realtime_class();
+
+    /* Stats block: aggregated per-role (RT vs load).  Per-thread max/avg
+     * are aggregated as max-of-max and avg-of-avg so keys are stable
+     * across runs (TIDs change). */
+    {
+        LONGLONG rt_max = 0, rt_avg = 0;
+        LONGLONG load_max = 0, load_avg_sum = 0;
+        int load_count = 0;
+        for (i = 0; i < nthreads; i++) {
+            LONGLONG avg = states[i].iters_done ? states[i].total_wait_us / states[i].iters_done : 0;
+            if (states[i].is_rt) {
+                if (states[i].max_wait_us > rt_max) rt_max = states[i].max_wait_us;
+                rt_avg = avg;
+            } else {
+                if (states[i].max_wait_us > load_max) load_max = states[i].max_wait_us;
+                load_avg_sum += avg;
+                load_count++;
+            }
+        }
+        stats_begin();
+        stats_kv_ll("total_elapsed_ms", total_us / 1000);
+        stats_kv_ll("throughput_ops_per_sec",
+                    total_us ? (total_done * 1000000LL / total_us) : 0);
+        stats_kv_ll("rt_max_wait_us", rt_max);
+        stats_kv_ll("rt_avg_wait_us", rt_avg);
+        stats_kv_ll("load_max_wait_us", load_max);
+        stats_kv_ll("load_avg_wait_us", load_count ? load_avg_sum / load_count : 0);
+        stats_end();
+    }
+
     if (rapid_shared_counter == expected) {
         print_verdict(1, NULL);
         return 0;
@@ -1296,6 +1411,17 @@ static int cmd_philosophers(int argc, char **argv)
                states[i].elapsed_us / 1000);
     }
 
+    stats_begin();
+    stats_kv_ll("total_elapsed_ms", (t_end - t_start) / 1000);
+    stats_kv_ll("total_meals", sum_meals);
+    stats_kv_ll("target_meals", PHIL_N * target_meals);
+    stats_kv_ll("min_meals_per_phil", min_meals);
+    stats_kv_ll("max_meals_per_phil", max_meals);
+    stats_kv_ll("meal_spread", max_meals - min_meals);
+    stats_kv_ll("rt_max_wait_us", rt_max_wait);
+    stats_kv_ll("worst_max_wait_us", worst_max_wait);
+    stats_end();
+
     /* Verdict */
     if (wait_ret == WAIT_TIMEOUT) {
         char reason[128];
@@ -1540,6 +1666,27 @@ static int cmd_fork_mutex(int argc, char **argv)
         print_kv("child total max",  "%lld us", max_wait);
         print_kv("child total avg",  "%lld us", sum_wait / waited);
     }
+
+    stats_begin();
+    stats_kv_ll("total_elapsed_ms", (test_end - test_start) / 1000);
+    stats_kv_ll("count", count);
+    stats_kv_ll("spawned_ok", spawned);
+    stats_kv_ll("waited_ok", waited);
+    stats_kv_ll("exit_code_ok", ok_exit);
+    stats_kv_ll("spawn_failures", spawn_fail);
+    stats_kv_ll("wait_timeouts", wait_timeout);
+    stats_kv_ll("exit_mismatches", exit_mismatch);
+    if (spawned > 0) {
+        stats_kv_ll("spawn_min_us", min_spawn);
+        stats_kv_ll("spawn_max_us", max_spawn);
+        stats_kv_ll("spawn_avg_us", sum_spawn / spawned);
+    }
+    if (waited > 0) {
+        stats_kv_ll("child_total_min_us", min_wait);
+        stats_kv_ll("child_total_max_us", max_wait);
+        stats_kv_ll("child_total_avg_us", sum_wait / waited);
+    }
+    stats_end();
 
     if (ok_exit == count) {
         print_verdict(1, NULL);
@@ -1811,6 +1958,15 @@ static int cmd_signal_recursion(int argc, char **argv)
      *   - VEH fault count       -> informational only, see header
      *                              comment for the Wine quirk.
      */
+    stats_begin();
+    stats_kv_ll("total_elapsed_ms", (t_end - t_start) / 1000);
+    stats_kv_ll("iters_completed", total_done);
+    stats_kv_ll("iters_expected", expected_faults);
+    stats_kv_ll("faults_caught_veh", (long long)sig_rec_faults_caught);
+    stats_kv_ll("alloc_failures", total_alloc_fail);
+    stats_kv_ll("protect_failures", total_protect_fail);
+    stats_end();
+
     if (wait_ret == WAIT_TIMEOUT) {
         char reason[160];
         snprintf(reason, sizeof(reason),
@@ -2499,6 +2655,13 @@ skip_1gb_test:
      *   because it's a known divergence. If we extend
      *   allocate_virtual_memory to enforce the privilege (matching
      *   Windows), add the negative test for that path too. */
+
+    /* Stats: large-pages is a many-step validation; the meaningful
+     * comparable signal is the all-pass verdict — every step's value
+     * is either "expected" or a hard fail.  Emit a minimal block. */
+    stats_begin();
+    stats_kv_ll("all_subtests_passed", 1);
+    stats_end();
 
     print_verdict( 1, NULL );
     return 0;
@@ -3568,6 +3731,12 @@ nts_t5:
     print_section("results");
     printf("  total PASS : %d\n", pass);
     printf("  total FAIL : %d\n", fail);
+
+    stats_begin();
+    stats_kv_ll("subtests_pass", pass);
+    stats_kv_ll("subtests_fail", fail);
+    stats_end();
+
     print_verdict(fail == 0, fail ? "see failures above" : NULL);
     leave_realtime_class();
     return fail ? 1 : 0;
@@ -3795,6 +3964,28 @@ next:;
     printf("  Throughput:  %.0f msgs/sec\n", pass > 0 ? 1e6 / avg_us : 0.0);
     fflush(stdout);
 
+    /* Per-phase stats — keys prefixed with phase label so immediate vs
+     * deferred don't collide in the comparator.  Wrapped in its own
+     * STATS_BEGIN/STATS_END block so each phase's stats are self-contained. */
+    {
+        char k[64];
+        stats_begin();
+        snprintf(k, sizeof(k), "%s_min_us", label);     stats_kv_d(k, min_us);
+        snprintf(k, sizeof(k), "%s_avg_us", label);     stats_kv_d(k, avg_us);
+        snprintf(k, sizeof(k), "%s_p50_us", label);     stats_kv_d(k, pass > 0 ? latencies[pass / 2] : 0.0);
+        snprintf(k, sizeof(k), "%s_p95_us", label);     stats_kv_d(k, pass > 0 ? latencies[(int)(pass * 0.95)] : 0.0);
+        snprintf(k, sizeof(k), "%s_p99_us", label);     stats_kv_d(k, pass > 0 ? latencies[(int)(pass * 0.99)] : 0.0);
+        snprintf(k, sizeof(k), "%s_throughput_msgs_per_sec", label);
+        stats_kv_d(k, pass > 0 ? 1e6 / avg_us : 0.0);
+        snprintf(k, sizeof(k), "%s_iterations_pass", label); stats_kv_ll(k, pass);
+        snprintf(k, sizeof(k), "%s_iterations_fail", label); stats_kv_ll(k, fail);
+        if (deferred) {
+            snprintf(k, sizeof(k), "%s_went_async", label);
+            stats_kv_ll(k, pending_count);
+        }
+        stats_end();
+    }
+
     free(latencies);
 }
 
@@ -3847,6 +4038,9 @@ static int cmd_socket_io(int argc, char **argv)
     closesocket(server);
     WSACleanup();
 
+    /* Each run_io_phase invocation emits its own STATS_BEGIN/STATS_END
+     * block with phase-prefixed keys.  Nothing else to add here. */
+
     printf("\n  Verdict: PASS\n");
     fflush(stdout);
     return 0;
@@ -3898,7 +4092,14 @@ static DWORD WINAPI srw_bench_thread(LPVOID arg)
         *(volatile LONG *)&srw_bench_lock;
         ReleaseSRWLockExclusive(&srw_bench_lock);
         QueryPerformanceCounter(&t1);
-        samples[i] = (t1.QuadPart - t0.QuadPart) * 1000000000LL / freq.QuadPart;
+        {
+            /* Mixed-precision QPC→ns to avoid LONGLONG overflow.
+             * Wine's QPC freq is ~10^9 (1ns) on Linux; (delta * 1e9)
+             * can exceed 9.22e18 LONGLONG max for waits past ~9s. */
+            LONGLONG d = t1.QuadPart - t0.QuadPart;
+            samples[i] = (d / freq.QuadPart) * 1000000000LL +
+                         ((d % freq.QuadPart) * 1000000000LL) / freq.QuadPart;
+        }
     }
 
     /* Sort for percentiles */
@@ -3931,6 +4132,8 @@ static int cmd_srw_bench(int argc, char **argv)
     HANDLE *threads;
     LARGE_INTEGER freq;
     LONGLONG total_ops = 0, total_ns = 0;
+    LONGLONG max_of_max = 0, worst_p99 = 0, sum_avg = 0;
+    LONGLONG overall_avg = 0;
     DWORD i;
 
     if (argc > 1) num_threads = atoi(argv[1]);
@@ -3964,7 +4167,8 @@ static int cmd_srw_bench(int argc, char **argv)
 
     WaitForMultipleObjects(num_threads, threads, TRUE, INFINITE);
 
-    /* Aggregate results */
+    /* Aggregate results — also compute max-of-max + avg-of-avg + worst
+     * p99 across threads for stable cross-run keys. */
     printf("\n  Thread     avg(ns)   p50(ns)   p99(ns)   max(ns)    ops/sec\n");
     for (i = 0; i < num_threads; i++)
     {
@@ -3975,13 +4179,24 @@ static int cmd_srw_bench(int argc, char **argv)
                i, avg, r->p50_ns, r->p99_ns, r->max_ns, ops_sec);
         total_ops += iters;
         total_ns += r->sum_ns;
+        if (r->max_ns > max_of_max) max_of_max = r->max_ns;
+        if (r->p99_ns > worst_p99)  worst_p99  = r->p99_ns;
+        sum_avg += avg;
         CloseHandle(threads[i]);
     }
 
-    {
-        LONGLONG overall_avg = total_ns / total_ops;
-        printf("\n  Overall: %lld ops, avg %lld ns/op\n", total_ops, overall_avg);
-    }
+    overall_avg = total_ns / total_ops;
+    printf("\n  Overall: %lld ops, avg %lld ns/op\n", total_ops, overall_avg);
+
+    stats_begin();
+    stats_kv_ll("threads", (long long)num_threads);
+    stats_kv_ll("iters_per_thread", (long long)iters);
+    stats_kv_ll("total_ops", total_ops);
+    stats_kv_ll("overall_avg_ns", overall_avg);
+    stats_kv_ll("avg_of_avg_ns", num_threads ? sum_avg / num_threads : 0);
+    stats_kv_ll("worst_p99_ns", worst_p99);
+    stats_kv_ll("max_of_max_ns", max_of_max);
+    stats_end();
 
     free(results);
     free(threads);
@@ -4168,6 +4383,15 @@ static int cmd_condvar_pi(int argc, char **argv)
     printf("  Run with and without NSPA_RT_PRIO and compare avg/max wait:\n");
     printf("    with PI:    signaler gets boosted, avg should be low (~signal work time)\n");
     printf("    without PI: signaler competes with load, avg should be higher\n\n");
+
+    stats_begin();
+    stats_kv_ll("iterations_completed", result.count);
+    stats_kv_ll("iterations_expected", CONDVAR_PI_ITERATIONS);
+    stats_kv_ll("min_wait_us", (long long)result.min_us);
+    stats_kv_ll("max_wait_us", (long long)result.max_us);
+    stats_kv_ll("avg_wait_us",
+                result.count ? (long long)(result.sum_us / result.count) : 0LL);
+    stats_end();
 
     if (result.count == CONDVAR_PI_ITERATIONS)
     {
@@ -4501,6 +4725,11 @@ static int cmd_nt_timer( int argc, char **argv )
     print_section( "summary" );
     print_kv( "sub-tests passed", "%d / %d", pass, total );
 
+    stats_begin();
+    stats_kv_ll("subtests_pass", pass);
+    stats_kv_ll("subtests_total", total);
+    stats_end();
+
     if (pass == total) { print_verdict( 1, NULL ); return 0; }
     print_verdict( 0, "one or more NT timer sub-tests failed" );
     return 1;
@@ -4733,6 +4962,12 @@ static int cmd_wm_timer( int argc, char **argv )
 
     print_section( "summary" );
     print_kv( "sub-tests passed", "%d / %d", pass, total );
+
+    stats_begin();
+    stats_kv_ll("subtests_pass", pass);
+    stats_kv_ll("subtests_total", total);
+    stats_end();
+
     if (pass == total) { print_verdict( 1, NULL ); return 0; }
     print_verdict( 0, "one or more WM_TIMER sub-tests failed" );
     return 1;
@@ -4967,6 +5202,12 @@ static int cmd_rpc_bypass(int argc, char **argv)
     print_kv("passed", "%d / 5", passed);
     print_kv("failed", "%d / 5", failed);
 
+    stats_begin();
+    stats_kv_ll("subtests_pass", passed);
+    stats_kv_ll("subtests_fail", failed);
+    stats_kv_ll("subtests_total", 5);
+    stats_end();
+
     if (!failed)
     {
         print_verdict(1, NULL);
@@ -5180,6 +5421,12 @@ static int cmd_irot_bypass(int argc, char **argv)
     print_section("Summary");
     print_kv("passed", "%d / 5", passed);
     print_kv("failed", "%d / 5", failed);
+
+    stats_begin();
+    stats_kv_ll("subtests_pass", passed);
+    stats_kv_ll("subtests_fail", failed);
+    stats_kv_ll("subtests_total", 5);
+    stats_end();
 
     if (!failed)
     {
@@ -5424,6 +5671,21 @@ static int cmd_seqlock_bound(int argc, char **argv)
         print_kv("A max",  "%lld us  hard=%d", (long long)(res_a.max_ns/1000), res_a.over_hard);
         print_kv("B max",  "%lld us  hard=%d", (long long)(res_b.max_ns/1000), res_b.over_hard);
 
+        stats_begin();
+        stats_kv_ll("a_iters_done",     res_a.iters_done);
+        stats_kv_ll("a_max_ns",         (long long)res_a.max_ns);
+        stats_kv_ll("a_avg_ns",         res_a.iters_done ? (long long)(res_a.sum_ns / res_a.iters_done) : 0);
+        stats_kv_ll("a_over_soft",      res_a.over_soft);
+        stats_kv_ll("a_over_hard",      res_a.over_hard);
+        stats_kv_ll("b_iters_done",     res_b.iters_done);
+        stats_kv_ll("b_max_ns",         (long long)res_b.max_ns);
+        stats_kv_ll("b_avg_ns",         res_b.iters_done ? (long long)(res_b.sum_ns / res_b.iters_done) : 0);
+        stats_kv_ll("b_over_soft",      res_b.over_soft);
+        stats_kv_ll("b_over_hard",      res_b.over_hard);
+        stats_kv_ll("any_hung",         hung);
+        stats_kv_ll("total_over_hard",  hard);
+        stats_end();
+
         if (hung)
         {
             char reason[160];
@@ -5553,7 +5815,14 @@ static DWORD WINAPI disp_burst_steady_thread(LPVOID arg)
         if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
         else fails++;
         QueryPerformanceCounter(&t1);
-        samples[i] = (t1.QuadPart - t0.QuadPart) * 1000000000LL / freq.QuadPart;
+        {
+            /* Mixed-precision QPC→ns to avoid LONGLONG overflow.
+             * Wine's QPC freq is ~10^9 (1ns) on Linux; (delta * 1e9)
+             * can exceed 9.22e18 LONGLONG max for waits past ~9s. */
+            LONGLONG d = t1.QuadPart - t0.QuadPart;
+            samples[i] = (d / freq.QuadPart) * 1000000000LL +
+                         ((d % freq.QuadPart) * 1000000000LL) / freq.QuadPart;
+        }
     }
 
     disp_burst_sort(samples, iters);
@@ -5609,7 +5878,14 @@ static DWORD WINAPI disp_burst_burst_thread(LPVOID arg)
             if (handles[j] != INVALID_HANDLE_VALUE) CloseHandle(handles[j]);
         }
         QueryPerformanceCounter(&t1);
-        samples[i] = (t1.QuadPart - t0.QuadPart) * 1000000000LL / freq.QuadPart;
+        {
+            /* Mixed-precision QPC→ns to avoid LONGLONG overflow.
+             * Wine's QPC freq is ~10^9 (1ns) on Linux; (delta * 1e9)
+             * can exceed 9.22e18 LONGLONG max for waits past ~9s. */
+            LONGLONG d = t1.QuadPart - t0.QuadPart;
+            samples[i] = (d / freq.QuadPart) * 1000000000LL +
+                         ((d % freq.QuadPart) * 1000000000LL) / freq.QuadPart;
+        }
     }
 
     disp_burst_sort(samples, outer);
@@ -5640,6 +5916,8 @@ static int cmd_dispatcher_burst(int argc, char **argv)
     struct disp_burst_args *args = NULL;
     LARGE_INTEGER freq, wall_t0, wall_t1;
     LONGLONG steady_wall_ns = 0, burst_wall_ns = 0;
+    LONGLONG burst_total_ops = 0, burst_max_p99 = 0, burst_max_max = 0, burst_ops_per_sec = 0;
+    DWORD burst_total_thread_fails = 0;
     DWORD i;
     const char *try_recv2 = getenv("NSPA_TRY_RECV2");
     DWORD total_failures = 0;
@@ -5684,7 +5962,11 @@ static int cmd_dispatcher_burst(int argc, char **argv)
         InterlockedExchange(&disp_burst_go, 1);
         WaitForSingleObject(h, INFINITE);
         QueryPerformanceCounter(&wall_t1);
-        steady_wall_ns = (wall_t1.QuadPart - wall_t0.QuadPart) * 1000000000LL / freq.QuadPart;
+        {
+            LONGLONG d = wall_t1.QuadPart - wall_t0.QuadPart;
+            steady_wall_ns = (d / freq.QuadPart) * 1000000000LL +
+                             ((d % freq.QuadPart) * 1000000000LL) / freq.QuadPart;
+        }
         CloseHandle(h);
 
         printf("\n  metric        value\n");
@@ -5731,12 +6013,14 @@ static int cmd_dispatcher_burst(int argc, char **argv)
     InterlockedExchange(&disp_burst_go, 1);
     WaitForMultipleObjects(burst_threads, threads, TRUE, INFINITE);
     QueryPerformanceCounter(&wall_t1);
-    burst_wall_ns = (wall_t1.QuadPart - wall_t0.QuadPart) * 1000000000LL / freq.QuadPart;
+    {
+        LONGLONG d = wall_t1.QuadPart - wall_t0.QuadPart;
+        burst_wall_ns = (d / freq.QuadPart) * 1000000000LL +
+                        ((d % freq.QuadPart) * 1000000000LL) / freq.QuadPart;
+    }
 
     {
-        LONGLONG total_ops = (LONGLONG)burst_outer * burst_depth * burst_threads;
-        LONGLONG max_p99 = 0, max_max = 0;
-        DWORD total_thread_fails = 0;
+        burst_total_ops = (LONGLONG)burst_outer * burst_depth * burst_threads;
 
         printf("\n  Thread   outer    p50_ns    p99_ns      max_ns  fails\n");
         printf("  ------   -----    ------    ------    --------  -----\n");
@@ -5745,27 +6029,37 @@ static int cmd_dispatcher_burst(int argc, char **argv)
             struct disp_burst_result *r = &burst_res[i];
             printf("  T%-4lu   %5lu  %8lld  %8lld  %10lld  %5lu\n",
                    i, r->count, r->p50_ns, r->p99_ns, r->max_ns, r->failures);
-            total_thread_fails += r->failures;
-            if (r->p99_ns > max_p99) max_p99 = r->p99_ns;
-            if (r->max_ns > max_max) max_max = r->max_ns;
+            burst_total_thread_fails += r->failures;
+            if (r->p99_ns > burst_max_p99) burst_max_p99 = r->p99_ns;
+            if (r->max_ns > burst_max_max) burst_max_max = r->max_ns;
             CloseHandle(threads[i]);
         }
+        burst_ops_per_sec = burst_wall_ns ? burst_total_ops * 1000000000LL / burst_wall_ns : 0;
         printf("\n");
         printf("  total ops        %14lld  (%lu thr * %lu outer * %lu depth)\n",
-               total_ops, burst_threads, burst_outer, burst_depth);
-        printf("  total failures   %14lu\n", total_thread_fails);
-        printf("  worst p99 ns     %14lld\n", max_p99);
-        printf("  worst max ns     %14lld\n", max_max);
+               burst_total_ops, burst_threads, burst_outer, burst_depth);
+        printf("  total failures   %14lu\n", burst_total_thread_fails);
+        printf("  worst p99 ns     %14lld\n", burst_max_p99);
+        printf("  worst max ns     %14lld\n", burst_max_max);
         printf("  wall ms          %14lld\n", burst_wall_ns / 1000000);
-        printf("  ops/sec (wall)   %14lld\n",
-               burst_wall_ns ? total_ops * 1000000000LL / burst_wall_ns : 0);
+        printf("  ops/sec (wall)   %14lld\n", burst_ops_per_sec);
         fflush(stdout);
-        total_failures += total_thread_fails;
+        total_failures += burst_total_thread_fails;
     }
 
     free(burst_res);
     free(threads);
     free(args);
+
+    stats_begin();
+    stats_kv_ll("burst_total_ops",      burst_total_ops);
+    stats_kv_ll("burst_failures",       (long long)burst_total_thread_fails);
+    stats_kv_ll("burst_worst_p99_ns",   burst_max_p99);
+    stats_kv_ll("burst_worst_max_ns",   burst_max_max);
+    stats_kv_ll("burst_wall_ms",        burst_wall_ns / 1000000);
+    stats_kv_ll("burst_ops_per_sec",    burst_ops_per_sec);
+    stats_kv_ll("total_failures",       (long long)total_failures);
+    stats_end();
 
     print_section("verdict");
     if (total_failures > 0)

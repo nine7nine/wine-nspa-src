@@ -1,0 +1,53 @@
+# NSPA RT test rig — install rules.
+#
+# Per-extension dispatch happens in tools/makedep.c:
+#   .sh files (output_source_sh)        -> $(datadir)/wine-nspa/tests/  mode 755
+#                                          plus $(bindir) symlinks for the
+#                                          two user-facing entry points
+#                                          (run-rt-suite.sh, compare-rt-suite.sh)
+#   .c files in nspa/ (output_source_default early-return)
+#                                       -> $(datadir)/wine-nspa/tests/  mode 644
+#                                          (no compile — runner builds them
+#                                          on first use against live kernel)
+#
+# Listing each file in INSTALL_LIB is required so add_install_command()
+# accepts the install request from the per-extension handlers (see
+# tools/makedep.c:2487 — the gate is `strarray_exists( make->install[i], target )`).
+
+SOURCES = \
+	run_rt_tests.sh \
+	tests/run-rt-suite.sh \
+	tests/compare-rt-suite.sh \
+	tests/report-rt-suite.sh \
+	tests/bpf-rpc-counts.sh \
+	tests/bpf-gamma.sh \
+	tests/bpf-wineserver.sh \
+	tests/perf-wineserver.sh \
+	tests/test-aggregate-wait.c \
+	tests/test-channel-recv-exclusive.c \
+	tests/test-channel-stress.c \
+	tests/test-cross-boost.c \
+	tests/test-event-set-pi.c \
+	tests/test-event-set-pi-stress.c \
+	tests/test-mixed-load-stress.c \
+	tests/test-mutex-pi-stress.c \
+	tests/test-wait-rejects-channel.c
+
+INSTALL_LIB = \
+	run_rt_tests.sh \
+	tests/run-rt-suite.sh \
+	tests/compare-rt-suite.sh \
+	tests/report-rt-suite.sh \
+	tests/bpf-rpc-counts.sh \
+	tests/bpf-gamma.sh \
+	tests/bpf-wineserver.sh \
+	tests/perf-wineserver.sh \
+	tests/test-aggregate-wait.c \
+	tests/test-channel-recv-exclusive.c \
+	tests/test-channel-stress.c \
+	tests/test-cross-boost.c \
+	tests/test-event-set-pi.c \
+	tests/test-event-set-pi-stress.c \
+	tests/test-mixed-load-stress.c \
+	tests/test-mutex-pi-stress.c \
+	tests/test-wait-rejects-channel.c

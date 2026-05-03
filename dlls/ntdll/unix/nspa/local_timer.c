@@ -752,12 +752,15 @@ NTSTATUS nspa_local_timer_create( HANDLE *handle, ACCESS_MASK access,
      * a SynchronizationTimer auto-resets after a single successful wait. */
     event_type = (timer_type == NotificationTimer) ? NotificationEvent : SynchronizationEvent;
 
-    /* Use nspa_create_internal_event so the backing event is client-range
-     * when NSPA_NT_LOCAL_TIMER=1 (Phase 4.5).  The dispatcher signals + the
-     * app waits PE-side via inproc-sync — the event handle never traverses
-     * the server_async chokepoint that breaks ordinary client-range events.
-     * Falls back to NtCreateEvent (server path) when the gate is off. */
-    if ((ret = nspa_create_internal_event( &event, access, event_type, FALSE /* initial state */ )))
+    /* The backing event is set/reset by the dispatcher thread and waited
+     * by app threads — both PE-side via inproc-sync.  After Phase 4.6
+     * (events Option A), NtCreateEvent itself routes anonymous events
+     * through the client-range fast path when NSPA_NT_LOCAL_EVENT is on.
+     * Server-aware client-range events handle the cross-context cases
+     * for which the timer backing previously required a workaround
+     * helper (nspa_create_internal_event, removed in Phase 4.6.F). */
+    if ((ret = NtCreateEvent( &event, access, NULL /* suppress name */,
+                              event_type, FALSE /* initial state */ )))
         return ret;
 
     if (!(entry = calloc( 1, sizeof(*entry) )))

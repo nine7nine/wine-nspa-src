@@ -73,10 +73,10 @@ enum uring_op_type
 {
     URING_OP_FILE_READ,
     URING_OP_FILE_WRITE,
-    URING_OP_SOCKET_RECV,
-    URING_OP_SOCKET_SEND,
     URING_OP_SOCKET_POLL_RECV,  /* Phase 3: async poll for socket recv readiness */
     URING_OP_SOCKET_POLL_SEND,  /* Phase 3: async poll for socket send readiness */
+    URING_OP_SOCKET_RECVMSG,    /* Phase 4.8.A: full RECVMSG (data movement + post-process via try_recv_post_process) */
+    URING_OP_SOCKET_SENDMSG,    /* Phase 4.8.B: full SENDMSG (reserved; wired by Phase B commit) */
 };
 
 struct uring_async_op
@@ -97,6 +97,15 @@ struct uring_async_op
     HANDLE             wait_handle; /* server async wait handle */
     int                poll_unix_fd;/* unix fd for bitmap clear on completion */
     int                event_sync_fd;/* pre-resolved ntsync fd for ov.hEvent (-1 = none) */
+    /* Phase 4.8.A socket RECVMSG fields — lifetime spans submit→CQE, kernel
+     * reads/writes msghdr in place across the io_uring round-trip.  Only
+     * populated for URING_OP_SOCKET_RECVMSG / URING_OP_SOCKET_SENDMSG ops;
+     * other op types ignore these fields.  Memory cost: ~600 bytes per
+     * op_pool slot regardless of which type is used (acceptable at
+     * RING_SIZE=32 = ~22 KB per thread). */
+    struct msghdr      sock_msghdr;     /* msghdr for RECVMSG/SENDMSG */
+    char               sock_control[512];/* control buffer (cmsg storage) */
+    union { struct sockaddr_storage st; char buf[128]; } sock_addr_storage; /* address storage */
     struct uring_async_op *next_free; /* freelist link (only valid when not in flight) */
 };
 
@@ -370,6 +379,8 @@ static int dup_fd_for_ring( int unix_fd )
  * completion (fd fetch, try_recv/try_send, file_complete_async) runs
  * later in ntdll_io_uring_flush_deferred, safely outside ntsync. */
 extern void ntdll_complete_socket_poll( struct uring_async_op *op, int poll_revents );
+/* Phase 4.8.A: socket-specific RECVMSG completion handler in socket.c. */
+extern void ntdll_complete_socket_recvmsg( struct uring_async_op *op, int result );
 
 /* Field accessors for socket.c — avoids exposing uring_async_op struct */
 void *ntdll_uring_op_sock_async( struct uring_async_op *op ) { return op->sock_async; }
@@ -387,6 +398,10 @@ PIO_APC_ROUTINE ntdll_uring_op_apc( struct uring_async_op *op ) { return op->apc
 void *ntdll_uring_op_apc_user( struct uring_async_op *op ) { return op->apc_user; }
 int ntdll_uring_op_event_sync_fd( struct uring_async_op *op ) { return op->event_sync_fd; }
 int ntdll_uring_op_dup_fd( struct uring_async_op *op ) { return op->dup_fd; }
+/* Phase 4.8.A accessors for the populated msghdr / addr storage carried
+ * across submit→CQE in the op slot (used by the RECVMSG CQE handler). */
+struct msghdr *ntdll_uring_op_sock_msghdr( struct uring_async_op *op ) { return &op->sock_msghdr; }
+void *ntdll_uring_op_sock_addr_storage( struct uring_async_op *op ) { return &op->sock_addr_storage; }
 
 static void complete_uring_op( struct uring_async_op *op, int result )
 {
@@ -399,6 +414,18 @@ static void complete_uring_op( struct uring_async_op *op, int result )
     if (op->type == URING_OP_SOCKET_POLL_RECV || op->type == URING_OP_SOCKET_POLL_SEND)
     {
         ntdll_complete_socket_poll( op, result );
+        op_pool_free( op );
+        return;
+    }
+
+    /* Phase 4.8.A: full RECVMSG completion — data is already moved by the
+     * kernel; CQE handler runs try_recv_post_process to apply Wine-specific
+     * post-processing (MSG_TRUNC, ICMP fixup, control / sockaddr conversion,
+     * OOB quirk).  The op slot's sock_msghdr / sock_control / sock_addr_storage
+     * carry the populated msghdr through the round-trip. */
+    if (op->type == URING_OP_SOCKET_RECVMSG)
+    {
+        ntdll_complete_socket_recvmsg( op, result );
         op_pool_free( op );
         return;
     }
@@ -536,10 +563,31 @@ int ntdll_io_uring_submit_file_write( int unix_fd, int needs_close, const void *
  * completion, or heap-allocated for true async).
  * ----------------------------------------------------------------------- */
 
-int ntdll_io_uring_submit_recv( int unix_fd, int needs_close, struct msghdr *hdr,
-                                int flags, HANDLE handle, HANDLE event,
-                                PIO_APC_ROUTINE apc, void *apc_user,
-                                IO_STATUS_BLOCK *io, unsigned int options )
+/* (Phase 4.8.A) socket-specific RECVMSG submission.  Earlier file-shaped
+ * submit_recv / submit_send stubs were removed because their completion
+ * routed through file_complete_async which produces wrong NT semantics
+ * for socket completions (no try_recv post-process, no
+ * set_async_direct_result, no NSPA bitmap clear).
+ *
+ * Lifetime: msghdr, control buffer, address storage all live in the
+ * uring_async_op slot from submit until CQE drain; kernel reads/writes
+ * them in place across the io_uring round-trip.  Caller (sock_recv)
+ * passes the async_recv_ioctl pointer so the CQE handler can run
+ * try_recv_post_process against the populated msghdr. */
+/* Setup helper provided by socket.c — populates msghdr / control / addr
+ * in the op slot from the async_recv_ioctl.  socket.c-private because
+ * async_recv_ioctl layout is socket.c-private. */
+extern void try_recv_setup_op_msghdr( void *sock_async,
+                                      struct msghdr *hdr,
+                                      char *control_buffer,
+                                      size_t control_size,
+                                      void *addr_storage );
+
+int ntdll_io_uring_submit_socket_recvmsg( int unix_fd, HANDLE handle,
+                                          HANDLE wait_handle, HANDLE event,
+                                          PIO_APC_ROUTINE apc, void *apc_user,
+                                          IO_STATUS_BLOCK *io, unsigned int options,
+                                          void *sock_async, int unix_flags )
 {
     struct uring_async_op *op;
     struct io_uring_sqe *sqe;
@@ -547,20 +595,34 @@ int ntdll_io_uring_submit_recv( int unix_fd, int needs_close, struct msghdr *hdr
 
     if (!ensure_ring()) return -ENOSYS;
 
+    /* dup the fd so we own a stable reference for the in-flight SQE — the
+     * caller's fd may be closed (or invalidated by handle close) before
+     * the CQE arrives. */
     ring_fd = dup_fd_for_ring( unix_fd );
     if (ring_fd < 0) return -errno;
 
     op = op_pool_alloc();
     if (!op) { close( ring_fd ); return -ENOMEM; }
 
-    op->type     = URING_OP_SOCKET_RECV;
-    op->handle   = handle;
-    op->event    = event;
-    op->apc      = apc;
-    op->apc_user = apc_user;
-    op->io       = io;
-    op->options  = options;
-    op->dup_fd   = ring_fd;
+    op->type         = URING_OP_SOCKET_RECVMSG;
+    op->handle       = handle;
+    op->event        = event;
+    op->apc          = apc;
+    op->apc_user     = apc_user;
+    op->io           = io;
+    op->options      = options;
+    op->dup_fd       = ring_fd;
+    op->sock_async   = sock_async;
+    op->wait_handle  = wait_handle;
+    op->poll_unix_fd = unix_fd;        /* for ntdll_client_poll_clear at completion */
+    op->event_sync_fd = -1;            /* not pre-resolved (uses set_async_direct_result via wait_handle) */
+
+    /* Populate msghdr / control / addr storage in the op slot from
+     * async_recv_ioctl fields.  socket.c-private helper because
+     * async_recv_ioctl layout is socket.c-private. */
+    try_recv_setup_op_msghdr( sock_async, &op->sock_msghdr,
+                              op->sock_control, sizeof(op->sock_control),
+                              &op->sock_addr_storage );
 
     sqe = io_uring_get_sqe( &thread_ring );
     if (!sqe)
@@ -571,55 +633,12 @@ int ntdll_io_uring_submit_recv( int unix_fd, int needs_close, struct msghdr *hdr
         if (!sqe) { close( ring_fd ); op_pool_free( op ); return -ENOMEM; }
     }
 
-    io_uring_prep_recvmsg( sqe, ring_fd, hdr, flags );
+    io_uring_prep_recvmsg( sqe, ring_fd, &op->sock_msghdr, unix_flags );
     io_uring_sqe_set_data( sqe, op );
     io_uring_submit( &thread_ring );
 
-    if (needs_close) close( unix_fd );
-    return 0;
-}
-
-
-int ntdll_io_uring_submit_send( int unix_fd, int needs_close, struct msghdr *hdr,
-                                int flags, HANDLE handle, HANDLE event,
-                                PIO_APC_ROUTINE apc, void *apc_user,
-                                IO_STATUS_BLOCK *io, unsigned int options )
-{
-    struct uring_async_op *op;
-    struct io_uring_sqe *sqe;
-    int ring_fd;
-
-    if (!ensure_ring()) return -ENOSYS;
-
-    ring_fd = dup_fd_for_ring( unix_fd );
-    if (ring_fd < 0) return -errno;
-
-    op = op_pool_alloc();
-    if (!op) { close( ring_fd ); return -ENOMEM; }
-
-    op->type     = URING_OP_SOCKET_SEND;
-    op->handle   = handle;
-    op->event    = event;
-    op->apc      = apc;
-    op->apc_user = apc_user;
-    op->io       = io;
-    op->options  = options;
-    op->dup_fd   = ring_fd;
-
-    sqe = io_uring_get_sqe( &thread_ring );
-    if (!sqe)
-    {
-        io_uring_submit( &thread_ring );
-        ntdll_io_uring_process_completions();
-        sqe = io_uring_get_sqe( &thread_ring );
-        if (!sqe) { close( ring_fd ); op_pool_free( op ); return -ENOMEM; }
-    }
-
-    io_uring_prep_sendmsg( sqe, ring_fd, hdr, flags );
-    io_uring_sqe_set_data( sqe, op );
-    io_uring_submit( &thread_ring );
-
-    if (needs_close) close( unix_fd );
+    TRACE( "submitted socket RECVMSG: handle=%p fd=%d(%d) sock_async=%p flags=%#x\n",
+           handle, unix_fd, ring_fd, sock_async, unix_flags );
     return 0;
 }
 
@@ -779,16 +798,10 @@ int ntdll_io_uring_submit_file_write( int unix_fd, int needs_close, const void *
                                       IO_STATUS_BLOCK *io, unsigned int options )
 { return -ENOSYS; }
 
-int ntdll_io_uring_submit_recv( int unix_fd, int needs_close, struct msghdr *hdr,
-                                int flags, HANDLE handle, HANDLE event,
-                                PIO_APC_ROUTINE apc, void *apc_user,
-                                IO_STATUS_BLOCK *io, unsigned int options )
-{ return -ENOSYS; }
-
-int ntdll_io_uring_submit_send( int unix_fd, int needs_close, struct msghdr *hdr,
-                                int flags, HANDLE handle, HANDLE event,
-                                PIO_APC_ROUTINE apc, void *apc_user,
-                                IO_STATUS_BLOCK *io, unsigned int options )
+int ntdll_io_uring_submit_socket_recvmsg( int unix_fd, HANDLE handle, HANDLE wait_handle,
+                                          HANDLE event, PIO_APC_ROUTINE apc, void *apc_user,
+                                          IO_STATUS_BLOCK *io, unsigned int options,
+                                          void *sock_async, int unix_flags )
 { return -ENOSYS; }
 
 #endif /* HAVE_LIBURING_H */

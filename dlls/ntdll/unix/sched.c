@@ -33,6 +33,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
+#include <signal.h>
 #include <unistd.h>
 #include <poll.h>
 
@@ -619,6 +620,28 @@ void sched_run( void )
     sched_pthread_id = pthread_self();
     pthread_setname_np( sched_pthread_id, "wine-sched" );
     __atomic_store_n( &sched_thread_alive, 1, __ATOMIC_RELEASE );
+
+    /* NSPA shutdown fix (project_sched_thread_no_shutdown_20260503):
+     * server_init_process applied server_block_set (which blocks SIGQUIT)
+     * to this thread before we got here.  We're about to enter
+     * sched_run_inst's permanent poll() loop and never make a wineserver
+     * call, so the mask is never cleared by server.c's normal save/restore
+     * dance.  Result: `wineserver -k` sends SIGQUIT to our unix_tid,
+     * the kernel queues it pending, the signal never delivers, and the
+     * sched thread stays alive — which keeps nb_threads > 0 — which
+     * prevents abort_process() from ever firing on the last Win32 thread.
+     *
+     * Unblock SIGQUIT so quit_handler runs and decrements nb_threads
+     * cleanly.  Keep the rest of server_block_set masked: SIGUSR1 (thread
+     * suspend) and SIGUSR2 (APC delivery) are not relevant to the sched
+     * thread and may cause unexpected behavior if they arrive here. */
+    if (!getenv( "NSPA_SCHED_NO_QUIT_UNBLOCK" ))
+    {
+        sigset_t unblock;
+        sigemptyset( &unblock );
+        sigaddset( &unblock, SIGQUIT );
+        pthread_sigmask( SIG_UNBLOCK, &unblock, NULL );
+    }
 
     /* NSPA Phase 3 consumer #2: queue the periodic observability
      * sampler (no-op unless NSPA_SCHED_OBS_INTERVAL_MS is set).

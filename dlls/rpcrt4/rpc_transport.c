@@ -1097,12 +1097,21 @@ static BOOL rpcrt4_sock_wait_for_recv(RpcConnection_tcp *tcpc)
   }
   wait_handles[0] = tcpc->sock_event;
   wait_handles[1] = tcpc->cancel_event;
-  res = WaitForMultipleObjects(2, wait_handles, FALSE, INFINITE);
+  /* NSPA Phase 2.B: bound the recv wait by the configurable I/O timeout
+   * (default 30s, NSPA_RPC_TIMEOUT_MS=0 restores INFINITE for compat).
+   * Symmetric with rpcrt4_sock_wait_for_send below.  Without this, peer-
+   * died-silently (no RST) hangs the client forever — the cancel_event
+   * only fires for explicit local cancellation, not silent peer death. */
+  res = WaitForMultipleObjects(2, wait_handles, FALSE, nspa_rpc_io_timeout_ms());
   switch (res)
   {
   case WAIT_OBJECT_0:
     return TRUE;
   case WAIT_OBJECT_0 + 1:
+    return FALSE;
+  case WAIT_TIMEOUT:
+    /* NSPA Phase 2.B: silent peer death — treat as recv failure.  Caller
+     * (the rpcrt4 transport layer) closes the connection on FALSE return. */
     return FALSE;
   default:
     ERR("WaitForMultipleObjects() failed with error %ld\n", GetLastError());

@@ -1018,6 +1018,14 @@ void close_client_inproc_sync( HANDLE handle )
 
     if ((cache = get_cached_inproc_sync( handle )))
     {
+        /* NSPA Phase 4.6.D: drop the wineserver's fd ref before we close
+         * our PE-side fd, so the kernel ntsync object refcount transitions
+         * cleanly.  No-op if the handle was never registered (mutex/sem
+         * paths don't register; failed-registration unwind already
+         * unregistered).  Best-effort. */
+        if (cache->type == INPROC_SYNC_EVENT)
+            nspa_unregister_inproc_event_with_server( handle );
+
         if (cache->type == INPROC_SYNC_MUTEX)
         {
             LIST_FOR_EACH_ENTRY_SAFE( mentry, next, &client_mutex_list, struct client_mutex_entry, entry )
@@ -1081,6 +1089,25 @@ static NTSTATUS create_inproc_event_local( HANDLE *handle, ACCESS_MASK access,
         close( fd );
         free_client_handle( h );
         return ret;
+    }
+
+    /* NSPA Phase 4.6.D: register the ntsync fd with the wineserver so
+     * server-side async I/O completion can signal this event via direct
+     * ioctl when the handle is passed to NtFsControlFile / NtRead /
+     * NtWrite / etc. (the server_async chokepoint).  Without this, those
+     * paths return STATUS_INVALID_HANDLE for client-range events.
+     *
+     * If registration fails, undo the cache + handle alloc and fall
+     * through to the legacy server-event path so we don't leave a
+     * half-functional client-range event in the cache. */
+    if ((ret = nspa_register_inproc_event_with_server( h, fd )))
+    {
+        sigset_t sigset;
+        server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );
+        close_client_inproc_sync( h );
+        server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
+        TRACE( "client event registration failed (%#x); falling back to server\n", ret );
+        return STATUS_NOT_IMPLEMENTED;
     }
 
     *handle = h;

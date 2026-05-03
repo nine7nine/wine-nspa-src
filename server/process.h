@@ -99,6 +99,7 @@ struct process
     int                  channel_dispatcher_running; /* NSPA gamma: lifecycle gate */
     struct nspa_uring_instance *nspa_uring;     /* NSPA 1010 Phase 3: pts into dispatcher_ctx->uring; NULL if no ring */
     void                *nspa_dispatcher_ctx;   /* NSPA 1010 Phase 3: opaque ctx ptr (struct nspa_dispatcher_ctx) */
+    struct list         *nspa_inproc_event_table; /* NSPA Phase 4.6.A: per-process client-range event registration; lazy-init */
 #endif
 };
 

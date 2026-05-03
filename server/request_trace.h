@@ -3690,6 +3690,17 @@ static void dump_nspa_irot_enum_running_reply( const struct nspa_irot_enum_runni
     dump_varargs_bytes( ", list=", cur_size );
 }
 
+static void dump_nspa_register_inproc_event_request( const struct nspa_register_inproc_event_request *req )
+{
+    fprintf( stderr, " handle=%04x", req->handle );
+    fprintf( stderr, ", fd=%d", req->fd );
+}
+
+static void dump_nspa_unregister_inproc_event_request( const struct nspa_unregister_inproc_event_request *req )
+{
+    fprintf( stderr, " handle=%04x", req->handle );
+}
+
 typedef void (*dump_func)( const void *req );
 
 static const dump_func req_dumpers[REQ_NB_REQUESTS] =
@@ -4015,6 +4026,8 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_nspa_irot_note_change_time_request,
     (dump_func)dump_nspa_irot_get_time_of_last_change_request,
     (dump_func)dump_nspa_irot_enum_running_request,
+    (dump_func)dump_nspa_register_inproc_event_request,
+    (dump_func)dump_nspa_unregister_inproc_event_request,
 };
 
 static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
@@ -4340,6 +4353,8 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     NULL,
     (dump_func)dump_nspa_irot_get_time_of_last_change_reply,
     (dump_func)dump_nspa_irot_enum_running_reply,
+    NULL,
+    NULL,
 };
 
 static const char * const req_names[REQ_NB_REQUESTS] =
@@ -4665,6 +4680,8 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "nspa_irot_note_change_time",
     "nspa_irot_get_time_of_last_change",
     "nspa_irot_enum_running",
+    "nspa_register_inproc_event",
+    "nspa_unregister_inproc_event",
 };
 
 static const struct

@@ -328,6 +328,8 @@ DECL_HANDLER(nspa_irot_get_object);
 DECL_HANDLER(nspa_irot_note_change_time);
 DECL_HANDLER(nspa_irot_get_time_of_last_change);
 DECL_HANDLER(nspa_irot_enum_running);
+DECL_HANDLER(nspa_register_inproc_event);
+DECL_HANDLER(nspa_unregister_inproc_event);
 
 typedef void (*req_handler)( const void *req, void *reply );
 static const req_handler req_handlers[REQ_NB_REQUESTS] =
@@ -653,6 +655,8 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_nspa_irot_note_change_time,
     (req_handler)req_nspa_irot_get_time_of_last_change,
     (req_handler)req_nspa_irot_enum_running,
+    (req_handler)req_nspa_register_inproc_event,
+    (req_handler)req_nspa_unregister_inproc_event,
 };
 
 C_ASSERT( sizeof(abstime_t) == 8 );
@@ -2490,3 +2494,8 @@ C_ASSERT( sizeof(struct nspa_irot_get_time_of_last_change_reply) == 16 );
 C_ASSERT( sizeof(struct nspa_irot_enum_running_request) == 16 );
 C_ASSERT( offsetof(struct nspa_irot_enum_running_reply, count) == 8 );
 C_ASSERT( sizeof(struct nspa_irot_enum_running_reply) == 16 );
+C_ASSERT( offsetof(struct nspa_register_inproc_event_request, handle) == 12 );
+C_ASSERT( offsetof(struct nspa_register_inproc_event_request, fd) == 16 );
+C_ASSERT( sizeof(struct nspa_register_inproc_event_request) == 24 );
+C_ASSERT( offsetof(struct nspa_unregister_inproc_event_request, handle) == 12 );
+C_ASSERT( sizeof(struct nspa_unregister_inproc_event_request) == 16 );

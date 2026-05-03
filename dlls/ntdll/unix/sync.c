@@ -1205,6 +1205,47 @@ NTSTATUS nspa_create_internal_event( HANDLE *handle, ACCESS_MASK access,
     return NtCreateEvent( handle, access, NULL, type, state );
 }
 
+/*
+ * NSPA Phase 4.6.A: client-side wrappers that push the (handle, fd) pair to
+ * the wineserver via the protocol RPCs added in this phase.  No call sites
+ * yet — they'll be wired into create_inproc_event_local + close_client_inproc_sync
+ * in Phase D.  Defined here in Phase A so the wineserver protocol round-trip
+ * can be smoke-tested in isolation if needed.
+ *
+ * The fd is sent via SCM_RIGHTS using wine_server_send_fd, then the server
+ * picks it up with thread_get_inflight_fd matching the slot we pass in
+ * req->fd.  Same pattern used by alloc_file_handle (server.c:1395).
+ */
+NTSTATUS nspa_register_inproc_event_with_server( HANDLE handle, int fd )
+{
+    NTSTATUS ret;
+
+    if (!handle || fd < 0) return STATUS_INVALID_PARAMETER;
+
+    wine_server_send_fd( fd );
+
+    SERVER_START_REQ( nspa_register_inproc_event )
+    {
+        req->handle = wine_server_obj_handle( handle );
+        req->fd     = fd;
+        ret = wine_server_call( req );
+    }
+    SERVER_END_REQ;
+    return ret;
+}
+
+void nspa_unregister_inproc_event_with_server( HANDLE handle )
+{
+    if (!handle) return;
+
+    SERVER_START_REQ( nspa_unregister_inproc_event )
+    {
+        req->handle = wine_server_obj_handle( handle );
+        wine_server_call( req );
+    }
+    SERVER_END_REQ;
+}
+
 static NTSTATUS inproc_release_semaphore( HANDLE handle, ULONG count, ULONG *prev_count )
 {
     struct inproc_sync stack, *sync;

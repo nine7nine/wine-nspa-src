@@ -913,8 +913,10 @@ static NTSTATUS try_recv( int fd, struct async_recv_ioctl *async, ULONG_PTR *siz
 
 /* Phase 4.8.A: feature gate for the io_uring RECVMSG fast path.  When ON,
  * recv_socket submits IORING_OP_RECVMSG via io_uring instead of the legacy
- * poll-then-syscall path.  Default-OFF this commit; flip after Ableton
- * soak validation.  Set NSPA_URING_RECV=0 to force OFF for diagnostic A/B. */
+ * poll-then-syscall path.  Default-ON since 2026-05-02 night —
+ * Ableton-validated + nspa_rt_test socket-io shows +6.6% throughput,
+ * -9.6% p99 latency, 0/2000 failures.  Set NSPA_URING_RECV=0 to force
+ * OFF for diagnostic A/B. */
 static int nspa_uring_recv_cached;
 
 static BOOL nspa_uring_recv_enabled(void)
@@ -923,7 +925,7 @@ static BOOL nspa_uring_recv_enabled(void)
     if (!v)
     {
         const char *env = getenv( "NSPA_URING_RECV" );
-        v = (env && env[0] == '1' && env[1] == 0) ? 2 : 1;
+        v = (env && env[0] == '0' && env[1] == 0) ? 1 : 2;
         __atomic_store_n( &nspa_uring_recv_cached, v, __ATOMIC_RELEASE );
     }
     return v == 2;
@@ -1478,8 +1480,10 @@ void ntdll_complete_socket_poll( struct uring_async_op *op, int poll_revents )
     }
 }
 
-/* Phase 4.8.B: feature gate for the io_uring SENDMSG fast path.  Default-OFF;
- * NSPA_URING_SEND=1 to engage. */
+/* Phase 4.8.B: feature gate for the io_uring SENDMSG fast path.  Default-ON
+ * since 2026-05-02 night — Ableton-validated + nspa_rt_test socket-io
+ * shows +6.5% throughput, -6.8% p99 latency, 0/2000 failures.
+ * Set NSPA_URING_SEND=0 to force OFF for diagnostic A/B. */
 static int nspa_uring_send_cached;
 
 static BOOL nspa_uring_send_enabled(void)
@@ -1488,7 +1492,7 @@ static BOOL nspa_uring_send_enabled(void)
     if (!v)
     {
         const char *env = getenv( "NSPA_URING_SEND" );
-        v = (env && env[0] == '1' && env[1] == 0) ? 2 : 1;
+        v = (env && env[0] == '0' && env[1] == 0) ? 1 : 2;
         __atomic_store_n( &nspa_uring_send_cached, v, __ATOMIC_RELEASE );
     }
     return v == 2;

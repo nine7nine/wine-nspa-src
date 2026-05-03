@@ -1182,8 +1182,11 @@ static BOOL nspa_nt_local_timer_enabled(void)
     int v = __atomic_load_n( &nspa_nt_local_timer_cached, __ATOMIC_ACQUIRE );
     if (!v)
     {
+        /* Default-ON since 2026-05-02 night — Phase 4.5 Ableton-validated.
+         * Set NSPA_NT_LOCAL_TIMER=0 to force OFF (kept as an env switch
+         * for diagnostic A/B). */
         const char *env = getenv( "NSPA_NT_LOCAL_TIMER" );
-        v = (env && env[0] == '1' && env[1] == 0) ? 2 : 1;
+        v = (env && env[0] == '0' && env[1] == 0) ? 1 : 2;
         __atomic_store_n( &nspa_nt_local_timer_cached, v, __ATOMIC_RELEASE );
     }
     return v == 2;

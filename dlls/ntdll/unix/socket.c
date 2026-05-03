@@ -787,41 +787,61 @@ static ssize_t fixup_icmp_over_dgram( struct msghdr *hdr, union unix_sockaddr *u
     return recv_len;
 }
 
-static NTSTATUS try_recv( int fd, struct async_recv_ioctl *async, ULONG_PTR *size )
+/* Setup msghdr for an async_recv_ioctl recvmsg call.  Caller owns the
+ * lifetime of hdr / control_buffer / unix_addr — they're typically on
+ * stack for the synchronous try_recv path, or embedded in a long-lived
+ * struct (uring_async_op) for the io_uring path. */
+static void try_recv_setup_msghdr( struct async_recv_ioctl *async, struct msghdr *hdr,
+                                   char *control_buffer, size_t control_size,
+                                   union unix_sockaddr *unix_addr )
 {
-    char control_buffer[512];
-    union unix_sockaddr unix_addr;
-    struct msghdr hdr;
-    NTSTATUS status;
-    ssize_t ret;
-
-    memset( &hdr, 0, sizeof(hdr) );
+    memset( hdr, 0, sizeof(*hdr) );
     if (async->addr || async->icmp_over_dgram)
     {
-        hdr.msg_name = &unix_addr.addr;
-        hdr.msg_namelen = sizeof(unix_addr);
+        hdr->msg_name = &unix_addr->addr;
+        hdr->msg_namelen = sizeof(*unix_addr);
     }
-    hdr.msg_iov = async->iov;
-    hdr.msg_iovlen = async->count;
-    hdr.msg_control = control_buffer;
-    hdr.msg_controllen = sizeof(control_buffer);
+    hdr->msg_iov = async->iov;
+    hdr->msg_iovlen = async->count;
+    hdr->msg_control = control_buffer;
+    hdr->msg_controllen = control_size;
+}
 
-    while ((ret = virtual_locked_recvmsg( fd, &hdr, async->unix_flags )) < 0 && errno == EINTR);
+/* Post-process the result of a recvmsg.  Called from try_recv (sync path)
+ * after virtual_locked_recvmsg, and from the io_uring CQE handler after
+ * IORING_OP_RECVMSG completion.
+ *
+ * On entry: ret = bytes returned (>=0) or -errno on error.
+ * On exit: *size = effective bytes (after icmp_over_dgram fixup);
+ *          returns NTSTATUS for the operation.
+ *
+ * Wine-specific post-processing that io_uring cannot do automatically:
+ * - MSG_TRUNC -> STATUS_BUFFER_OVERFLOW
+ * - icmp_over_dgram fixup
+ * - control message format conversion (wow64 + WSA shape)
+ * - Unix -> WSA sockaddr conversion
+ * - OOB EINVAL -> EWOULDBLOCK quirk on the error side
+ */
+static NTSTATUS try_recv_post_process( struct async_recv_ioctl *async, struct msghdr *hdr,
+                                       union unix_sockaddr *unix_addr, ssize_t ret,
+                                       int saved_errno, ULONG_PTR *size )
+{
+    NTSTATUS status;
 
     if (ret < 0)
     {
         /* Unix-like systems return EINVAL when attempting to read OOB data from
          * an empty socket buffer; Windows returns WSAEWOULDBLOCK. */
-        if ((async->unix_flags & MSG_OOB) && errno == EINVAL)
-            errno = EWOULDBLOCK;
+        if ((async->unix_flags & MSG_OOB) && saved_errno == EINVAL)
+            saved_errno = EWOULDBLOCK;
 
-        if (errno != EWOULDBLOCK) WARN( "recvmsg: %s\n", strerror( errno ) );
-        return sock_errno_to_status( errno );
+        if (saved_errno != EWOULDBLOCK) WARN( "recvmsg: %s\n", strerror( saved_errno ) );
+        return sock_errno_to_status( saved_errno );
     }
 
-    status = (hdr.msg_flags & MSG_TRUNC) ? STATUS_BUFFER_OVERFLOW : STATUS_SUCCESS;
+    status = (hdr->msg_flags & MSG_TRUNC) ? STATUS_BUFFER_OVERFLOW : STATUS_SUCCESS;
     if (async->icmp_over_dgram)
-        ret = fixup_icmp_over_dgram( &hdr, &unix_addr, async->io.handle, ret, &status );
+        ret = fixup_icmp_over_dgram( hdr, unix_addr, async->io.handle, ret, &status );
 
     if (async->control)
     {
@@ -835,7 +855,7 @@ static NTSTATUS try_recv( int fd, struct async_recv_ioctl *async, ULONG_PTR *siz
 
             wsabuf.len = sizeof(control_buffer64);
             wsabuf.buf = control_buffer64;
-            if (convert_control_headers( &hdr, &wsabuf ))
+            if (convert_control_headers( hdr, &wsabuf ))
             {
                 if (!wow64_translate_control( &wsabuf, async->control ))
                 {
@@ -853,7 +873,7 @@ static NTSTATUS try_recv( int fd, struct async_recv_ioctl *async, ULONG_PTR *siz
         }
         else
         {
-            if (!convert_control_headers( &hdr, async->control ))
+            if (!convert_control_headers( hdr, async->control ))
             {
                 WARN( "Application passed insufficient room for control headers.\n" );
                 *async->ret_flags |= WS_MSG_CTRUNC;
@@ -868,11 +888,27 @@ static NTSTATUS try_recv( int fd, struct async_recv_ioctl *async, ULONG_PTR *siz
      * MSDN says that the address is ignored for connection-oriented sockets, so
      * don't try to translate it.
      */
-    if (async->addr && hdr.msg_namelen)
-        *async->addr_len = sockaddr_from_unix( &unix_addr, async->addr, *async->addr_len );
+    if (async->addr && hdr->msg_namelen)
+        *async->addr_len = sockaddr_from_unix( unix_addr, async->addr, *async->addr_len );
 
     *size = ret;
     return status;
+}
+
+static NTSTATUS try_recv( int fd, struct async_recv_ioctl *async, ULONG_PTR *size )
+{
+    char control_buffer[512];
+    union unix_sockaddr unix_addr;
+    struct msghdr hdr;
+    ssize_t ret;
+    int saved_errno;
+
+    try_recv_setup_msghdr( async, &hdr, control_buffer, sizeof(control_buffer), &unix_addr );
+
+    while ((ret = virtual_locked_recvmsg( fd, &hdr, async->unix_flags )) < 0 && errno == EINTR);
+    saved_errno = errno;
+
+    return try_recv_post_process( async, &hdr, &unix_addr, ret, saved_errno, size );
 }
 
 static BOOL async_recv_proc( void *user, ULONG_PTR *info, unsigned int *status )

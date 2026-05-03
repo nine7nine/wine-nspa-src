@@ -33,6 +33,12 @@
 #include "process.h"
 #include "handle.h"
 
+#ifdef __linux__
+#include <sys/ioctl.h>
+#include <linux/ntsync.h>
+#include "nspa/inproc_event_table.h"
+#endif
+
 struct async_cancel
 {
     struct object        obj;                 /* object header */
@@ -119,6 +125,7 @@ struct async
     struct timeout_user *timeout;
     unsigned int         timeout_status;  /* status to report upon timeout */
     struct event        *event;
+    int                  client_event_fd; /* NSPA Phase 4.6.B/C: ntsync fd for client-range event handle (only when ->event == NULL); -1 otherwise.  Owned by the per-process inproc_event_table — do not close from here. */
     struct async_data    data;            /* data for async I/O call */
     struct iosb         *iosb;            /* I/O status block */
     obj_handle_t         wait_handle;     /* pre-allocated wait handle */
@@ -329,9 +336,30 @@ struct async *create_async( struct fd *fd, struct thread *thread, const struct a
 {
     struct event *event = NULL;
     struct async *async;
+    int client_event_fd = -1;
 
-    if (data->event && !(event = get_event_obj( thread->process, data->event, EVENT_MODIFY_STATE )))
-        return NULL;
+    if (data->event)
+    {
+        event = get_event_obj( thread->process, data->event, EVENT_MODIFY_STATE );
+        if (!event)
+        {
+#ifdef __linux__
+            /* NSPA Phase 4.6.B: handle isn't in the server's event table —
+             * check if it's a PE-side client-range event registered via
+             * nspa_register_inproc_event.  If so, the server signals it on
+             * completion via direct ntsync ioctl (Phase 4.6.C), not via
+             * a server-side event obj.  Clear the error get_event_obj set
+             * before continuing. */
+            client_event_fd = nspa_inproc_event_lookup( thread->process, data->event );
+            if (client_event_fd >= 0)
+                clear_error();
+            else
+                return NULL;
+#else
+            return NULL;
+#endif
+        }
+    }
 
     if (!(async = alloc_object( &async_ops )))
     {
@@ -339,9 +367,10 @@ struct async *create_async( struct fd *fd, struct thread *thread, const struct a
         return NULL;
     }
 
-    async->thread        = (struct thread *)grab_object( thread );
-    async->event         = event;
-    async->data          = *data;
+    async->thread          = (struct thread *)grab_object( thread );
+    async->event           = event;
+    async->client_event_fd = client_event_fd;
+    async->data            = *data;
     async->timeout       = NULL;
     async->queue         = NULL;
     async->fd            = (struct fd *)grab_object( fd );
@@ -624,6 +653,19 @@ void async_set_result( struct object *obj, unsigned int status, apc_param_t tota
             }
 
             if (async->event) set_event( async->event );
+#ifdef __linux__
+            /* NSPA Phase 4.6.C: when the async carries a client-range event
+             * (the PE-side event handle wasn't in the server's event table
+             * but was registered via nspa_register_inproc_event), signal
+             * the underlying ntsync event fd directly.  Same effect as
+             * set_event for an immediate signal — PE-side waiters wake via
+             * inproc-sync. */
+            else if (async->client_event_fd >= 0)
+            {
+                __u32 count;
+                ioctl( async->client_event_fd, NTSYNC_IOC_EVENT_SET, &count );
+            }
+#endif
             else if (async->fd && !async->is_system) set_fd_signaled( async->fd, 1 );
         }
 

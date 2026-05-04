@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -215,6 +216,15 @@ int nspa_local_file_table_lookup( unsigned long long device, unsigned long long 
     (FILE_READ_DATA | FILE_READ_ATTRIBUTES | FILE_READ_EA | \
      READ_CONTROL | SYNCHRONIZE | GENERIC_READ)
 
+/* Phase 2 write extension: data-write subset.  WRITE_DAC / WRITE_OWNER
+ * (security-descriptor mutation) and DELETE (file deletion path)
+ * remain server-mediated — clients with those bits fall back.
+ * GENERIC_WRITE is included; try_bypass expands it into the bits below
+ * before any sharing arbitration or storage. */
+#define NSPA_LF_STD_WRITE_ACCESS \
+    (FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA | \
+     FILE_APPEND_DATA | GENERIC_WRITE)
+
 /* Options that disqualify even within FILE_OPEN read.  FILE_DIRECTORY_FILE
  * and FILE_DELETE_ON_CLOSE get their own counters; everything else here
  * is collapsed under "other_options".  Only options that have semantic
@@ -252,12 +262,41 @@ BOOL nspa_local_file_disp_categorize( BOOL loader_open,
     if (loader_open) return FALSE;
     if (attr && attr->RootDirectory) return FALSE;
     if (attr && attr->SecurityDescriptor) return FALSE;
-    if (disposition != FILE_OPEN && disposition != FILE_OPEN_IF) return FALSE;
+    /* Allowed dispositions:
+     *   FILE_OPEN          — file must exist; existing-file path.
+     *   FILE_OPEN_IF       — non-existent falls back to server.
+     *   FILE_OVERWRITE     — existing-file path + O_TRUNC.
+     *   FILE_CREATE        — alternate `openat(O_CREAT|O_EXCL) then
+     *                         fstat then publish` ordering.
+     *   FILE_OVERWRITE_IF  — stat-first dispatch: existing-file path
+     *                         (O_TRUNC) or alternate-order (O_CREAT|
+     *                         O_EXCL|O_TRUNC); io->Information set per
+     *                         path.  TOCTOU between stat + openat
+     *                         falls back gracefully.
+     *   FILE_SUPERSEDE     — same shape as FILE_OVERWRITE_IF; differs
+     *                         only in io->Information value (FILE_SUPERSEDED
+     *                         vs FILE_OVERWRITTEN) on the existing-file
+     *                         path.  Server's create_file (file.c:239-241)
+     *                         uses identical Linux flags for both.
+     */
+    if (disposition != FILE_OPEN &&
+        disposition != FILE_OPEN_IF &&
+        disposition != FILE_OVERWRITE &&
+        disposition != FILE_CREATE &&
+        disposition != FILE_OVERWRITE_IF &&
+        disposition != FILE_SUPERSEDE) return FALSE;
     if (options & FILE_OPEN_BY_FILE_ID) return FALSE;
-    if (options & FILE_DIRECTORY_FILE) return FALSE;
+    /* FILE_DIRECTORY_FILE is NOT excluded at the gate — try_bypass's
+     * dir-mint path handles directory opens.  The gate only rejects
+     * the inverse case (FILE_DIRECTORY_FILE on a regular-file path),
+     * which try_bypass detects after stat() and falls back so the
+     * server returns STATUS_NOT_A_DIRECTORY. */
     if (options & FILE_DELETE_ON_CLOSE) return FALSE;
     if (!(options & (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT))) return FALSE;
-    if (access & ~NSPA_LF_STD_READ_ACCESS) return FALSE;
+    /* Eligibility = read-class | write-class.  WRITE_DAC, WRITE_OWNER
+     * (security descriptor mutation) and DELETE (deletion semantics)
+     * are NOT in the union; opens with those bits fall back. */
+    if (access & ~(NSPA_LF_STD_READ_ACCESS | NSPA_LF_STD_WRITE_ACCESS)) return FALSE;
     return TRUE;
 }
 
@@ -731,14 +770,27 @@ static void nspa_lf_aggregate_from_slot( const nspa_inode_slot_t *slot,
  * arbitration.  The bit overlaps GENERIC_WRITE in raw client access,
  * but try_bypass strips GENERIC_* before storage so the only way this
  * bit appears in existing_access is via the server's publish. */
-#define NSPA_LF_FILE_MAPPING_WRITE 0x40000000u
+#define NSPA_LF_FILE_MAPPING_WRITE  0x40000000u
+/* Mirror server/file.h::FILE_MAPPING_IMAGE (SEC_IMAGE mapping) and
+ * FILE_MAPPING_ACCESS (any mapping).  Aggregated into existing_access
+ * via server-side `nspa_publish_inode_state` (server/fd.c:287) which
+ * folds every fd in inode->open into agg_access; mapping fds carry
+ * these bits via `dup_fd_object(fd, mapping_access, ...)` at
+ * server/mapping.c:1279. */
+#define NSPA_LF_FILE_MAPPING_IMAGE  0x80000000u
+#define NSPA_LF_FILE_MAPPING_ACCESS 0x20000000u
 
 /* Apply the same algorithm as server/fd.c:check_sharing on aggregated
- * existing state.  Returns STATUS_SHARING_VIOLATION on conflict. */
+ * existing state.  Phase 2 write extension: takes my_open_flags so the
+ * O_TRUNC vs FILE_MAPPING_ACCESS arbitration matches the server's
+ * line-1820 check.  Returns STATUS_SHARING_VIOLATION,
+ * STATUS_USER_MAPPED_FILE, STATUS_CANNOT_DELETE, or STATUS_SUCCESS. */
 static NTSTATUS nspa_lf_check_sharing_algorithm( unsigned int existing_access,
                                                  unsigned int existing_sharing,
                                                  unsigned int my_access,
-                                                 unsigned int my_sharing )
+                                                 unsigned int my_sharing,
+                                                 unsigned int my_options,
+                                                 int my_open_flags )
 {
     const unsigned int read_access  = FILE_READ_DATA | FILE_EXECUTE;
     const unsigned int write_access = FILE_WRITE_DATA | FILE_APPEND_DATA;
@@ -749,16 +801,23 @@ static NTSTATUS nspa_lf_check_sharing_algorithm( unsigned int existing_access,
         ((my_access & DELETE)       && !(existing_sharing & FILE_SHARE_DELETE)))
         return STATUS_SHARING_VIOLATION;
 
-    /* Sync-parity with server/fd.c::check_sharing — a writable section
-     * mapping on this inode (FILE_MAPPING_WRITE in existing_access via
-     * server's subentry[0] publish) requires the new open to allow
-     * FILE_SHARE_WRITE.  The other server-side mapping checks
-     * (FILE_MAPPING_IMAGE && FILE_WRITE_DATA, FILE_MAPPING_IMAGE &&
-     * FILE_DELETE_ON_CLOSE, FILE_MAPPING_ACCESS && O_TRUNC) are moot
-     * here: LF eligibility excludes FILE_WRITE_DATA, FILE_DELETE_ON_CLOSE,
-     * and any disposition that produces O_TRUNC. */
+    /* Sync-parity with server/fd.c::check_sharing lines 1815-1820.
+     * Phase 1 (read-only): only FILE_MAPPING_WRITE was reachable
+     * because LF eligibility excluded write/delete/trunc.  Phase 2
+     * write extension allows FILE_WRITE_DATA and O_TRUNC, so the
+     * three additional clauses below are now reachable. */
     if ((existing_access & NSPA_LF_FILE_MAPPING_WRITE) && !(my_sharing & FILE_SHARE_WRITE))
         return STATUS_SHARING_VIOLATION;
+    if ((existing_access & NSPA_LF_FILE_MAPPING_IMAGE) && (my_access & FILE_WRITE_DATA))
+        return STATUS_SHARING_VIOLATION;
+    /* FILE_DELETE_ON_CLOSE remains in the eligibility deny-list (line
+     * ~258), so the FILE_MAPPING_IMAGE && FILE_DELETE_ON_CLOSE clause
+     * cannot fire here — keeping it as a defensive assert via the
+     * options-bit check anyway, in case eligibility ever loosens. */
+    if ((existing_access & NSPA_LF_FILE_MAPPING_IMAGE) && (my_options & FILE_DELETE_ON_CLOSE))
+        return STATUS_CANNOT_DELETE;
+    if ((existing_access & NSPA_LF_FILE_MAPPING_ACCESS) && (my_open_flags & O_TRUNC))
+        return STATUS_USER_MAPPED_FILE;
 
     if (!(my_access & all_access))
         return STATUS_SUCCESS;   /* zero-access opens ignore sharing */
@@ -773,11 +832,11 @@ static NTSTATUS nspa_lf_check_sharing_algorithm( unsigned int existing_access,
 
 /* Replicates server/fd.c:check_sharing using slot subentries.  Called
  * by NtCreateFile bypass dispatch (Phase 1A.2.d) before opening locally.
- * Returns STATUS_SUCCESS if the new open with `my_access`/`my_sharing`
- * would not violate any existing open's sharing mode, or
- * STATUS_SHARING_VIOLATION otherwise. */
+ * Phase 2 write extension: takes my_options + my_open_flags so the
+ * mapping/O_TRUNC arbitration matches server-side behavior. */
 NTSTATUS nspa_local_file_check_sharing( unsigned long long device, unsigned long long inode,
-                                        unsigned int my_access, unsigned int my_sharing )
+                                        unsigned int my_access, unsigned int my_sharing,
+                                        unsigned int my_options, int my_open_flags )
 {
     nspa_inode_slot_t snapshot;
     unsigned int agg_access = 0;
@@ -787,7 +846,8 @@ NTSTATUS nspa_local_file_check_sharing( unsigned long long device, unsigned long
         return STATUS_SUCCESS;   /* no existing opens */
 
     nspa_lf_aggregate_from_slot( &snapshot, &agg_access, &agg_sharing );
-    return nspa_lf_check_sharing_algorithm( agg_access, agg_sharing, my_access, my_sharing );
+    return nspa_lf_check_sharing_algorithm( agg_access, agg_sharing, my_access, my_sharing,
+                                            my_options, my_open_flags );
 }
 
 /* Atomic check-sharing + publish.  Used by NtCreateFile bypass dispatch
@@ -802,7 +862,9 @@ NTSTATUS nspa_local_file_check_sharing( unsigned long long device, unsigned long
 static NTSTATUS nspa_local_file_check_and_publish_open( unsigned long long device,
                                                         unsigned long long inode,
                                                         unsigned int access,
-                                                        unsigned int sharing )
+                                                        unsigned int sharing,
+                                                        unsigned int options,
+                                                        int open_flags )
 {
     const unsigned int all_access = FILE_READ_DATA | FILE_EXECUTE
                                   | FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE;
@@ -835,7 +897,7 @@ static NTSTATUS nspa_local_file_check_and_publish_open( unsigned long long devic
         nspa_inode_slot_t snap = (nspa_inode_slot_t)bucket->slots[slot_idx];
         nspa_lf_aggregate_from_slot( &snap, &existing_access, &existing_sharing );
         status = nspa_lf_check_sharing_algorithm( existing_access, existing_sharing,
-                                                  access, sharing );
+                                                  access, sharing, options, open_flags );
         if (status != STATUS_SUCCESS)
         {
             pi_mutex_unlock( nspa_lf_lock_of( bucket ) );
@@ -1066,6 +1128,7 @@ static int nspa_local_dir_disabled( void )
 NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
                                      const UNICODE_STRING *nt_name,
                                      ACCESS_MASK access, ULONG sharing,
+                                     ULONG disposition,
                                      ULONG options, ULONG attributes,
                                      IO_STATUS_BLOCK *io )
 {
@@ -1097,6 +1160,112 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
         if (access & GENERIC_EXECUTE) access |= ge;
         if (access & GENERIC_ALL)     access |= ga;
         access &= ~(GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | GENERIC_ALL);
+    }
+
+    /* Phase 2 FILE_CREATE — alternate ordering.  (dev, inode) is not
+     * known pre-open because the file doesn't exist yet.  Sequence:
+     *   1. derive open flags + mode from access + attributes
+     *   2. openat(O_CREAT|O_EXCL, mode) — atomic create-or-fail
+     *   3. fstat the resulting fd → (dev, inode)
+     *   4. check_and_publish_open under bucket lock
+     *
+     * On openat EEXIST: STATUS_OBJECT_NAME_COLLISION (NT semantic).
+     * On check_and_publish failure (sharing/mapping conflict): close fd,
+     * leave file on disk — matches server/file.c::create_file behavior
+     * where check_sharing failure post-create leaves the file. */
+    if (disposition == FILE_CREATE)
+    {
+        const ACCESS_MASK unix_read  = FILE_READ_DATA  | FILE_READ_ATTRIBUTES  | FILE_READ_EA;
+        const ACCESS_MASK unix_write = FILE_WRITE_DATA | FILE_APPEND_DATA |
+                                       FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA;
+        mode_t mode;
+        size_t name_len;
+
+        /* FILE_DIRECTORY_FILE + FILE_CREATE = mkdir.  Server handles
+         * directory creation; LF doesn't.  Fall back. */
+        if (options & FILE_DIRECTORY_FILE)
+            return STATUS_NOT_SUPPORTED;
+
+        /* Mode_t derivation — mirror server/file.c:256-269 (regular-file
+         * branch — FILE_DIRECTORY_FILE excluded by gate). */
+        mode = (attributes & FILE_ATTRIBUTE_READONLY) ? 0444 : 0666;
+        name_len = strlen( unix_name );
+        if (name_len >= 4 &&
+            (!strcasecmp( unix_name + name_len - 4, ".exe" ) ||
+             !strcasecmp( unix_name + name_len - 4, ".com" )))
+        {
+            if (mode & S_IRUSR) mode |= S_IXUSR;
+            if (mode & S_IRGRP) mode |= S_IXGRP;
+            if (mode & S_IROTH) mode |= S_IXOTH;
+        }
+
+        if (access & unix_write)
+            open_flags = (access & unix_read) ? O_RDWR : O_WRONLY;
+        else
+            open_flags = O_RDONLY;
+        open_flags |= O_CREAT | O_EXCL;
+        if (options & FILE_OPEN_REPARSE_POINT) open_flags |= O_NOFOLLOW;
+
+        unix_fd = open( unix_name, open_flags, mode );
+        if (unix_fd < 0)
+        {
+            if (errno == EEXIST) return STATUS_OBJECT_NAME_COLLISION;
+            return STATUS_NOT_SUPPORTED;   /* fall back to server */
+        }
+
+        if (fstat( unix_fd, &st ) != 0)
+        {
+            close( unix_fd );
+            return STATUS_NOT_SUPPORTED;
+        }
+
+        status = nspa_local_file_check_and_publish_open(
+            (unsigned long long)st.st_dev, (unsigned long long)st.st_ino,
+            access, sharing, options, open_flags );
+        if (status == STATUS_SHARING_VIOLATION ||
+            status == STATUS_USER_MAPPED_FILE  ||
+            status == STATUS_CANNOT_DELETE)
+        {
+            /* Match server semantics: file we just created remains on
+             * disk; only the OPEN failed.  Caller propagates the NT
+             * error to the app. */
+            close( unix_fd );
+            return status;
+        }
+        if (status != STATUS_SUCCESS)
+        {
+            close( unix_fd );
+            return STATUS_NOT_SUPPORTED;
+        }
+
+        h = nspa_lf_alloc_handle();
+        if (!h)
+        {
+            nspa_local_file_publish_close( (unsigned long long)st.st_dev,
+                                           (unsigned long long)st.st_ino );
+            close( unix_fd );
+            return STATUS_NOT_SUPPORTED;
+        }
+
+        status = nspa_local_file_table_add( h, unix_fd,
+                                            (unsigned long long)st.st_dev,
+                                            (unsigned long long)st.st_ino,
+                                            access, sharing, options, attributes,
+                                            FD_TYPE_FILE, nt_name );
+        if (status != STATUS_SUCCESS)
+        {
+            nspa_lf_free_handle( h );
+            nspa_local_file_publish_close( (unsigned long long)st.st_dev,
+                                           (unsigned long long)st.st_ino );
+            close( unix_fd );
+            return STATUS_NOT_SUPPORTED;
+        }
+
+        *handle = h;
+        if (io) io->Information = FILE_CREATED;
+        NSPA_TRACE( LF_TRACE, "NSPA-LF create-mint h=%p fd=%d access=%x options=%x path=%s\n",
+                    h, unix_fd, (unsigned)access, (unsigned)options, unix_name );
+        return STATUS_SUCCESS;
     }
 
     /* stat the unix path to derive (dev, inode) for the table lookup. */
@@ -1175,21 +1344,45 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
         return STATUS_NOT_SUPPORTED;
     }
 
-    /* Atomic check-sharing + publish_open under the bucket lock. */
+    /* Caller asked for a directory but stat resolved to a regular file
+     * — server returns STATUS_NOT_A_DIRECTORY for this case; fall back
+     * so the upstream error path produces the correct NT status. */
+    if (options & FILE_DIRECTORY_FILE)
+        return STATUS_NOT_SUPPORTED;
+
+    /* Phase 2 write extension — derive Linux open flags from access +
+     * disposition + options.  Mirrors server/fd.c:2322-2327's rw_mode
+     * derivation so PE-side opens use the same syscall flags as the
+     * server would have.  open_flags must be computed BEFORE the
+     * check_and_publish call so the O_TRUNC bit can participate in
+     * the FILE_MAPPING_ACCESS arbitration (server/fd.c:1820 parity). */
+    {
+        const ACCESS_MASK unix_read  = FILE_READ_DATA  | FILE_READ_ATTRIBUTES  | FILE_READ_EA;
+        const ACCESS_MASK unix_write = FILE_WRITE_DATA | FILE_APPEND_DATA |
+                                       FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA;
+        if (access & unix_write)
+            open_flags = (access & unix_read) ? O_RDWR : O_WRONLY;
+        else
+            open_flags = O_RDONLY;
+        if (disposition == FILE_OVERWRITE) open_flags |= O_TRUNC;
+        if (options & FILE_OPEN_REPARSE_POINT) open_flags |= O_NOFOLLOW;
+    }
+
+    /* Atomic check-sharing + publish_open under the bucket lock.
+     * options + open_flags forwarded for FILE_MAPPING_IMAGE /
+     * FILE_MAPPING_ACCESS arbitration (mirrors server check_sharing). */
     status = nspa_local_file_check_and_publish_open(
         (unsigned long long)st.st_dev, (unsigned long long)st.st_ino,
-        access, sharing );
-    if (status == STATUS_SHARING_VIOLATION)
-        return status;   /* real error — propagate to caller */
+        access, sharing, options, open_flags );
+    if (status == STATUS_SHARING_VIOLATION ||
+        status == STATUS_USER_MAPPED_FILE  ||
+        status == STATUS_CANNOT_DELETE)
+        return status;   /* real NT error — propagate to caller */
     if (status != STATUS_SUCCESS)
     {
         return STATUS_NOT_SUPPORTED;   /* overflow/etc → fall back */
     }
 
-    /* Open locally.  O_RDONLY for MVP read-only access; O_NOFOLLOW
-     * when caller asked for FILE_OPEN_REPARSE_POINT. */
-    open_flags = O_RDONLY;
-    if (options & FILE_OPEN_REPARSE_POINT) open_flags |= O_NOFOLLOW;
     unix_fd = open( unix_name, open_flags );
     if (unix_fd < 0)
     {

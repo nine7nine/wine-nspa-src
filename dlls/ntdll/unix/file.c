@@ -4717,7 +4717,7 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
         if (nspa_local_file_disp_categorize( loader_open, attr, access, disposition, options ))
         {
             NTSTATUS bypass = nspa_local_file_try_bypass( handle, unix_name, attr->ObjectName,
-                                                          access, sharing, options,
+                                                          access, sharing, disposition, options,
                                                           attr->Attributes, io );
             if (bypass == STATUS_SUCCESS)
             {

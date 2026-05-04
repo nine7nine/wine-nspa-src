@@ -336,10 +336,12 @@ extern int      nspa_local_file_table_lookup_unix_fd( HANDLE handle );
 extern int      nspa_local_file_table_lookup_full( HANDLE handle, int *unix_fd_out, unsigned int *options_out,
                                                    enum server_fd_type *kind_out );
 extern NTSTATUS nspa_local_file_check_sharing( unsigned long long device, unsigned long long inode,
-                                               unsigned int my_access, unsigned int my_sharing );
+                                               unsigned int my_access, unsigned int my_sharing,
+                                               unsigned int my_options, int my_open_flags );
 extern NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
                                             const UNICODE_STRING *nt_name,
                                             ACCESS_MASK access, ULONG sharing,
+                                            ULONG disposition,
                                             ULONG options, ULONG attributes,
                                             IO_STATUS_BLOCK *io );
 extern void     nspa_local_file_promote_inheritable( void );

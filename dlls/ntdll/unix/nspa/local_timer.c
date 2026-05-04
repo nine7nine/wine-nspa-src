@@ -740,11 +740,11 @@ NTSTATUS nspa_local_timer_create( HANDLE *handle, ACCESS_MASK access,
 
     /* The backing event is set/reset by the dispatcher thread and waited
      * by app threads — both PE-side via inproc-sync.  After Phase 4.6
-     * (events Option A), NtCreateEvent itself routes anonymous events
-     * through the client-range fast path when NSPA_NT_LOCAL_EVENT is on.
-     * Server-aware client-range events handle the cross-context cases
-     * for which the timer backing previously required a workaround
-     * helper (nspa_create_internal_event, removed in Phase 4.6.F). */
+     * (events Option A), NtCreateEvent routes anonymous events through
+     * the client-range fast path; server-aware client-range events
+     * handle the cross-context cases for which the timer backing
+     * previously required a workaround helper (nspa_create_internal_event,
+     * removed in Phase 4.6.F). */
     if ((ret = NtCreateEvent( &event, access, NULL /* suppress name */,
                               event_type, FALSE /* initial state */ )))
         return ret;

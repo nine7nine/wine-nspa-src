@@ -2064,15 +2064,16 @@ NTSTATUS nspa_local_section_table_add( HANDLE handle, HANDLE file_handle, int un
 
     s = malloc( sizeof(*s) );
     if (!s) return STATUS_NO_MEMORY;
-    s->handle       = handle;
-    s->file_handle  = file_handle;
-    s->unix_fd      = unix_fd;
-    s->size         = size;
-    s->sec_flags    = sec_flags;
-    s->file_access  = file_access;
-    s->access       = access;
-    s->mapping_bits = mapping_bits;
-    s->ref          = 1;
+    s->handle        = handle;
+    s->file_handle   = file_handle;
+    s->server_handle = 0;          /* lazy-promoted on Phase F NtDuplicateObject */
+    s->unix_fd       = unix_fd;
+    s->size          = size;
+    s->sec_flags     = sec_flags;
+    s->file_access   = file_access;
+    s->access        = access;
+    s->mapping_bits  = mapping_bits;
+    s->ref           = 1;
     list_init( &s->views );
 
     pi_mutex_lock( &nspa_ls_sections_mutex );
@@ -2177,6 +2178,144 @@ int nspa_local_section_close( HANDLE handle )
      * NtClose(section) (DirectWrite font loader does exactly this). */
     if (snap.unix_fd >= 0) close( snap.unix_fd );
 
+    /* Phase F: if this section was ever promoted to a server-side
+     * mapping (NtDuplicateObject path), close the server handle so
+     * the server-side mapping object is freed. */
+    if (snap.server_handle)
+    {
+        SERVER_START_REQ( close_handle )
+        {
+            req->handle = wine_server_obj_handle( snap.server_handle );
+            wine_server_call( req );
+        }
+        SERVER_END_REQ;
+    }
+
     nspa_local_section_free_handle( handle );
     return 1;
+}
+
+/* Phase F — promote a local section to a server-side mapping.
+ *
+ * Mirrors nspa_local_file_get_or_promote_server_handle's pattern:
+ * keeps the local section table entry alive (so subsequent ops on the
+ * original handle continue to work via Phase C-G) and caches the
+ * resulting server_handle on the entry for future reuse.
+ *
+ * Used by NtDuplicateObject when the source is a local-range section:
+ * the server doesn't know our local handle, so we mint a real
+ * server-side mapping from the section's unix_fd, swap it in for the
+ * dup_handle RPC, and let the server handle the rest of the dup
+ * (cross-process or same-process) normally.
+ *
+ * Side effects on success:
+ *   - section->server_handle populated.
+ *   - LF aggregate mapping bits cleared in our subentry — the
+ *     server's nspa_publish_inode_state walk picks them up via the
+ *     newly-added struct fd in inode->open.  This avoids double-
+ *     publication and keeps the cross-process arbitration consistent.
+ *
+ * Returns the server handle on success, NULL on failure.  Caller can
+ * then proceed with the original local handle (still valid) for
+ * non-server-needing ops, OR with the server handle for ops that need
+ * server-tracked state. */
+HANDLE nspa_local_section_get_or_promote_server_handle( HANDLE handle )
+{
+    struct nspa_local_section *s;
+    HANDLE cached = 0;
+    int unix_fd = -1;
+    int section_dup_fd = -1;
+    unsigned int sec_access = 0, sec_flags = 0, sec_file_access = 0;
+    size_t size = 0;
+    HANDLE file_handle = 0;
+    HANDLE server_handle = 0;
+    struct object_attributes *objattr = NULL;
+    data_size_t objattr_len = 0;
+    unsigned int rpc_status;
+
+    if (!nspa_local_section_is_local_handle( handle )) return 0;
+
+    /* Snapshot under the table lock; check cache. */
+    pi_mutex_lock( &nspa_ls_sections_mutex );
+    LIST_FOR_EACH_ENTRY( s, &nspa_ls_sections, struct nspa_local_section, entry )
+    {
+        if (s->handle != handle) continue;
+        if (s->server_handle) { cached = s->server_handle; break; }
+        unix_fd         = s->unix_fd;
+        sec_access      = s->access;
+        sec_flags       = s->sec_flags;
+        sec_file_access = s->file_access;
+        size            = s->size;
+        file_handle     = s->file_handle;
+        break;
+    }
+    pi_mutex_unlock( &nspa_ls_sections_mutex );
+
+    if (cached) return cached;
+    if (unix_fd < 0) return 0;   /* entry not found or invalid */
+
+    /* Dup so the section's PE-side fd survives the RPC.  Server's
+     * nspa_create_mapping_from_unix_fd handler consumes the inflight
+     * fd via thread_get_inflight_fd. */
+    section_dup_fd = dup( unix_fd );
+    if (section_dup_fd < 0) return 0;
+
+    /* Minimal objattr — local sections are always unnamed + no SD. */
+    if (alloc_object_attributes( NULL, &objattr, &objattr_len ) != STATUS_SUCCESS)
+    {
+        close( section_dup_fd );
+        return 0;
+    }
+
+    wine_server_send_fd( section_dup_fd );
+    SERVER_START_REQ( nspa_create_mapping_from_unix_fd )
+    {
+        req->fd          = section_dup_fd;
+        req->access      = sec_access;
+        req->flags       = sec_flags;
+        req->file_access = sec_file_access;
+        req->size        = size;
+        wine_server_add_data( req, objattr, objattr_len );
+        rpc_status = wine_server_call( req );
+        if (!rpc_status) server_handle = wine_server_ptr_handle( reply->handle );
+    }
+    SERVER_END_REQ;
+    free( objattr );
+
+    if (!server_handle) return 0;
+
+    /* Install on the entry.  Race window: another thread may have
+     * concurrently promoted; whichever installs first wins and the
+     * loser closes its server handle. */
+    {
+        HANDLE winner = 0;
+        pi_mutex_lock( &nspa_ls_sections_mutex );
+        LIST_FOR_EACH_ENTRY( s, &nspa_ls_sections, struct nspa_local_section, entry )
+        {
+            if (s->handle != handle) continue;
+            if (s->server_handle) winner = s->server_handle;
+            else { s->server_handle = server_handle; winner = server_handle; }
+            break;
+        }
+        pi_mutex_unlock( &nspa_ls_sections_mutex );
+
+        if (winner != server_handle)
+        {
+            /* Race lost — close our handle, return the winner. */
+            SERVER_START_REQ( close_handle )
+            {
+                req->handle = wine_server_obj_handle( server_handle );
+                wine_server_call( req );
+            }
+            SERVER_END_REQ;
+            return winner;
+        }
+    }
+
+    /* Server now publishes the mapping via inode->open walk.  Drop
+     * our PE-side aggregate bits to avoid double-publication. */
+    if (file_handle && nspa_local_file_is_local_handle( file_handle ))
+        nspa_local_file_aggregate_publish_mapping_for_handle( file_handle, 0 );
+
+    return server_handle;
 }

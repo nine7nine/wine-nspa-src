@@ -40,6 +40,8 @@
 #include "vssym32.h"
 #endif
 
+#include "wine/rbtree.h"
+
 extern HMODULE COMCTL32_hModule;
 extern HBRUSH  COMCTL32_hPattern55AABrush;
 
@@ -223,6 +225,8 @@ typedef struct
    WNDPROC origproc;
    int is_unicode;
    int running;
+   struct rb_entry entry;
+   HWND hwnd;
 } SUBCLASS_INFO, *LPSUBCLASS_INFO;
 
 /* WM_NOTIFY unicode to ansi conversion and forwarding stuff */

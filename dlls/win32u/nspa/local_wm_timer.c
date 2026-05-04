@@ -43,8 +43,8 @@
  *   drains it.  Dispatcher's coalescing can never re-publish a killed
  *   entry because it's gone from the table.
  *
- * Feature gate: on by default.  Set NSPA_DISABLE_LOCAL_WM_TIMERS=1 to
- * fall back to wineserver WM_TIMER dispatch (bisection aid).
+ * Local dispatch is always on; the env-gate retired 2026-05-04 after
+ * confirming production never used the opt-out path.
  */
 
 #if 0
@@ -151,20 +151,11 @@ static int             wm_timer_use_sched = -1;          /* tri-state cache */
 static sched_handle_t  wm_timer_pending_dispatch;        /* protected by wm_timer_lock */
 static pthread_once_t  wm_timer_atexit_once = PTHREAD_ONCE_INIT;
 
-static int              nspa_wm_timers_enabled = -1;
-static pthread_once_t   gate_once = PTHREAD_ONCE_INIT;
 static pthread_once_t   table_once = PTHREAD_ONCE_INIT;
 
 /*--------------------------------------------------------------------------
- * Feature gate
+ * Lazy table init
  *--------------------------------------------------------------------------*/
-
-static void init_feature_gate(void)
-{
-    nspa_wm_timers_enabled = (getenv( "NSPA_DISABLE_LOCAL_WM_TIMERS" ) == NULL);
-    if (!nspa_wm_timers_enabled)
-        TRACE( "NSPA local WM_TIMER dispatch: DISABLED (NSPA_DISABLE_LOCAL_WM_TIMERS set)\n" );
-}
 
 static void init_table_buckets(void)
 {
@@ -174,10 +165,8 @@ static void init_table_buckets(void)
 
 static inline BOOL nspa_wm_timers_active(void)
 {
-    pthread_once( &gate_once, init_feature_gate );
-    if (nspa_wm_timers_enabled == 1)
-        pthread_once( &table_once, init_table_buckets );
-    return nspa_wm_timers_enabled == 1;
+    pthread_once( &table_once, init_table_buckets );
+    return TRUE;
 }
 
 /*--------------------------------------------------------------------------

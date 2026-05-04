@@ -29,12 +29,6 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <unistd.h>
-#ifdef __linux__
-/* NSPA: for linux_get_min_hugepage_size() — scans /sys/kernel/mm/hugepages */
-#include <dirent.h>
-#include <errno.h>
-#include <limits.h>
-#endif
 #ifdef HAVE_LINUX_MEMFD_H
 # include <linux/memfd.h>
 #endif
@@ -50,6 +44,7 @@
 #include "process.h"
 #include "request.h"
 #include "security.h"
+#include "nspa/mapping_helpers.h"
 
 /* list of memory ranges, used to store committed info */
 struct ranges
@@ -1702,59 +1697,10 @@ struct obj_locator get_shared_object_locator( volatile void *object_shm )
     return locator;
 }
 
-#ifdef __linux__
-/* NSPA: scan /sys/kernel/mm/hugepages and return the SMALLEST configured
- * hugepage size in bytes. Returns 0 if no hugepages are configured (or the
- * directory can't be opened, e.g. on a kernel without hugetlbfs).
- *
- * Used to populate KUSER_SHARED_DATA::LargePageMinimum so that
- * GetLargePageMinimum() in apps returns the actual smallest huge page the
- * kernel can give us, rather than the hardcoded 2 MB Wine used to return.
- * On a typical x86_64 system this returns 2*1024*1024 (2 MB) — the directory
- * "hugepages-2048kB" exists when nr_hugepages-2048kB > 0. */
-static size_t linux_get_min_hugepage_size( void )
-{
-    DIR *sysfs_hugepages;
-    struct dirent *supported_size;
-    size_t min_size = 0;
-    size_t total_supported_sizes = 0;
-
-    sysfs_hugepages = opendir( "/sys/kernel/mm/hugepages" );
-    if (sysfs_hugepages == NULL) return 0;
-
-    while ((supported_size = readdir( sysfs_hugepages )) != NULL)
-    {
-        long hugepage_size;
-        char *endptr;
-
-        if (strncmp( supported_size->d_name, "hugepages-", 10 ) != 0)
-            continue;
-
-        errno = 0;
-        hugepage_size = strtol( &supported_size->d_name[10], &endptr, 10 );
-        /* Valid entry name format: "hugepages-NNNNkB". The number must
-         * parse cleanly and the suffix must start with 'k' (kilobytes). */
-        if (errno != 0 || endptr == &supported_size->d_name[10] || *endptr != 'k')
-            continue;
-        if (hugepage_size <= 0)
-            continue;
-
-        hugepage_size *= 1024;  /* directory uses kB; we want bytes */
-
-        if (total_supported_sizes == 0 || (size_t)hugepage_size < min_size)
-            min_size = hugepage_size;
-        total_supported_sizes++;
-    }
-
-    closedir( sysfs_hugepages );
-    return min_size;
-}
-#endif /* __linux__ */
-
 static size_t get_min_large_page_size( void )
 {
 #ifdef __linux__
-    return linux_get_min_hugepage_size();
+    return nspa_get_min_hugepage_size();
 #else
     return 0;
 #endif

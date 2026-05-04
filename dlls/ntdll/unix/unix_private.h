@@ -387,6 +387,12 @@ extern int      nspa_local_section_table_lookup( HANDLE handle, struct nspa_loca
 extern int      nspa_local_section_table_remove( HANDLE handle, struct nspa_local_section *out );
 extern int      nspa_local_section_close( HANDLE handle );
 extern HANDLE   nspa_local_section_get_or_promote_server_handle( HANDLE handle );
+extern NTSTATUS nspa_local_section_create_from_lf_file( HANDLE *handle_out, HANDLE file,
+                                                        ACCESS_MASK access, ULONG sec_flags,
+                                                        unsigned int file_access,
+                                                        ULONGLONG explicit_size, BOOL has_name,
+                                                        const struct object_attributes *objattr,
+                                                        data_size_t objattr_len );
 extern int      nspa_local_file_table_remove( HANDLE handle, int *unix_fd_out,
                                               unsigned long long *device_out,
                                               unsigned long long *inode_out );

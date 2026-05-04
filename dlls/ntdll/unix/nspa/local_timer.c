@@ -25,10 +25,8 @@
  *   - Cross-process NtDuplicateObject of a managed timer: rejected with
  *     STATUS_ACCESS_DENIED.  Matches timer audit §H.
  *
- * Feature gate: local dispatch is on by default.  Set
- * NSPA_DISABLE_LOCAL_TIMERS=1 to fall back to wineserver; useful for
- * bisecting regressions, per the NSPA invariant "local dispatch is
- * optimisation, never a behaviour change".
+ * Local dispatch is always on; the env-gate retired 2026-05-04 after
+ * confirming production never used the opt-out path.
  *
  * Clock semantics: the dispatcher's internal deadline, queue ordering, and
  * pi_cond_timedwait all run on CLOCK_MONOTONIC.  This is the RT-correct
@@ -125,9 +123,6 @@ static pthread_t  timer_thread;
 static int        timer_thread_started;
 static int        timer_shutdown;
 
-/* Feature gate state: -1 = uninit, 0 = disabled, 1 = enabled. */
-static int nspa_local_timers_enabled = -1;
-static pthread_once_t gate_once = PTHREAD_ONCE_INIT;
 static pthread_once_t table_once = PTHREAD_ONCE_INIT;
 
 /*--------------------------------------------------------------------------
@@ -161,15 +156,8 @@ static sched_handle_t  local_timer_pending_dispatch;     /* protected by timer_l
 static pthread_once_t  local_timer_atexit_once = PTHREAD_ONCE_INIT;
 
 /*--------------------------------------------------------------------------
- * Feature gate
+ * Lazy table init
  *--------------------------------------------------------------------------*/
-
-static void init_feature_gate(void)
-{
-    nspa_local_timers_enabled = (getenv( "NSPA_DISABLE_LOCAL_TIMERS" ) == NULL);
-    if (!nspa_local_timers_enabled)
-        TRACE( "NSPA local NT timer dispatch: DISABLED (NSPA_DISABLE_LOCAL_TIMERS set)\n" );
-}
 
 static void init_table_buckets(void)
 {
@@ -177,17 +165,15 @@ static void init_table_buckets(void)
     for (i = 0; i < TIMER_TABLE_BUCKETS; i++) list_init( &timer_table[i] );
 }
 
+/* Ensure the hash buckets are initialised before any entry point runs
+ * find_entry().  Without this, NtClose -> nspa_local_timer_close can
+ * reach find_entry() before any NtCreateTimer ever did — the buckets
+ * would be zero memory and LIST_FOR_EACH_ENTRY would deref a NULL next
+ * pointer on the first handle passed through close. */
 static inline BOOL nspa_local_timers_active(void)
 {
-    pthread_once( &gate_once, init_feature_gate );
-    /* Ensure the hash buckets are initialised before any entry point
-     * runs find_entry().  Without this, NtClose -> nspa_local_timer_close
-     * can reach find_entry() before any NtCreateTimer ever did — the
-     * buckets would be zero memory and LIST_FOR_EACH_ENTRY would deref
-     * a NULL next pointer on the first handle passed through close. */
-    if (nspa_local_timers_enabled == 1)
-        pthread_once( &table_once, init_table_buckets );
-    return nspa_local_timers_enabled == 1;
+    pthread_once( &table_once, init_table_buckets );
+    return TRUE;
 }
 
 /*--------------------------------------------------------------------------

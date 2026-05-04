@@ -138,15 +138,6 @@ static struct nspa_cache_entry *nspa_cache_get( void )
     return cache;
 }
 
-static BOOL nspa_bypass_disabled( void )
-{
-    static int cached = -1;
-
-    if (cached == -1)
-        cached = (getenv( "NSPA_DISABLE_MSG_BYPASS" ) != NULL);
-    return cached;
-}
-
 /* ---------------------------------------------------------------------
  * T1 SEND/POST diagnostic — rejection-path counters.
  *
@@ -725,15 +716,6 @@ BOOL nspa_try_post_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
 
     nspa_post_diag_bump( POST_ENTRY );
 
-    if (nspa_bypass_disabled())
-    {
-        TRACE_(nspa_bypass)( "skip disabled tid=%04x dest=%04x hwnd=%p msg=%04x\n",
-                             HandleToULong(NtCurrentTeb()->ClientId.UniqueThread),
-                             (UINT)dest_tid, hwnd, msg );
-        nspa_post_diag_bump( POST_REJ_GATE_OFF );
-        return FALSE;
-    }
-
     /* This increment: MSG_POSTED only.  Other types fall through. */
     if (type_enum != MSG_POSTED)
     {
@@ -932,14 +914,6 @@ static void nspa_own_tls_init_once( void )
     pthread_key_create( &nspa_own_tls_key, nspa_own_tls_destructor );
 }
 
-static int nspa_own_bootstrap_disabled( void )
-{
-    static int cached = -1;
-    if (cached < 0)
-        cached = (getenv( "NSPA_DISABLE_OWN_BOOTSTRAP" ) != NULL);
-    return cached;
-}
-
 static const nspa_queue_bypass_shm_t *nspa_get_own_bypass_shm( void )
 {
     const nspa_queue_bypass_shm_t *cached;
@@ -958,7 +932,6 @@ static const nspa_queue_bypass_shm_t *nspa_get_own_bypass_shm( void )
      *    wakes the dispatcher until some other trigger fires.
      * 2. Reply slot reservation for SEND-class bypass (nspa_try_send_ring).
      */
-    if (nspa_bypass_disabled()) return NULL;
 
     pthread_once( &nspa_own_tls_once, nspa_own_tls_init_once );
 
@@ -1049,15 +1022,7 @@ const nspa_queue_bypass_shm_t *nspa_get_peer_bypass_shm_public( DWORD peer_tid )
 /* peek_message scans the own ring for SEND-class msgs BEFORE issuing the
  * wineserver get_message request.  This is the Phase 4.6 dispatch-latency
  * fix: removes the server RTT from the hot SEND dispatch path so MainThread
- * can consume ring SENDs within microseconds instead of tens of milliseconds.
- * Set NSPA_DISABLE_CLIENT_RING_DISPATCH=1 to fall back to server-scan. */
-static int nspa_client_ring_dispatch_disabled( void )
-{
-    static int cached = -1;
-    if (cached < 0)
-        cached = (getenv( "NSPA_DISABLE_CLIENT_RING_DISPATCH" ) != NULL);
-    return cached;
-}
+ * can consume ring SENDs within microseconds instead of tens of milliseconds. */
 
 /* Walk own ring tail forward, marking CONSUMED slots as EMPTY and
  * advancing tail.  Mirrors server's consume_nspa_ring_message tail
@@ -1101,7 +1066,6 @@ BOOL nspa_try_pop_own_ring_send( HWND filter_hwnd, UINT first, UINT last,
     volatile nspa_msg_ring_t *ring;
     unsigned int head, tail, cursor;
 
-    if (nspa_client_ring_dispatch_disabled()) return FALSE;
     if (!own) return FALSE;
 
     /* Only the "any window" case can be handled correctly client-side.
@@ -1200,10 +1164,6 @@ BOOL nspa_try_pop_own_ring_post( HWND filter_hwnd, UINT first, UINT last,
     const nspa_queue_bypass_shm_t *own;
     volatile nspa_msg_ring_t *ring;
     unsigned int head, tail, cursor;
-
-    /* Same opt-in gate as Phase 4.6 — single env var for all client-side
-     * ring dispatch behaviour. */
-    if (nspa_client_ring_dispatch_disabled()) return FALSE;
 
     /* Specific-window filter requires server's window tree to evaluate
      * is_child_window correctly.  Fall back to server.  Same constraint
@@ -1393,14 +1353,6 @@ BOOL nspa_try_send_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
 
     nspa_send_diag_bump( SEND_ENTRY );
 
-    if (nspa_bypass_disabled())
-    {
-        TRACE_(nspa_bypass)( "send skip disabled dest=%04x hwnd=%p msg=%04x\n",
-                             (UINT)dest_tid, hwnd, msg );
-        nspa_send_diag_bump( SEND_REJ_GATE_OFF );
-        return FALSE;
-    }
-
     is_notify = (type_enum == MSG_NOTIFY);
     if (type_enum != MSG_ASCII && type_enum != MSG_UNICODE && !is_notify)
     {
@@ -1464,17 +1416,7 @@ BOOL nspa_try_send_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
     /* Sync sends need our own reply ring + sync handle. */
     if (!is_notify)
     {
-        /* SEND bypass uses the caller's own reply ring + sync handle.
-         * Can be disabled for bisection via NSPA_DISABLE_OWN_BOOTSTRAP;
-         * the own ring is still bootstrapped for wake-bit synthesis
-         * (nspa_get_own_bypass_shm is called elsewhere). */
-        if (nspa_own_bootstrap_disabled())
-        {
-            TRACE_(nspa_bypass)( "send skip send-opt-in-disabled dest=%04x msg=%04x\n",
-                                 (UINT)dest_tid, msg );
-            nspa_send_diag_bump( SEND_REJ_SEND_OPT_IN_OFF );
-            return FALSE;
-        }
+        /* SEND bypass uses the caller's own reply ring + sync handle. */
         own_bypass = nspa_get_own_bypass_shm();
         if (!own_bypass)
         {

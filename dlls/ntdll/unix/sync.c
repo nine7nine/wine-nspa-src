@@ -3820,15 +3820,31 @@ NTSTATUS WINAPI NtCreateSection( HANDLE *handle, ACCESS_MASK access, const OBJEC
                     unsigned int mbits =
                         0x20000000u  /* NSPA_LF_FILE_MAPPING_ACCESS */
                         | ((file_access & FILE_WRITE_DATA) ? 0x40000000u : 0);
-                    HANDLE h = nspa_local_section_alloc_handle();
-                    if (!h) goto ls_fallback;
+                    HANDLE h;
+                    /* Section must OWN its own fd — dup the LF unix_fd
+                     * so the section survives NtClose on the file
+                     * handle.  Pattern: dwrite font loader does
+                     *   CreateFile → CreateFileMapping → CloseHandle(file)
+                     *                                  → MapViewOfFile
+                     * which would otherwise hit EBADF in
+                     * virtual_map_section_local's map_file_into_view. */
+                    int section_fd = dup( unix_fd );
+                    if (section_fd < 0) goto ls_fallback;
 
-                    ret = nspa_local_section_table_add( h, file, unix_fd,
+                    h = nspa_local_section_alloc_handle();
+                    if (!h)
+                    {
+                        close( section_fd );
+                        goto ls_fallback;
+                    }
+
+                    ret = nspa_local_section_table_add( h, file, section_fd,
                                                         actual_size, sec_flags,
                                                         file_access, access, mbits );
                     if (ret != STATUS_SUCCESS)
                     {
                         nspa_local_section_free_handle( h );
+                        close( section_fd );
                         goto ls_fallback;
                     }
 

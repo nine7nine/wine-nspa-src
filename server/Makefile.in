@@ -28,6 +28,7 @@ SOURCES = \
 	nspa/hook_cache.c \
 	nspa/inproc_event_table.c \
 	nspa/local_file.c \
+	nspa/mapping_helpers.c \
 	nspa/profile.c \
 	nspa/range_publish.c \
 	nspa/redraw_ring.c \

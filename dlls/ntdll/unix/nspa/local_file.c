@@ -2021,6 +2021,54 @@ int nspa_local_section_is_local_handle( HANDLE h )
     return slot < NSPA_LS_HANDLE_CAP;
 }
 
+/* Probe the LF aggregate for any FILE_MAPPING_* bits on the inode
+ * backing this handle.  Returns:
+ *   1  — at least one process (server-side or PE-side) has a
+ *        mapping on the inode.
+ *   0  — no mapping bits set OR handle isn't LF (caller should fall
+ *        back to server-mediated path which has its own arbitration).
+ *
+ * Used by Path A in NtSetInformationFile/FileEndOfFileInformation:
+ * if no process has the inode mapped, set_fd_eof's mapping conflict
+ * check would have returned success — we can ftruncate the unix fd
+ * directly client-side and skip the wineserver RPC.
+ *
+ * Cross-process correctness: server-side mappings publish via
+ * nspa_publish_inode_state walking inode->open (server/fd.c:287);
+ * PE-side sections publish via Phase H's
+ * nspa_local_file_aggregate_publish_mapping.  Both flow into
+ * sub_access; reading the aggregate-OR sees both. */
+int nspa_local_file_aggregate_has_mappings( HANDLE handle )
+{
+    static const unsigned int MAPPING_MASK =
+        NSPA_LF_FILE_MAPPING_WRITE | NSPA_LF_FILE_MAPPING_IMAGE | NSPA_LF_FILE_MAPPING_ACCESS;
+    struct nspa_local_open *o;
+    unsigned long long dev = 0, ino = 0;
+    int found = 0;
+    nspa_inode_slot_t snapshot;
+    unsigned int agg_access = 0, agg_sharing = 0;
+
+    if (!nspa_local_file_is_local_handle( handle )) return 0;
+
+    pi_mutex_lock( &nspa_lf_opens_mutex );
+    LIST_FOR_EACH_ENTRY( o, &nspa_lf_opens, struct nspa_local_open, entry )
+    {
+        if (o->handle == handle)
+        {
+            dev = o->device;
+            ino = o->inode;
+            found = 1;
+            break;
+        }
+    }
+    pi_mutex_unlock( &nspa_lf_opens_mutex );
+
+    if (!found) return 0;
+    if (!nspa_local_file_table_lookup( dev, ino, &snapshot )) return 0;
+    nspa_lf_aggregate_from_slot( &snapshot, &agg_access, &agg_sharing );
+    return !!(agg_access & MAPPING_MASK);
+}
+
 /* Convenience wrapper — resolve (device, inode) from an LF handle and
  * call publish_mapping.  Used by Phase B NtCreateSection PE-side fast
  * path so the eligibility check + bit publication is one helper call.

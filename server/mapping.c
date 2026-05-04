@@ -1638,35 +1638,6 @@ static struct session_object *find_free_session_object( mem_size_t size )
     return NULL;
 }
 
-/* NSPA probe 1: gate mark_block_uninitialized 0x55 fill via env var
- * NSPA_MSG_BYPASS_SERVER_NO_POISON=1.  Separates "poison fill" from "ID bump"
- * + "session_object_t entry existence" as the library-regression cause. */
-static int nspa_alloc_poison_disabled( void )
-{
-    static int cached = -1;
-    if (cached < 0)
-    {
-        const char *v = getenv( "NSPA_MSG_BYPASS_SERVER_NO_POISON" );
-        cached = (v && *v && *v != '0');
-    }
-    return cached;
-}
-
-/* NSPA probe 2: shift last_object_id by a stride each allocation, so the
- * nspa_queue_bypass_shm_t objects land in a completely different ID range.
- * NSPA_MSG_BYPASS_SERVER_ID_STRIDE=1  -> bump by 65536 instead of 1.
- * Tests whether a specific ID value (or modular boundary) is the trigger. */
-static int nspa_alloc_id_stride( void )
-{
-    static int cached = -1;
-    if (cached < 0)
-    {
-        const char *v = getenv( "NSPA_MSG_BYPASS_SERVER_ID_STRIDE" );
-        cached = (v && *v && *v != '0') ? 65536 : 1;
-    }
-    return cached;
-}
-
 volatile void *alloc_shared_object( mem_size_t shm_size )
 {
     struct session_object *object;
@@ -1688,9 +1659,8 @@ volatile void *alloc_shared_object( mem_size_t shm_size )
     SHARED_WRITE_BEGIN( &object->obj.shm, object_shm_t )
     {
         /* mark the object data as uninitialized */
-        if (!nspa_alloc_poison_disabled())
-            mark_block_uninitialized( (void *)shared, shm_size );
-        session.last_object_id += nspa_alloc_id_stride();
+        mark_block_uninitialized( (void *)shared, shm_size );
+        session.last_object_id++;
         CONTAINING_RECORD( shared, shared_object_t, shm )->id = session.last_object_id;
     }
     SHARED_WRITE_END;

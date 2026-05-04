@@ -6952,9 +6952,11 @@ NTSTATUS WINAPI NtFlushBuffersFileEx( HANDLE handle, ULONG flags, void *params, 
 
     if (!io || !virtual_check_buffer_for_write( io, sizeof(*io) )) return STATUS_ACCESS_VIOLATION;
 
-    /* NSPA local-file Phase 1A.5+: server_async + flush RPC use the
-     * handle.  fsync path uses local fd via server_get_unix_fd. */
-    srv_handle = nspa_promote_if_local( handle );
+    /* NSPA local-file Phase 1A.5+ (deferred): only the async/block-device
+     * branch passes srv_handle to a SERVER_START_REQ.  fsync (regular
+     * file / dir / char) and serial paths use the unix fd directly via
+     * server_get_unix_fd's LF fast path; for those, the promote is wasted.
+     * Defer to the async branch. */
 
     ret = server_get_unix_fd( handle, FILE_WRITE_DATA, &fd, &needs_close, &type, NULL );
     if (ret == STATUS_ACCESS_DENIED)
@@ -6974,6 +6976,7 @@ NTSTATUS WINAPI NtFlushBuffersFileEx( HANDLE handle, ULONG flags, void *params, 
     {
         struct async_irp *async;
 
+        srv_handle = nspa_promote_if_local( handle );
         if (!(async = (struct async_irp *)alloc_fileio( sizeof(*async), irp_completion, srv_handle )))
             return STATUS_NO_MEMORY;
         async->buffer  = NULL;

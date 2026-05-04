@@ -5337,6 +5337,49 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
         {
             const FILE_END_OF_FILE_INFORMATION *info = ptr;
 
+            /* NSPA Path A — local ftruncate when safe.  Mirrors
+             * server/fd.c:set_fd_eof's mapping-conflict check using
+             * the LF aggregate (cross-process visible thanks to the
+             * Phase H + section bypass campaign):
+             *   - Grow case  (eof >= current size): server doesn't
+             *     check mappings either; ftruncate locally.
+             *   - Shrink case (eof < current size): only safe if no
+             *     process has the inode mapped (FILE_MAPPING_* bits
+             *     in the aggregate are zero).  Else fall through to
+             *     server which produces STATUS_USER_MAPPED_FILE.
+             * Eliminates the wineserver RPC + the wineserver-dispatch
+             * blocking on the ftruncate syscall (queueing-theory win
+             * for surrounding RPC traffic).  Per-call latency for the
+             * caller is largely unchanged (syscall happens locally
+             * instead). */
+            if (nspa_local_file_is_local_handle( handle ))
+            {
+                int unix_fd = nspa_local_file_table_lookup_unix_fd( handle );
+                if (unix_fd >= 0)
+                {
+                    struct stat st;
+                    if (fstat( unix_fd, &st ) == 0)
+                    {
+                        int can_local = 0;
+                        if (info->EndOfFile.QuadPart >= st.st_size)
+                            can_local = 1;
+                        else if (!nspa_local_file_aggregate_has_mappings( handle ))
+                            can_local = 1;
+                        if (can_local)
+                        {
+                            if (ftruncate( unix_fd, info->EndOfFile.QuadPart ) == 0)
+                            {
+                                status = STATUS_SUCCESS;
+                                io->Information = 0;
+                                return io->Status = status;
+                            }
+                            /* ftruncate failed (rare — bad fd, EROFS, etc.);
+                             * fall through to RPC for proper error mapping. */
+                        }
+                    }
+                }
+            }
+
             srv_handle = nspa_promote_if_local( handle );
             SERVER_START_REQ( set_fd_eof_info )
             {

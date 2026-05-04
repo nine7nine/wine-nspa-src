@@ -111,10 +111,11 @@ struct ntsync_channel_recv2_args {
             _IOWR('N', 0x96, struct ntsync_channel_recv2_args)
 #endif
 
-/* NSPA 1010 Phase 3: AGGREGATE_WAIT UAPI fallback.  Independent #ifndef
- * so this builds against any kernel header up to ntsync 1009 — runtime
- * detect via ENOTTY at first ioctl falls back to direct CHANNEL_RECV2
- * (today's behaviour). */
+/* NSPA 1010: AGGREGATE_WAIT UAPI build-time header compat.  Provides
+ * the struct + ioctl definitions when the build environment's
+ * linux/ntsync.h is pristine upstream (lacks our 1010 additions),
+ * even though the runtime kernel has them.  Not a runtime fallback
+ * — the dispatcher always issues NTSYNC_IOC_AGGREGATE_WAIT. */
 #ifndef NTSYNC_IOC_AGGREGATE_WAIT
 struct ntsync_aggregate_source {
     __u32 type;
@@ -140,12 +141,10 @@ struct ntsync_aggregate_wait_args {
             _IOWR('N', 0x97, struct ntsync_aggregate_wait_args)
 #endif
 
-/* NSPA 1011: NTSYNC_IOC_CHANNEL_TRY_RECV2 — non-blocking RECV2.
- * Same args struct as RECV2 but returns -EAGAIN instead of blocking
- * when the channel pending queue is empty.  Pre-1011 kernels return
- * -ENOTTY → runtime detect, sticky fallback to legacy blocking
- * RECV2.  Independent #ifndef so this builds against headers up to
- * 1010. */
+/* NSPA 1011: NTSYNC_IOC_CHANNEL_TRY_RECV2 build-time header compat.
+ * Same args struct as RECV2 but returns -EAGAIN when pending queue is
+ * empty.  Provided here for builds against pre-1011 kernel headers;
+ * runtime kernel always has it. */
 #ifndef NTSYNC_IOC_CHANNEL_TRY_RECV2
 # define NTSYNC_IOC_CHANNEL_TRY_RECV2 \
             _IOWR('N', 0x98, struct ntsync_channel_recv2_args)
@@ -174,8 +173,8 @@ extern int get_inproc_device_fd(void); /* server/inproc_sync.c */
  *    pointers in process for handler access (process->nspa_uring,
  *    process->nspa_dispatcher_ctx), pthread_create.
  *  - shmem_channel_destroy: write to ctx->shutdown_efd to wake the
- *    dispatcher, close the channel_fd (EBADF wakes pre-1010 fallback
- *    path), clear process->* back-pointers.  Does NOT free ctx —
+ *    dispatcher (AGG_WAIT returns shutdown_idx fired), close the
+ *    channel_fd, clear process->* back-pointers.  Does NOT free ctx —
  *    the process struct may be torn down concurrently with the
  *    dispatcher pthread, so the dispatcher owns ctx lifetime.
  *  - dispatcher exit: drain in-flight CQEs, shutdown uring, close
@@ -195,30 +194,26 @@ struct nspa_dispatcher_ctx
 };
 
 /*
- * Dispatcher pthread.  Has two operating modes selected at runtime:
+ * Dispatcher pthread.  Single mode of operation:
  *
- * Post-1010 (preferred): NTSYNC_IOC_AGGREGATE_WAIT on
- *   {channel, uring eventfd, shutdown eventfd} — atomic wait for
- *   either channel request, io_uring CQE, or shutdown signal.  On
- *   channel-fired, follows up with CHANNEL_RECV2 to consume the
- *   entry (existing path, unchanged).  On uring-fired, drains CQEs
- *   inline.  On shutdown-fired, cleans up and exits.
+ *   NTSYNC_IOC_AGGREGATE_WAIT on {channel, uring eventfd, shutdown
+ *   eventfd} — atomic wait for either channel request, io_uring CQE,
+ *   or shutdown signal.  On channel-fired, follows up with
+ *   CHANNEL_RECV2 to consume the entry, then non-blocking
+ *   CHANNEL_TRY_RECV2 in a loop to burst-drain additional pending
+ *   entries before returning to AGG_WAIT.  On uring-fired, drains
+ *   CQEs inline.  On shutdown-fired, cleans up and exits.
  *
- * Pre-1010 fallback: direct CHANNEL_RECV2 (or legacy CHANNEL_RECV
- * when NSPA_DISPATCHER_USE_TOKEN=0) — today's behaviour.  Exits on
- * EBADF when shmem_channel_destroy closes channel_fd.
- *
- * Selection is by ENOTTY at first AGGREGATE_WAIT call (set
- * agg_supported = 0 permanently for this ctx).  Once detected, no
- * per-iteration cost.
+ * Kernel ntsync >= 1011 is assumed (AGGREGATE_WAIT + TRY_RECV2 both
+ * present).  The pre-1010 / pre-1011 sticky-fallback machinery and
+ * UAPI #ifndef blocks were retired 2026-05-04.
  *
  * The default since 2026-04-26 is RECV2 + direct thread_token
  * consumption (skips get_thread_from_id when the kernel provides a
  * non-zero token).  Set NSPA_DISPATCHER_USE_TOKEN=0 to force legacy
  * RECV + get_thread_from_id for A/B testing.
  */
-/* Forward declaration: process one channel entry (RECV2 result).
- * Shared between AGGREGATE_WAIT path and pre-1010 fallback. */
+/* Forward declaration: process one channel entry (RECV2 result). */
 static void dispatch_channel_entry( int channel_fd, int use_token,
                                     const struct ntsync_channel_recv2_args *recv,
                                     unsigned long *generation_ptr );
@@ -233,52 +228,19 @@ static void *channel_dispatcher( void *param )
     unsigned long generation = 0;
     int cached_use_token;
     int recv2_state;
-    int agg_supported;
-    int try_recv2_supported;
     const char *v;
-    const char *agg_v;
-    const char *try_v;
 
     /* recv2_state: 1 = try RECV2 first, 0 = legacy RECV.  Set once. */
     v = getenv( "NSPA_DISPATCHER_USE_TOKEN" );
     cached_use_token = !(v && *v == '0');
     recv2_state = cached_use_token ? 1 : 0;
 
-    /* AGGREGATE_WAIT path: DEFAULT-ON since 2026-04-29.  Validated by
-     * test-aggregate-wait 9/9 + 1k stress + Ableton level-2/3 session
-     * (boot, library scan, demo load, 60s play, GUI interaction)
-     * under NSPA_AGG_WAIT=1 with kernel CFF56DE1EF28.  The PI-boost
-     * regression that gated this default-off was fixed in ntsync 1010
-     * (send_pi any_waiters fallback + wake-after-boost reorder).
-     *
-     * Set NSPA_AGG_WAIT=0 to opt out (legacy CHANNEL_RECV2 path,
-     * today's pre-Phase-3 behaviour) for A/B testing.
-     *
-     *   agg_supported: -1 unknown (try once), 1 use AGG, 0 fallback.
-     *   Falls back permanently on ENOTTY (pre-1010 kernel) or unexpected
-     *   error (we break out — no infinite-retry loop). */
-    agg_v = getenv( "NSPA_AGG_WAIT" );
-    agg_supported = (dev_fd >= 0 && !(agg_v && *agg_v == '0')) ? -1 : 0;
-
-    /* NSPA 1011 burst-drain: after a successful CHANNEL_RECV2 + dispatch,
-     * try non-blocking TRY_RECV2 in a loop to drain additional pending
-     * entries without paying another AGG_WAIT round-trip per entry.
-     * Saves N×AGG_WAIT under burst (N entries queued at the moment of
-     * channel-fired).  -1 unknown (try once); 1 supported; 0 sticky
-     * fallback after ENOTTY (pre-1011 kernel).
-     *
-     * Set NSPA_TRY_RECV2=0 to opt out — falls back to one entry per
-     * AGG_WAIT cycle (today's pre-1011 behaviour). */
-    try_v = getenv( "NSPA_TRY_RECV2" );
-    try_recv2_supported = !(try_v && *try_v == '0') ? -1 : 0;
-
     for (;;)
     {
         struct ntsync_channel_recv2_args recv;
         int ret;
 
-        /* ---- AGGREGATE_WAIT path (post-1010 kernel, opt-in) ---- */
-        if (agg_supported != 0)
+        /* ---- AGGREGATE_WAIT on {channel, uring eventfd, shutdown eventfd} ---- */
         {
             struct ntsync_aggregate_wait_args agg;
             struct ntsync_aggregate_source srcs[3];
@@ -321,12 +283,6 @@ static void *channel_dispatcher( void *param )
             ret = ioctl( dev_fd, NTSYNC_IOC_AGGREGATE_WAIT, &agg );
             if (ret < 0)
             {
-                if (errno == ENOTTY)
-                {
-                    /* Pre-1010 kernel — fall back permanently. */
-                    agg_supported = 0;
-                    continue;
-                }
                 if (errno == EINTR) continue;
                 /* EBADF on dev_fd (or any other unexpected error) =
                  * we cannot continue safely.  Break out — dispatcher
@@ -339,24 +295,17 @@ static void *channel_dispatcher( void *param )
             if (agg.fired_index == shutdown_idx)
                 break;
 
-            /* Uring CQE?  Drain inline.  global_lock NOT taken here in
-             * Phase 3 because there are no submitters yet — drain is a
-             * no-op.  Phase 4 will wrap drain in pi_mutex_lock so CQE
-             * callbacks can mutate per-thread state safely. */
+            /* Uring CQE?  Drain inline.  global_lock taken so CQE
+             * callbacks can mutate per-thread state (current,
+             * request_shm reply, thread->error, etc.) and call
+             * send_reply_shm / nspa_shmem_channel_reply, serialized
+             * with other handlers + main thread state. */
             if (uring_idx != (__u32)-1 && agg.fired_index == uring_idx)
             {
                 uint64_t evfd_val;
                 if (read( uring_efd, &evfd_val, sizeof(evfd_val) ) < 0
                     && errno != EAGAIN)
                     break;     /* fatal eventfd error — exit cleanly */
-                /* Phase 4: drain runs CQE callbacks which mutate
-                 * per-thread state (current, request_shm reply,
-                 * thread->error, etc.) and call send_reply_shm /
-                 * nspa_shmem_channel_reply.  Take global_lock to
-                 * serialize with other handlers + main thread state.
-                 * Phase 3 left this unlocked because there were no
-                 * submitters; Phase 4's create_file handler is the
-                 * first. */
                 pi_mutex_lock( &global_lock );
                 nspa_uring_drain( &ctx->uring );
                 pi_mutex_unlock( &global_lock );
@@ -395,10 +344,10 @@ static void *channel_dispatcher( void *param )
         if (ret < 0)
         {
             if (errno == EINTR) continue;
-            /* In the AGGREGATE_WAIT path, channel-fired but RECV2 empty
-             * is a benign race (another consumer drained — shouldn't
-             * happen with one dispatcher, but defensive).  In the
-             * pre-1010 path, EBADF is the exit signal. */
+            /* Channel-fired but RECV2 empty is a benign race (another
+             * consumer drained — shouldn't happen with one dispatcher,
+             * but defensive).  EBADF on channel_fd is the shutdown
+             * signal from shmem_channel_destroy. */
             if (errno == EAGAIN) continue;
             break;
         }
@@ -410,28 +359,19 @@ static void *channel_dispatcher( void *param )
          * is >0 we save the AGG_WAIT round-trip and dispatch
          * immediately; on -EAGAIN we return to the AGG_WAIT loop
          * (current state is "no more queued, wait for next fire").
-         *
-         * Pre-1011 kernel returns -ENOTTY → sticky fallback to the
-         * single-entry-per-AGG_WAIT pattern (existing behaviour).
          * Other unexpected errors → break out of the drain (next
          * AGG_WAIT iteration handles cleanup). */
-        while (try_recv2_supported != 0)
+        for (;;)
         {
             struct ntsync_channel_recv2_args drain_recv;
             int drain_ret = ioctl( channel_fd, NTSYNC_IOC_CHANNEL_TRY_RECV2, &drain_recv );
             if (drain_ret == 0)
             {
-                if (try_recv2_supported < 0) try_recv2_supported = 1;
                 dispatch_channel_entry( channel_fd, cached_use_token, &drain_recv, &generation );
                 continue;
             }
             if (errno == EAGAIN) break;          /* drained */
             if (errno == EINTR)  continue;       /* signal — retry */
-            if (errno == ENOTTY)
-            {
-                try_recv2_supported = 0;         /* pre-1011 kernel; sticky fallback */
-                break;
-            }
             break;                               /* unexpected — back to AGG_WAIT */
         }
     }
@@ -626,18 +566,16 @@ void nspa_shmem_channel_destroy( struct process *process )
     process->nspa_uring          = NULL;
     process->nspa_dispatcher_ctx = NULL;
 
-    /* Close channel_fd: pre-1010 path's dispatcher exits via EBADF on
-     * its blocking RECV.  In the post-1010 path the AGGREGATE_WAIT
-     * holds an internal fget on the channel so close alone won't wake
-     * it — that's what shutdown_efd is for. */
+    /* Close channel_fd.  AGGREGATE_WAIT holds an internal fget on the
+     * channel so close alone won't wake the dispatcher — that's what
+     * shutdown_efd is for (signalled below). */
     close( process->request_channel_fd );
     process->request_channel_fd = -1;
 
-    /* Wake the AGGREGATE_WAIT path (if active).  eventfd write is
-     * level-triggered; one byte is enough.  Errors here are advisory
-     * — if write fails, the dispatcher will eventually exit on its
-     * own (channel close already triggered the EBADF path; pre-1010
-     * path doesn't need shutdown_efd at all). */
+    /* Wake the AGGREGATE_WAIT.  eventfd write is level-triggered; one
+     * byte is enough.  Errors here are advisory — if write fails, the
+     * dispatcher will exit on its own when it next observes EBADF on
+     * a downstream ioctl. */
     if (ctx)
     {
         uint64_t one = 1;

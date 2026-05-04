@@ -205,16 +205,17 @@ struct nspa_dispatcher_ctx
  *   CQEs inline.  On shutdown-fired, cleans up and exits.
  *
  * Kernel ntsync >= 1011 is assumed (AGGREGATE_WAIT + TRY_RECV2 both
- * present).  The pre-1010 / pre-1011 sticky-fallback machinery and
- * UAPI #ifndef blocks were retired 2026-05-04.
+ * present).  The pre-1010 / pre-1011 sticky-fallback machinery, the
+ * legacy CHANNEL_RECV path, and the NSPA_DISPATCHER_USE_TOKEN env-gate
+ * were retired 2026-05-04.
  *
- * The default since 2026-04-26 is RECV2 + direct thread_token
- * consumption (skips get_thread_from_id when the kernel provides a
- * non-zero token).  Set NSPA_DISPATCHER_USE_TOKEN=0 to force legacy
- * RECV + get_thread_from_id for A/B testing.
+ * Sender-thread resolution uses the kernel-provided thread_token
+ * (registered via NTSYNC_IOC_CHANNEL_REGISTER_THREAD), falling back
+ * to get_thread_from_id when the token is zero (un-registered sender,
+ * e.g. very early pre-init traffic).
  */
 /* Forward declaration: process one channel entry (RECV2 result). */
-static void dispatch_channel_entry( int channel_fd, int use_token,
+static void dispatch_channel_entry( int channel_fd,
                                     const struct ntsync_channel_recv2_args *recv,
                                     unsigned long *generation_ptr );
 
@@ -226,14 +227,6 @@ static void *channel_dispatcher( void *param )
     int dev_fd      = get_inproc_device_fd();
     int uring_efd   = nspa_uring_get_eventfd( &ctx->uring );  /* -1 if uring inactive */
     unsigned long generation = 0;
-    int cached_use_token;
-    int recv2_state;
-    const char *v;
-
-    /* recv2_state: 1 = try RECV2 first, 0 = legacy RECV.  Set once. */
-    v = getenv( "NSPA_DISPATCHER_USE_TOKEN" );
-    cached_use_token = !(v && *v == '0');
-    recv2_state = cached_use_token ? 1 : 0;
 
     for (;;)
     {
@@ -317,30 +310,7 @@ static void *channel_dispatcher( void *param )
         }
 
         /* ---- RECV path (consume the channel entry) ---- */
-        if (recv2_state == 1)
-        {
-            ret = ioctl( channel_fd, NTSYNC_IOC_CHANNEL_RECV2, &recv );
-            if (ret < 0 && errno == ENOTTY)
-            {
-                /* Old kernel without 1005 patch — fall back permanently. */
-                recv2_state = 0;
-                continue;
-            }
-        }
-        else
-        {
-            struct ntsync_channel_recv_args recv1;
-            ret = ioctl( channel_fd, NTSYNC_IOC_CHANNEL_RECV, &recv1 );
-            if (ret >= 0)
-            {
-                recv.entry_id     = recv1.entry_id;
-                recv.payload_off  = recv1.payload_off;
-                recv.reply_off    = recv1.reply_off;
-                recv.sender_tid   = recv1.sender_tid;
-                recv.prio         = recv1.prio;
-                recv.thread_token = 0;
-            }
-        }
+        ret = ioctl( channel_fd, NTSYNC_IOC_CHANNEL_RECV2, &recv );
         if (ret < 0)
         {
             if (errno == EINTR) continue;
@@ -352,7 +322,7 @@ static void *channel_dispatcher( void *param )
             break;
         }
 
-        dispatch_channel_entry( channel_fd, cached_use_token, &recv, &generation );
+        dispatch_channel_entry( channel_fd, &recv, &generation );
 
         /* NSPA 1011 burst-drain: after a successful dispatch, try
          * non-blocking TRY_RECV2 in a tight loop.  If pending depth
@@ -367,7 +337,7 @@ static void *channel_dispatcher( void *param )
             int drain_ret = ioctl( channel_fd, NTSYNC_IOC_CHANNEL_TRY_RECV2, &drain_recv );
             if (drain_ret == 0)
             {
-                dispatch_channel_entry( channel_fd, cached_use_token, &drain_recv, &generation );
+                dispatch_channel_entry( channel_fd, &drain_recv, &generation );
                 continue;
             }
             if (errno == EAGAIN) break;          /* drained */
@@ -389,7 +359,7 @@ static void *channel_dispatcher( void *param )
 /* Process one received channel entry: lock global_lock, resolve sender
  * thread, read request, write reply, REPLY ioctl.  Same lifecycle as
  * the pre-Phase-3 inline body. */
-static void dispatch_channel_entry( int channel_fd, int use_token,
+static void dispatch_channel_entry( int channel_fd,
                                     const struct ntsync_channel_recv2_args *recv,
                                     unsigned long *generation_ptr )
 {
@@ -401,7 +371,7 @@ static void dispatch_channel_entry( int channel_fd, int use_token,
     /* Resolve the originating thread.  Prefer the kernel-provided
      * token (no userspace lookup); fall back to get_thread_from_id
      * when token is zero (un-registered sender, e.g. very early
-     * pre-init traffic) or when the recv2 path is disabled. */
+     * pre-init traffic). */
     if (recv->thread_token)
         thread = (struct thread *)(uintptr_t)recv->thread_token;
     else
@@ -468,7 +438,6 @@ static void dispatch_channel_entry( int channel_fd, int use_token,
      * both are benign (force_exit_poll is just a wakeup nudge). */
     if (poll_generation != *generation_ptr)
         force_exit_poll();
-    (void)use_token;
 }
 
 void nspa_shmem_channel_init( struct process *process )

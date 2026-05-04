@@ -34,8 +34,7 @@ struct fd;
  * the unlocked window so a concurrent handler running on the other RT
  * thread cannot trample us; fd_object and root_object are pinned via
  * grab_object for the unlocked window so neither can be freed by a
- * concurrent handler.  Set NSPA_OPENFD_LOCKDROP=0 to fall back to the
- * pre-Phase-B (held-throughout) helper for A/B testing.
+ * concurrent handler.  Always-on as of 2026-05-04 (env-gate retired).
  *
  * Caller MUST hold global_lock; on return the caller again holds it.
  *

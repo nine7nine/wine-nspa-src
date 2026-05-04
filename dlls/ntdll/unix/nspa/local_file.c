@@ -225,6 +225,17 @@ int nspa_local_file_table_lookup( unsigned long long device, unsigned long long 
     (FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA | \
      FILE_APPEND_DATA | GENERIC_WRITE)
 
+/* Benign permission bits allowed alongside read/write access.  These
+ * bits are stored on the handle's access mask but don't affect the
+ * open path — their semantics fire on later operations (which promote
+ * if needed):
+ *   FILE_EXECUTE      = 0x20  ("execute" on file, "traverse" on dir).
+ *                       Server's check_sharing treats it as read_access.
+ *   FILE_DELETE_CHILD = 0x40  (right to delete children of a dir).
+ *                       Checked at NtDeleteFile time, not at open. */
+#define NSPA_LF_STD_BENIGN_ACCESS \
+    (FILE_EXECUTE | FILE_DELETE_CHILD)
+
 /* Options that disqualify even within FILE_OPEN read.  FILE_DIRECTORY_FILE
  * and FILE_DELETE_ON_CLOSE get their own counters; everything else here
  * is collapsed under "other_options".  Only options that have semantic
@@ -293,10 +304,12 @@ BOOL nspa_local_file_disp_categorize( BOOL loader_open,
      * server returns STATUS_NOT_A_DIRECTORY. */
     if (options & FILE_DELETE_ON_CLOSE) return FALSE;
     if (!(options & (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT))) return FALSE;
-    /* Eligibility = read-class | write-class.  WRITE_DAC, WRITE_OWNER
-     * (security descriptor mutation) and DELETE (deletion semantics)
-     * are NOT in the union; opens with those bits fall back. */
-    if (access & ~(NSPA_LF_STD_READ_ACCESS | NSPA_LF_STD_WRITE_ACCESS)) return FALSE;
+    /* Eligibility = read-class | write-class | benign-permission-bits.
+     * WRITE_DAC, WRITE_OWNER (security descriptor mutation) and DELETE
+     * (deletion semantics) are NOT in the union; opens with those bits
+     * fall back. */
+    if (access & ~(NSPA_LF_STD_READ_ACCESS | NSPA_LF_STD_WRITE_ACCESS |
+                   NSPA_LF_STD_BENIGN_ACCESS)) return FALSE;
     return TRUE;
 }
 

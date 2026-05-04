@@ -241,10 +241,6 @@ static void queue_hardware_message( struct desktop *desktop, struct message *msg
 static void free_message( struct message *msg );
 static inline unsigned int nspa_ring_changed_bits( const struct msg_queue *queue );
 static inline unsigned int nspa_ring_status_bits( const struct msg_queue *queue );
-static inline int nspa_ring_arb_disabled(void);
-static inline int nspa_ring_wake_syn_disabled(void);
-static inline int nspa_ring_alloc_disabled(void);
-static inline int nspa_seq_ops_disabled(void);
 static int nspa_ensure_shared( struct msg_queue *queue );
 
 /* set the caret window in a given thread input, requires write lock on the thread input shared member */
@@ -369,10 +365,10 @@ static struct msg_queue *create_msg_queue( struct thread *thread, struct thread_
          * can reach this queue from moment-zero — no chicken-and-egg
          * lazy-bootstrap order, no peer-lookup negative caching while we
          * wait for the owner to do its own first ensure_own_bypass call.
-         * Idempotent + honours NSPA_MSG_BYPASS_SERVER_NO_ALLOC kill switch.
-         * Failure is non-fatal — the queue still functions on the legacy
-         * server-RPC message path; bypass simply remains absent for this
-         * queue (matches pre-2026-04-22 lazy-alloc fallback behaviour). */
+         * Idempotent.  Failure is non-fatal — the queue still functions on
+         * the legacy server-RPC message path; bypass simply remains absent
+         * for this queue (matches pre-2026-04-22 lazy-alloc fallback
+         * behaviour). */
         nspa_ensure_shared( queue );
 
         if ((desktop = get_thread_desktop( thread, 0 )))
@@ -1089,71 +1085,13 @@ static void free_message( struct message *msg )
     free( msg );
 }
 
-/* Subsystem kill-switches for isolating the library-panel regression.
- *
- *   NSPA_MSG_BYPASS_SERVER_NO_RING_ARB — get_posted_message / get_message
- *     ring-first arbitration is skipped; server always uses the legacy
- *     msg_list path.
- *   NSPA_MSG_BYPASS_SERVER_NO_WAKE_SYN — wake-bit / changed-bit
- *     synthesis from ring state is suppressed; wake_bits returns only
- *     the legacy `shared->wake_bits`.
- *
- * Both are evaluated at wineserver start and cached.  Independent of
- * the client-side bypass gate so the plumbing can be A/B tested with
- * bypass on.  See docs/send-message-bypass-design.md §15.10. */
-static int nspa_server_ring_arb_off = -1;
-static int nspa_server_wake_syn_off = -1;
-static int nspa_server_alloc_off    = -1;
-static int nspa_server_seq_off      = -1;
-
-static inline int nspa_ring_arb_disabled(void)
-{
-    if (nspa_server_ring_arb_off == -1)
-        nspa_server_ring_arb_off = (getenv("NSPA_MSG_BYPASS_SERVER_NO_RING_ARB") != NULL);
-    return nspa_server_ring_arb_off;
-}
-
-static inline int nspa_ring_wake_syn_disabled(void)
-{
-    if (nspa_server_wake_syn_off == -1)
-        nspa_server_wake_syn_off = (getenv("NSPA_MSG_BYPASS_SERVER_NO_WAKE_SYN") != NULL);
-    return nspa_server_wake_syn_off;
-}
-
-/* NSPA_MSG_BYPASS_SERVER_NO_ALLOC: skip per-queue nspa_shared allocation
- * entirely so the bypass infrastructure is effectively absent at runtime.
- * Used to isolate whether the library-panel regression is caused by the
- * structural plumbing (allocation + ring publish) rather than the ring
- * arbitration or wake-bit synthesis subsystems. */
-static inline int nspa_ring_alloc_disabled(void)
-{
-    if (nspa_server_alloc_off == -1)
-        nspa_server_alloc_off = (getenv("NSPA_MSG_BYPASS_SERVER_NO_ALLOC") != NULL);
-    return nspa_server_alloc_off;
-}
-
-/* NSPA_MSG_BYPASS_SERVER_NO_SEQ: suppress the two remaining per-message
- * atomic side effects that run whenever a queue has nspa_shared allocated:
- *   - nspa_alloc_post_seq: always returns 0 (no ring-side next_post_seq bump)
- *   - nspa_ring_ack_changes: no-op (no change_ack_seq update)
- * Used to narrow whether these atomic operations on the per-queue bypass
- * shmem cause the library regression independent of ring arbitration and
- * wake-bit synthesis. */
-static inline int nspa_seq_ops_disabled(void)
-{
-    if (nspa_server_seq_off == -1)
-        nspa_server_seq_off = (getenv("NSPA_MSG_BYPASS_SERVER_NO_SEQ") != NULL);
-    return nspa_server_seq_off;
-}
-
 /* Lazy-allocate per-queue nspa_shared (bypass msg+reply rings).  Queues
  * are created with nspa_shared == NULL; this function allocates on first
  * demand and publishes the locator into queue_shm so clients can find it.
  *
  * Called from nspa_get_thread_queue handler when a peer queries this
  * queue (→ peer is about to bypass-post to us).  Idempotent: if already
- * allocated, returns immediately.  Gated by NSPA_MSG_BYPASS_SERVER_NO_ALLOC
- * (returns 0 without allocating when set). */
+ * allocated, returns immediately. */
 /* Allocate a memfd-backed bypass shmem region for @queue.  The ring lives
  * OUTSIDE Wine's session shmem so its allocation doesn't touch any of the
  * session_object_t / shared_object_t machinery that couples queue_shm_t
@@ -1238,7 +1176,6 @@ static void nspa_free_bypass_shm( struct msg_queue *queue )
 static int nspa_ensure_shared( struct msg_queue *queue )
 {
     if (queue->nspa_shared) return 1;
-    if (nspa_ring_alloc_disabled()) return 0;
 
     if (!nspa_alloc_bypass_shm( queue ))
         return 0;
@@ -1271,7 +1208,6 @@ static inline int nspa_ring_has_pending_send( const struct msg_queue *queue )
 static inline unsigned int nspa_ring_status_bits( const struct msg_queue *queue )
 {
     unsigned int bits = 0;
-    if (nspa_ring_wake_syn_disabled()) return 0;
     if (nspa_ring_has_pending_posted( queue )) bits |= QS_POSTMESSAGE | QS_ALLPOSTMESSAGE;
     if (nspa_ring_has_pending_send( queue ))   bits |= QS_SENDMESSAGE;
     return bits;
@@ -1283,7 +1219,6 @@ static inline unsigned int nspa_ring_changed_bits( const struct msg_queue *queue
     unsigned int seq, ack;
     unsigned int bits = 0;
 
-    if (nspa_ring_wake_syn_disabled()) return 0;
     if (!queue->nspa_shared) return 0;
 
     ring = &queue->nspa_shared->nspa_msg_ring;
@@ -1300,7 +1235,6 @@ static inline void nspa_ring_ack_changes( const struct msg_queue *queue )
     volatile nspa_msg_ring_t *ring;
     unsigned int seq;
 
-    if (nspa_seq_ops_disabled()) return;
     if (!queue->nspa_shared) return;
     ring = &queue->nspa_shared->nspa_msg_ring;
     seq = __atomic_load_n( &ring->change_seq, __ATOMIC_ACQUIRE );
@@ -1309,7 +1243,6 @@ static inline void nspa_ring_ack_changes( const struct msg_queue *queue )
 
 static inline unsigned int nspa_alloc_post_seq( struct msg_queue *queue )
 {
-    if (nspa_seq_ops_disabled()) return 0;
     if (!queue->nspa_shared) return 0;
     return __atomic_add_fetch( &queue->nspa_shared->nspa_msg_ring.next_post_seq, 1, __ATOMIC_RELAXED );
 }
@@ -1649,8 +1582,7 @@ static int get_posted_message( struct msg_queue *queue, user_handle_t win,
 {
     struct nspa_posted_match ring_match;
     struct message *msg = find_posted_message( queue, win, first, last );
-    int have_ring = nspa_ring_arb_disabled() ? 0 :
-                    find_nspa_posted_message( queue, win, first, last, &ring_match );
+    int have_ring = find_nspa_posted_message( queue, win, first, last, &ring_match );
 
     if (have_ring && (!msg || nspa_seq_before( ring_match.seq, msg->post_seq )))
         return return_nspa_ring_message( queue, &ring_match, flags, reply );
@@ -3586,11 +3518,10 @@ DECL_HANDLER(nspa_get_thread_queue)
         reply->sync_handle = alloc_handle( current->process, queue->sync,
                                            EVENT_MODIFY_STATE | SYNCHRONIZE, 0 );
 
-        /* NSPA: deliver the peer's bypass memfd unconditionally.  Queues are
-         * eager-allocated at create_msg_queue time, so the ring is always
-         * present here (modulo the NSPA_MSG_BYPASS_SERVER_NO_ALLOC kill
-         * switch which makes nspa_ensure_shared a no-op).  reply->fd_sent
-         * tells the client whether the fd followed on the socket. */
+        /* NSPA: deliver the peer's bypass memfd unconditionally.  Queues
+         * are eager-allocated at create_msg_queue time, so the ring is
+         * always present here.  reply->fd_sent tells the client whether
+         * the fd followed on the socket. */
         if (reply->sync_handle && nspa_ensure_shared( queue ) &&
             queue->nspa_bypass_fd != -1 &&
             send_client_fd( current->process, queue->nspa_bypass_fd, reply->sync_handle ) == 0)
@@ -3877,10 +3808,8 @@ DECL_HANDLER(get_message)
     /* first check for ring-delivered sent messages (NSPA bypass) — these
      * take precedence over server-allocated msg_list entries because the
      * sender is actively waiting on its own reply ring and we want to
-     * minimise latency.  Gated by NSPA_MSG_BYPASS_SERVER_NO_RING_ARB for
-     * A/B isolation of the library-panel regression (§15.10). */
-    if (!nspa_ring_arb_disabled() &&
-        get_nspa_ring_send_message( queue, get_win, 0, ~0U, req->flags, reply ))
+     * minimise latency. */
+    if (get_nspa_ring_send_message( queue, get_win, 0, ~0U, req->flags, reply ))
         return;
 
     /* first check for sent messages */

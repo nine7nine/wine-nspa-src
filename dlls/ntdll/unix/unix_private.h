@@ -359,7 +359,6 @@ struct nspa_local_section
     struct list      views;
 };
 extern int      nspa_local_section_is_local_handle( HANDLE h );
-extern int      nspa_local_section_disabled( void );
 extern HANDLE   nspa_local_section_alloc_handle( void );
 extern void     nspa_local_section_free_handle( HANDLE h );
 extern NTSTATUS nspa_local_section_table_add( HANDLE handle, HANDLE file_handle, int unix_fd,

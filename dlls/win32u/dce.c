@@ -1516,23 +1516,11 @@ static HRGN get_update_region( HWND hwnd, UINT *flags, HWND *child )
  * from the caller's perspective.  We append to a per-queue SPSC ring
  * in the memfd-backed bypass shm; the wineserver drains lazily on the
  * next request handler dispatched from this queue (drain hook in
- * server/request.c::call_req_handler{,_shm}).  Default-on; opt-out
- * via NSPA_DISABLE_REDRAW_RING.  Falls back to the legacy RPC for
- * regions with > NSPA_REDRAW_INLINE_RECTS rectangles, when the ring
- * is full, or when the bypass shm isn't mapped. */
+ * server/request.c::call_req_handler{,_shm}).  Falls back to the
+ * legacy RPC for regions with > NSPA_REDRAW_INLINE_RECTS rectangles,
+ * when the ring is full, or when the bypass shm isn't mapped. */
 static unsigned long long nspa_redraw_ring_pushed;
 static unsigned long long nspa_redraw_ring_fallback;
-
-static int nspa_redraw_ring_disabled( void )
-{
-    static int cached = -1;
-    if (cached < 0)
-    {
-        const char *v = getenv( "NSPA_DISABLE_REDRAW_RING" );
-        cached = (v && *v && *v != '0');
-    }
-    return cached;
-}
 
 static BOOL nspa_redraw_ring_try_push( HWND hwnd, UINT flags, const RECT *rects, UINT count )
 {
@@ -1541,7 +1529,6 @@ static BOOL nspa_redraw_ring_try_push( HWND hwnd, UINT flags, const RECT *rects,
     nspa_redraw_slot_t *slot;
     unsigned int head, tail, i;
 
-    if (nspa_redraw_ring_disabled()) return FALSE;
     if (count > NSPA_REDRAW_INLINE_RECTS) return FALSE;
 
     bypass = (nspa_queue_bypass_shm_t *)nspa_get_own_bypass_shm_public();

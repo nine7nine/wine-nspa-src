@@ -1239,16 +1239,6 @@ int nspa_local_file_is_local_handle( HANDLE h )
     return slot < NSPA_LF_HANDLE_CAP;
 }
 
-/* Bypass dispatch is on by default.  Set NSPA_DISABLE_LOCAL_FILES=1 to
- * fall back to the regular server create_file RPC (bisection aid). */
-static int nspa_local_file_disabled( void )
-{
-    static int cached = -1;
-    if (cached < 0)
-        cached = (getenv( "NSPA_DISABLE_LOCAL_FILES" ) != NULL);
-    return cached;
-}
-
 /* Directory bypass — DEFAULT-ON since 2026-04-28.  When enabled,
  * try_bypass also handles paths that stat() reveals as S_ISDIR.
  * Requires the kind plumbing through nspa_local_file_table_add /
@@ -1295,7 +1285,6 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
     NTSTATUS status;
     HANDLE h;
 
-    if (nspa_local_file_disabled()) return STATUS_NOT_SUPPORTED;
     if (nspa_lf_table_state != 1)   return STATUS_NOT_SUPPORTED;
 
     /* Expand GENERIC_* into specific bits before any sharing arbitration
@@ -1913,11 +1902,12 @@ int nspa_local_file_close( HANDLE handle )
 /* ====================================================================
  * Phase A — PE-side section handle range + table foundation.
  *
- * Default-OFF (env gate NSPA_LOCAL_SECTION=1).  Phase B-G consumers
- * (NtCreateSection / NtMapViewOfSection / NtUnmapViewOfSection / NtClose
- * / NtDuplicateObject) come in subsequent commits.  This commit lands
- * only the foundation: handle range allocator, struct nspa_local_section
- * + nspa_section_view, table add / remove / lookup helpers.
+ * Default-on, always-on as of 2026-05-04 (env gate retired).  Phase B-G
+ * consumers (NtCreateSection / NtMapViewOfSection / NtUnmapViewOfSection
+ * / NtClose / NtDuplicateObject) come in subsequent commits.  This
+ * commit lands only the foundation: handle range allocator, struct
+ * nspa_local_section + nspa_section_view, table add / remove / lookup
+ * helpers.
  *
  * Handle range:
  *   [NSPA_LS_HANDLE_BASE, NSPA_LS_HANDLE_BASE + NSPA_LS_HANDLE_CAP*4)
@@ -1955,22 +1945,12 @@ static struct list      nspa_ls_sections     = LIST_INIT(nspa_ls_sections);
  * nspa_local_file_aggregate_publish_mapping (Phase H). */
 static DEFINE_PI_MUTEX(nspa_ls_sections_mutex, 0);
 
-/* NSPA local-section bypass — DEFAULT-ON since Phase J (2026-05-03 PM).
- * Validated end-to-end on Ableton workload: -70% nspa_create_mapping_from_unix_fd
- * RPCs, no EBADF / mapping failures, Phase F (NtDuplicateObject promote-to-server)
+/* NSPA local-section bypass — DEFAULT-ON since Phase J (2026-05-03 PM),
+ * env gate retired 2026-05-04.  Validated end-to-end on Ableton
+ * workload: -70% nspa_create_mapping_from_unix_fd RPCs, no EBADF /
+ * mapping failures, Phase F (NtDuplicateObject promote-to-server)
  * handles same-process DUP correctly, cross-process DUP returns clean
- * STATUS_INVALID_HANDLE.  Set NSPA_LOCAL_SECTION=0 to opt out
- * (matches the convention from nspa_local_dir_disabled — `=0` disables). */
-int nspa_local_section_disabled( void )
-{
-    static int cached = -1;
-    if (cached < 0)
-    {
-        const char *v = getenv( "NSPA_LOCAL_SECTION" );
-        cached = (v && *v == '0');
-    }
-    return cached;
-}
+ * STATUS_INVALID_HANDLE. */
 
 /* Allocate a section handle from the LS range.  Same shape as
  * nspa_lf_alloc_handle; returns NULL on cap-full.  Public so Phase B's
@@ -2333,7 +2313,7 @@ NTSTATUS nspa_local_section_create_from_lf_file( HANDLE *handle_out, HANDLE file
      *   - no name (no cross-process discovery via OpenSection)
      *   - !SEC_IMAGE       (no PE header parsing PE-side)
      *   - !SEC_LARGE_PAGES (no privilege check / hugepage alignment) */
-    if (!nspa_local_section_disabled() && !has_name && !img_or_lp)
+    if (!has_name && !img_or_lp)
     {
         size_t actual_size = explicit_size;
         if (!actual_size)

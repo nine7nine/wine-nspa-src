@@ -113,9 +113,9 @@ BOOL is_hooked( INT id )
  * an RPC.  Nested calls (one hook proc triggering another hook chain)
  * push/pop via the prev pointer.
  *
- * Default-on; opt out with NSPA_DISABLE_HOOK_TIER2.  Falls back to the
- * Tier 1 RPC path on overflow, seqlock retry exhaustion, or any
- * structural reason the cache can't serve the request. */
+ * Falls back to the Tier 1 RPC path on overflow, seqlock retry
+ * exhaustion, or any structural reason the cache can't serve the
+ * request. */
 
 struct nspa_hook_walker
 {
@@ -132,17 +132,6 @@ struct nspa_hook_walker
 
 static __thread struct nspa_hook_walker *nspa_hook_walker_current;
 
-static int nspa_hook_tier2_env_enabled( void )
-{
-    static int cached = -1;
-    if (cached < 0)
-    {
-        const char *v = getenv( "NSPA_DISABLE_HOOK_TIER2" );
-        cached = !(v && *v && *v != '0');
-    }
-    return cached;
-}
-
 /* Try to populate `walker` from the cache.  Returns count of matching
  * entries (>=0) on success, or -1 on overflow / retry exhaustion /
  * bypass shm unavailable / module copy out of range.  Caller falls back
@@ -156,8 +145,6 @@ static int nspa_hook_try_read_cache( struct nspa_hook_walker *walker, int hook_i
     unsigned int my_tid;
     int idx;
     int retry;
-
-    if (!nspa_hook_tier2_env_enabled()) return -1;
 
     bypass = (nspa_queue_bypass_shm_t *)nspa_get_own_bypass_shm_public();
     if (!bypass) return -1;

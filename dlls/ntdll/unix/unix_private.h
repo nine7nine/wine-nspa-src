@@ -331,6 +331,9 @@ extern NTSTATUS nspa_local_file_table_add( HANDLE handle, int unix_fd,
                                            const UNICODE_STRING *nt_name,
                                            const char *unix_name );
 extern NTSTATUS nspa_local_file_get_unix_name( HANDLE handle, char **unix_name_out );
+extern NTSTATUS nspa_local_file_aggregate_publish_mapping( unsigned long long device,
+                                                           unsigned long long inode,
+                                                           unsigned int mapping_bits );
 extern int      nspa_local_file_table_remove( HANDLE handle, int *unix_fd_out,
                                               unsigned long long *device_out,
                                               unsigned long long *inode_out );

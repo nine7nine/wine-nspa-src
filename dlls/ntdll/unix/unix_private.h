@@ -337,6 +337,7 @@ extern NTSTATUS nspa_local_file_aggregate_publish_mapping( unsigned long long de
 extern NTSTATUS nspa_local_file_aggregate_publish_mapping_for_handle( HANDLE file_handle,
                                                                       unsigned int mapping_bits );
 extern int      nspa_local_file_aggregate_has_mappings( HANDLE handle );
+extern NTSTATUS nspa_local_file_try_set_eof( HANDLE handle, file_pos_t eof );
 
 /* NSPA local-section (Phase A foundation; Phase B-G consumers come
  * separately).  Default-OFF until Phase J.  See

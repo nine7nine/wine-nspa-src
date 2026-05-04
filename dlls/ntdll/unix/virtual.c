@@ -146,6 +146,10 @@ struct file_view
 #define VPROT_SYSTEM           0x0200  /* system view (underlying mmap not under our control) */
 #define VPROT_PLACEHOLDER      0x0400
 #define VPROT_FREE_PLACEHOLDER 0x0800
+/* NSPA: view came from a PE-side local section (Phase C-G).  The
+ * underlying server has no mapping object to unmap, so
+ * unmap_view_of_section must skip the unmap_view RPC for these. */
+#define VPROT_NSPA_LOCAL_SECTION 0x1000
 
 /* Conversion from VPROT_* to Win32 flags */
 static const BYTE VIRTUAL_Win32Flags[16] =
@@ -3605,6 +3609,121 @@ done:
 
 
 /***********************************************************************
+ *             virtual_map_section_local
+ *
+ * NSPA Phase C — PE-side fast path for local-section handles created
+ * by NtCreateSection's Phase B branch.  Mirrors virtual_map_section's
+ * non-image path but sources mapping info + unix_fd from the local
+ * section table instead of via get_mapping_info / server_get_unix_fd
+ * RPCs, and skips the trailing SERVER_START_REQ(map_view) registration.
+ *
+ * Tags the resulting view with VPROT_NSPA_LOCAL_SECTION so
+ * unmap_view_of_section knows to skip the matching server RPC.
+ *
+ * Returns the same status codes as virtual_map_section for matching
+ * paths; falls back to STATUS_INVALID_HANDLE if the section table
+ * lookup races with a close (returns NOT_SUPPORTED on early failures
+ * so the caller can route to server fallback).
+ */
+static unsigned int virtual_map_section_local( HANDLE handle, PVOID *addr_ptr, ULONG_PTR limit_low,
+                                               ULONG_PTR limit_high, const LARGE_INTEGER *offset_ptr,
+                                               SIZE_T *size_ptr, ULONG alloc_type, ULONG protect )
+{
+    struct nspa_local_section sec;
+    unsigned int res;
+    ACCESS_MASK access;
+    SIZE_T size;
+    void *base;
+    unsigned int vprot;
+    struct file_view *view;
+    LARGE_INTEGER offset;
+    sigset_t sigset;
+
+    switch (protect)
+    {
+    case PAGE_NOACCESS:
+    case PAGE_READONLY:
+    case PAGE_WRITECOPY:
+        access = SECTION_MAP_READ;
+        break;
+    case PAGE_READWRITE:
+        access = SECTION_MAP_WRITE;
+        break;
+    case PAGE_EXECUTE:
+    case PAGE_EXECUTE_READ:
+    case PAGE_EXECUTE_WRITECOPY:
+        access = SECTION_MAP_READ | SECTION_MAP_EXECUTE;
+        break;
+    case PAGE_EXECUTE_READWRITE:
+        access = SECTION_MAP_WRITE | SECTION_MAP_EXECUTE;
+        break;
+    default:
+        return STATUS_INVALID_PAGE_PROTECTION;
+    }
+    (void)access;  /* validated; section table already gates access at create */
+
+    /* Snapshot the section entry under the table lock.  Subsequent ops
+     * use the snapshot — racing close just means we'll fail later at
+     * mmap.  Caller's NT contract: don't close the section while
+     * mapping it. */
+    if (!nspa_local_section_table_lookup( handle, &sec )) return STATUS_INVALID_HANDLE;
+    if (sec.unix_fd < 0) return STATUS_INVALID_HANDLE;
+
+    offset.QuadPart = offset_ptr ? offset_ptr->QuadPart : 0;
+    base = *addr_ptr;
+
+    /* SEC_LARGE_PAGES is excluded by Phase B eligibility but defend
+     * against the impossible case anyway. */
+    if (sec.sec_flags & SEC_LARGE_PAGES) return STATUS_INVALID_PARAMETER;
+
+    if ((unsigned long long)offset.QuadPart >= sec.size) return STATUS_INVALID_PARAMETER;
+    if (*size_ptr)
+    {
+        size = *size_ptr;
+        if ((unsigned long long)size > (unsigned long long)sec.size - offset.QuadPart)
+            return STATUS_INVALID_VIEW_SIZE;
+    }
+    else
+    {
+        size = sec.size - offset.QuadPart;
+        if (size != sec.size - offset.QuadPart) return STATUS_INVALID_PARAMETER;
+    }
+    if (!(size = ROUND_SIZE( 0, size, page_mask ))) return STATUS_INVALID_PARAMETER;
+
+    get_vprot_flags( protect, &vprot, FALSE );
+    vprot |= sec.sec_flags;
+    if (!(sec.sec_flags & SEC_RESERVE)) vprot |= VPROT_COMMITTED;
+    /* Tag the view as local-section so unmap_view_of_section skips
+     * the server RPC (which has no object to unmap). */
+    vprot |= VPROT_NSPA_LOCAL_SECTION;
+
+    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+
+    res = map_view( &view, base, size, alloc_type, vprot, limit_low, limit_high, 0 );
+    if (res) goto done;
+
+    res = map_file_into_view( view, sec.unix_fd, 0, size, offset.QuadPart, vprot, FALSE );
+    if (res == STATUS_SUCCESS)
+    {
+        mprotect_range( view->base, view->size, VPROT_COMMITTED, 0 );
+        *addr_ptr = view->base;
+        *size_ptr = size;
+        VIRTUAL_DEBUG_DUMP_VIEW( view );
+    }
+    else
+    {
+        ERR( "local-section mapping %p %lx %s failed\n", view->base, size,
+             wine_dbgstr_longlong(offset.QuadPart) );
+        delete_view( view );
+    }
+
+done:
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    return res;
+}
+
+
+/***********************************************************************
  *             virtual_map_section
  *
  * Map a file section into memory.
@@ -6743,6 +6862,12 @@ NTSTATUS WINAPI NtMapViewOfSection( HANDLE handle, HANDLE process, PVOID *addr_p
         return result.map_view.status;
     }
 
+    /* NSPA Phase C — PE-side local-section fast path. */
+    if (nspa_local_section_is_local_handle( handle ))
+        return virtual_map_section_local( handle, addr_ptr, 0,
+                                          get_zero_bits_limit( zero_bits ),
+                                          offset_ptr, size_ptr, alloc_type, protect );
+
     return virtual_map_section( handle, addr_ptr, 0, get_zero_bits_limit( zero_bits ), commit_size,
                                 offset_ptr, size_ptr, alloc_type, protect, 0 );
 }
@@ -6819,6 +6944,11 @@ NTSTATUS WINAPI NtMapViewOfSectionEx( HANDLE handle, HANDLE process, PVOID *addr
         return result.map_view_ex.status;
     }
 
+    /* NSPA Phase C — PE-side local-section fast path. */
+    if (nspa_local_section_is_local_handle( handle ))
+        return virtual_map_section_local( handle, addr_ptr, limit_low, limit_high,
+                                          offset_ptr, size_ptr, alloc_type, protect );
+
     return virtual_map_section( handle, addr_ptr, limit_low, limit_high, 0,
                                 offset_ptr, size_ptr, alloc_type, protect, machine );
 }
@@ -6871,12 +7001,24 @@ static NTSTATUS unmap_view_of_section( HANDLE process, PVOID addr, ULONG flags )
         }
     }
 
-    SERVER_START_REQ( unmap_view )
+    /* NSPA Phase D — local-section views have no server-side mapping
+     * object; skip the unmap_view RPC.  delete_view + view destructor
+     * still run.  The local-section table entry is unhooked separately
+     * via nspa_local_section_close() from NtClose on the section
+     * handle (Phase E). */
+    if (view->protect & VPROT_NSPA_LOCAL_SECTION)
     {
-        req->base = wine_server_client_ptr( view->base );
-        status = wine_server_call( req );
+        status = STATUS_SUCCESS;
     }
-    SERVER_END_REQ;
+    else
+    {
+        SERVER_START_REQ( unmap_view )
+        {
+            req->base = wine_server_client_ptr( view->base );
+            status = wine_server_call( req );
+        }
+        SERVER_END_REQ;
+    }
     if (!status)
     {
         if (view->protect & SEC_IMAGE) release_builtin_module( view->base );
@@ -6973,6 +7115,25 @@ NTSTATUS WINAPI NtQuerySection( HANDLE handle, SECTION_INFORMATION_CLASS class, 
 	return STATUS_NOT_IMPLEMENTED;
     }
     if (!ptr) return STATUS_ACCESS_VIOLATION;
+
+    /* NSPA Phase G — answer NtQuerySection from local section table.
+     * Local sections are guaranteed !SEC_IMAGE (Phase B eligibility),
+     * so SectionImageInformation is always STATUS_SECTION_NOT_IMAGE. */
+    if (nspa_local_section_is_local_handle( handle ))
+    {
+        struct nspa_local_section sec;
+        if (!nspa_local_section_table_lookup( handle, &sec )) return STATUS_INVALID_HANDLE;
+        if (class == SectionBasicInformation)
+        {
+            SECTION_BASIC_INFORMATION *info = ptr;
+            info->Attributes    = sec.sec_flags;
+            info->BaseAddress   = NULL;
+            info->Size.QuadPart = sec.size;
+            if (ret_size) *ret_size = sizeof(*info);
+            return STATUS_SUCCESS;
+        }
+        return STATUS_SECTION_NOT_IMAGE;
+    }
 
     SERVER_START_REQ( get_mapping_info )
     {

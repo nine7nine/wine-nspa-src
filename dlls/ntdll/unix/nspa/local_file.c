@@ -2133,3 +2133,44 @@ int nspa_local_section_table_remove( HANDLE handle, struct nspa_local_section *o
     pi_mutex_unlock( &nspa_ls_sections_mutex );
     return found;
 }
+
+/* Phase E — NtClose handler for local-section handles.  Returns 1 if
+ * the handle was a local section and was cleaned up; 0 if not ours.
+ * Mirrors the nspa_local_file_close shape so server.c's NtClose can
+ * gate on this before falling through to the regular close path.
+ *
+ * Cleanup sequence:
+ *   1. Snapshot + remove the section table entry.
+ *   2. Clear LF aggregate mapping bits for our subentry (Phase H).
+ *      Best-effort — failure leaves stale bits but doesn't crash;
+ *      the bits are also recomputed on file-handle publish_close.
+ *   3. Free the handle slot LAST (ABA-safety; matches LF discipline). */
+int nspa_local_section_close( HANDLE handle )
+{
+    struct nspa_local_section snap;
+
+    if (!nspa_local_section_is_local_handle( handle )) return 0;
+
+    if (!nspa_local_section_table_remove( handle, &snap ))
+    {
+        /* Handle in our range but not in table — racing close, or
+         * never registered.  Free the slot anyway so future allocs
+         * can reclaim it. */
+        nspa_local_section_free_handle( handle );
+        return 1;
+    }
+
+    /* Clear our subentry's mapping bits.  If multiple sections in
+     * this process backed by the same file handle, the caller's
+     * (Phase F) ref-counting would re-publish the union here.  For
+     * the single-section-per-file common case, clearing is correct.
+     *
+     * Future Phase F dup support: change this to publish the union
+     * of remaining sections' bits (computed by walking
+     * nspa_ls_sections for the same file_handle). */
+    if (snap.file_handle && nspa_local_file_is_local_handle( snap.file_handle ))
+        nspa_local_file_aggregate_publish_mapping_for_handle( snap.file_handle, 0 );
+
+    nspa_local_section_free_handle( handle );
+    return 1;
+}

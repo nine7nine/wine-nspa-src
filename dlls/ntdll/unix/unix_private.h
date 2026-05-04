@@ -383,6 +383,7 @@ extern NTSTATUS nspa_local_section_table_add( HANDLE handle, HANDLE file_handle,
                                               unsigned int mapping_bits );
 extern int      nspa_local_section_table_lookup( HANDLE handle, struct nspa_local_section *out );
 extern int      nspa_local_section_table_remove( HANDLE handle, struct nspa_local_section *out );
+extern int      nspa_local_section_close( HANDLE handle );
 extern int      nspa_local_file_table_remove( HANDLE handle, int *unix_fd_out,
                                               unsigned long long *device_out,
                                               unsigned long long *inode_out );

@@ -2247,6 +2247,51 @@ int nspa_local_section_close( HANDLE handle )
     return 1;
 }
 
+/* NtSetInformationFile/FileEndOfFileInformation Path A — try to
+ * ftruncate the LF unix_fd directly without a wineserver RPC.
+ *
+ * Only safe when no process has the inode mapped (server's set_fd_eof
+ * returns STATUS_USER_MAPPED_FILE in that case for the shrink path).
+ * Grow path doesn't check mappings server-side either, so always safe
+ * if eof >= current size.
+ *
+ * Returns:
+ *   STATUS_SUCCESS         — ftruncate succeeded; caller should
+ *                            return immediately.
+ *   STATUS_NOT_SUPPORTED   — handle isn't LF, or fstat failed, or
+ *                            ftruncate failed (EROFS / EBADF / etc.)
+ *                            — caller falls through to the regular
+ *                            set_fd_eof_info RPC for proper error
+ *                            mapping.
+ *   STATUS_USER_MAPPED_FILE
+ *                          — shrink with mappings present; caller
+ *                            could either propagate this directly OR
+ *                            fall through to RPC (server returns
+ *                            same status).  We return NOT_SUPPORTED
+ *                            and let the RPC produce the canonical
+ *                            error so semantics match exactly.
+ *
+ * The caller is responsible for setting io->Status / io->Information
+ * on STATUS_SUCCESS (the helper returns the status only). */
+NTSTATUS nspa_local_file_try_set_eof( HANDLE handle, file_pos_t eof )
+{
+    int unix_fd;
+    struct stat st;
+
+    if (!nspa_local_file_is_local_handle( handle )) return STATUS_NOT_SUPPORTED;
+    unix_fd = nspa_local_file_table_lookup_unix_fd( handle );
+    if (unix_fd < 0) return STATUS_NOT_SUPPORTED;
+    if (fstat( unix_fd, &st ) != 0) return STATUS_NOT_SUPPORTED;
+
+    /* Grow: no mapping check needed (matches server/fd.c:set_fd_eof grow path).
+     * Shrink: only proceed if no process has the inode mapped. */
+    if (eof < (file_pos_t)st.st_size && nspa_local_file_aggregate_has_mappings( handle ))
+        return STATUS_NOT_SUPPORTED;
+
+    if (ftruncate( unix_fd, eof ) != 0) return STATUS_NOT_SUPPORTED;
+    return STATUS_SUCCESS;
+}
+
 /* NtCreateSection LF-handle dispatch — encapsulates the PE-side
  * bypass attempt (Phase B) plus the server-RPC fallback that uses the
  * LF unix_fd via nspa_create_mapping_from_unix_fd.  Replaces ~90 lines

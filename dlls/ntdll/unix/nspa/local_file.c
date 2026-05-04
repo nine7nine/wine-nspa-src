@@ -1955,15 +1955,19 @@ static struct list      nspa_ls_sections     = LIST_INIT(nspa_ls_sections);
  * nspa_local_file_aggregate_publish_mapping (Phase H). */
 static DEFINE_PI_MUTEX(nspa_ls_sections_mutex, 0);
 
-/* Phase A — env gate.  Set NSPA_LOCAL_SECTION=1 to enable Phase B-G
- * NtCreateSection PE-side dispatch.  Default-OFF until Phase J. */
+/* NSPA local-section bypass — DEFAULT-ON since Phase J (2026-05-03 PM).
+ * Validated end-to-end on Ableton workload: -70% nspa_create_mapping_from_unix_fd
+ * RPCs, no EBADF / mapping failures, Phase F (NtDuplicateObject promote-to-server)
+ * handles same-process DUP correctly, cross-process DUP returns clean
+ * STATUS_INVALID_HANDLE.  Set NSPA_LOCAL_SECTION=0 to opt out
+ * (matches the convention from nspa_local_dir_disabled — `=0` disables). */
 int nspa_local_section_disabled( void )
 {
     static int cached = -1;
     if (cached < 0)
     {
         const char *v = getenv( "NSPA_LOCAL_SECTION" );
-        cached = !(v && *v == '1');
+        cached = (v && *v == '0');
     }
     return cached;
 }

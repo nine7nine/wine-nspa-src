@@ -353,6 +353,36 @@ extern NTSTATUS nspa_local_file_get_unix_name( HANDLE handle, char **unix_name_o
 extern NTSTATUS nspa_local_file_aggregate_publish_mapping( unsigned long long device,
                                                            unsigned long long inode,
                                                            unsigned int mapping_bits );
+extern NTSTATUS nspa_local_file_aggregate_publish_mapping_for_handle( HANDLE file_handle,
+                                                                      unsigned int mapping_bits );
+
+/* NSPA local-section (Phase A foundation; Phase B-G consumers come
+ * separately).  Default-OFF until Phase J.  See
+ * wine/nspa/docs/nt-create-section-pe-side-scoping-20260503.md. */
+struct nspa_local_section
+{
+    struct list      entry;
+    HANDLE           handle;
+    HANDLE           file_handle;
+    int              unix_fd;
+    size_t           size;
+    unsigned int     sec_flags;
+    unsigned int     file_access;
+    unsigned int     access;
+    unsigned int     mapping_bits;
+    unsigned int     ref;
+    struct list      views;
+};
+extern int      nspa_local_section_is_local_handle( HANDLE h );
+extern int      nspa_local_section_disabled( void );
+extern HANDLE   nspa_local_section_alloc_handle( void );
+extern void     nspa_local_section_free_handle( HANDLE h );
+extern NTSTATUS nspa_local_section_table_add( HANDLE handle, HANDLE file_handle, int unix_fd,
+                                              size_t size, unsigned int sec_flags,
+                                              unsigned int file_access, unsigned int access,
+                                              unsigned int mapping_bits );
+extern int      nspa_local_section_table_lookup( HANDLE handle, struct nspa_local_section *out );
+extern int      nspa_local_section_table_remove( HANDLE handle, struct nspa_local_section *out );
 extern int      nspa_local_file_table_remove( HANDLE handle, int *unix_fd_out,
                                               unsigned long long *device_out,
                                               unsigned long long *inode_out );

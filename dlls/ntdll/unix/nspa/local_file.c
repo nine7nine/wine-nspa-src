@@ -1909,3 +1909,227 @@ int nspa_local_file_close( HANDLE handle )
     nspa_lf_free_handle( handle );
     return 1;
 }
+
+/* ====================================================================
+ * Phase A — PE-side section handle range + table foundation.
+ *
+ * Default-OFF (env gate NSPA_LOCAL_SECTION=1).  Phase B-G consumers
+ * (NtCreateSection / NtMapViewOfSection / NtUnmapViewOfSection / NtClose
+ * / NtDuplicateObject) come in subsequent commits.  This commit lands
+ * only the foundation: handle range allocator, struct nspa_local_section
+ * + nspa_section_view, table add / remove / lookup helpers.
+ *
+ * Handle range:
+ *   [NSPA_LS_HANDLE_BASE, NSPA_LS_HANDLE_BASE + NSPA_LS_HANDLE_CAP*4)
+ *   = [0x7FFF8000, 0x7FFFC000) — 4096 slots, 4-byte aligned.
+ * Below the LF file handle range [0x7FFFC000, 0x80000000), no overlap.
+ * The is_local_section predicate distinguishes from LF handles by
+ * range membership.
+ *
+ * See wine/nspa/docs/nt-create-section-pe-side-scoping-20260503.md for
+ * the full design + phase plan.
+ * ==================================================================== */
+
+#define NSPA_LS_HANDLE_CAP     4096
+static unsigned int nspa_ls_handle_base = 0x80000000u
+                                          - NSPA_LF_HANDLE_CAP * 4
+                                          - NSPA_LS_HANDLE_CAP * 4;
+static int          nspa_ls_handles_in_use[NSPA_LS_HANDLE_CAP];
+static unsigned int nspa_ls_handle_next;
+static DEFINE_PI_MUTEX(nspa_ls_handle_mutex, 0);
+
+/* struct nspa_local_section defined in unix_private.h (used by Phase B-G
+ * consumers in sync.c).  struct nspa_section_view stays internal — view
+ * tracking is fully managed inside this file. */
+struct nspa_section_view
+{
+    struct list   entry;        /* in section->views */
+    void         *addr;         /* mmap'd virtual address */
+    size_t        size;         /* view size */
+    int           prot;         /* mmap PROT_* flags applied */
+};
+
+static struct list      nspa_ls_sections     = LIST_INIT(nspa_ls_sections);
+/* Process-local PI mutex protecting the section table.  Cross-process
+ * coordination of mapping bits goes through the LF aggregate via
+ * nspa_local_file_aggregate_publish_mapping (Phase H). */
+static DEFINE_PI_MUTEX(nspa_ls_sections_mutex, 0);
+
+/* Phase A — env gate.  Set NSPA_LOCAL_SECTION=1 to enable Phase B-G
+ * NtCreateSection PE-side dispatch.  Default-OFF until Phase J. */
+int nspa_local_section_disabled( void )
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *v = getenv( "NSPA_LOCAL_SECTION" );
+        cached = !(v && *v == '1');
+    }
+    return cached;
+}
+
+/* Allocate a section handle from the LS range.  Same shape as
+ * nspa_lf_alloc_handle; returns NULL on cap-full.  Public so Phase B's
+ * NtCreateSection PE-side fast path can mint handles. */
+HANDLE nspa_local_section_alloc_handle( void )
+{
+    unsigned int i, slot;
+    HANDLE result = NULL;
+
+    pi_mutex_lock( &nspa_ls_handle_mutex );
+    for (i = 0; i < NSPA_LS_HANDLE_CAP; i++)
+    {
+        slot = (nspa_ls_handle_next + i) % NSPA_LS_HANDLE_CAP;
+        if (!nspa_ls_handles_in_use[slot])
+        {
+            nspa_ls_handles_in_use[slot] = 1;
+            nspa_ls_handle_next = (slot + 1) % NSPA_LS_HANDLE_CAP;
+            result = (HANDLE)(ULONG_PTR)(nspa_ls_handle_base + slot * 4);
+            break;
+        }
+    }
+    pi_mutex_unlock( &nspa_ls_handle_mutex );
+    return result;
+}
+
+void nspa_local_section_free_handle( HANDLE h )
+{
+    unsigned int v = (unsigned int)(ULONG_PTR)h;
+    unsigned int slot;
+    if (v < nspa_ls_handle_base) return;
+    slot = (v - nspa_ls_handle_base) / 4;
+    if (slot >= NSPA_LS_HANDLE_CAP) return;
+    pi_mutex_lock( &nspa_ls_handle_mutex );
+    nspa_ls_handles_in_use[slot] = 0;
+    pi_mutex_unlock( &nspa_ls_handle_mutex );
+}
+
+/* Range membership test — distinguishes section handles from LF file
+ * handles + from server handles.  Cheap range check; no table lookup. */
+int nspa_local_section_is_local_handle( HANDLE h )
+{
+    unsigned int v = (unsigned int)(ULONG_PTR)h;
+    unsigned int slot;
+    if (v == 0x7FFFFFFFu || v >= 0xFFFFFFFAu) return 0;
+    if (v < nspa_ls_handle_base) return 0;
+    if (v >= nspa_ls_handle_base + NSPA_LS_HANDLE_CAP * 4) return 0;
+    slot = (v - nspa_ls_handle_base) / 4;
+    return slot < NSPA_LS_HANDLE_CAP;
+}
+
+/* Convenience wrapper — resolve (device, inode) from an LF handle and
+ * call publish_mapping.  Used by Phase B NtCreateSection PE-side fast
+ * path so the eligibility check + bit publication is one helper call.
+ *
+ * Returns STATUS_NOT_SUPPORTED if the file handle isn't local-range
+ * (caller should fall back to server) or if the LF entry isn't found
+ * (which shouldn't happen if is_local_handle returned true and no
+ * close raced).  Other failures propagate from the underlying publish. */
+NTSTATUS nspa_local_file_aggregate_publish_mapping_for_handle( HANDLE file_handle,
+                                                               unsigned int mapping_bits )
+{
+    struct nspa_local_open *o;
+    unsigned long long dev = 0, ino = 0;
+    int found = 0;
+
+    if (!nspa_local_file_is_local_handle( file_handle )) return STATUS_NOT_SUPPORTED;
+
+    pi_mutex_lock( &nspa_lf_opens_mutex );
+    LIST_FOR_EACH_ENTRY( o, &nspa_lf_opens, struct nspa_local_open, entry )
+    {
+        if (o->handle == file_handle)
+        {
+            dev = o->device;
+            ino = o->inode;
+            found = 1;
+            break;
+        }
+    }
+    pi_mutex_unlock( &nspa_lf_opens_mutex );
+
+    if (!found) return STATUS_NOT_SUPPORTED;
+    return nspa_local_file_aggregate_publish_mapping( dev, ino, mapping_bits );
+}
+
+/* Add a freshly-allocated section to the per-process table.  Caller has
+ * already nspa_ls_alloc_handle'd `handle` and populated unix_fd / size /
+ * sec_flags / file_access / access / mapping_bits / file_handle.
+ * On STATUS_NO_MEMORY the caller should nspa_ls_free_handle(handle). */
+NTSTATUS nspa_local_section_table_add( HANDLE handle, HANDLE file_handle, int unix_fd,
+                                       size_t size, unsigned int sec_flags,
+                                       unsigned int file_access, unsigned int access,
+                                       unsigned int mapping_bits )
+{
+    struct nspa_local_section *s;
+
+    s = malloc( sizeof(*s) );
+    if (!s) return STATUS_NO_MEMORY;
+    s->handle       = handle;
+    s->file_handle  = file_handle;
+    s->unix_fd      = unix_fd;
+    s->size         = size;
+    s->sec_flags    = sec_flags;
+    s->file_access  = file_access;
+    s->access       = access;
+    s->mapping_bits = mapping_bits;
+    s->ref          = 1;
+    list_init( &s->views );
+
+    pi_mutex_lock( &nspa_ls_sections_mutex );
+    list_add_head( &nspa_ls_sections, &s->entry );
+    pi_mutex_unlock( &nspa_ls_sections_mutex );
+    return STATUS_SUCCESS;
+}
+
+/* Look up a tracked section.  Returns 1 + fills `*out` with a snapshot
+ * of the entry on success, 0 if not in table.  Snapshot is taken under
+ * the table lock so the caller can use values without further locking,
+ * but the table entry itself may have been freed by another thread by
+ * the time the caller acts on the snapshot — caller must validate via
+ * nspa_local_section_is_local_handle for any subsequent ops. */
+int nspa_local_section_table_lookup( HANDLE handle, struct nspa_local_section *out )
+{
+    struct nspa_local_section *s;
+    int found = 0;
+
+    pi_mutex_lock( &nspa_ls_sections_mutex );
+    LIST_FOR_EACH_ENTRY( s, &nspa_ls_sections, struct nspa_local_section, entry )
+    {
+        if (s->handle == handle)
+        {
+            *out = *s;
+            list_init( &out->views );  /* don't expose views list to caller */
+            found = 1;
+            break;
+        }
+    }
+    pi_mutex_unlock( &nspa_ls_sections_mutex );
+    return found;
+}
+
+/* Remove a section from the table and return its data via *out (callers
+ * may want unix_fd to close, etc.).  Returns 1 if removed, 0 if not
+ * found.  Caller is responsible for nspa_ls_free_handle(handle) AFTER
+ * any cleanup that uses the snapshot fields, to preserve ABA-safety
+ * (same ordering invariant as nspa_local_file_table_remove). */
+int nspa_local_section_table_remove( HANDLE handle, struct nspa_local_section *out )
+{
+    struct nspa_local_section *s, *next;
+    int found = 0;
+
+    pi_mutex_lock( &nspa_ls_sections_mutex );
+    LIST_FOR_EACH_ENTRY_SAFE( s, next, &nspa_ls_sections, struct nspa_local_section, entry )
+    {
+        if (s->handle == handle)
+        {
+            *out = *s;
+            list_init( &out->views );
+            list_remove( &s->entry );
+            free( s );
+            found = 1;
+            break;
+        }
+    }
+    pi_mutex_unlock( &nspa_ls_sections_mutex );
+    return found;
+}

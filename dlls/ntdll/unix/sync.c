@@ -36,6 +36,7 @@
 #include <sys/types.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #ifdef HAVE_SYS_SYSCALL_H
 #include <sys/syscall.h>
 #endif
@@ -3775,16 +3776,76 @@ NTSTATUS WINAPI NtCreateSection( HANDLE *handle, ACCESS_MASK access, const OBJEC
 
     if ((ret = alloc_object_attributes( attr, &objattr, &len ))) return ret;
 
-    /* NSPA local-file Phase 1A.3: if the file handle is a local-range
-     * handle (opened via the bypass in NtCreateFile), promote it to
-     * a server-side mapping by sending the unix fd via inflight + a
-     * dedicated RPC.  Server allocates an inode-tracked struct file
-     * from the unix fd and creates the section against it. */
+    /* NSPA local-section Phase B — PE-side bypass for eligible
+     * file-backed sections on LF unix_fds.  Skips the server roundtrip
+     * (no nspa_create_mapping_from_unix_fd RPC).  Eligibility:
+     *   - file is LF-bypassed (we hold the unix_fd locally)
+     *   - !SEC_IMAGE          (no PE header parsing on PE-side)
+     *   - !SEC_LARGE_PAGES    (no hugepage privilege check on PE-side)
+     *   - no name             (no cross-process discovery via OpenSection)
+     *   - PE-side enabled     (NSPA_LOCAL_SECTION=1; default-OFF)
+     * Phase H mapping-bit publication is wired here so other LF
+     * openers' check_sharing arbitration sees our mapping. */
     if (file && nspa_local_file_is_local_handle( file ))
     {
         int unix_fd = nspa_local_file_table_lookup_unix_fd( file );
         if (unix_fd >= 0)
         {
+            int has_name  = (attr && attr->ObjectName && attr->ObjectName->Length > 0);
+            int img_or_lp = !!(sec_flags & (SEC_IMAGE | SEC_LARGE_PAGES));
+            if (!nspa_local_section_disabled() && !has_name && !img_or_lp)
+            {
+                /* Determine mapping size: explicit > fstat-derived. */
+                size_t actual_size = size ? size->QuadPart : 0;
+                if (!actual_size)
+                {
+                    struct stat st;
+                    if (fstat( unix_fd, &st ) != 0) goto ls_fallback;
+                    actual_size = st.st_size;
+                    /* MAPPED_FILE_SIZE_ZERO matches server semantics
+                     * (server/mapping.c:1303) when no explicit size and
+                     * file is empty. */
+                    if (!actual_size)
+                    {
+                        free( objattr );
+                        return STATUS_MAPPED_FILE_SIZE_ZERO;
+                    }
+                }
+
+                /* Compute mapping_bits.  All file-backed mappings carry
+                 * FILE_MAPPING_ACCESS; writable ones add FILE_MAPPING_WRITE.
+                 * SEC_IMAGE excluded by eligibility above.  Mirrors
+                 * server/mapping.c:1273-1275. */
+                {
+                    unsigned int mbits =
+                        0x20000000u  /* NSPA_LF_FILE_MAPPING_ACCESS */
+                        | ((file_access & FILE_WRITE_DATA) ? 0x40000000u : 0);
+                    HANDLE h = nspa_local_section_alloc_handle();
+                    if (!h) goto ls_fallback;
+
+                    ret = nspa_local_section_table_add( h, file, unix_fd,
+                                                        actual_size, sec_flags,
+                                                        file_access, access, mbits );
+                    if (ret != STATUS_SUCCESS)
+                    {
+                        nspa_local_section_free_handle( h );
+                        goto ls_fallback;
+                    }
+
+                    /* Phase H: publish mapping bits to LF aggregate so
+                     * cross-process LF openers' check_sharing sees them.
+                     * Best-effort — failure to publish doesn't abort the
+                     * mapping; sharing arbitration just won't reflect
+                     * this PE-side mapping (single-process correctness
+                     * still holds). */
+                    nspa_local_file_aggregate_publish_mapping_for_handle( file, mbits );
+
+                    *handle = h;
+                    free( objattr );
+                    return STATUS_SUCCESS;
+                }
+            }
+        ls_fallback:
             wine_server_send_fd( unix_fd );
             SERVER_START_REQ( nspa_create_mapping_from_unix_fd )
             {

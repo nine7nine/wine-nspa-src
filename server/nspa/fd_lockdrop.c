@@ -55,29 +55,12 @@ int nspa_openat_lockdrop( struct fd *fd_object,
 {
     int unix_fd, local_errno = 0;
 
-    /* NSPA: lock-drop default ON since 2026-04-26.  Originally gated
-     * default-off after a host lockup on the first validation run, but
-     * the root cause was traced to ntsync driver bugs (kfree under
-     * raw_spinlock_t — fixed in ntsync-patches/1006-ntsync-rt-alloc-
-     * hoist.patch), not Phase B itself.  Re-validated post-1006 with
-     * Ableton drum-track-load-while-playing (the file-open-burst
-     * workload Phase B targets) — clean and measurably better.
-     * Set NSPA_OPENFD_LOCKDROP=0 to fall back to the pre-Phase-B
-     * (held-throughout) helper for A/B testing. */
-    {
-        static int cached_enabled = -1;
-        if (cached_enabled < 0)
-        {
-            const char *v = getenv( "NSPA_OPENFD_LOCKDROP" );
-            cached_enabled = !(v && *v == '0');
-        }
-        if (!cached_enabled)
-        {
-            unix_fd = do_openat( dirfd, name, rw_mode, flags, *mode, access, &local_errno );
-            errno = local_errno;
-            return unix_fd;
-        }
-    }
+    /* NSPA: lock-drop is always-on as of 2026-05-04 (env-gate retired).
+     * Originally default-off after a host lockup on the first validation
+     * run; the root cause was traced to ntsync driver bugs (kfree under
+     * raw_spinlock_t — fixed in ntsync-patches 1006) and re-validated
+     * post-1006 with Ableton drum-track-load-while-playing (the
+     * file-open-burst workload Phase B targets). */
 
     /* Lock-drop path.
      *

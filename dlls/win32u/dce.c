@@ -1642,30 +1642,6 @@ static int nspa_paint_diag_enabled( void )
     return cached;
 }
 
-static int nspa_paint_fastpath_disabled( void )
-{
-    /* DEFAULT-ON since 2026-04-28.  The 2026-04-26 default-on flip
-     * had been reverted same day after Ableton reproducibly locked
-     * up in userspace ~5 min into a session with paint-cache
-     * enabled.  The MR1 (reply-slot ABA) + MR4 (POST wake-loss CAS
-     * rollback) fixes shipped 2026-04-27 in msg_ring.c resolved the
-     * cascade: paint-cache amplifies the rate of cross-thread sync
-     * sends that depend on accurate reply correlation, and the ABA-
-     * driven misdelivery / dropped-wake combo was the build-up that
-     * reached deadlock at the ~5 min mark.  Validated 2026-04-28
-     * with two clean Ableton sessions, the second with paint-cache=1
-     * past the historical 5-min lockup threshold including drum-
-     * track-load-while-playing.  Set NSPA_ENABLE_PAINT_CACHE=0 to
-     * disable for A/B testing. */
-    static int cached = -1;
-    if (cached < 0)
-    {
-        const char *v = getenv( "NSPA_ENABLE_PAINT_CACHE" );
-        cached = (v && *v == '0');
-    }
-    return cached;
-}
-
 static BOOL nspa_get_update_flags_try_fastpath( HWND hwnd, HWND *child, UINT *flags )
 {
     struct object_lock lock = OBJECT_LOCK_INIT;
@@ -1673,8 +1649,6 @@ static BOOL nspa_get_update_flags_try_fastpath( HWND hwnd, HWND *child, UINT *fl
     unsigned int wake_bits = 0;
     unsigned int spin = 0;
     UINT status;
-
-    if (nspa_paint_fastpath_disabled()) return FALSE;
 
     /* No hwnd → server interprets as "any window owned by current
      * thread"; the queue-level QS_PAINT bit IS the answer for that

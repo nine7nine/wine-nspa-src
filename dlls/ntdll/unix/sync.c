@@ -937,39 +937,14 @@ static inline BOOL is_anonymous_attr( const OBJECT_ATTRIBUTES *attr )
     return attr->ObjectName->Length == 0;
 }
 
-/* NSPA Phase 4.6.E: gate for the client-range event fast path.  When ON,
- * anonymous NtCreateEvent routes to create_inproc_event_local (Phase D),
- * which registers the event with the server (Phase A) so async-I/O
- * completion can signal it via direct ntsync ioctl (Phase B+C).  When OFF,
- * anonymous events stay on the legacy wineserver path.  Default-OFF this
- * commit; flip to default-ON in Phase F after Ableton soak validates. */
-static int nspa_nt_local_event_cached;
-
-static BOOL nspa_nt_local_event_enabled(void)
-{
-    int v = __atomic_load_n( &nspa_nt_local_event_cached, __ATOMIC_ACQUIRE );
-    if (!v)
-    {
-        /* Default-ON since 2026-05-02 night — Phase 4.6 events Option A
-         * Ableton-validated.  Set NSPA_NT_LOCAL_EVENT=0 to force OFF
-         * (kept as an env switch for diagnostic A/B). */
-        const char *env = getenv( "NSPA_NT_LOCAL_EVENT" );
-        v = (env && env[0] == '0' && env[1] == 0) ? 1 : 2;
-        __atomic_store_n( &nspa_nt_local_event_cached, v, __ATOMIC_RELEASE );
-    }
-    return v == 2;
-}
-
 static inline BOOL allow_client_sync_creation( enum inproc_sync_type type, const OBJECT_ATTRIBUTES *attr )
 {
-    /* Phase 4.6: client-range events are now signaled correctly across
+    /* Phase 4.6: client-range events are signaled correctly across
      * server-async paths via the Option A fix (server-side fd registration
      * + completion-via-direct-ntsync-ioctl).  See plan doc
-     * wine/nspa/docs/events-option-a-plan-20260502.md and the historical
-     * handoff doc events-fully-local-handoff-20260502.md.  Gate the event
-     * fast path behind NSPA_NT_LOCAL_EVENT until soak validates; legacy
-     * server-event path stays the safe default. */
-    if (type == INPROC_SYNC_EVENT && !nspa_nt_local_event_enabled()) return FALSE;
+     * wine/nspa/docs/events-option-a-plan-20260502.md.  Always-on as of
+     * 2026-05-04 (env-gate retired). */
+    (void)type;
     return is_anonymous_attr( attr );
 }
 

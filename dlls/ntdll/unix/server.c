@@ -2168,6 +2168,19 @@ NTSTATUS WINAPI NtDuplicateObject( HANDLE source_process, HANDLE source, HANDLE 
         }
     }
 
+    /* NSPA local-section Phase F — same-process DUP on a local section
+     * promotes the section to a server-side mapping; subsequent dup
+     * proceeds through the regular dup_handle RPC.  Cross-process DUP
+     * (different source_process) hits the dup_handle RPC unchanged
+     * with the source-process's local handle, which the server won't
+     * recognise — falls back to STATUS_INVALID_HANDLE.  Phase F's
+     * scope is the same-process case. */
+    if (source_process == NtCurrentProcess() && nspa_local_section_is_local_handle( source ))
+    {
+        HANDLE promoted = nspa_local_section_get_or_promote_server_handle( source );
+        if (promoted) source = promoted;
+    }
+
     /* hold fd_cache_mutex to prevent the fd from being added again between the
      * call to remove_fd_from_cache and close_handle */
     server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );

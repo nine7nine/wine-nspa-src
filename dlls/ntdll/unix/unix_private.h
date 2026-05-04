@@ -345,6 +345,7 @@ struct nspa_local_section
     struct list      entry;
     HANDLE           handle;
     HANDLE           file_handle;
+    HANDLE           server_handle;   /* cached server-side mapping (Phase F promote) */
     int              unix_fd;
     size_t           size;
     unsigned int     sec_flags;
@@ -365,6 +366,7 @@ extern NTSTATUS nspa_local_section_table_add( HANDLE handle, HANDLE file_handle,
 extern int      nspa_local_section_table_lookup( HANDLE handle, struct nspa_local_section *out );
 extern int      nspa_local_section_table_remove( HANDLE handle, struct nspa_local_section *out );
 extern int      nspa_local_section_close( HANDLE handle );
+extern HANDLE   nspa_local_section_get_or_promote_server_handle( HANDLE handle );
 extern int      nspa_local_file_table_remove( HANDLE handle, int *unix_fd_out,
                                               unsigned long long *device_out,
                                               unsigned long long *inode_out );

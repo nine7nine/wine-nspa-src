@@ -231,10 +231,23 @@ int nspa_local_file_table_lookup( unsigned long long device, unsigned long long 
  * if needed):
  *   FILE_EXECUTE      = 0x20  ("execute" on file, "traverse" on dir).
  *                       Server's check_sharing treats it as read_access.
- *   FILE_DELETE_CHILD = 0x40  (right to delete children of a dir).
- *                       Checked at NtDeleteFile time, not at open. */
+ *   FILE_DELETE_CHILD = 0x40  (right to delete children of a dir). */
 #define NSPA_LF_STD_BENIGN_ACCESS \
     (FILE_EXECUTE | FILE_DELETE_CHILD)
+
+/* Server-internal "magic" access bits for mapping arbitration.  Mirrors
+ * server/file.h FILE_MAPPING_{WRITE,IMAGE,ACCESS} — duplicated here to
+ * avoid pulling server headers into ntdll.  Server's
+ * nspa_publish_inode_state walks inode->open and OR's every fd's access
+ * into agg_access, so server-side mappings land in subentry[0]'s
+ * sub_access.  PE-side sections (Phase B-G) publish the same bits into
+ * their own subentry via nspa_local_file_aggregate_publish_mapping.
+ * The bits overlap GENERIC_WRITE / READ / EXECUTE in raw client access,
+ * but try_bypass strips GENERIC_* before storage so the only way these
+ * bits appear in sub_access is via mapping-publish (server's or PE-side). */
+#define NSPA_LF_FILE_MAPPING_WRITE  0x40000000u
+#define NSPA_LF_FILE_MAPPING_IMAGE  0x80000000u
+#define NSPA_LF_FILE_MAPPING_ACCESS 0x20000000u
 
 /* Options that disqualify even within FILE_OPEN read.  FILE_DIRECTORY_FILE
  * and FILE_DELETE_ON_CLOSE get their own counters; everything else here
@@ -783,6 +796,96 @@ NTSTATUS nspa_local_file_get_unix_name( HANDLE handle, char **unix_name_out )
     return status;
 }
 
+/* Phase H — cross-process mapping-bit publication for the LF aggregate.
+ *
+ * The aggregate's sub_access field already carries FILE_MAPPING_WRITE
+ * (0x40000000), FILE_MAPPING_IMAGE (0x80000000), and FILE_MAPPING_ACCESS
+ * (0x20000000) bits in the high range — server-side mappings publish
+ * these via nspa_publish_inode_state walking inode->open
+ * (server/fd.c:287).  PE-side section bypass (Phase A-G) needs the
+ * matching publication channel: when a section is created from an LF
+ * unix_fd without going through wineserver, server doesn't see the
+ * mapping and other LF openers' check_sharing arbitration would miss
+ * it (silent NT-semantic violation when they need
+ * STATUS_SHARING_VIOLATION / STATUS_USER_MAPPED_FILE).
+ *
+ * This helper modifies ONLY the mapping bits in our process's
+ * subentry (subentry[N=this-pid]).  File-access bits (FILE_READ_DATA
+ * etc.) are managed by publish_open / publish_close and unchanged.
+ *
+ * Caller is the source of truth for the union of bits across the
+ * caller's per-section bookkeeping — this helper just stamps that
+ * union into the aggregate.  Pass mapping_bits=0 to clear.
+ *
+ * Returns:
+ *   STATUS_SUCCESS                 — subentry updated, seqlock bumped.
+ *   STATUS_NOT_SUPPORTED           — aggregate table not mapped, or
+ *                                    bucket lookup failed (overflow).
+ *   STATUS_NOT_FOUND               — no slot for (device, inode) or
+ *                                    no subentry for this pid.  Caller
+ *                                    must publish_open before calling.
+ *
+ * Invariants:
+ *   - Only the three FILE_MAPPING_* bits are touched; other bits in
+ *     sub_access[sub_idx] are preserved.
+ *   - Seqlock bumped before+after the write, so lock-free readers
+ *     see consistent state.
+ *   - Bucket PI mutex held across the write; pairs with the existing
+ *     publish_open / publish_close locking discipline. */
+NTSTATUS nspa_local_file_aggregate_publish_mapping( unsigned long long device,
+                                                    unsigned long long inode,
+                                                    unsigned int mapping_bits )
+{
+    static const unsigned int MAPPING_MASK =
+        NSPA_LF_FILE_MAPPING_WRITE | NSPA_LF_FILE_MAPPING_IMAGE | NSPA_LF_FILE_MAPPING_ACCESS;
+    nspa_inode_bucket_t *bucket;
+    int slot_idx = -1, sub_idx = -1;
+    unsigned int i, seq, my_pid;
+    nspa_inode_slot_t *slot;
+
+    /* Defensive — caller may pass through extra bits, but only the
+     * mapping bits should land in sub_access. */
+    mapping_bits &= MAPPING_MASK;
+
+    if (!(bucket = nspa_lf_bucket_for( device, inode ))) return STATUS_NOT_SUPPORTED;
+    my_pid = nspa_lf_self_pid();
+
+    pi_mutex_lock( nspa_lf_lock_of( bucket ) );
+
+    for (i = 0; i < NSPA_INODE_SLOTS_PER_BUCKET; i++)
+    {
+        if (bucket->slots[i].device == device && bucket->slots[i].inode == inode)
+        {
+            slot_idx = (int)i;
+            break;
+        }
+    }
+    if (slot_idx < 0)
+    {
+        pi_mutex_unlock( nspa_lf_lock_of( bucket ) );
+        return STATUS_NOT_FOUND;
+    }
+    slot = (nspa_inode_slot_t *)&bucket->slots[slot_idx];
+
+    for (i = 1; i < NSPA_INODE_SUBENTRIES; i++)
+    {
+        if (slot->pids[i] == my_pid) { sub_idx = (int)i; break; }
+    }
+    if (sub_idx < 0)
+    {
+        pi_mutex_unlock( nspa_lf_lock_of( bucket ) );
+        return STATUS_NOT_FOUND;
+    }
+
+    seq = bucket->seq;
+    __atomic_store_n( &bucket->seq, seq + 1, __ATOMIC_RELEASE );
+    slot->sub_access[sub_idx] = (slot->sub_access[sub_idx] & ~MAPPING_MASK) | mapping_bits;
+    __atomic_store_n( &bucket->seq, seq + 2, __ATOMIC_RELEASE );
+
+    pi_mutex_unlock( nspa_lf_lock_of( bucket ) );
+    return STATUS_SUCCESS;
+}
+
 /* Phase 1A.4 fix: also return the options the file was opened with so
  * server_get_unix_fd can return them to NtReadFile/NtWriteFile.  Without
  * this, options=0 makes those functions treat sync handles (FILE_
@@ -833,26 +936,6 @@ static void nspa_lf_aggregate_from_slot( const nspa_inode_slot_t *slot,
     *agg_access  = ax;
     *agg_sharing = sh;
 }
-
-/* Server-internal "magic" access bit for writable shared mappings.
- * Mirrors server/file.h::FILE_MAPPING_WRITE — duplicated here to avoid
- * pulling server headers into ntdll.  The server's nspa_publish_inode_state
- * walks inode->open and OR's every fd's access into agg_access, so a
- * writable section mapping on the inode causes this bit to land in
- * subentry[0] (server's published view).  LF's algorithm must check it
- * to match server/fd.c::check_sharing's mapping-aware sharing
- * arbitration.  The bit overlaps GENERIC_WRITE in raw client access,
- * but try_bypass strips GENERIC_* before storage so the only way this
- * bit appears in existing_access is via the server's publish. */
-#define NSPA_LF_FILE_MAPPING_WRITE  0x40000000u
-/* Mirror server/file.h::FILE_MAPPING_IMAGE (SEC_IMAGE mapping) and
- * FILE_MAPPING_ACCESS (any mapping).  Aggregated into existing_access
- * via server-side `nspa_publish_inode_state` (server/fd.c:287) which
- * folds every fd in inode->open into agg_access; mapping fds carry
- * these bits via `dup_fd_object(fd, mapping_access, ...)` at
- * server/mapping.c:1279. */
-#define NSPA_LF_FILE_MAPPING_IMAGE  0x80000000u
-#define NSPA_LF_FILE_MAPPING_ACCESS 0x20000000u
 
 /* Apply the same algorithm as server/fd.c:check_sharing on aggregated
  * existing state.  Phase 2 write extension: takes my_open_flags so the

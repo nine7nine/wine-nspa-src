@@ -2260,6 +2260,12 @@ NTSTATUS WINAPI NtClose( HANDLE handle )
     if (HandleToLong( handle ) >= ~5 && HandleToLong( handle ) <= ~0)
         return STATUS_SUCCESS;
 
+    /* NSPA local-section bypass (Phase E): clean up local section
+     * table + aggregate mapping bits, skip server RPC.  Section
+     * handle range is below the LF file range; check first since
+     * the predicates are mutually exclusive (different handle ranges). */
+    if (nspa_local_section_close( handle )) return STATUS_SUCCESS;
+
     /* NSPA local-file bypass: if this is a local-file handle, clean up
      * locally and skip the server RPC entirely.  Returns 1 if handled,
      * 0 if handle isn't ours.  Must run before any other path since

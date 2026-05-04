@@ -361,6 +361,11 @@ struct nspa_local_open
      * apps run on the handle (e.g. Ableton .als loader). */
     WCHAR            *nt_name;           /* malloc'd; NULL if no name captured */
     USHORT            nt_name_len;       /* in bytes (matches UNICODE_STRING.Length) */
+    /* Unix path captured at try_bypass time.  Stashed so SIF/FileBasic
+     * (file.c:NtSetInformationFile) can resolve unix_name without
+     * promote + get_handle_unix_name RPC.  Also usable by any future
+     * call that needs the Unix path without a server roundtrip. */
+    char             *unix_name;         /* malloc'd, NUL-terminated; NULL if not captured */
 };
 
 static struct list      nspa_lf_opens          = LIST_INIT(nspa_lf_opens);
@@ -634,7 +639,8 @@ NTSTATUS nspa_local_file_table_add( HANDLE handle, int unix_fd,
                                     unsigned int options,
                                     unsigned int attributes,
                                     enum server_fd_type kind,
-                                    const UNICODE_STRING *nt_name )
+                                    const UNICODE_STRING *nt_name,
+                                    const char *unix_name )
 {
     struct nspa_local_open *o;
 
@@ -658,6 +664,7 @@ NTSTATUS nspa_local_file_table_add( HANDLE handle, int unix_fd,
     o->kind          = kind;
     o->nt_name       = NULL;
     o->nt_name_len   = 0;
+    o->unix_name     = NULL;
     if (nt_name && nt_name->Buffer && nt_name->Length)
     {
         o->nt_name = malloc( nt_name->Length );
@@ -669,6 +676,15 @@ NTSTATUS nspa_local_file_table_add( HANDLE handle, int unix_fd,
         /* malloc failure leaves nt_name NULL — promotion still works,
          * just without populated FileNameInformation.  Don't fail the
          * whole add. */
+    }
+    if (unix_name)
+    {
+        size_t un_len = strlen( unix_name );
+        o->unix_name = malloc( un_len + 1 );
+        if (o->unix_name)
+            memcpy( o->unix_name, unix_name, un_len + 1 );
+        /* malloc failure leaves unix_name NULL — accessor returns
+         * NOT_SUPPORTED, caller falls back to promote + server RPC. */
     }
     pi_mutex_lock( &nspa_lf_opens_mutex );
     list_add_head( &nspa_lf_opens, &o->entry );
@@ -697,6 +713,7 @@ int nspa_local_file_table_remove( HANDLE handle, int *unix_fd_out,
             *inode_out   = o->inode;
             list_remove( &o->entry );
             free( o->nt_name );
+            free( o->unix_name );
             free( o );
             found = 1;
             break;
@@ -720,6 +737,50 @@ int nspa_local_file_table_lookup_unix_fd( HANDLE handle )
     }
     pi_mutex_unlock( &nspa_lf_opens_mutex );
     return fd;
+}
+
+/* Resolve the Unix path for an LF handle from the local table without
+ * a server roundtrip.  Returns:
+ *   STATUS_SUCCESS         + sets *unix_name_out to a malloc'd copy
+ *                            (caller must free).  String is NUL-terminated.
+ *   STATUS_NOT_SUPPORTED   handle isn't local-range, OR LF entry didn't
+ *                            capture a unix_name (fall back to promote +
+ *                            server_get_unix_name).
+ *   STATUS_NO_MEMORY       malloc failed for the copy.
+ * Used by NtSetInformationFile/FileBasicInformation to skip the
+ * unconditional promote that fed get_handle_unix_name. */
+NTSTATUS nspa_local_file_get_unix_name( HANDLE handle, char **unix_name_out )
+{
+    struct nspa_local_open *o;
+    NTSTATUS status = STATUS_NOT_SUPPORTED;
+
+    *unix_name_out = NULL;
+
+    if (!nspa_local_file_is_local_handle( handle )) return STATUS_NOT_SUPPORTED;
+
+    pi_mutex_lock( &nspa_lf_opens_mutex );
+    LIST_FOR_EACH_ENTRY( o, &nspa_lf_opens, struct nspa_local_open, entry )
+    {
+        if (o->handle != handle) continue;
+        if (o->unix_name)
+        {
+            size_t len = strlen( o->unix_name );
+            char *copy = malloc( len + 1 );
+            if (copy)
+            {
+                memcpy( copy, o->unix_name, len + 1 );
+                *unix_name_out = copy;
+                status = STATUS_SUCCESS;
+            }
+            else status = STATUS_NO_MEMORY;
+        }
+        /* Found the entry but it has no unix_name (rare — early-table
+         * entries from before this accessor existed, or malloc failure
+         * during table_add).  status stays NOT_SUPPORTED. */
+        break;
+    }
+    pi_mutex_unlock( &nspa_lf_opens_mutex );
+    return status;
 }
 
 /* Phase 1A.4 fix: also return the options the file was opened with so
@@ -1264,7 +1325,7 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
                                             (unsigned long long)st.st_dev,
                                             (unsigned long long)st.st_ino,
                                             access, sharing, options, attributes,
-                                            FD_TYPE_FILE, nt_name );
+                                            FD_TYPE_FILE, nt_name, unix_name );
         if (status != STATUS_SUCCESS)
         {
             nspa_lf_free_handle( h );
@@ -1339,7 +1400,7 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
                                                 (unsigned long long)st.st_dev,
                                                 (unsigned long long)st.st_ino,
                                                 access, sharing, options, attributes,
-                                                FD_TYPE_DIR, nt_name );
+                                                FD_TYPE_DIR, nt_name, unix_name );
             if (status != STATUS_SUCCESS)
             {
                 nspa_lf_free_handle( h );
@@ -1418,7 +1479,7 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
                                         (unsigned long long)st.st_dev,
                                         (unsigned long long)st.st_ino,
                                         access, sharing, options, attributes,
-                                        FD_TYPE_FILE, nt_name );
+                                        FD_TYPE_FILE, nt_name, unix_name );
     if (status != STATUS_SUCCESS)
     {
         nspa_lf_free_handle( h );
@@ -1696,6 +1757,7 @@ int nspa_local_file_close( HANDLE handle )
             sharing       = o->sharing;
             list_remove( &o->entry );
             free( o->nt_name );
+            free( o->unix_name );
             free( o );
             found = 1;
             break;

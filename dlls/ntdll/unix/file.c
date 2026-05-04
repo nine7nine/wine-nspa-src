@@ -5290,8 +5290,15 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
             if ((status = server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, NULL )))
                 return io->Status = status;
 
-            srv_handle = nspa_promote_if_local( handle );
-            if (server_get_unix_name( srv_handle, &unix_name )) unix_name = NULL;
+            /* NSPA local-file: try to resolve unix_name from the LF
+             * aggregate first.  If the handle is LF-bypassed and has
+             * its unix_name captured, skip the promote + server RPC
+             * entirely.  Falls back to the server-side path otherwise. */
+            if (nspa_local_file_get_unix_name( handle, &unix_name ) != STATUS_SUCCESS)
+            {
+                srv_handle = nspa_promote_if_local( handle );
+                if (server_get_unix_name( srv_handle, &unix_name )) unix_name = NULL;
+            }
 
             mtime.QuadPart = info->LastWriteTime.QuadPart == -1 ? 0 : info->LastWriteTime.QuadPart;
             atime.QuadPart = info->LastAccessTime.QuadPart == -1 ? 0 : info->LastAccessTime.QuadPart;

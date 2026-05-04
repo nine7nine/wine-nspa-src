@@ -2171,6 +2171,12 @@ int nspa_local_section_close( HANDLE handle )
     if (snap.file_handle && nspa_local_file_is_local_handle( snap.file_handle ))
         nspa_local_file_aggregate_publish_mapping_for_handle( snap.file_handle, 0 );
 
+    /* Close the section's owned unix fd.  Phase B dup()'d it from the
+     * LF table at section-create so the section's lifetime is decoupled
+     * from the file handle's — apps may NtClose(file) before
+     * NtClose(section) (DirectWrite font loader does exactly this). */
+    if (snap.unix_fd >= 0) close( snap.unix_fd );
+
     nspa_local_section_free_handle( handle );
     return 1;
 }

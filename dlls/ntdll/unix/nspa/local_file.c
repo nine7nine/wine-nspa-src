@@ -1342,11 +1342,24 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
         return STATUS_SUCCESS;
     }
 
-    /* stat the unix path to derive (dev, inode) for the table lookup. */
-    if (stat( unix_name, &st ) != 0)
+    /* stat the unix path to derive (dev, inode) for the table lookup.
+     * For FILE_OPEN_REPARSE_POINT use lstat: the caller wants to
+     * operate on the symlink itself, not the target.  open() below
+     * uses O_NOFOLLOW for the same reason; without lstat here, stat
+     * would follow the symlink and we'd register the TARGET's
+     * (dev, inode) while the fd actually refers to the symlink —
+     * split identity in the LF aggregate.  For non-REPARSE_POINT,
+     * stat() correctly follows the symlink so (dev, inode) matches
+     * what open() yields. */
     {
-        /* Real open failure — let caller's normal path map errno. */
-        return STATUS_NOT_SUPPORTED;   /* fall back rather than guess errno mapping */
+        int rc = (options & FILE_OPEN_REPARSE_POINT)
+               ? lstat( unix_name, &st )
+               : stat( unix_name, &st );
+        if (rc != 0)
+        {
+            /* Real open failure — let caller's normal path map errno. */
+            return STATUS_NOT_SUPPORTED;   /* fall back rather than guess errno mapping */
+        }
     }
     if (!S_ISREG( st.st_mode ))
     {

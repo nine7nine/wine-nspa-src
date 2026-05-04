@@ -3776,108 +3776,25 @@ NTSTATUS WINAPI NtCreateSection( HANDLE *handle, ACCESS_MASK access, const OBJEC
 
     if ((ret = alloc_object_attributes( attr, &objattr, &len ))) return ret;
 
-    /* NSPA local-section Phase B — PE-side bypass for eligible
-     * file-backed sections on LF unix_fds.  Skips the server roundtrip
-     * (no nspa_create_mapping_from_unix_fd RPC).  Eligibility:
-     *   - file is LF-bypassed (we hold the unix_fd locally)
-     *   - !SEC_IMAGE          (no PE header parsing on PE-side)
-     *   - !SEC_LARGE_PAGES    (no hugepage privilege check on PE-side)
-     *   - no name             (no cross-process discovery via OpenSection)
-     *   - PE-side enabled     (NSPA_LOCAL_SECTION=1; default-OFF)
-     * Phase H mapping-bit publication is wired here so other LF
-     * openers' check_sharing arbitration sees our mapping. */
+    /* NSPA local-section bypass + LF-promote dispatch.  See
+     * dlls/ntdll/unix/nspa/local_file.c::nspa_local_section_create_from_lf_file
+     * for the full eligibility check + PE-side bypass attempt + server
+     * RPC fallback (Phase B + H + dup-fd lifetime fix).  Returns
+     * STATUS_NOT_SUPPORTED if file isn't actually LF (rare race window);
+     * caller falls through to the regular create_mapping RPC. */
     if (file && nspa_local_file_is_local_handle( file ))
     {
-        int unix_fd = nspa_local_file_table_lookup_unix_fd( file );
-        if (unix_fd >= 0)
+        BOOL has_name = (attr && attr->ObjectName && attr->ObjectName->Length > 0);
+        ULONGLONG size_arg = size ? size->QuadPart : 0;
+        ret = nspa_local_section_create_from_lf_file( handle, file, access, sec_flags,
+                                                      file_access, size_arg, has_name,
+                                                      objattr, len );
+        if (ret != STATUS_NOT_SUPPORTED)
         {
-            int has_name  = (attr && attr->ObjectName && attr->ObjectName->Length > 0);
-            int img_or_lp = !!(sec_flags & (SEC_IMAGE | SEC_LARGE_PAGES));
-            if (!nspa_local_section_disabled() && !has_name && !img_or_lp)
-            {
-                /* Determine mapping size: explicit > fstat-derived. */
-                size_t actual_size = size ? size->QuadPart : 0;
-                if (!actual_size)
-                {
-                    struct stat st;
-                    if (fstat( unix_fd, &st ) != 0) goto ls_fallback;
-                    actual_size = st.st_size;
-                    /* MAPPED_FILE_SIZE_ZERO matches server semantics
-                     * (server/mapping.c:1303) when no explicit size and
-                     * file is empty. */
-                    if (!actual_size)
-                    {
-                        free( objattr );
-                        return STATUS_MAPPED_FILE_SIZE_ZERO;
-                    }
-                }
-
-                /* Compute mapping_bits.  All file-backed mappings carry
-                 * FILE_MAPPING_ACCESS; writable ones add FILE_MAPPING_WRITE.
-                 * SEC_IMAGE excluded by eligibility above.  Mirrors
-                 * server/mapping.c:1273-1275. */
-                {
-                    unsigned int mbits =
-                        0x20000000u  /* NSPA_LF_FILE_MAPPING_ACCESS */
-                        | ((file_access & FILE_WRITE_DATA) ? 0x40000000u : 0);
-                    HANDLE h;
-                    /* Section must OWN its own fd — dup the LF unix_fd
-                     * so the section survives NtClose on the file
-                     * handle.  Pattern: dwrite font loader does
-                     *   CreateFile → CreateFileMapping → CloseHandle(file)
-                     *                                  → MapViewOfFile
-                     * which would otherwise hit EBADF in
-                     * virtual_map_section_local's map_file_into_view. */
-                    int section_fd = dup( unix_fd );
-                    if (section_fd < 0) goto ls_fallback;
-
-                    h = nspa_local_section_alloc_handle();
-                    if (!h)
-                    {
-                        close( section_fd );
-                        goto ls_fallback;
-                    }
-
-                    ret = nspa_local_section_table_add( h, file, section_fd,
-                                                        actual_size, sec_flags,
-                                                        file_access, access, mbits );
-                    if (ret != STATUS_SUCCESS)
-                    {
-                        nspa_local_section_free_handle( h );
-                        close( section_fd );
-                        goto ls_fallback;
-                    }
-
-                    /* Phase H: publish mapping bits to LF aggregate so
-                     * cross-process LF openers' check_sharing sees them.
-                     * Best-effort — failure to publish doesn't abort the
-                     * mapping; sharing arbitration just won't reflect
-                     * this PE-side mapping (single-process correctness
-                     * still holds). */
-                    nspa_local_file_aggregate_publish_mapping_for_handle( file, mbits );
-
-                    *handle = h;
-                    free( objattr );
-                    return STATUS_SUCCESS;
-                }
-            }
-        ls_fallback:
-            wine_server_send_fd( unix_fd );
-            SERVER_START_REQ( nspa_create_mapping_from_unix_fd )
-            {
-                req->fd          = unix_fd;
-                req->access      = access;
-                req->flags       = sec_flags;
-                req->file_access = file_access;
-                req->size        = size ? size->QuadPart : 0;
-                wine_server_add_data( req, objattr, len );
-                ret = wine_server_call( req );
-                *handle = wine_server_ptr_handle( reply->handle );
-            }
-            SERVER_END_REQ;
             free( objattr );
             return ret;
         }
+        /* fall through to server-direct create_mapping path */
     }
 
     SERVER_START_REQ( create_mapping )

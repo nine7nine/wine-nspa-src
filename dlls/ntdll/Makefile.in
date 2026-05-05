@@ -57,6 +57,7 @@ SOURCES = \
 	unix/loader.c \
 	unix/loadorder.c \
 	unix/nspa/close_queue.c \
+	unix/nspa/huge_auto.c \
 	unix/nspa/local_file.c \
 	unix/nspa/mlock_ws.c \
 	unix/nspa/rt.c \

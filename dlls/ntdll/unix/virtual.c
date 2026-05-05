@@ -91,6 +91,7 @@
 #include "wine/list.h"
 #include "wine/rbtree.h"
 #include "unix_private.h"
+#include "nspa/huge_auto.h"
 #include "wine/debug.h"
 #include <rtpi.h>
 
@@ -150,6 +151,15 @@ struct file_view
  * underlying server has no mapping object to unmap, so
  * unmap_view_of_section must skip the unmap_view RPC for these. */
 #define VPROT_NSPA_LOCAL_SECTION 0x1000
+
+/* NSPA Phase 2: marks a view as auto-promoted to MAP_HUGETLB backing
+ * by the opportunistic hugetlb opt-in heuristic (huge_auto.c).  Lets
+ * partial-op handlers (decommit, protect, release) tell the difference
+ * between "app explicitly asked for MEM_LARGE_PAGES" and "we did this
+ * opportunistically" — relevant for the future demote path (Phase 2.5).
+ * Set only on views that also have SEC_LARGE_PAGES; never set together
+ * with VPROT_SYSTEM, VPROT_PLACEHOLDER, or any image/file backing. */
+#define VPROT_NSPA_HUGE_AUTO     0x2000
 
 /* Conversion from VPROT_* to Win32 flags */
 static const BYTE VIRTUAL_Win32Flags[16] =
@@ -5395,12 +5405,34 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
      * normal case (no large pages). */
     enum large_pages_type lp_type = LARGE_PAGES_NONE;
 
+    /* NSPA Phase 2: opportunistic auto-promote to MEM_LARGE_PAGES.
+     * Tracked separately from app-requested LARGE_PAGES so the view can
+     * be tagged VPROT_NSPA_HUGE_AUTO (relevant for the future demote
+     * path).  See nspa/huge_auto.c for the eligibility heuristic. */
+    BOOL lp_auto_promoted = FALSE;
+
     if (type & MEM_LARGE_PAGES)
     {
         if (attributes & MEM_EXTENDED_PARAMETER_NONPAGED_HUGE)
             lp_type = LARGE_PAGES_HUGE;
         else
             lp_type = LARGE_PAGES_LARGE;
+    }
+    /* Guard user_shared_data deref behind a size pre-check: the very
+     * first NtAllocateVirtualMemory call in a process IS the one that
+     * maps user_shared_data (4 KB at 0x7ffe0000), so dereferencing
+     * user_shared_data->LargePageMinimum during that call segfaults.
+     * Any allocation below the minimum possible hugepage (2 MB on
+     * x86_64) cannot auto-promote anyway, so skipping the check keeps
+     * us safe through bootstrap. */
+    else if (*size_ptr >= 0x200000
+             && user_shared_data->LargePageMinimum
+             && nspa_huge_auto_eligible( type, protect, *ret, *size_ptr,
+                                          attributes,
+                                          user_shared_data->LargePageMinimum ))
+    {
+        lp_type = LARGE_PAGES_LARGE;
+        lp_auto_promoted = TRUE;
     }
 
     /* Round parameters to a page boundary */
@@ -5494,6 +5526,11 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
             {
                 base = view->base;
                 if (vprot & VPROT_EXEC || force_exec_prot) mprotect_range( base, size, 0, 0 );
+                /* NSPA Phase 2: tag auto-promoted views so partial-op
+                 * handlers can distinguish them from app-requested
+                 * MEM_LARGE_PAGES (relevant for the demote path in
+                 * Phase 2.5). */
+                if (lp_auto_promoted) view->protect |= VPROT_NSPA_HUGE_AUTO;
             }
         }
     }

@@ -328,77 +328,42 @@ C_ASSERT( offsetof(struct heap, subheap) <= REGION_ALIGN - 1 );
 
 #define HEAP_MAGIC       ((DWORD)('H' | ('E'<<8) | ('A'<<16) | ('P'<<24)))
 
-/* NSPA Phase 3: per-process gate for arena round-up to LargePageMinimum.
- * Read once from PEB env on first call; cached process-wide.  Walks
- * PEB.ProcessParameters.Environment directly (matching the convention
- * established in dlls/ntdll/sync.c for NSPA_RT_PRIO).  PE-side code
- * cannot call into unix-side huge_auto helpers, so the env logic is
- * duplicated here.
- *
- * Env values:
- *   NSPA_HEAP_HUGEPAGE_ARENAS=1 / y / Y    force enable
- *   NSPA_HEAP_HUGEPAGE_ARENAS=0 / n / N    force disable
- *   unset, NSPA_RT_PRIO set                default ENABLE
- *   unset, NSPA_RT_PRIO unset              default DISABLE
- *
- * Negative cache value (-1) = uninitialised; 0 = disabled; 1 = enabled. */
+/* NSPA Phase 3: arena round-up gate.  Single signal: NSPA_RT_PRIO
+ * presence.  Walks PEB.ProcessParameters.Environment directly
+ * (matching the convention established in dlls/ntdll/sync.c) — PE-side
+ * code cannot call into unix-side helpers.  Cached process-wide;
+ * negative value -1 = uninitialised, 0 = inactive, 1 = active. */
 static volatile LONG nspa_heap_huge_arenas_state = -1;
 
-/* Look up an env var by name in PEB.ProcessParameters.Environment.
- * Returns the value pointer (just past the '=') if found and non-empty,
- * NULL otherwise.  Caller treats *valptr like a NUL-terminated WCHAR string.
- * Single-pass scan; called rarely (once per state init). */
-static const WCHAR *nspa_heap_peb_lookup_env( const WCHAR *target, SIZE_T target_len )
-{
-    PEB *peb = NtCurrentTeb()->Peb;
-    const WCHAR *env;
-
-    if (!peb || !peb->ProcessParameters) return NULL;
-    env = peb->ProcessParameters->Environment;
-    if (!env) return NULL;
-
-    while (*env)
-    {
-        const WCHAR *p = env;
-        SIZE_T i;
-
-        for (i = 0; i < target_len && p[i] == target[i]; i++) { }
-        if (i == target_len && p[target_len] == '=' && p[target_len + 1] != 0)
-            return p + target_len + 1;
-
-        while (*env) env++;
-        env++;
-    }
-    return NULL;
-}
-
-/* Returns TRUE if Phase 3 arena round-up is active for this process. */
 static BOOL nspa_heap_huge_arenas_enabled( void )
 {
     LONG state = nspa_heap_huge_arenas_state;
-    LONG new_state;
-    const WCHAR *val;
-    static const WCHAR target_arenas[] = { 'N','S','P','A','_','H','E','A','P','_','H','U','G','E','P','A','G','E','_','A','R','E','N','A','S' };
-    static const WCHAR target_rt[]     = { 'N','S','P','A','_','R','T','_','P','R','I','O' };
+    LONG new_state = 0;
+    PEB *peb;
+    const WCHAR *env;
+    static const WCHAR target[] = { 'N','S','P','A','_','R','T','_','P','R','I','O' };
+    const SIZE_T target_len = sizeof(target) / sizeof(WCHAR);
 
     if (state >= 0) return state > 0;
 
-    new_state = 0;
-
-    val = nspa_heap_peb_lookup_env( target_arenas, sizeof(target_arenas) / sizeof(WCHAR) );
-    if (val)
+    peb = NtCurrentTeb()->Peb;
+    if (peb && peb->ProcessParameters && (env = peb->ProcessParameters->Environment))
     {
-        if (val[0] == '1' || val[0] == 'y' || val[0] == 'Y') new_state = 1;
-        else if (val[0] == '0' || val[0] == 'n' || val[0] == 'N') new_state = 0;
-        /* unrecognised value: fall through to NSPA_RT_PRIO default. */
-        else val = NULL;
-    }
+        while (*env)
+        {
+            const WCHAR *p = env;
+            SIZE_T i;
 
-    if (!val)
-    {
-        /* No explicit gate — default-on under NSPA_RT_PRIO. */
-        if (nspa_heap_peb_lookup_env( target_rt, sizeof(target_rt) / sizeof(WCHAR) ))
-            new_state = 1;
+            for (i = 0; i < target_len && p[i] == target[i]; i++) { }
+            if (i == target_len && p[target_len] == '=' && p[target_len + 1] != 0)
+            {
+                new_state = 1;
+                break;
+            }
+
+            while (*env) env++;
+            env++;
+        }
     }
 
     InterlockedCompareExchange( &nspa_heap_huge_arenas_state, new_state, -1 );

@@ -34,11 +34,8 @@
  * start_main_thread() after server_init_process() has populated the
  * environment.  Idempotent — second call is a no-op.
  *
- * Env:
- *   NSPA_MLOCK_WORKINGSET=1     force enable
- *   NSPA_MLOCK_WORKINGSET=0     force disable
- *   unset + NSPA_RT_PRIO set    default ENABLE
- *   unset + NSPA_RT_PRIO unset  default DISABLE
+ * Gate: NSPA_RT_PRIO presence.  No separate env override — RT processes
+ * get the RT defaults; non-RT processes get vanilla behaviour.
  *
  * Failure (EPERM, ENOMEM, EINVAL) is non-fatal — logs a one-shot WARN
  * and leaves the process unlocked.  RLIMIT_MEMLOCK is raised to

@@ -42,24 +42,6 @@ WINE_DEFAULT_DEBUG_CHANNEL(virtual);
 
 static int mlock_ws_init_done;
 
-static BOOL mlock_ws_should_enable( void )
-{
-    const char *gate = getenv( "NSPA_MLOCK_WORKINGSET" );
-
-    if (gate)
-    {
-        if (gate[0] == '1' || gate[0] == 'y' || gate[0] == 'Y')
-            return TRUE;
-        if (gate[0] == '0' || gate[0] == 'n' || gate[0] == 'N')
-            return FALSE;
-        /* Anything else: fall through to NSPA_RT_PRIO heuristic. */
-    }
-
-    /* Default: auto-enable for RT processes.  NSPA_RT_PRIO is the
-     * canonical NSPA "this is a real-time workload" signal. */
-    return getenv( "NSPA_RT_PRIO" ) != NULL;
-}
-
 static void mlock_ws_raise_rlimit( void )
 {
     struct rlimit rl;
@@ -92,9 +74,10 @@ void nspa_mlock_ws_init( void )
     if (mlock_ws_init_done) return;
     mlock_ws_init_done = 1;
 
-    if (!mlock_ws_should_enable())
+    /* Single gate: NSPA_RT_PRIO presence.  RT processes get RT defaults. */
+    if (!getenv( "NSPA_RT_PRIO" ))
     {
-        TRACE( "working-set locking disabled\n" );
+        TRACE( "working-set locking disabled (NSPA_RT_PRIO unset)\n" );
         return;
     }
 

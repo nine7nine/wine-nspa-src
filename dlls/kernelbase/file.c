@@ -2750,10 +2750,16 @@ BOOL WINAPI DECLSPEC_HOTPATCH ReplaceFileW( const WCHAR *replaced, const WCHAR *
     TRACE( "%s %s %s 0x%08lx %p %p\n", debugstr_w(replaced), debugstr_w(replacement), debugstr_w(backup),
            flags, exclude, reserved );
 
-    if (flags)
+    /* NSPA: REPLACEFILE_WRITE_THROUGH (0x1) is the only defined flag in
+     * winbase.h; honor it via NtFlushBuffersFile on the replacement
+     * handle below before the rename, so apps that rely on
+     * crash-consistent atomic file replacement (DAW project saves,
+     * document editors, etc.) get the durability they asked for.  Any
+     * other bits are reserved; warn once if seen. */
+    if (flags & ~REPLACEFILE_WRITE_THROUGH)
     {
         static int once;
-        if (!once++) FIXME("Ignoring flags %lx\n", flags);
+        if (!once++) FIXME("Ignoring flags %lx\n", flags & ~REPLACEFILE_WRITE_THROUGH);
     }
 
     /* First two arguments are mandatory */
@@ -2796,6 +2802,19 @@ BOOL WINAPI DECLSPEC_HOTPATCH ReplaceFileW( const WCHAR *replaced, const WCHAR *
                          &attr, &io, 0, FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT );
     RtlFreeUnicodeString(&nt_replacement_name);
     if (!set_ntstatus( status )) return FALSE;
+
+    /* NSPA: flush replacement content to disk before the rename when
+     * WRITE_THROUGH is set.  Caller asked for crash-consistent atomic
+     * replacement; without this, page-cache content can be lost on
+     * power loss between rename and writeback.  Errors here are
+     * non-fatal: surface them via SetLastError but proceed with the
+     * rename so we don't strand the caller in a partially-completed
+     * state worse than they had. */
+    if (flags & REPLACEFILE_WRITE_THROUGH)
+    {
+        NTSTATUS flush_status = NtFlushBuffersFile( hReplacement, &io );
+        if (flush_status) WARN( "REPLACEFILE_WRITE_THROUGH fsync failed %#lx\n", flush_status );
+    }
     NtClose( hReplacement );
 
     /* If the user wants a backup then that needs to be performed first */

@@ -89,6 +89,7 @@
 #include "winioctl.h"
 #include "winternl.h"
 #include "unix_private.h"
+#include "nspa/mlock_ws.h"
 #include "wine/list.h"
 #include "wine/debug.h"
 
@@ -1869,6 +1870,11 @@ static void start_main_thread(void)
     init_startup_info( info_size );
     *(ULONG_PTR *)&peb->CloudFileFlags = get_image_address();
     set_load_order_app_name( main_wargv[0] );
+    /* NSPA Phase 1: pin process pages in RAM so first-touch fault overhead
+     * is paid here at init, not on the audio path.  Gated by
+     * NSPA_MLOCK_WORKINGSET (or NSPA_RT_PRIO presence).  See:
+     *   nspa/docs/working-set-and-hugetlb-design-20260505.md  */
+    nspa_mlock_ws_init();
     init_thread_stack( teb, 0, 0, 0, TRUE );
     NtCreateKeyedEvent( &keyed_event, GENERIC_READ | GENERIC_WRITE, NULL, 0 );
     load_ntdll();

@@ -58,6 +58,7 @@ SOURCES = \
 	unix/loadorder.c \
 	unix/nspa/close_queue.c \
 	unix/nspa/local_file.c \
+	unix/nspa/mlock_ws.c \
 	unix/nspa/rt.c \
 	unix/nspa/local_timer.c \
 	unix/nspa/sched_helpers.c \

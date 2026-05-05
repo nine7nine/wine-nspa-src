@@ -28,110 +28,38 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(virtual);
 
-static enum nspa_huge_auto_mode huge_auto_mode = NSPA_HUGE_AUTO_OFF;
+static BOOL huge_auto_active;
 static int huge_auto_init_done;
 
 static void huge_auto_init( void )
 {
-    const char *gate;
-
     if (huge_auto_init_done) return;
     huge_auto_init_done = 1;
 
-    gate = getenv( "NSPA_HEAP_HUGEPAGE" );
-    if (gate)
-    {
-        if (gate[0] == '2')
-        {
-            huge_auto_mode = NSPA_HUGE_AUTO_AGGRESSIVE;
-            TRACE( "aggressive mode (explicit)\n" );
-            return;
-        }
-        if (gate[0] == '1' || gate[0] == 'y' || gate[0] == 'Y')
-        {
-            huge_auto_mode = NSPA_HUGE_AUTO_CONSERVATIVE;
-            TRACE( "conservative mode (explicit)\n" );
-            return;
-        }
-        if (gate[0] == '0' || gate[0] == 'n' || gate[0] == 'N')
-        {
-            return;  /* off — leave mode at default OFF */
-        }
-        /* anything else: fall through to NSPA_RT_PRIO default. */
-    }
-
-    /* Default policy: NSPA_RT_PRIO presence triggers conservative.
-     * Aggressive is NEVER auto-on — explicit opt-in only. */
+    /* Single gate: NSPA_RT_PRIO presence.  RT processes get RT defaults. */
     if (getenv( "NSPA_RT_PRIO" ))
     {
-        huge_auto_mode = NSPA_HUGE_AUTO_CONSERVATIVE;
-        TRACE( "conservative mode (auto under NSPA_RT_PRIO)\n" );
+        huge_auto_active = TRUE;
+        TRACE( "huge auto-promote active (NSPA_RT_PRIO set)\n" );
     }
-}
-
-enum nspa_huge_auto_mode nspa_huge_auto_get_mode( void )
-{
-    huge_auto_init();
-    return huge_auto_mode;
 }
 
 BOOL nspa_huge_auto_eligible( ULONG type, ULONG protect,
                                void *base, SIZE_T size,
                                ULONG attributes, SIZE_T lp_unit )
 {
-    enum nspa_huge_auto_mode mode = nspa_huge_auto_get_mode();
-
-    if (mode == NSPA_HUGE_AUTO_OFF) return FALSE;
+    huge_auto_init();
+    if (!huge_auto_active) return FALSE;
     if (lp_unit == 0) return FALSE;
 
-    /* Common conditions (both modes):
-     *   anonymous: implicit — virtual.c only calls us in the anon path.
-     *   size:      must be >= and a multiple of lp_unit.
-     *   no NONPAGED_HUGE attribute (1 GiB pages — explicit-only path). */
+    /* All conditions must hold (see huge_auto.h for rationale): */
     if (size < lp_unit) return FALSE;
     if ((size % lp_unit) != 0) return FALSE;
     if (attributes & MEM_EXTENDED_PARAMETER_NONPAGED_HUGE) return FALSE;
-
-    if (mode == NSPA_HUGE_AUTO_CONSERVATIVE)
-    {
-        /* Single-shot reserve+commit: heap arenas, large RW buffers. */
-        if (!(type & MEM_RESERVE) || !(type & MEM_COMMIT)) return FALSE;
-        /* No exotic flags. MEM_TOP_DOWN is fine — kernel just hints
-         * placement; doesn't change correctness. */
-        if (type & ~(MEM_RESERVE | MEM_COMMIT | MEM_TOP_DOWN)) return FALSE;
-        /* Kernel-chosen placement only — no fixed-address requests. */
-        if (base) return FALSE;
-        /* PAGE_READWRITE only.  PAGE_EXECUTE_*, PAGE_WRITECOPY,
-         * PAGE_GUARD, PAGE_NOCACHE are incompatible with MAP_HUGETLB |
-         * MAP_LOCKED, and PAGE_READONLY/NOACCESS are excluded here to
-         * keep conservative truly conservative.  Aggressive mode below
-         * relaxes this. */
-        if (protect != PAGE_READWRITE) return FALSE;
-    }
-    else /* NSPA_HUGE_AUTO_AGGRESSIVE */
-    {
-        /* Still require single-shot RES+COMMIT — the existing
-         * map_view_large_pages validation in allocate_virtual_memory
-         * rejects anything else, and the commit-after-reserve case
-         * needs a different code path (existing view → set_protection
-         * → mprotect on hugetlb).  That's a Phase 2.5 follow-on. */
-        if (!(type & MEM_RESERVE) || !(type & MEM_COMMIT)) return FALSE;
-        /* MEM_WRITE_WATCH stays excluded — incompatible with MAP_HUGETLB. */
-        if (type & MEM_WRITE_WATCH) return FALSE;
-        /* No exotic flags — but accept MEM_TOP_DOWN like conservative. */
-        if (type & ~(MEM_RESERVE | MEM_COMMIT | MEM_TOP_DOWN)) return FALSE;
-        /* Fixed-base allocations allowed iff hugepage-aligned (relaxed
-         * vs conservative which rejects any non-NULL base). */
-        if (base && ((UINT_PTR)base % lp_unit) != 0) return FALSE;
-        /* RW, RO, and NOACCESS — but NEVER any EXEC variant or
-         * WRITECOPY/GUARD (those break MAP_HUGETLB | MAP_LOCKED). */
-        if (protect != PAGE_READWRITE
-            && protect != PAGE_READONLY
-            && protect != PAGE_NOACCESS)
-        {
-            return FALSE;
-        }
-    }
+    if (!(type & MEM_RESERVE) || !(type & MEM_COMMIT)) return FALSE;
+    if (type & ~(MEM_RESERVE | MEM_COMMIT | MEM_TOP_DOWN)) return FALSE;
+    if (base) return FALSE;
+    if (protect != PAGE_READWRITE) return FALSE;
 
     return TRUE;
 }

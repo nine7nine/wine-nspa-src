@@ -6,36 +6,28 @@
  * requiring the app to pass MEM_LARGE_PAGES.  Drops dTLB miss rate
  * on the affected views ~512× by backing them with 2 MB pages.
  *
- * Two modes (env NSPA_HEAP_HUGEPAGE):
+ * Gate: NSPA_RT_PRIO presence.  No separate env override.
  *
- *   1   conservative  6-condition heuristic — single-shot RES+COMMIT,
- *                     kernel-chosen placement, PAGE_READWRITE only.
- *                     Excludes every JIT pattern, file-backed mapping,
- *                     fixed-address allocation, RX/COW/EXEC scenario.
+ * Eligibility heuristic (all must hold):
  *
- *   2   aggressive    relaxed: commit-after-reserve, caller-specified
- *                     hugepage-aligned base, PAGE_READONLY + NOACCESS
- *                     also accepted.  Explicit-only — never auto-on.
+ *   1. Anonymous (no file backing) — implicit (caller is the anon path).
+ *   2. Single-shot reserve+commit — (type & MEM_RESERVE) && (type & MEM_COMMIT).
+ *   3. No exotic flags — type & ~(MEM_RESERVE|MEM_COMMIT|MEM_TOP_DOWN) == 0.
+ *   4. Kernel-chosen placement — base == NULL.
+ *   5. Size ≥ LargePageMinimum AND multiple of LargePageMinimum.
+ *   6. Protection is PAGE_READWRITE only (excludes JIT/RX/COW/EXEC patterns).
  *
- * NSPA_RT_PRIO presence triggers conservative when the explicit env
- * is unset; never triggers aggressive.
+ * Excluded patterns: every JIT pattern, every file-backed mapping,
+ * every fixed-address allocation, every RX/COW/EXEC/WRITECOPY/GUARD.
  *
- * First iteration (this version) does NOT implement the demote-on-
- * partial-op path.  An auto-promoted view that hits a partial
- * decommit / partial-protect / partial-release will surface
- * STATUS_INVALID_PARAMETER (or similar) from the underlying kernel
- * EINVAL — non-fatal, non-corrupting, but the app's operation fails.
- * This is acceptable for the default-OFF testing rollout: the
- * conservative heuristic excludes patterns we expect to hit partial
- * ops, and aggressive mode is opt-in for stress-testing.  When real
- * workloads demonstrate demote-need, the demote path is added in a
- * Phase 2.5 follow-on; this file's API is shaped to allow that.
- *
- * Design doc:
- *   nspa/docs/working-set-and-hugetlb-design-20260505.md
+ * Companion to Phase 3 (heap.c arena round-up) — Phase 3 reshapes
+ * heap.c's arena allocations into single-shot RES+COMMIT requests
+ * that satisfy this eligibility check.  Phase 2 alone catches any
+ * direct VirtualAlloc(MEM_RESERVE|MEM_COMMIT) with size ≥ 2 MB and
+ * RW protection.
  *
  * NT semantics: views auto-promoted are tagged VPROT_NSPA_HUGE_AUTO
- * (visible to virtual.c; opaque to apps).  SEC_LARGE_PAGES is set on
+ * (visible to virtual.c; opaque to apps).  SEC_LARGE_PAGES set on
  * the view, so QueryWorkingSetEx truthfully reports LargePage.  No
  * Win32 API surface change.
  *
@@ -57,34 +49,15 @@
 
 #include <windef.h>
 
-enum nspa_huge_auto_mode
-{
-    NSPA_HUGE_AUTO_OFF          = 0,
-    NSPA_HUGE_AUTO_CONSERVATIVE = 1,
-    NSPA_HUGE_AUTO_AGGRESSIVE   = 2,
-};
-
-/* Returns the active mode (read-once cached on first call).  Cheap
- * after the first call. */
-extern enum nspa_huge_auto_mode nspa_huge_auto_get_mode( void );
-
 /* Returns TRUE if the requested allocation is eligible for opportunistic
  * auto-promotion to MEM_LARGE_PAGES backing.  Caller passes args from
  * NtAllocateVirtualMemory; lp_unit is user_shared_data->LargePageMinimum
  * (typically 2 MB on x86_64).
  *
- * The caller is expected to be allocate_virtual_memory() in virtual.c —
- * the eligibility check assumes the request is anonymous (no file
- * backing) because that's the only path that reaches this helper.
+ * Implicitly OFF unless NSPA_RT_PRIO is set in the environment.
  */
 extern BOOL nspa_huge_auto_eligible( ULONG type, ULONG protect,
                                       void *base, SIZE_T size,
                                       ULONG attributes, SIZE_T lp_unit );
-
-/* Phase 3 note: heap.c (PE side) has its own arena round-up gate
- * (NSPA_HEAP_HUGEPAGE_ARENAS).  PE-side code can't easily call into
- * unix-side helpers, so the env reader is duplicated there following
- * sync.c's PEB-walking convention.  When heap.c rounds + single-shots,
- * the existing eligibility helper above catches it transparently. */
 
 #endif /* __NSPA_HUGE_AUTO_H */

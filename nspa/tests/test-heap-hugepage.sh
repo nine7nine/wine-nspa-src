@@ -1,22 +1,19 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: LGPL-2.1-or-later
 #
-# test-heap-hugepage.sh — smoke + functional test for Phase 3 heap arena
+# test-heap-hugepage.sh — smoke + presence test for Phase 3 heap arena
 # hugetlb backing.
 #
-# Validates:
-#   1. Bootstrap with default off (no NSPA_HEAP_HUGEPAGE_ARENAS, no
-#      NSPA_RT_PRIO).
-#   2. Bootstrap with NSPA_HEAP_HUGEPAGE_ARENAS=0 (explicit off).
-#   3. Bootstrap with NSPA_HEAP_HUGEPAGE_ARENAS=1 (explicit on).
-#   4. NSPA_RT_PRIO triggers Phase 3 default-on.
-#   5. Notepad with Phase 3 active produces hugepage-backed regions
-#      (it has at least a process heap → at least one Phase 3 promote).
-#   6. Phase 3 OFF + NSPA_RT_PRIO=ON yields fewer hugepage regions
-#      than Phase 3 ON.
+# Single gate: NSPA_RT_PRIO presence.  When active, heap.c::allocate_region
+# rounds arena allocations to LargePageMinimum and merges the two-call
+# RES+COMMIT pattern into a single shot, which Phase 2's huge_auto
+# eligibility check then catches and routes through MAP_HUGETLB.
 #
-# A workload-driven dTLB validation (Ableton) is separate — this is
-# just smoke + presence checks.
+# Validates:
+#   1. Wine boots clean under NSPA_RT_PRIO (Phase 3 active).
+#   2. notepad with NSPA_RT_PRIO produces hugepage-backed regions
+#      (process heap is rounded + promoted).
+#   3. notepad WITHOUT NSPA_RT_PRIO produces fewer / no hugepage regions.
 
 set -u
 
@@ -42,26 +39,8 @@ trap cleanup EXIT
 cleanup
 sleep 1
 
-run_smoke() {
-    local label="$1"; shift
-    local rc
-    out=$(env "$@" \
-              NSPA_RT_POLICY=FF WINEPRELOADREMAPVDSO=force \
-              timeout 15 /usr/bin/wine cmd /c echo hello 2>&1)
-    rc=$?
-    if [[ $rc -eq 0 ]] && echo "$out" | grep -q '\bhello\b'; then
-        ok "$label"
-    else
-        bad "$label (rc=$rc):"
-        echo "$out" | tail -8 | sed 's/^/      /'
-    fi
-    cleanup
-    sleep 1
-}
-
 count_hugepages_for() {
-    local pid="$1"
-    awk '/^KernelPageSize:.*2048 kB/{c++} END{print c+0}' /proc/$pid/smaps 2>/dev/null
+    awk '/^KernelPageSize:.*2048 kB/{c++} END{print c+0}' /proc/$1/smaps 2>/dev/null
 }
 
 echo "================================================================"
@@ -69,29 +48,23 @@ echo "  Phase 3: heap arena hugetlb backing — smoke + presence test"
 echo "================================================================"
 echo
 
-echo "[1/6] bootstrap: default off (NSPA_HEAP_HUGEPAGE_ARENAS unset, NSPA_RT_PRIO unset)..."
-run_smoke "default-off boot" \
-    -u WINEDEBUG -u NSPA_RT_PRIO -u NSPA_HEAP_HUGEPAGE_ARENAS
+# --- [1/3] level-0 smoke ---------------------------------------------------
+echo "[1/3] level-0 smoke under NSPA_RT_PRIO..."
+out=$(NSPA_RT_PRIO=80 NSPA_RT_POLICY=FF WINEPRELOADREMAPVDSO=force \
+        timeout 15 /usr/bin/wine cmd /c echo hello 2>/dev/null)
+rc=$?
+if [[ $rc -eq 0 ]] && echo "$out" | grep -q '\bhello\b'; then
+    ok "wine cmd echoed 'hello' (rc=$rc)"
+else
+    bad "wine cmd failed (rc=$rc): '$out'"
+fi
+cleanup
+sleep 1
 
+# --- [2/3] notepad with Phase 3 active produces hugepage regions ----------
 echo
-echo "[2/6] bootstrap: NSPA_HEAP_HUGEPAGE_ARENAS=0 (explicit off)..."
-run_smoke "explicit-off boot" \
-    -u WINEDEBUG -u NSPA_RT_PRIO NSPA_HEAP_HUGEPAGE_ARENAS=0
-
-echo
-echo "[3/6] bootstrap: NSPA_HEAP_HUGEPAGE_ARENAS=1 (explicit on)..."
-run_smoke "explicit-on boot" \
-    -u WINEDEBUG -u NSPA_RT_PRIO NSPA_HEAP_HUGEPAGE_ARENAS=1
-
-echo
-echo "[4/6] bootstrap: NSPA_RT_PRIO=80 (auto-on default)..."
-run_smoke "auto-on boot" \
-    -u WINEDEBUG NSPA_RT_PRIO=80
-
-echo
-echo "[5/6] notepad with Phase 3 active produces hugepage regions..."
+echo "[2/3] notepad with NSPA_RT_PRIO produces hugepage regions..."
 NSPA_RT_PRIO=80 NSPA_RT_POLICY=FF WINEPRELOADREMAPVDSO=force \
-    NSPA_HEAP_HUGEPAGE_ARENAS=1 \
     /usr/bin/wine notepad >/dev/null 2>&1 &
 sleep 4
 TPID=$(pgrep -af 'notepad\.exe$' 2>/dev/null | awk '{print $1}' | head -1)
@@ -111,10 +84,10 @@ pkill -KILL -x notepad.exe 2>/dev/null || true
 wineserver -k -w 2>/dev/null || true
 sleep 2
 
+# --- [3/3] OFF baseline: no NSPA_RT_PRIO → fewer regions -------------------
 echo
-echo "[6/6] OFF baseline: notepad with Phase 3=0 produces fewer regions..."
-NSPA_RT_POLICY=FF WINEPRELOADREMAPVDSO=force \
-    NSPA_HEAP_HUGEPAGE_ARENAS=0 NSPA_HEAP_HUGEPAGE=0 \
+echo "[3/3] notepad WITHOUT NSPA_RT_PRIO (Phase 3 inactive)..."
+env -u NSPA_RT_PRIO WINEPRELOADREMAPVDSO=force \
     /usr/bin/wine notepad >/dev/null 2>&1 &
 sleep 4
 TPID=$(pgrep -af 'notepad\.exe$' 2>/dev/null | awk '{print $1}' | head -1)
@@ -127,7 +100,7 @@ else
     if [[ "$huge_off" -lt "${huge_on:-0}" ]]; then
         ok "OFF baseline ($huge_off) < ON ($huge_on) — gate respected"
     elif [[ "$huge_off" -eq 0 ]]; then
-        ok "OFF baseline 0 — gate respected (no Phase 3 + no Phase 2)"
+        ok "OFF baseline 0 — gate respected"
     else
         bad "OFF baseline $huge_off vs ON $huge_on — gate not honored"
     fi

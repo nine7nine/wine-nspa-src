@@ -81,4 +81,10 @@ extern BOOL nspa_huge_auto_eligible( ULONG type, ULONG protect,
                                       void *base, SIZE_T size,
                                       ULONG attributes, SIZE_T lp_unit );
 
+/* Phase 3 note: heap.c (PE side) has its own arena round-up gate
+ * (NSPA_HEAP_HUGEPAGE_ARENAS).  PE-side code can't easily call into
+ * unix-side helpers, so the env reader is duplicated there following
+ * sync.c's PEB-walking convention.  When heap.c rounds + single-shots,
+ * the existing eligibility helper above catches it transparently. */
+
 #endif /* __NSPA_HUGE_AUTO_H */

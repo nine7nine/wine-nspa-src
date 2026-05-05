@@ -174,9 +174,24 @@ C_ASSERT( HEAP_MAX_FREE_BLOCK_SIZE >= HEAP_MAX_BLOCK_REGION_SIZE );
 /* for reference, update this when changing parameters */
 C_ASSERT( FREE_LIST_COUNT == 0x3d );
 
+/* NSPA Phase 3: per-subheap flags.  The leading slot of __pad was
+ * always padding for alignment; we repurpose it as a SIZE_T flags
+ * field without changing struct size or any subsequent field offsets.
+ * Flags currently defined:
+ *   SUBHEAP_FLAG_NSPA_HUGE_AUTO  — subheap was reserved+committed in
+ *     a single shot under Phase 3 round-up.  Kernel-side virtual.c
+ *     auto-promoted it to MAP_HUGETLB | MAP_LOCKED backing.  Implies
+ *     the subheap is fully committed at creation; subheap_decommit
+ *     must skip it (mprotect on hugetlb at non-hugepage-aligned
+ *     ranges returns EINVAL — would WARN-spam the heap log). */
+#define SUBHEAP_FLAG_NSPA_HUGE_AUTO  ((SIZE_T)1 << 0)
+
 typedef struct DECLSPEC_ALIGN(BLOCK_ALIGN) tagSUBHEAP
 {
-    SIZE_T __pad[sizeof(SIZE_T) / sizeof(DWORD)];
+    SIZE_T flags;   /* NSPA Phase 3 — was first slot of __pad */
+#ifdef _WIN64
+    SIZE_T __pad[1];   /* original was __pad[2]; flags consumed one slot */
+#endif
     SIZE_T block_size;
     SIZE_T data_size;
     struct list entry;
@@ -312,6 +327,83 @@ C_ASSERT( sizeof(struct heap) % BLOCK_ALIGN == 0 );
 C_ASSERT( offsetof(struct heap, subheap) <= REGION_ALIGN - 1 );
 
 #define HEAP_MAGIC       ((DWORD)('H' | ('E'<<8) | ('A'<<16) | ('P'<<24)))
+
+/* NSPA Phase 3: per-process gate for arena round-up to LargePageMinimum.
+ * Read once from PEB env on first call; cached process-wide.  Walks
+ * PEB.ProcessParameters.Environment directly (matching the convention
+ * established in dlls/ntdll/sync.c for NSPA_RT_PRIO).  PE-side code
+ * cannot call into unix-side huge_auto helpers, so the env logic is
+ * duplicated here.
+ *
+ * Env values:
+ *   NSPA_HEAP_HUGEPAGE_ARENAS=1 / y / Y    force enable
+ *   NSPA_HEAP_HUGEPAGE_ARENAS=0 / n / N    force disable
+ *   unset, NSPA_RT_PRIO set                default ENABLE
+ *   unset, NSPA_RT_PRIO unset              default DISABLE
+ *
+ * Negative cache value (-1) = uninitialised; 0 = disabled; 1 = enabled. */
+static volatile LONG nspa_heap_huge_arenas_state = -1;
+
+/* Look up an env var by name in PEB.ProcessParameters.Environment.
+ * Returns the value pointer (just past the '=') if found and non-empty,
+ * NULL otherwise.  Caller treats *valptr like a NUL-terminated WCHAR string.
+ * Single-pass scan; called rarely (once per state init). */
+static const WCHAR *nspa_heap_peb_lookup_env( const WCHAR *target, SIZE_T target_len )
+{
+    PEB *peb = NtCurrentTeb()->Peb;
+    const WCHAR *env;
+
+    if (!peb || !peb->ProcessParameters) return NULL;
+    env = peb->ProcessParameters->Environment;
+    if (!env) return NULL;
+
+    while (*env)
+    {
+        const WCHAR *p = env;
+        SIZE_T i;
+
+        for (i = 0; i < target_len && p[i] == target[i]; i++) { }
+        if (i == target_len && p[target_len] == '=' && p[target_len + 1] != 0)
+            return p + target_len + 1;
+
+        while (*env) env++;
+        env++;
+    }
+    return NULL;
+}
+
+/* Returns TRUE if Phase 3 arena round-up is active for this process. */
+static BOOL nspa_heap_huge_arenas_enabled( void )
+{
+    LONG state = nspa_heap_huge_arenas_state;
+    LONG new_state;
+    const WCHAR *val;
+    static const WCHAR target_arenas[] = { 'N','S','P','A','_','H','E','A','P','_','H','U','G','E','P','A','G','E','_','A','R','E','N','A','S' };
+    static const WCHAR target_rt[]     = { 'N','S','P','A','_','R','T','_','P','R','I','O' };
+
+    if (state >= 0) return state > 0;
+
+    new_state = 0;
+
+    val = nspa_heap_peb_lookup_env( target_arenas, sizeof(target_arenas) / sizeof(WCHAR) );
+    if (val)
+    {
+        if (val[0] == '1' || val[0] == 'y' || val[0] == 'Y') new_state = 1;
+        else if (val[0] == '0' || val[0] == 'n' || val[0] == 'N') new_state = 0;
+        /* unrecognised value: fall through to NSPA_RT_PRIO default. */
+        else val = NULL;
+    }
+
+    if (!val)
+    {
+        /* No explicit gate — default-on under NSPA_RT_PRIO. */
+        if (nspa_heap_peb_lookup_env( target_rt, sizeof(target_rt) / sizeof(WCHAR) ))
+            new_state = 1;
+    }
+
+    InterlockedCompareExchange( &nspa_heap_huge_arenas_state, new_state, -1 );
+    return nspa_heap_huge_arenas_state > 0;
+}
 
 #define HEAP_INITIAL_SIZE      0x10000
 #define HEAP_INITIAL_GROW_SIZE 0x100000
@@ -835,6 +927,12 @@ static inline BOOL subheap_decommit( const struct heap *heap, SUBHEAP *subheap, 
     SIZE_T size;
     void *addr;
 
+    /* NSPA Phase 3: skip decommit on hugetlb-backed subheaps.  mprotect /
+     * MEM_DECOMMIT on a hugetlb VMA at non-hugepage-aligned ranges
+     * returns EINVAL; the existing kernel-level RAM-return purpose is
+     * also moot under Phase 1 mlockall (pages stay pinned regardless). */
+    if (subheap->flags & SUBHEAP_FLAG_NSPA_HUGE_AUTO) return TRUE;
+
     commit_end = ROUND_ADDR( (char *)commit_end + REGION_ALIGN - 1, REGION_ALIGN - 1 );
     if (subheap == &heap->subheap) commit_end = max( (char *)commit_end, (char *)base + heap->min_size );
     if (commit_end >= subheap_commit_end( subheap )) return TRUE;
@@ -971,11 +1069,20 @@ static struct block *split_block( struct heap *heap, ULONG flags, struct block *
 }
 
 
-static void *allocate_region( struct heap *heap, ULONG flags, SIZE_T *region_size, SIZE_T *commit_size )
+static void *allocate_region( struct heap *heap, ULONG flags, SIZE_T *region_size, SIZE_T *commit_size,
+                              BOOL *huge_auto )
 {
     const SIZE_T align = 0x400 * sizeof(void*);  /* minimum alignment for virtual allocations */
+    /* NSPA Phase 3: 2 MB hugepage minimum on x86_64.  Hardcoded because
+     * we need it before user_shared_data->LargePageMinimum is mapped on
+     * the very first call.  If the kernel uses a different size, the
+     * unix-side eligibility check rejects and we fall back. */
+    const SIZE_T huge_unit = 0x200000;
+    ULONG protect = get_protection_type( flags );
     void *addr = NULL;
     NTSTATUS status;
+
+    if (huge_auto) *huge_auto = FALSE;
 
     if (heap && !(flags & HEAP_GROWABLE) && (NtCurrentTeb()->Peb->OSPlatformId != VER_PLATFORM_WIN32_WINDOWS))
     {
@@ -986,15 +1093,63 @@ static void *allocate_region( struct heap *heap, ULONG flags, SIZE_T *region_siz
     *region_size = ROUND_SIZE( *region_size, align - 1 );
     *commit_size = ROUND_SIZE( *commit_size, align - 1 );
 
+    /* NSPA Phase 3: opportunistic hugetlb arena backing.  Eligible when:
+     *   - global gate active (NSPA_HEAP_HUGEPAGE_ARENAS or NSPA_RT_PRIO);
+     *   - heap is growable (no hard caller-set max_size constraint);
+     *   - protection is PAGE_READWRITE only (excludes EXEC heaps);
+     *   - rounded-up region fits in a sensible margin (skip if the
+     *     rounding is going to multiply size by >4× — small heaps).
+     *
+     * When eligible: round both region and commit to huge_unit, fold
+     * the two NtAllocateVirtualMemory calls into a single MEM_RESERVE |
+     * MEM_COMMIT call.  virtual.c's huge_auto eligibility heuristic
+     * sees the single-shot RES+COMMIT request, promotes it to
+     * MAP_HUGETLB | MAP_LOCKED automatically.  Fallback to the existing
+     * two-call pattern on failure (e.g., hugepage pool exhausted). */
+    if ((flags & HEAP_GROWABLE) && protect == PAGE_READWRITE
+        && nspa_heap_huge_arenas_enabled())
+    {
+        SIZE_T orig_region = *region_size;
+        SIZE_T orig_commit = *commit_size;
+
+        /* Skip if the round-up multiplies the request by more than 4×
+         * (avoid bloating tiny heaps).  Anything ≥ 512 KB rounds up at
+         * most 4× to 2 MB; below that, we leave it on the normal path. */
+        if (orig_region >= (huge_unit / 4))
+        {
+            SIZE_T huge_region = ROUND_SIZE( orig_region, huge_unit - 1 );
+            void *huge_addr = NULL;
+
+            if (!(status = NtAllocateVirtualMemory( NtCurrentProcess(), &huge_addr, 0,
+                                                     &huge_region, MEM_RESERVE | MEM_COMMIT,
+                                                     protect )))
+            {
+                /* Phase 3 path success.  Update sizes to reflect the
+                 * rounded-up region; the caller's create_subheap
+                 * uses these for subheap_set_bounds + block init. */
+                *region_size = huge_region;
+                *commit_size = huge_region;
+                if (huge_auto) *huge_auto = TRUE;
+                return huge_addr;
+            }
+            /* Fall through to the two-call path with original sizes. */
+            TRACE( "Phase 3 single-shot RES+COMMIT failed (status %#lx), "
+                   "falling back to two-call (region=%#Ix commit=%#Ix)\n",
+                   status, orig_region, orig_commit );
+            *region_size = orig_region;
+            *commit_size = orig_commit;
+        }
+    }
+
     /* allocate the memory block */
     if ((status = NtAllocateVirtualMemory( NtCurrentProcess(), &addr, 0, region_size, MEM_RESERVE,
-                                           get_protection_type( flags ) )))
+                                           protect )))
     {
         WARN( "Could not allocate %#Ix bytes, status %#lx\n", *region_size, status );
         return NULL;
     }
     if ((status = NtAllocateVirtualMemory( NtCurrentProcess(), &addr, 0, commit_size, MEM_COMMIT,
-                                           get_protection_type( flags ) )))
+                                           protect )))
     {
         WARN( "Could not commit %#Ix bytes, status %#lx\n", *commit_size, status );
         return NULL;
@@ -1012,7 +1167,11 @@ static NTSTATUS heap_allocate_large( struct heap *heap, ULONG flags, SIZE_T bloc
     struct block *block;
 
     if (total_size < size) return STATUS_NO_MEMORY;  /* overflow */
-    if (!(arena = allocate_region( heap, flags, &total_size, &total_size ))) return STATUS_NO_MEMORY;
+    /* heap_allocate_large allocates one ARENA_LARGE per call; not a
+     * subheap, so no SUBHEAP flag to set.  Pass NULL for huge_auto —
+     * Phase 3's gate check still applies inside allocate_region, but
+     * we don't track promotion state on this allocation type. */
+    if (!(arena = allocate_region( heap, flags, &total_size, &total_size, NULL ))) return STATUS_NO_MEMORY;
 
     block = &arena->block;
     arena->data_size = size;
@@ -1092,12 +1251,17 @@ static SUBHEAP *create_subheap( struct heap *heap, DWORD flags, SIZE_T total_siz
 {
     SIZE_T block_size;
     SUBHEAP *subheap;
+    BOOL huge_auto = FALSE;
 
     commit_size = ROUND_SIZE( max( commit_size, REGION_ALIGN ), REGION_ALIGN - 1 );
     total_size = min( max( commit_size, total_size ), 0xffff0000 );  /* don't allow a heap larger than 4GB */
 
-    if (!(subheap = allocate_region( heap, flags, &total_size, &commit_size ))) return NULL;
+    if (!(subheap = allocate_region( heap, flags, &total_size, &commit_size, &huge_auto ))) return NULL;
 
+    /* allocate_region may have rounded total_size + commit_size up via
+     * the Phase 3 path.  Initialise flags BEFORE setting bounds so the
+     * subheap_decommit gate below is consistent with the layout. */
+    subheap->flags = huge_auto ? SUBHEAP_FLAG_NSPA_HUGE_AUTO : 0;
     subheap->user_value = heap;
     subheap_set_bounds( subheap, (char *)subheap + commit_size, (char *)subheap + total_size );
     block_size = (SIZE_T)ROUND_ADDR( subheap_size( subheap ) - subheap_overhead( subheap ), BLOCK_ALIGN - 1 );
@@ -1507,6 +1671,7 @@ HANDLE WINAPI RtlCreateHeap( ULONG flags, void *addr, SIZE_T total_size, SIZE_T 
     SIZE_T block_size;
     SUBHEAP *subheap;
     unsigned int i;
+    BOOL huge_auto = FALSE;   /* NSPA Phase 3 — set by allocate_region */
 
     TRACE( "flags %#lx, addr %p, total_size %#Ix, commit_size %#Ix, lock %p, params %p\n",
            flags, addr, total_size, commit_size, lock, params );
@@ -1522,7 +1687,7 @@ HANDLE WINAPI RtlCreateHeap( ULONG flags, void *addr, SIZE_T total_size, SIZE_T 
         if (!commit_size) commit_size = REGION_ALIGN;
         total_size = min( max( total_size, commit_size ), 0xffff0000 );  /* don't allow a heap larger than 4GB */
         commit_size = min( total_size, ROUND_SIZE( commit_size, REGION_ALIGN - 1 ) );
-        if (!(heap = allocate_region( NULL, flags, &total_size, &commit_size ))) return 0;
+        if (!(heap = allocate_region( NULL, flags, &total_size, &commit_size, &huge_auto ))) return 0;
     }
 
     heap->ffeeffee      = 0xffeeffee;
@@ -1562,6 +1727,7 @@ HANDLE WINAPI RtlCreateHeap( ULONG flags, void *addr, SIZE_T total_size, SIZE_T 
     }
 
     subheap = &heap->subheap;
+    subheap->flags = huge_auto ? SUBHEAP_FLAG_NSPA_HUGE_AUTO : 0;
     subheap->user_value = heap;
     subheap_set_bounds( subheap, (char *)heap + commit_size, (char *)heap + total_size );
     block_size = (SIZE_T)ROUND_ADDR( subheap_size( subheap ) - subheap_overhead( subheap ), BLOCK_ALIGN - 1 );

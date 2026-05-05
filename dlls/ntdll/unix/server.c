@@ -105,7 +105,11 @@ BOOL process_exiting = FALSE;
 timeout_t server_start_time = 0;  /* time of server startup */
 
 sigset_t server_block_set;  /* signals to block during server calls */
-static int fd_socket = -1;  /* socket to exchange file descriptors with the server */
+/* NSPA: exposed via extern in unix_private.h so nspa/server_disconnect.c
+ * can register a passive POLLHUP listener on this fd without re-plumbing
+ * accessor functions.  Matches the inproc_device_fd / nspa_request_channel_fd
+ * pattern already used here. */
+int fd_socket = -1;         /* socket to exchange file descriptors with the server */
 static int initial_cwd = -1;
 static pid_t server_pid;
 pi_mutex_t fd_cache_mutex = PI_MUTEX_INIT(0);

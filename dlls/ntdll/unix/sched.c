@@ -661,6 +661,15 @@ void sched_run( void )
         nspa_sched_rt_probe_init();
     }
 
+    /* NSPA: passive POLLHUP listener on the wineserver socket.  Closes
+     * the bug documented in project_sched_thread_no_shutdown_20260503
+     * for cases where SIGQUIT delivery from `wineserver -k` does not
+     * reach this process (server crash, kill -9 of server, etc.). */
+    {
+        extern void nspa_server_disconnect_init( void );
+        nspa_server_disconnect_init();
+    }
+
     sched_run_inst( &default_inst );
 }
 

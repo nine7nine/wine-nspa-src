@@ -5392,8 +5392,18 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
      * user_shared_data->LargePageMinimum during that call segfaults.
      * Any allocation below the minimum possible hugepage (2 MB on
      * x86_64) cannot auto-promote anyway, so skipping the check keeps
-     * us safe through bootstrap. */
-    else if (*size_ptr >= 0x200000
+     * us safe through bootstrap.
+     *
+     * Skip wow64 callers entirely: kernel mmap(NULL, ..., MAP_HUGETLB)
+     * picks any 2 MB-aligned address within TASK_SIZE_MAX_32 (~3 GB),
+     * but the wow64 user_space_limit is ~0x7fff0000 (~2 GB).  The kernel
+     * can return an address above wow64's ceiling (e.g. 0x82600000)
+     * that the 32-bit code can't reach — NtAllocateVirtualMemory returns
+     * SUCCESS, the caller dereferences, page fault.  Surfaced by
+     * dpclat.exe (i386 PE) post-Phase-3.  Native 64-bit callers are
+     * unaffected since all their addresses are 64-bit-native. */
+    else if (!is_wow64()
+             && *size_ptr >= 0x200000
              && user_shared_data->LargePageMinimum
              && nspa_huge_auto_eligible( type, protect, *ret, *size_ptr,
                                           attributes,

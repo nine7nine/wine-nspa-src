@@ -500,13 +500,30 @@ static void paint_window(HWND hwnd, HDC hdc, RECT *rc)
     SetTextColor(hdc, COLOR_DIM);
     TextOutA(hdc, 12, 30, mode_desc[active_mode], (int)strlen(mode_desc[active_mode]));
 
+    /* Layout: scale histogram + stats panels to the actual client rect
+     * so the user can resize the window and content stretches to fill.
+     * Top: title + desc (fixed 60 px).  Bottom: stats + menu (fixed
+     * ~120 px).  Histogram fills the middle. */
+    int win_w = rc->right - rc->left;
+    int win_h = rc->bottom - rc->top;
+    if (win_w < 320) win_w = 320;
+    if (win_h < 240) win_h = 240;
+    int header_h = 60;
+    int axis_label_h = 18;
+    int stats_h = 44;
+    int menu_h = 80;
+    int hist_x = 12, hist_y = header_h, hist_w = win_w - 24;
+    int hist_h = win_h - header_h - axis_label_h - stats_h - menu_h - 12;
+    if (hist_h < 60) hist_h = 60;
+    int hist_bottom = hist_y + hist_h;
+    int stats_y = hist_bottom + axis_label_h;
+    int menu_y  = stats_y + stats_h;
+
     /* histogram region — log Y scale spans 1us .. 16ms.  Linear 0-16ms
      * squishes the realistic sub-ms range into the bottom 3% of the
      * graph, which is why the previous scale looked empty under healthy
      * RT load.  Log scale: 1us at 0%, 10us at 24%, 100us at 48%,
      * 1ms at 71%, 10ms at 95%. */
-    int hist_x = 12, hist_y = 80, hist_w = WIN_W - 24, hist_h = 220;
-    int hist_bottom = hist_y + hist_h;
     static const double Y_LOG_MIN = 0.0;   /* log10(1 us)  */
     static const double Y_LOG_MAX = 4.2;   /* log10(16000 us) */
     #define Y_FOR_US(us)  ((us) < 1 ? hist_bottom :                                    \
@@ -610,18 +627,20 @@ static void paint_window(HWND hwnd, HDC hdc, RECT *rc)
                  b_last, b_min, b_max);
         snprintf(l2, sizeof(l2), "p50: %-12s  p99: %-12s  p99.9: %-12s   (n=%d)",
                  b_p50, b_p99, b_p999, s.count);
-        TextOutA(hdc, 12, 320, l1, (int)strlen(l1));
-        TextOutA(hdc, 12, 340, l2, (int)strlen(l2));
+        TextOutA(hdc, 12, stats_y,      l1, (int)strlen(l1));
+        TextOutA(hdc, 12, stats_y + 20, l2, (int)strlen(l2));
     }
 
     /* mode menu */
     {
         SetTextColor(hdc, COLOR_DIM);
-        TextOutA(hdc, 12, 376, "press 1..5 to switch mode, ESC to quit, R to reset stats", 56);
+        TextOutA(hdc, 12, menu_y, "press 1..5 to switch mode, ESC to quit, R to reset stats", 56);
         for (int i = 0; i < MODE_COUNT; i++)
         {
             SetTextColor(hdc, i == active_mode ? COLOR_ACCENT : COLOR_DIM);
-            TextOutA(hdc, 12, 400 + i * 16, mode_names[i], (int)strlen(mode_names[i]));
+            /* compact 5-mode menu in two columns when window is narrow.
+             * For now, single column anchored at menu_y + 24. */
+            TextOutA(hdc, 12, menu_y + 24 + i * 14, mode_names[i], (int)strlen(mode_names[i]));
         }
     }
 

@@ -1341,6 +1341,33 @@ typedef volatile struct
     unsigned int         dpi_context;
 } window_shm_t;
 
+/* NSPA: server-published per-thread state for client-side seqlock reads.
+ * Read by NtQueryInformationThread fast paths; written by server in
+ * SHARED_WRITE_BEGIN blocks at every thread-state mutator.  Same publication
+ * model as queue_shm_t/window_shm_t/etc. — see bypass-extension-plan-20260506.md
+ * §6 + thread-process-shm-mutator-audit-20260506.md. */
+typedef volatile struct
+{
+    int                  priority;
+    int                  base_priority;
+    affinity_t           affinity;
+    int                  exit_code;
+    timeout_t            creation_time;
+    timeout_t            exit_time;
+    client_ptr_t         teb;
+    client_ptr_t         entry_point;
+    int                  unix_pid;
+    int                  unix_tid;
+    unsigned int         suspend;
+    unsigned int         flags;
+} thread_shm_t;
+
+/* thread_shm_t->flags bits.  Bit numbering must match across builds; new
+ * bits append, never reuse. */
+#define THREAD_SHM_FLAG_DBG_HIDDEN     0x00000001
+#define THREAD_SHM_FLAG_TERMINATED     0x00000002
+#define THREAD_SHM_FLAG_DISABLE_BOOST  0x00000004
+
 typedef volatile union
 {
     desktop_shm_t        desktop;
@@ -1348,6 +1375,7 @@ typedef volatile union
     input_shm_t          input;
     class_shm_t          class;
     window_shm_t         window;
+    thread_shm_t         thread;
 } object_shm_t;
 
 typedef volatile struct
@@ -7794,6 +7822,6 @@ union generic_reply
     struct nspa_unregister_inproc_event_reply nspa_unregister_inproc_event_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 962
+#define SERVER_PROTOCOL_VERSION 963
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

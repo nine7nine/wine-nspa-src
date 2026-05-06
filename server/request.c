@@ -137,7 +137,7 @@ void fatal_protocol_error( struct thread *thread, const char *err, ... )
     fprintf( stderr, "Protocol error:%04x: ", thread->id );
     vfprintf( stderr, err, args );
     va_end( args );
-    thread->exit_code = 1;
+    thread_set_exit_code( thread, 1 );
     kill_thread( thread, 1 );
 }
 
@@ -411,7 +411,7 @@ void call_req_handler_shm( struct thread *thread, struct request_shm *request_sh
         }
         else
         {
-            current->exit_code = 1;
+            thread_set_exit_code( current, 1 );
             kill_thread( current, 1 );
         }
     }
@@ -460,7 +460,7 @@ static void call_req_handler( struct thread *thread )
         }
         else
         {
-            current->exit_code = 1;
+            thread_set_exit_code( current, 1 );
             kill_thread( current, 1 );  /* no way to continue without reply fd */
         }
     }

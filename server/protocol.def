@@ -1402,6 +1402,7 @@ typedef volatile struct
     int                  exit_code;         /* STILL_ACTIVE while running */
     timeout_t            start_time;        /* absolute time at process start */
     timeout_t            end_time;          /* absolute time at process end (0 while running) */
+    client_ptr_t         peb;               /* PEB address in client space (set in get_startup_info) */
     process_id_t         id;                /* this process's pid */
     process_id_t         parent_id;         /* parent process pid */
     process_id_t         group_id;          /* group id */
@@ -1672,6 +1673,16 @@ typedef volatile struct
     obj_handle_t handle;        /* thread handle (THREAD_QUERY_LIMITED_INFORMATION sufficient) */
 @REPLY
     struct obj_locator locator; /* locator for thread->shared in the session block */
+@END
+
+
+/* NSPA: locate the per-process shared-memory snapshot for client-side
+ * seqlock reads of NtQueryInformationProcess fields.  Same pattern as
+ * get_thread_shm. */
+@REQ(get_process_shm)
+    obj_handle_t handle;        /* process handle (PROCESS_QUERY_LIMITED_INFORMATION sufficient) */
+@REPLY
+    struct obj_locator locator; /* locator for process->shared in the session block */
 @END
 
 

@@ -1050,6 +1050,11 @@ static void process_killed( struct process *process )
 
     assert( list_empty( &process->thread_list ));
     process->end_time = current_time;
+    SHARED_WRITE_BEGIN( process->shared, process_shm_t )
+    {
+        shared->end_time = process->end_time;
+    }
+    SHARED_WRITE_END;
     close_process_desktop( process );
     process->winstation = 0;
     process->desktop = 0;
@@ -1106,6 +1111,11 @@ void remove_process_thread( struct process *process, struct thread *thread )
     {
         /* we have removed the last running thread, exit the process */
         process->exit_code = thread->exit_code;
+        SHARED_WRITE_BEGIN( process->shared, process_shm_t )
+        {
+            shared->exit_code = process->exit_code;
+        }
+        SHARED_WRITE_END;
         generate_debug_event( thread, DbgExitProcessStateChange, process );
         list_remove( &process->entry );
         process_killed( process );
@@ -1117,7 +1127,13 @@ void remove_process_thread( struct process *process, struct thread *thread )
 /* suspend all the threads of a process */
 void suspend_process( struct process *process )
 {
-    if (!process->suspend++)
+    int was_zero = !process->suspend++;
+    SHARED_WRITE_BEGIN( process->shared, process_shm_t )
+    {
+        shared->suspend = process->suspend;
+    }
+    SHARED_WRITE_END;
+    if (was_zero)
     {
         struct list *ptr, *next;
 
@@ -1132,8 +1148,15 @@ void suspend_process( struct process *process )
 /* resume all the threads of a process */
 void resume_process( struct process *process )
 {
+    int reached_zero;
     assert (process->suspend > 0);
-    if (!--process->suspend)
+    reached_zero = !--process->suspend;
+    SHARED_WRITE_BEGIN( process->shared, process_shm_t )
+    {
+        shared->suspend = process->suspend;
+    }
+    SHARED_WRITE_END;
+    if (reached_zero)
     {
         struct list *ptr, *next;
 
@@ -1416,6 +1439,16 @@ DECL_HANDLER(new_process)
     process->machine = req->machine;
     process->startup_info = (struct startup_info *)grab_object( info );
     process->thread_flags = req->thread_flags;
+    /* NSPA: publish machine + thread_flags into the per-process shared
+     * snapshot.  Initial publish at create_process carried the native_machine
+     * default and thread_flags=0; new_process handler is the canonical site
+     * for setting the real values from the client's request. */
+    SHARED_WRITE_BEGIN( process->shared, process_shm_t )
+    {
+        shared->machine      = process->machine;
+        shared->thread_flags = process->thread_flags;
+    }
+    SHARED_WRITE_END;
     if (thread_sd && !(process->thread_sd = memdup( thread_sd, req->sd_len ))) goto done;
 
     job = parent->job;
@@ -1478,7 +1511,14 @@ DECL_HANDLER(new_process)
     }
 
     if (info->data->process_group_id == parent->group_id)
+    {
         process->group_id = parent->group_id;
+        SHARED_WRITE_BEGIN( process->shared, process_shm_t )
+        {
+            shared->group_id = process->group_id;
+        }
+        SHARED_WRITE_END;
+    }
     else
         info->data->process_group_id = process->group_id;
 
@@ -1776,6 +1816,11 @@ void set_process_base_priority( struct process *process, int base_priority )
     }
 
     process->base_priority = base_priority;
+    SHARED_WRITE_BEGIN( process->shared, process_shm_t )
+    {
+        shared->base_priority = base_priority;
+    }
+    SHARED_WRITE_END;
 
     if ((thread = process->sched_thread)) set_thread_base_priority( thread, thread->base_priority );
     LIST_FOR_EACH_ENTRY( thread, &process->thread_list, struct thread, proc_entry )
@@ -1789,6 +1834,11 @@ static void set_process_priority( struct process *process, int priority )
     int base_priority;
 
     process->priority = priority;
+    SHARED_WRITE_BEGIN( process->shared, process_shm_t )
+    {
+        shared->priority = priority;
+    }
+    SHARED_WRITE_END;
 
     switch (priority)
     {
@@ -1822,6 +1872,12 @@ static void set_process_disable_boost( struct process *process, int disable_boos
     struct thread *thread;
 
     process->disable_boost = disable_boost;
+    SHARED_WRITE_BEGIN( process->shared, process_shm_t )
+    {
+        shared->flags = disable_boost ? (shared->flags | PROCESS_SHM_FLAG_DISABLE_BOOST)
+                                      : (shared->flags & ~PROCESS_SHM_FLAG_DISABLE_BOOST);
+    }
+    SHARED_WRITE_END;
 
     if ((thread = process->sched_thread)) set_thread_disable_boost( thread, disable_boost );
     LIST_FOR_EACH_ENTRY( thread, &process->thread_list, struct thread, proc_entry )
@@ -1841,6 +1897,11 @@ static void set_process_affinity( struct process *process, affinity_t affinity )
     }
 
     process->affinity = affinity;
+    SHARED_WRITE_BEGIN( process->shared, process_shm_t )
+    {
+        shared->affinity = affinity;
+    }
+    SHARED_WRITE_END;
 
     if ((thread = process->sched_thread)) set_thread_affinity( thread, affinity );
     LIST_FOR_EACH_ENTRY( thread, &process->thread_list, struct thread, proc_entry )

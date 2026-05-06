@@ -171,6 +171,29 @@ static DWORD WINAPI dpc_dispatch_thread(void *arg)
             }
         }
 
+        /* NSPA fix: recompute the wait timeout AFTER the fire batch.
+         * The original `have_timeout` / `timeout` were computed from
+         * the queue head BEFORE firing.  If the queue became empty
+         * during the pop loop (the only entry was a periodic one we
+         * just popped to fire), the pre-fire computation set
+         * have_timeout = FALSE → infinite wait — but we just re-
+         * inserted the periodic entry above, so the wait would block
+         * forever waiting on dpc_wake (which periodic re-insert does
+         * not signal).  This was the cause of mode 5's "n=2 in 30s"
+         * regression in nspa_rt_monitor.  Recomputing here picks up
+         * the re-inserted entries and waits the right amount. */
+        EnterCriticalSection(&dpc_cs);
+        have_timeout = FALSE;
+        if (!list_empty(&dpc_queue))
+        {
+            LONGLONG now2 = dpc_now_nt();
+            entry = LIST_ENTRY(list_head(&dpc_queue), struct dpc_entry, entry);
+            timeout.QuadPart = -(entry->deadline - now2);
+            if (timeout.QuadPart > 0) timeout.QuadPart = 0;
+            have_timeout = TRUE;
+        }
+        LeaveCriticalSection(&dpc_cs);
+
         NtWaitForSingleObject(dpc_wake, FALSE, have_timeout ? &timeout : NULL);
     }
     return 0;

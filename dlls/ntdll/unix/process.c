@@ -66,6 +66,7 @@
 #include "winioctl.h"
 #include "ddk/ntddk.h"
 #include "unix_private.h"
+#include "nspa/process_shm.h"
 #include "wine/condrv.h"
 #include "wine/server.h"
 #include "wine/debug.h"
@@ -1124,13 +1125,32 @@ NTSTATUS WINAPI NtQueryInformationProcess( HANDLE handle, PROCESSINFOCLASS class
         {
             PROCESS_BASIC_INFORMATION pbi;
             const ULONG_PTR affinity_mask = get_system_affinity_mask();
+            struct nspa_process_shm_snapshot snap;
 
             if (size >= sizeof(PROCESS_BASIC_INFORMATION))
             {
                 if (!info) ret = STATUS_ACCESS_VIOLATION;
                 else
                 {
-                    SERVER_START_REQ(get_process_info)
+                    /* NSPA: shmem fast path. */
+                    ret = nspa_process_shm_query( handle, &snap );
+                    if (ret == STATUS_SUCCESS)
+                    {
+                        pbi.ExitStatus = snap.exit_code;
+                        pbi.PebBaseAddress = wine_server_get_ptr( snap.peb );
+                        pbi.AffinityMask = snap.affinity & affinity_mask;
+                        pbi.BasePriority = snap.base_priority;
+                        pbi.UniqueProcessId = snap.id;
+                        pbi.InheritedFromUniqueProcessId = snap.parent_id;
+                        if (is_old_wow64())
+                        {
+                            if (!is_machine_64bit( snap.machine ))
+                                pbi.PebBaseAddress = (PEB *)((char *)pbi.PebBaseAddress + 0x1000);
+                            else
+                                pbi.PebBaseAddress = NULL;
+                        }
+                    }
+                    else SERVER_START_REQ(get_process_info)
                     {
                         req->handle = wine_server_obj_handle( handle );
                         if ((ret = wine_server_call( req )) == STATUS_SUCCESS)
@@ -1257,16 +1277,25 @@ NTSTATUS WINAPI NtQueryInformationProcess( HANDLE handle, PROCESSINFOCLASS class
                         pti.KernelTime.QuadPart = (ULONGLONG)tms.tms_stime * 10000000 / ticks;
                     }
 
-                    SERVER_START_REQ(get_process_info)
                     {
-                        req->handle = wine_server_obj_handle( handle );
-                        if ((ret = wine_server_call( req )) == STATUS_SUCCESS)
+                        struct nspa_process_shm_snapshot snap;
+                        ret = nspa_process_shm_query( handle, &snap );
+                        if (ret == STATUS_SUCCESS)
                         {
-                            pti.CreateTime.QuadPart = reply->start_time;
-                            pti.ExitTime.QuadPart = reply->end_time;
+                            pti.CreateTime.QuadPart = snap.start_time;
+                            pti.ExitTime.QuadPart = snap.end_time;
                         }
+                        else SERVER_START_REQ(get_process_info)
+                        {
+                            req->handle = wine_server_obj_handle( handle );
+                            if ((ret = wine_server_call( req )) == STATUS_SUCCESS)
+                            {
+                                pti.CreateTime.QuadPart = reply->start_time;
+                                pti.ExitTime.QuadPart = reply->end_time;
+                            }
+                        }
+                        SERVER_END_REQ;
                     }
-                    SERVER_END_REQ;
 
                     memcpy(info, &pti, sizeof(KERNEL_USER_TIMES));
                     len = sizeof(KERNEL_USER_TIMES);
@@ -1317,7 +1346,10 @@ NTSTATUS WINAPI NtQueryInformationProcess( HANDLE handle, PROCESSINFOCLASS class
         else
         {
             ULONG *disable_boost = info;
-            SERVER_START_REQ(get_process_info)
+            struct nspa_process_shm_snapshot snap;
+            ret = nspa_process_shm_query( handle, &snap );
+            if (ret == STATUS_SUCCESS) *disable_boost = nspa_process_shm_snapshot_is_disable_boost( &snap );
+            else SERVER_START_REQ(get_process_info)
             {
                 req->handle = wine_server_obj_handle( handle );
                 ret = wine_server_call( req );
@@ -1403,8 +1435,11 @@ NTSTATUS WINAPI NtQueryInformationProcess( HANDLE handle, PROCESSINFOCLASS class
         if (size == len)
         {
             const ULONG_PTR system_mask = get_system_affinity_mask();
+            struct nspa_process_shm_snapshot snap;
 
-            SERVER_START_REQ(get_process_info)
+            ret = nspa_process_shm_query( handle, &snap );
+            if (ret == STATUS_SUCCESS) *(ULONG_PTR *)info = snap.affinity & system_mask;
+            else SERVER_START_REQ(get_process_info)
             {
                 req->handle = wine_server_obj_handle( handle );
                 if (!(ret = wine_server_call( req )))
@@ -1419,7 +1454,10 @@ NTSTATUS WINAPI NtQueryInformationProcess( HANDLE handle, PROCESSINFOCLASS class
         len = sizeof(DWORD);
         if (size == len)
         {
-            SERVER_START_REQ(get_process_info)
+            struct nspa_process_shm_snapshot snap;
+            ret = nspa_process_shm_query( handle, &snap );
+            if (ret == STATUS_SUCCESS) *(DWORD *)info = snap.session_id;
+            else SERVER_START_REQ(get_process_info)
             {
                 req->handle = wine_server_obj_handle( handle );
                 if (!(ret = wine_server_call( req )))
@@ -1498,17 +1536,26 @@ NTSTATUS WINAPI NtQueryInformationProcess( HANDLE handle, PROCESSINFOCLASS class
             {
                 PROCESS_PRIORITY_CLASS *priority = info;
 
-                SERVER_START_REQ(get_process_info)
                 {
-                    req->handle = wine_server_obj_handle( handle );
-                    if ((ret = wine_server_call( req )) == STATUS_SUCCESS)
+                    struct nspa_process_shm_snapshot snap;
+                    ret = nspa_process_shm_query( handle, &snap );
+                    if (ret == STATUS_SUCCESS)
                     {
-                        priority->PriorityClass = reply->priority;
-                        /* FIXME: Not yet supported by the wineserver */
+                        priority->PriorityClass = snap.priority;
                         priority->Foreground = FALSE;
                     }
+                    else SERVER_START_REQ(get_process_info)
+                    {
+                        req->handle = wine_server_obj_handle( handle );
+                        if ((ret = wine_server_call( req )) == STATUS_SUCCESS)
+                        {
+                            priority->PriorityClass = reply->priority;
+                            /* FIXME: Not yet supported by the wineserver */
+                            priority->Foreground = FALSE;
+                        }
+                    }
+                    SERVER_END_REQ;
                 }
-                SERVER_END_REQ;
             }
         }
         else ret = STATUS_INFO_LENGTH_MISMATCH;

@@ -487,6 +487,7 @@ static inline void init_thread_structure( struct thread *thread )
     thread->desc            = NULL;
     thread->desc_len        = 0;
     thread->exit_poll       = NULL;
+    thread->shared          = NULL;  /* NSPA: alloc_shared_object in create_thread */
 
     thread->creation_time = current_time;
     thread->exit_time     = 0;
@@ -646,6 +647,13 @@ struct thread *create_thread( int fd, struct process *process, unsigned int flag
     if (!(thread->request_fd = create_anonymous_fd( &thread_fd_ops, fd, &thread->obj, 0 ))) goto error;
     if (!(thread->sync = create_internal_sync( 1, 0 ))) goto error;
     if (get_inproc_device_fd() >= 0 && !(thread->alert_sync = create_inproc_internal_sync( 1, 0 ))) goto error;
+    /* NSPA: allocate per-thread shared-memory object for client-side seqlock
+     * reads.  Mutator-wrap commit (commit 2) populates fields via
+     * SHARED_WRITE_BEGIN; client-reader commit (commit 3) reads via
+     * shared_object_acquire/release_seqlock.  Failure is fatal — leaves the
+     * thread without a publication path, which client readers can't safely
+     * fall back from. */
+    if (!(thread->shared = alloc_shared_object( sizeof(*thread->shared) ))) goto error;
 
 #ifdef __linux__
     /* NSPA: allocate the per-thread request_shm region used as the
@@ -787,6 +795,10 @@ static void destroy_thread( struct object *obj )
     if (thread->token) release_object( thread->token );
     if (thread->alert_sync) release_object( thread->alert_sync );
     if (thread->sync) release_object( thread->sync );
+    /* NSPA: release the per-thread shared-memory object back to the session
+     * pool.  Safe even if alloc failed (thread->shared = NULL); free_shared_object
+     * would be called on the inner shm field, NULL-check first. */
+    if (thread->shared) free_shared_object( thread->shared );
 }
 
 /* dump a thread on stdout for debugging purposes */

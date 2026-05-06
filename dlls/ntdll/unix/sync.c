@@ -659,7 +659,8 @@ struct inproc_sync
  * the cache ceiling downward. With 524,288 cacheable positions and typical
  * server usage of <10K handles, collision is effectively impossible.
  */
-#define CLIENT_HANDLE_BASE  (INPROC_SYNC_CACHE_TOTAL - 256)
+#define CLIENT_HANDLE_POOL_SIZE  256
+#define CLIENT_HANDLE_BASE  (INPROC_SYNC_CACHE_TOTAL - CLIENT_HANDLE_POOL_SIZE)
 /* Initialised to INPROC_SYNC_CACHE_TOTAL (one above the highest valid idx)
  * so the first InterlockedDecrement returns INPROC_SYNC_CACHE_TOTAL - 1,
  * yielding handle ((INPROC_SYNC_CACHE_TOTAL - 1) + 1) << 2 = the highest
@@ -675,6 +676,18 @@ struct inproc_sync
  * close paths don't check CloseHandle's return; surfaced via wined3d_cs_destroy
  * (events Phase 4.6.F default-ON) which does check it. */
 static LONG client_handle_next = INPROC_SYNC_CACHE_TOTAL;
+
+/* Lock-free LIFO of recycled client-handle slot offsets.  Each entry stores
+ * the next free offset (relative to CLIENT_HANDLE_BASE), or -1 for the
+ * stack bottom.  client_handle_freelist_head packs (offset + 1) into the
+ * low 16 bits (0 = empty stack) and a generation counter into the high 16
+ * bits to defeat ABA on concurrent pop.  alloc_client_handle pops from the
+ * freelist before drawing from client_handle_next; without this, the 256
+ * slot pool was a one-shot — once cumulative allocations crossed the cap,
+ * every subsequent anonymous create fell back to the server even though
+ * most handles had since been closed. */
+static LONG client_handle_freelist[CLIENT_HANDLE_POOL_SIZE];
+static LONG client_handle_freelist_head;
 
 /* NSPA: Track client-created mutexes for thread-death abandonment.
  * Protected by fd_cache_mutex. */
@@ -950,26 +963,60 @@ static inline BOOL allow_client_sync_creation( enum inproc_sync_type type, const
 
 static HANDLE alloc_client_handle(void)
 {
-    LONG idx = InterlockedDecrement( &client_handle_next );
+    LONG head, next_off, new_head, idx;
+    unsigned int off;
 
-    /* Stop at CLIENT_HANDLE_BASE — handles below would fail is_client_handle's
-     * lower-bound check.  The 256-slot cap (INPROC_SYNC_CACHE_TOTAL -
-     * CLIENT_HANDLE_BASE) bounds total active client-range handles per
-     * process.  Returns NULL to fall back to the legacy server-allocated
-     * handle path when the pool is exhausted. */
+    /* Pop a recycled slot before drawing from the never-allocated band.
+     * Bounds total active (not cumulative) client-range handles to
+     * CLIENT_HANDLE_POOL_SIZE.  Returns NULL to fall back to the legacy
+     * server-allocated handle path when both the freelist and the
+     * never-allocated band are empty. */
+    for (;;)
+    {
+        head = client_handle_freelist_head;
+        if (!(head & 0xffff)) break;
+        off = (unsigned int)(head & 0xffff) - 1;
+        next_off = client_handle_freelist[off];
+        new_head = (LONG)(((unsigned int)head + 0x10000u) & 0xffff0000u);
+        if (next_off >= 0) new_head |= (LONG)((unsigned int)(next_off + 1));
+        if (InterlockedCompareExchange( &client_handle_freelist_head, new_head, head ) == head)
+            return wine_server_ptr_handle( ((unsigned int)(CLIENT_HANDLE_BASE + off) + 1) << 2 );
+    }
+
+    idx = InterlockedDecrement( &client_handle_next );
     if (idx < CLIENT_HANDLE_BASE)
     {
         InterlockedIncrement( &client_handle_next );
         return NULL;
     }
-
     return wine_server_ptr_handle( (unsigned int)(idx + 1) << 2 );
 }
 
 static void free_client_handle( HANDLE handle )
 {
-    /* Handles are allocated top-down and not individually recycled. */
-    (void)handle;
+    unsigned int idx, off;
+    LONG head, new_head;
+
+    if (!handle) return;
+    idx = (wine_server_obj_handle( handle ) >> 2) - 1;
+    if (idx < CLIENT_HANDLE_BASE || idx >= INPROC_SYNC_CACHE_TOTAL) return;
+    off = idx - CLIENT_HANDLE_BASE;
+
+    /* Push onto the lock-free LIFO freelist.  Caller owns the slot at
+     * `off` (close paths run under fd_cache_mutex; create error paths
+     * unwind before publishing the handle), so we are the only writer
+     * to client_handle_freelist[off] until our CAS succeeds. */
+    for (;;)
+    {
+        head = client_handle_freelist_head;
+        client_handle_freelist[off] = (head & 0xffff)
+                                      ? (LONG)((unsigned int)(head & 0xffff) - 1)
+                                      : -1;
+        new_head = (LONG)(((unsigned int)head + 0x10000u) & 0xffff0000u);
+        new_head |= (LONG)(off + 1);
+        if (InterlockedCompareExchange( &client_handle_freelist_head, new_head, head ) == head)
+            return;
+    }
 }
 
 /* Populate the inproc_sync cache directly for a client-created object.

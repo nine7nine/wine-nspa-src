@@ -143,6 +143,7 @@ struct thread
     WCHAR                 *desc;          /* thread description string */
     struct completion_wait *completion_wait; /* completion port wait object the thread is associated with */
     struct timeout_user   *exit_poll;     /* poll if violently terminated thread is really dead */
+    thread_shm_t          *shared;        /* NSPA: shared-memory snapshot of thread state for client-side seqlock reads.  Allocated in create_thread, freed in destroy_thread.  Mutators wrap field writes in SHARED_WRITE_BEGIN — see bypass-extension-plan-20260506.md §6. */
 };
 
 extern struct thread *current;

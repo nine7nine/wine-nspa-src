@@ -672,6 +672,8 @@ struct thread *create_thread( int fd, struct process *process, unsigned int flag
         shared->exit_time     = thread->exit_time;
         shared->teb           = thread->teb;
         shared->entry_point   = thread->entry_point;
+        shared->id            = thread->id;
+        shared->process_id    = thread->process->id;
         shared->unix_pid      = thread->unix_pid;
         shared->unix_tid      = thread->unix_tid;
         shared->suspend       = thread->suspend;

@@ -2139,8 +2139,25 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
     {
         THREAD_BASIC_INFORMATION info;
         const ULONG_PTR affinity_mask = get_system_affinity_mask();
+        struct nspa_thread_shm_snapshot snap;
 
-        SERVER_START_REQ( get_thread_info )
+        /* NSPA: shmem fast path.  Reads ALL ThreadBasicInformation fields
+         * (exit_code, teb, tid, pid, affinity, priority, base_priority) from
+         * the per-thread shared snapshot in one seqlock cycle.  pid is
+         * mirrored from thread->process->id at create_thread time and is
+         * write-once (process membership is immutable). */
+        status = nspa_thread_shm_query( handle, &snap );
+        if (status == STATUS_SUCCESS)
+        {
+            info.ExitStatus             = snap.exit_code;
+            info.TebBaseAddress         = wine_server_get_ptr( snap.teb );
+            info.ClientId.UniqueProcess = ULongToHandle(snap.process_id);
+            info.ClientId.UniqueThread  = ULongToHandle(snap.id);
+            info.AffinityMask           = snap.affinity & affinity_mask;
+            info.Priority               = snap.priority;
+            info.BasePriority           = snap.base_priority;
+        }
+        else SERVER_START_REQ( get_thread_info )
         {
             req->handle = wine_server_obj_handle( handle );
             if (!(status = wine_server_call( req )))

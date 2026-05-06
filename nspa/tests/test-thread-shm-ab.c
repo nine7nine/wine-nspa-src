@@ -28,6 +28,9 @@
 
 /* mingw's winternl.h ships these prototypes but not always the full
  * ThreadInformationClass enum — declare the values we use. */
+#ifndef ThreadBasicInformation
+# define ThreadBasicInformation          ((THREADINFOCLASS)0)
+#endif
 #ifndef ThreadAffinityMask
 # define ThreadAffinityMask              ((THREADINFOCLASS)4)
 #endif
@@ -51,6 +54,18 @@
 #endif
 
 /* GROUP_AFFINITY comes in via <windows.h>; don't redefine. */
+
+/* mingw's winternl.h lacks THREAD_BASIC_INFORMATION; declare locally
+ * to match Wine's include/winternl.h layout. */
+typedef struct _TEST_THREAD_BASIC_INFORMATION
+{
+    NTSTATUS  ExitStatus;
+    PVOID     TebBaseAddress;
+    CLIENT_ID ClientId;
+    ULONG_PTR AffinityMask;
+    LONG      Priority;
+    LONG      BasePriority;
+} TEST_THREAD_BASIC_INFORMATION;
 
 NTSYSAPI NTSTATUS NTAPI NtQueryInformationThread(
     HANDLE ThreadHandle, THREADINFOCLASS ThreadInformationClass,
@@ -81,6 +96,18 @@ static void dump( HANDLE h, HANDLE worker_h )
     NTSTATUS s;
     ULONG ret;
 
+    /* ThreadBasicInformation */
+    {
+        TEST_THREAD_BASIC_INFORMATION tbi;
+        memset( &tbi, 0xcc, sizeof(tbi) );
+        s = NtQueryInformationThread( h, ThreadBasicInformation, &tbi, sizeof(tbi), &ret );
+        printf( "%s ThreadBasicInformation          status=0x%08lx exit=0x%lx teb=%p pid=%llu tid=%llu mask=0x%016llx prio=%ld baseprio=%ld\n",
+                who, (unsigned long)s, (unsigned long)tbi.ExitStatus, tbi.TebBaseAddress,
+                (unsigned long long)(ULONG_PTR)tbi.ClientId.UniqueProcess,
+                (unsigned long long)(ULONG_PTR)tbi.ClientId.UniqueThread,
+                (unsigned long long)tbi.AffinityMask,
+                (long)tbi.Priority, (long)tbi.BasePriority );
+    }
     /* ThreadAffinityMask */
     {
         ULONG_PTR mask = 0;

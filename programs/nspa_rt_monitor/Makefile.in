@@ -1,0 +1,8 @@
+MODULE      = nspa_rt_monitor.exe
+INSTALL_LIB = nspa_rt_monitor.exe
+IMPORTS     = user32 gdi32 ntoskrnl
+
+EXTRADLLFLAGS = -mwindows
+
+SOURCES = \
+	main.c

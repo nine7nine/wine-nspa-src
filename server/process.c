@@ -705,6 +705,7 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
     process->rawinput_device_count = 0;
     process->rawinput_mouse  = NULL;
     process->rawinput_kbd    = NULL;
+    process->shared          = NULL;  /* NSPA: alloc_shared_object below, after parent inherit */
     memset( &process->image_info, 0, sizeof(process->image_info) );
 #ifdef __linux__
     process->client_poll_bitmap = NULL;
@@ -765,6 +766,34 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
     if (!process->handles || !process->token) goto error;
     process->session_id = token_get_session_id( process->token );
 
+    /* NSPA: allocate per-process shared-memory object for client-side seqlock
+     * reads.  Mutator-wrap (commit 6) populates fields via SHARED_WRITE_BEGIN;
+     * client-reader (commit 7) reads via shared_object_acquire/release_seqlock.
+     * Failure is fatal — leaves the process without a publication path, which
+     * client readers can't safely fall back from.  Initial publish below
+     * establishes a coherent snapshot from the post-init / post-parent-inherit
+     * field state so subsequent SHARED_WRITE_BEGIN mutators always see a
+     * fully populated published copy. */
+    if (!(process->shared = alloc_shared_object( sizeof(*process->shared) ))) goto error;
+    SHARED_WRITE_BEGIN( process->shared, process_shm_t )
+    {
+        shared->priority      = process->priority;
+        shared->base_priority = process->base_priority;
+        shared->affinity      = process->affinity;
+        shared->exit_code     = process->exit_code;
+        shared->start_time    = process->start_time;
+        shared->end_time      = process->end_time;
+        shared->id            = process->id;
+        shared->parent_id     = process->parent_id;
+        shared->group_id      = process->group_id;
+        shared->session_id    = process->session_id;
+        shared->suspend       = process->suspend;
+        shared->thread_flags  = process->thread_flags;
+        shared->machine       = process->machine;
+        shared->flags         = process->disable_boost ? PROCESS_SHM_FLAG_DISABLE_BOOST : 0;
+    }
+    SHARED_WRITE_END;
+
     set_fd_events( process->msg_fd, POLLIN );  /* start listening to events */
     return process;
 
@@ -824,6 +853,10 @@ static void process_destroy( struct object *obj )
     if (process->id) free_ptid( process->id );
     if (process->token) release_object( process->token );
     if (process->sync) release_object( process->sync );
+    /* NSPA: release the per-process shared-memory object back to the session
+     * pool.  Safe even if alloc failed (process->shared = NULL); free_shared_object
+     * would dereference invalid memory in that case, NULL-check first. */
+    if (process->shared) free_shared_object( process->shared );
     list_remove( &process->rawinput_entry );
     free( process->rawinput_devices );
     free( process->dir_cache );

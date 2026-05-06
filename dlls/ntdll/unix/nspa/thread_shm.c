@@ -253,8 +253,13 @@ void nspa_thread_shm_init(void)
      * Subsequent calls observe the cached state.  No mutex needed. */
     if (ReadNoFence( &gate_state ) != GATE_UNINIT) return;
 
+    /* Default ON; NSPA_THREAD_SHM=0 is the explicit escape hatch.  A/B
+     * validated bit-identical with the get_thread_info RPC fallback
+     * across all 7 covered query classes (4 thread states each — self,
+     * suspended worker, resumed worker, terminated worker), so the
+     * fast path is the standing default. */
     env = getenv( "NSPA_THREAD_SHM" );
-    next = (env && !strcmp( env, "1" )) ? GATE_ON : GATE_OFF;
+    next = (env && !strcmp( env, "0" )) ? GATE_OFF : GATE_ON;
 
     InterlockedCompareExchange( &gate_state, next, expected );
 }

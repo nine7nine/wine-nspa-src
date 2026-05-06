@@ -2041,6 +2041,13 @@ DECL_HANDLER(map_image_view)
         if (add_process_view( current, view ))
         {
             current->entry_point = view->base + req->entry;
+            /* NSPA: publish entry_point into the per-thread shared snapshot.
+             * Image-load path is a cross-file writer of thread state. */
+            SHARED_WRITE_BEGIN( current->shared, thread_shm_t )
+            {
+                shared->entry_point = current->entry_point;
+            }
+            SHARED_WRITE_END;
             current->process->machine = (view->image.image_flags & IMAGE_FLAGS_ComPlusNativeReady) ?
                                          native_machine : req->machine;
         }
@@ -2086,6 +2093,13 @@ DECL_HANDLER(map_builtin_view)
         if (add_process_view( current, view ))
         {
             current->entry_point = view->base + image->entry_point;
+            /* NSPA: publish entry_point into the per-thread shared snapshot.
+             * Builtin-image-load path is a cross-file writer of thread state. */
+            SHARED_WRITE_BEGIN( current->shared, thread_shm_t )
+            {
+                shared->entry_point = current->entry_point;
+            }
+            SHARED_WRITE_END;
             current->process->machine = image->machine;
         }
     }

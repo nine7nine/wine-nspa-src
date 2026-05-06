@@ -733,6 +733,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
 int WINAPI WinMain(HINSTANCE hi, HINSTANCE prev, LPSTR cmd, int show)
 {
+    /* Bump process priority class to REALTIME so worker threads calling
+     * SetThreadPriority(THREAD_PRIORITY_TIME_CRITICAL) actually get NT
+     * priority 31 (which NSPA maps to FF 80 per the banner) rather than
+     * NT 15 under NORMAL_PRIORITY_CLASS — which would map to ~FF 60-65,
+     * below wineserver's FF 64.  Without this, the workers run at lower
+     * priority than wineserver and get starved on a busy system,
+     * dilating measured latencies.  Same priority class real audio
+     * threads use under NSPA_RT_PRIO. */
+    SetPriorityClass(GetCurrentProcess(), REALTIME_PRIORITY_CLASS);
+
     QueryPerformanceFrequency(&qpc_freq);
     qpc_to_us = 1000000.0 / (double)qpc_freq.QuadPart;
 

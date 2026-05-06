@@ -1356,6 +1356,8 @@ typedef volatile struct
     timeout_t            exit_time;
     client_ptr_t         teb;
     client_ptr_t         entry_point;
+    thread_id_t          id;
+    process_id_t         process_id;
     int                  unix_pid;
     int                  unix_tid;
     unsigned int         suspend;
@@ -7893,6 +7895,6 @@ union generic_reply
     struct nspa_unregister_inproc_event_reply nspa_unregister_inproc_event_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 967
+#define SERVER_PROTOCOL_VERSION 968
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

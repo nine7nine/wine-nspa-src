@@ -35,8 +35,14 @@
  * stay decoupled from the wire format. */
 struct nspa_thread_shm_snapshot
 {
+    int          priority;     /* current effective thread priority */
+    int          base_priority;/* base priority level */
     ULONG_PTR    affinity;     /* ULONG_PTR-cast affinity mask */
+    int          exit_code;    /* STILL_PENDING (0x103) when running */
+    client_ptr_t teb;          /* TEB address */
     client_ptr_t entry_point;  /* Win32 entry point */
+    DWORD        id;           /* this thread's NT tid */
+    DWORD        process_id;   /* owning process's NT pid */
     ULONG        suspend;      /* current suspend count */
     ULONG        flags;        /* THREAD_SHM_FLAG_* — see thread_shm.c bit accessors */
 };

@@ -361,11 +361,17 @@ NTSTATUS nspa_thread_shm_query( HANDLE handle, struct nspa_thread_shm_snapshot *
     do
     {
         shm_acquire_seqlock( object, &seq );
-        cur_id          = object->id;
-        snap.affinity    = (ULONG_PTR)object->shm.thread.affinity;
-        snap.entry_point = object->shm.thread.entry_point;
-        snap.suspend     = (ULONG)object->shm.thread.suspend;
-        snap.flags       = (ULONG)object->shm.thread.flags;
+        cur_id            = object->id;
+        snap.priority      = object->shm.thread.priority;
+        snap.base_priority = object->shm.thread.base_priority;
+        snap.affinity      = (ULONG_PTR)object->shm.thread.affinity;
+        snap.exit_code     = object->shm.thread.exit_code;
+        snap.teb           = object->shm.thread.teb;
+        snap.entry_point   = object->shm.thread.entry_point;
+        snap.id            = (DWORD)object->shm.thread.id;
+        snap.process_id    = (DWORD)object->shm.thread.process_id;
+        snap.suspend       = (ULONG)object->shm.thread.suspend;
+        snap.flags         = (ULONG)object->shm.thread.flags;
     } while (!shm_release_seqlock( object, seq ));
 
     /* Slot recycling: if id no longer matches the locator we cached, the

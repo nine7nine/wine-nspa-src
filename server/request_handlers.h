@@ -22,6 +22,7 @@ DECL_HANDLER(get_process_vm_counters);
 DECL_HANDLER(set_process_info);
 DECL_HANDLER(get_thread_info);
 DECL_HANDLER(get_thread_times);
+DECL_HANDLER(get_thread_shm);
 DECL_HANDLER(set_thread_info);
 DECL_HANDLER(suspend_thread);
 DECL_HANDLER(resume_thread);
@@ -349,6 +350,7 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_set_process_info,
     (req_handler)req_get_thread_info,
     (req_handler)req_get_thread_times,
+    (req_handler)req_get_thread_shm,
     (req_handler)req_set_thread_info,
     (req_handler)req_suspend_thread,
     (req_handler)req_resume_thread,
@@ -851,6 +853,10 @@ C_ASSERT( offsetof(struct get_thread_times_reply, exit_time) == 16 );
 C_ASSERT( offsetof(struct get_thread_times_reply, unix_pid) == 24 );
 C_ASSERT( offsetof(struct get_thread_times_reply, unix_tid) == 28 );
 C_ASSERT( sizeof(struct get_thread_times_reply) == 32 );
+C_ASSERT( offsetof(struct get_thread_shm_request, handle) == 12 );
+C_ASSERT( sizeof(struct get_thread_shm_request) == 16 );
+C_ASSERT( offsetof(struct get_thread_shm_reply, locator) == 8 );
+C_ASSERT( sizeof(struct get_thread_shm_reply) == 24 );
 C_ASSERT( offsetof(struct set_thread_info_request, handle) == 12 );
 C_ASSERT( offsetof(struct set_thread_info_request, priority) == 16 );
 C_ASSERT( offsetof(struct set_thread_info_request, base_priority) == 20 );

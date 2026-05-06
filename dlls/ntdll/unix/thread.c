@@ -75,6 +75,7 @@
 #include "wine/server.h"
 #include "wine/debug.h"
 #include "unix_private.h"
+#include "nspa/thread_shm.h"
 #include <rtpi.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(thread);
@@ -2181,13 +2182,19 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
         const ULONG_PTR affinity_mask = get_system_affinity_mask();
         ULONG_PTR affinity = 0;
 
-        SERVER_START_REQ( get_thread_info )
+        /* NSPA: shmem fast path.  STATUS_NOT_SUPPORTED → fall back to RPC. */
+        status = nspa_thread_shm_query_affinity( handle, &affinity );
+        if (status == STATUS_SUCCESS) affinity &= affinity_mask;
+        else
         {
-            req->handle = wine_server_obj_handle( handle );
-            req->access = THREAD_QUERY_INFORMATION;
-            if (!(status = wine_server_call( req ))) affinity = reply->affinity & affinity_mask;
+            SERVER_START_REQ( get_thread_info )
+            {
+                req->handle = wine_server_obj_handle( handle );
+                req->access = THREAD_QUERY_INFORMATION;
+                if (!(status = wine_server_call( req ))) affinity = reply->affinity & affinity_mask;
+            }
+            SERVER_END_REQ;
         }
-        SERVER_END_REQ;
         if (status == STATUS_SUCCESS)
         {
             if (data) memcpy( data, &affinity, min( length, sizeof(affinity) ));

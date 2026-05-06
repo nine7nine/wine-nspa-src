@@ -1705,6 +1705,22 @@ struct get_thread_times_reply
 };
 
 
+/* NSPA: locate the per-thread shared-memory snapshot for client-side
+ * seqlock reads of NtQueryInformationThread fields.  Mirrors the
+ * get_thread_desktop pattern: returns an obj_locator that the client
+ * resolves through the session mapping. */
+struct get_thread_shm_request
+{
+    struct request_header __header;
+    obj_handle_t handle;
+};
+struct get_thread_shm_reply
+{
+    struct reply_header __header;
+    struct obj_locator locator;
+};
+
+
 
 struct set_thread_info_request
 {
@@ -6854,6 +6870,7 @@ enum request
     REQ_set_process_info,
     REQ_get_thread_info,
     REQ_get_thread_times,
+    REQ_get_thread_shm,
     REQ_set_thread_info,
     REQ_suspend_thread,
     REQ_resume_thread,
@@ -7184,6 +7201,7 @@ union generic_request
     struct set_process_info_request set_process_info_request;
     struct get_thread_info_request get_thread_info_request;
     struct get_thread_times_request get_thread_times_request;
+    struct get_thread_shm_request get_thread_shm_request;
     struct set_thread_info_request set_thread_info_request;
     struct suspend_thread_request suspend_thread_request;
     struct resume_thread_request resume_thread_request;
@@ -7512,6 +7530,7 @@ union generic_reply
     struct set_process_info_reply set_process_info_reply;
     struct get_thread_info_reply get_thread_info_reply;
     struct get_thread_times_reply get_thread_times_reply;
+    struct get_thread_shm_reply get_thread_shm_reply;
     struct set_thread_info_reply set_thread_info_reply;
     struct suspend_thread_reply suspend_thread_reply;
     struct resume_thread_reply resume_thread_reply;
@@ -7822,6 +7841,6 @@ union generic_reply
     struct nspa_unregister_inproc_event_reply nspa_unregister_inproc_event_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 963
+#define SERVER_PROTOCOL_VERSION 964
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

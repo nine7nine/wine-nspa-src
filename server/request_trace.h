@@ -298,6 +298,16 @@ static void dump_get_thread_times_reply( const struct get_thread_times_reply *re
     fprintf( stderr, ", unix_tid=%d", req->unix_tid );
 }
 
+static void dump_get_thread_shm_request( const struct get_thread_shm_request *req )
+{
+    fprintf( stderr, " handle=%04x", req->handle );
+}
+
+static void dump_get_thread_shm_reply( const struct get_thread_shm_reply *req )
+{
+    dump_obj_locator( " locator=", &req->locator );
+}
+
 static void dump_set_thread_info_request( const struct set_thread_info_request *req )
 {
     fprintf( stderr, " handle=%04x", req->handle );
@@ -3720,6 +3730,7 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_set_process_info_request,
     (dump_func)dump_get_thread_info_request,
     (dump_func)dump_get_thread_times_request,
+    (dump_func)dump_get_thread_shm_request,
     (dump_func)dump_set_thread_info_request,
     (dump_func)dump_suspend_thread_request,
     (dump_func)dump_resume_thread_request,
@@ -4047,6 +4058,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     NULL,
     (dump_func)dump_get_thread_info_reply,
     (dump_func)dump_get_thread_times_reply,
+    (dump_func)dump_get_thread_shm_reply,
     NULL,
     (dump_func)dump_suspend_thread_reply,
     (dump_func)dump_resume_thread_reply,
@@ -4374,6 +4386,7 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "set_process_info",
     "get_thread_info",
     "get_thread_times",
+    "get_thread_shm",
     "set_thread_info",
     "suspend_thread",
     "resume_thread",

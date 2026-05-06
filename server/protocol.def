@@ -1631,6 +1631,17 @@ typedef volatile struct
 @END
 
 
+/* NSPA: locate the per-thread shared-memory snapshot for client-side
+ * seqlock reads of NtQueryInformationThread fields.  Mirrors the
+ * get_thread_desktop pattern: returns an obj_locator that the client
+ * resolves through the session mapping. */
+@REQ(get_thread_shm)
+    obj_handle_t handle;        /* thread handle (THREAD_QUERY_LIMITED_INFORMATION sufficient) */
+@REPLY
+    struct obj_locator locator; /* locator for thread->shared in the session block */
+@END
+
+
 /* Set a thread information */
 @REQ(set_thread_info)
     obj_handle_t handle;       /* thread handle */

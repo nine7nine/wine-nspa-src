@@ -1,13 +1,10 @@
 /*
  * NSPA per-thread shared-memory snapshot reader (client side).
  *
- * Mirrors the session-mapping plumbing in dlls/win32u/winstation.c so
- * that ntdll/unix can resolve obj_locators independently — win32u may
- * not be loaded in every Wine process (command-line tools, services),
- * and circular-dep concerns rule out calling into win32u from ntdll.
- * The duplicate NtMapViewOfSection on the same `\KernelObjects\
- * __wine_session` section shares physical pages with win32u's mapping;
- * cost is one extra address-space slot per process.
+ * Builds on dlls/ntdll/unix/nspa/shared_obj_reader.{c,h} for the
+ * session-mapping + seqlock plumbing.  Owns the per-handle resolve
+ * cache, the env-gate state, the get_thread_shm RPC wrapper, and the
+ * thread-specific snapshot read.
  *
  * Copyright 2026 NSPA contributors
  *
@@ -33,176 +30,39 @@
 #include "winnt.h"
 #include "wine/server.h"
 #include "wine/list.h"
-#include "wine/debug.h"
 
 #include <rtpi.h>
 
+#include "shared_obj_reader.h"
 #include "thread_shm.h"
-
-WINE_DEFAULT_DEBUG_CHANNEL(nspa);
-
-/* Process-wide state: env-gate decision, session blocks, and per-handle cache. */
 
 enum gate_state
 {
-    GATE_UNINIT = 0,    /* nspa_thread_shm_init not yet run */
-    GATE_OFF,           /* env unset or != "1" */
-    GATE_ON,            /* env == "1" */
+    GATE_UNINIT = 0,
+    GATE_OFF,
+    GATE_ON,
 };
 
-static LONG gate_state;     /* atomic, written once via InterlockedCompareExchange */
+static LONG gate_state;
 
-struct session_block
-{
-    struct list entry;
-    const char *data;       /* mmap base */
-    SIZE_T      offset;     /* offset within the session shared mapping */
-    SIZE_T      size;       /* mapped size */
-};
-
-static DEFINE_PI_MUTEX( session_lock, 0 );
-static struct list session_blocks = LIST_INIT( session_blocks );
-
-/* Per-handle resolved-object cache.  Most processes query
- * GetCurrentThread() (handle == ~1) almost exclusively, but
- * NtQueryInformationThread accepts any thread handle so we keep a
- * small linked list rather than a single static.
- *
- * `locator_id` is captured at resolve time and re-checked on every
- * read: if the server-side slot was freed and recycled (thread died,
- * a later thread alloc grabbed the same slot), the slot's id field is
- * incremented inside alloc_shared_object's seqlock, so any reader
- * comparing object->id to the cached locator_id catches it.  Without
- * this check, the reader would silently consume fields from another
- * thread's snapshot. */
+/* Per-handle resolved-object cache.  `locator_id` is captured at
+ * resolve time and re-checked on every read: if the server-side slot
+ * was freed and recycled, the slot's id field is incremented inside
+ * alloc_shared_object's seqlock, so any reader comparing object->id
+ * to the cached locator_id catches it.  Without this check, the
+ * reader would silently consume fields from another thread's snapshot. */
 struct handle_cache_entry
 {
     struct list entry;
-    HANDLE      handle;     /* thread handle as passed to the query */
-    object_id_t locator_id; /* locator->id at cache-insert time */
-    const shared_object_t *object;  /* resolved through the session mapping */
+    HANDLE      handle;
+    object_id_t locator_id;
+    const shared_object_t *object;
 };
 
+static DEFINE_PI_MUTEX( cache_lock, 0 );
 static struct list handle_cache = LIST_INIT( handle_cache );
 
-/* x86: only need to block compiler reordering of non-volatile reads
- * (memcpy etc.) past the seq check.  Other archs need a real fence.
- * Same trade-off as dlls/win32u/win32u_private.h. */
-#if defined(__i386__) || defined(__x86_64__)
-# define NSPA_SHM_READ_FENCE do { __asm__ __volatile__( "" ::: "memory" ); } while (0)
-#else
-# define NSPA_SHM_READ_FENCE __atomic_thread_fence( __ATOMIC_ACQUIRE )
-#endif
-
-/* Mirrors of dlls/win32u/winstation.c's seqlock helpers.  Inline-able
- * since they're tiny; declared static so they don't escape this TU. */
-static void shm_acquire_seqlock( const shared_object_t *object, UINT64 *seq )
-{
-    while ((*seq = ReadNoFence64( &object->seq )) & 1) YieldProcessor();
-    NSPA_SHM_READ_FENCE;
-}
-
-static BOOL shm_release_seqlock( const shared_object_t *object, UINT64 seq )
-{
-    NSPA_SHM_READ_FENCE;
-    return ReadNoFence64( &object->seq ) == seq;
-}
-
-static NTSTATUS map_session_block( SIZE_T offset, SIZE_T size, struct session_block **ret )
-{
-    static const WCHAR nameW[] =
-    {
-        '\\','K','e','r','n','e','l','O','b','j','e','c','t','s','\\',
-        '_','_','w','i','n','e','_','s','e','s','s','i','o','n',0
-    };
-    UNICODE_STRING name = RTL_CONSTANT_STRING( nameW );
-    SYSTEM_BASIC_INFORMATION info;
-    LARGE_INTEGER off;
-    struct session_block *block;
-    OBJECT_ATTRIBUTES attr;
-    NTSTATUS status;
-    HANDLE handle;
-
-    if ((status = NtQuerySystemInformation( SystemBasicInformation, &info, sizeof(info), NULL )))
-        return status;
-
-    off.QuadPart = offset - (offset % info.AllocationGranularity);
-
-    if (!(block = calloc( 1, sizeof(*block) ))) return STATUS_NO_MEMORY;
-
-    InitializeObjectAttributes( &attr, &name, 0, NULL, NULL );
-    if ((status = NtOpenSection( &handle, SECTION_MAP_READ, &attr )))
-    {
-        WARN( "NtOpenSection __wine_session failed, status %#x\n", (unsigned int)status );
-        free( block );
-        return status;
-    }
-
-    if ((status = NtMapViewOfSection( handle, GetCurrentProcess(), (void **)&block->data,
-                                       0, 0, &off, &block->size, ViewUnmap, 0, PAGE_READONLY )))
-    {
-        WARN( "NtMapViewOfSection failed, status %#x\n", (unsigned int)status );
-        NtClose( handle );
-        free( block );
-        return status;
-    }
-
-    NtClose( handle );
-    block->offset = off.QuadPart;
-    list_add_tail( &session_blocks, &block->entry );
-    *ret = block;
-    return STATUS_SUCCESS;
-}
-
-/* Caller holds session_lock. */
-static NTSTATUS find_session_block( SIZE_T offset, SIZE_T size, struct session_block **ret )
-{
-    struct session_block *block;
-
-    LIST_FOR_EACH_ENTRY( block, &session_blocks, struct session_block, entry )
-    {
-        if (block->offset <= offset && offset + size <= block->offset + block->size)
-        {
-            *ret = block;
-            return STATUS_SUCCESS;
-        }
-    }
-    return map_session_block( offset, size, ret );
-}
-
-/* Caller holds session_lock.  Resolves a server-supplied locator into
- * a stable shared_object_t pointer; verifies the object's id matches
- * what the server told us so we don't read into a recycled slot. */
-static const shared_object_t *resolve_locator( struct obj_locator locator )
-{
-    const shared_object_t *object;
-    struct session_block *block = NULL;
-
-    if (!locator.id) return NULL;
-    if (find_session_block( locator.offset, sizeof(*object), &block )) return NULL;
-
-    object = (const shared_object_t *)(block->data + locator.offset - block->offset);
-
-    /* Walk the seqlock once to read object->id; any mismatch with the
-     * locator indicates the underlying server-side slot was freed and
-     * possibly re-allocated to another object since the server returned
-     * the locator.  Fail closed in that case. */
-    {
-        UINT64 seq;
-        object_id_t id;
-        do
-        {
-            shm_acquire_seqlock( object, &seq );
-            id = object->id;
-        } while (!shm_release_seqlock( object, seq ));
-
-        if (id != locator.id) return NULL;
-    }
-
-    return object;
-}
-
-/* Caller holds session_lock. */
+/* Caller holds cache_lock. */
 static struct handle_cache_entry *cache_lookup( HANDLE handle )
 {
     struct handle_cache_entry *entry;
@@ -214,7 +74,7 @@ static struct handle_cache_entry *cache_lookup( HANDLE handle )
     return NULL;
 }
 
-/* Caller holds session_lock. */
+/* Caller holds cache_lock. */
 static void cache_insert( HANDLE handle, struct obj_locator locator, const shared_object_t *object )
 {
     struct handle_cache_entry *entry;
@@ -226,8 +86,7 @@ static void cache_insert( HANDLE handle, struct obj_locator locator, const share
     list_add_tail( &handle_cache, &entry->entry );
 }
 
-/* Caller holds session_lock.  Drops a stale entry so a subsequent
- * resolve_thread_object call re-asks the server. */
+/* Caller holds cache_lock. */
 static void cache_evict( HANDLE handle )
 {
     struct handle_cache_entry *entry;
@@ -249,15 +108,11 @@ void nspa_thread_shm_init(void)
     LONG next;
     const char *env;
 
-    /* Single-shot: only the first caller transitions GATE_UNINIT → GATE_ON/OFF.
-     * Subsequent calls observe the cached state.  No mutex needed. */
     if (ReadNoFence( &gate_state ) != GATE_UNINIT) return;
 
-    /* Default ON; NSPA_THREAD_SHM=0 is the explicit escape hatch.  A/B
-     * validated bit-identical with the get_thread_info RPC fallback
-     * across all 7 covered query classes (4 thread states each — self,
-     * suspended worker, resumed worker, terminated worker), so the
-     * fast path is the standing default. */
+    /* Default ON; NSPA_THREAD_SHM=0 is the explicit escape hatch.
+     * A/B validated bit-identical with the get_thread_info RPC
+     * fallback across all 7 covered query classes. */
     env = getenv( "NSPA_THREAD_SHM" );
     next = (env && !strcmp( env, "0" )) ? GATE_OFF : GATE_ON;
 
@@ -286,15 +141,15 @@ static const shared_object_t *resolve_thread_object( HANDLE handle, object_id_t 
     struct obj_locator locator;
     NTSTATUS status;
 
-    pi_mutex_lock( &session_lock );
+    pi_mutex_lock( &cache_lock );
     if ((entry = cache_lookup( handle )))
     {
         object       = entry->object;
         *locator_id  = entry->locator_id;
-        pi_mutex_unlock( &session_lock );
+        pi_mutex_unlock( &cache_lock );
         return object;
     }
-    pi_mutex_unlock( &session_lock );
+    pi_mutex_unlock( &cache_lock );
 
     /* Cache miss — round-trip to the server.  Drop the lock during the
      * RPC; multiple threads may race and each insert a duplicate, but
@@ -310,7 +165,7 @@ static const shared_object_t *resolve_thread_object( HANDLE handle, object_id_t 
 
     if (status) return NULL;
 
-    pi_mutex_lock( &session_lock );
+    pi_mutex_lock( &cache_lock );
     if ((entry = cache_lookup( handle )))    /* re-check after lock re-acq */
     {
         object      = entry->object;
@@ -318,14 +173,14 @@ static const shared_object_t *resolve_thread_object( HANDLE handle, object_id_t 
     }
     else
     {
-        object = resolve_locator( locator );
+        object = nspa_shared_obj_resolve( locator );
         if (object)
         {
             cache_insert( handle, locator, object );
             *locator_id = locator.id;
         }
     }
-    pi_mutex_unlock( &session_lock );
+    pi_mutex_unlock( &cache_lock );
 
     return object;
 }
@@ -360,8 +215,8 @@ NTSTATUS nspa_thread_shm_query( HANDLE handle, struct nspa_thread_shm_snapshot *
      * the seqlock retry dominates over the field copies. */
     do
     {
-        shm_acquire_seqlock( object, &seq );
-        cur_id            = object->id;
+        nspa_shared_obj_acquire_seqlock( object, &seq );
+        cur_id             = object->id;
         snap.priority      = object->shm.thread.priority;
         snap.base_priority = object->shm.thread.base_priority;
         snap.affinity      = (ULONG_PTR)object->shm.thread.affinity;
@@ -372,19 +227,17 @@ NTSTATUS nspa_thread_shm_query( HANDLE handle, struct nspa_thread_shm_snapshot *
         snap.process_id    = (DWORD)object->shm.thread.process_id;
         snap.suspend       = (ULONG)object->shm.thread.suspend;
         snap.flags         = (ULONG)object->shm.thread.flags;
-    } while (!shm_release_seqlock( object, seq ));
+    } while (!nspa_shared_obj_release_seqlock( object, seq ));
 
     /* Slot recycling: if id no longer matches the locator we cached, the
      * server freed this slot (thread died) and possibly re-allocated it
      * to another object.  Evict the stale cache entry and report not-
-     * supported so the caller falls back to the RPC, which will
-     * authoritatively answer the query (and report STATUS_INVALID_HANDLE
-     * if appropriate). */
+     * supported so the caller falls back to the RPC. */
     if (cur_id != locator_id)
     {
-        pi_mutex_lock( &session_lock );
+        pi_mutex_lock( &cache_lock );
         cache_evict( handle );
-        pi_mutex_unlock( &session_lock );
+        pi_mutex_unlock( &cache_lock );
         return STATUS_NOT_SUPPORTED;
     }
 

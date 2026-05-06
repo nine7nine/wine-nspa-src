@@ -92,6 +92,7 @@ struct process
     struct list          rawinput_entry;  /* entry in the rawinput process list */
     struct list          kernel_object;   /* list of kernel object pointers */
     struct pe_image_info image_info;      /* main exe image info */
+    process_shm_t       *shared;          /* NSPA: shared-memory snapshot of process state for client-side seqlock reads.  Allocated in create_process, freed in process_destroy.  Mutators wrap field writes in SHARED_WRITE_BEGIN — see bypass-extension-plan-20260506.md §6. */
 #ifdef __linux__
     volatile unsigned char *client_poll_bitmap; /* NSPA E2: per-fd bitmap in first thread's request_shm tail */
     int                  request_channel_fd;    /* NSPA gamma: ntsync channel for shm-IPC */

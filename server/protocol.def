@@ -1357,6 +1357,33 @@ typedef volatile struct
     unsigned int         dpi_context;      /* DPI awareness context */
 } window_shm_t;
 
+/* NSPA: server-published per-thread state for client-side seqlock reads.
+ * Read by NtQueryInformationThread fast paths; written by server in
+ * SHARED_WRITE_BEGIN blocks at every thread-state mutator.  Same publication
+ * model as queue_shm_t/window_shm_t/etc. — see bypass-extension-plan-20260506.md
+ * §6 + thread-process-shm-mutator-audit-20260506.md. */
+typedef volatile struct
+{
+    int                  priority;          /* current effective thread priority */
+    int                  base_priority;     /* base priority level */
+    affinity_t           affinity;          /* affinity mask */
+    int                  exit_code;         /* thread exit code (STILL_PENDING when running) */
+    timeout_t            creation_time;     /* thread creation time */
+    timeout_t            exit_time;         /* thread exit time */
+    client_ptr_t         teb;               /* TEB address */
+    client_ptr_t         entry_point;       /* entry point */
+    int                  unix_pid;          /* Unix pid; -1 once process is gone */
+    int                  unix_tid;          /* Unix tid; -1 once process is gone */
+    unsigned int         suspend;           /* suspend count */
+    unsigned int         flags;             /* dbg_hidden / terminated / etc. — see thread_shm_flags below */
+} thread_shm_t;
+
+/* thread_shm_t->flags bits.  Bit numbering must match across builds; new
+ * bits append, never reuse. */
+#define THREAD_SHM_FLAG_DBG_HIDDEN     0x00000001
+#define THREAD_SHM_FLAG_TERMINATED     0x00000002
+#define THREAD_SHM_FLAG_DISABLE_BOOST  0x00000004
+
 typedef volatile union
 {
     desktop_shm_t        desktop;
@@ -1364,6 +1391,7 @@ typedef volatile union
     input_shm_t          input;
     class_shm_t          class;
     window_shm_t         window;
+    thread_shm_t         thread;
 } object_shm_t;
 
 typedef volatile struct

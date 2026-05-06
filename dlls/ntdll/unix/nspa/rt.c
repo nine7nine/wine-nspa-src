@@ -87,8 +87,26 @@ void nspa_rt_set_cached_priocls( int cls )
 }
 
 /* v1.2 map — HANDLE → unix_tid, populated at NtCreateThreadEx.
- * Open addressing with linear probe, 256 slots, lock-protected. */
-#define NSPA_RT_MAP_SIZE 256
+ * Open addressing with linear probe, lock-protected.
+ *
+ * Delete uses backward-shift compaction: when a slot is cleared, any
+ * forward-displaced entry whose ideal home is at-or-before the gap (in
+ * forward cyclic distance) is moved into the gap, and the gap walks
+ * forward.  Without this, a NULL slot in the middle of a probe chain
+ * would silently truncate every lookup for handles that hashed earlier
+ * in the same chain — and since `nspa_rt_map_remove` is called from
+ * `NtClose` while `nspa_rt_map_add` is called from `NtCreateThreadEx`,
+ * any long-lived process with thread churn will eventually hit it.
+ *
+ * Adds that find the table full now log a WARN and skip the entry.
+ * The lookup falls back to the wineserver-routed Tier-2 path, so this
+ * is degradation rather than failure, but the WARN surfaces it.
+ *
+ * Table grown from 256 to 1024 slots (16 KB at 16 B/entry).  Real Wine
+ * apps run with 100s of threads at peak (DAW plugin scan, browsers,
+ * games); 256 was tight enough that a single hash-cluster could wedge
+ * the probe chain even before the silent-fall-through hit. */
+#define NSPA_RT_MAP_SIZE 1024
 struct nspa_rt_map_entry
 {
     HANDLE handle;
@@ -115,10 +133,14 @@ void nspa_rt_map_add( HANDLE handle, int tid )
         {
             nspa_rt_map[idx].handle = handle;
             nspa_rt_map[idx].unix_tid = tid;
-            break;
+            pi_mutex_unlock( &nspa_rt_map_lock );
+            return;
         }
     }
     pi_mutex_unlock( &nspa_rt_map_lock );
+    WARN( "nspa_rt_map full (%u slots), handle %p tid %d not tracked — "
+          "Tier-2 RT push falls back to wineserver\n",
+          NSPA_RT_MAP_SIZE, handle, tid );
 }
 
 int nspa_rt_map_lookup( HANDLE handle )
@@ -144,21 +166,57 @@ int nspa_rt_map_lookup( HANDLE handle )
 
 void nspa_rt_map_remove( HANDLE handle )
 {
-    unsigned int i, p;
+    unsigned int i, p, j, home, dj_h, dj_i;
+    BOOL found = FALSE;
     if (!handle) return;
     pi_mutex_lock( &nspa_rt_map_lock );
     i = nspa_rt_map_hash( handle );
+
+    /* Locate the entry. */
+    j = i;
     for (p = 0; p < NSPA_RT_MAP_SIZE; p++)
     {
-        unsigned int idx = (i + p) % NSPA_RT_MAP_SIZE;
-        if (!nspa_rt_map[idx].handle) break;
-        if (nspa_rt_map[idx].handle == handle)
+        j = (i + p) % NSPA_RT_MAP_SIZE;
+        if (!nspa_rt_map[j].handle)
         {
-            nspa_rt_map[idx].handle = NULL;
-            nspa_rt_map[idx].unix_tid = 0;
+            pi_mutex_unlock( &nspa_rt_map_lock );
+            return;
+        }
+        if (nspa_rt_map[j].handle == handle)
+        {
+            found = TRUE;
             break;
         }
     }
+    if (!found)
+    {
+        pi_mutex_unlock( &nspa_rt_map_lock );
+        return;
+    }
+
+    /* Knuth Algorithm R backward-shift delete.  `j` tracks the current
+     * gap.  Walk `i` forward from `j`: for each occupied slot, if
+     * h(slot[i]) lies in the cyclic forward range (j, i] it must stay
+     * (it would be unreachable from its home if moved before j), so
+     * advance i without touching j; otherwise move slot[i] → slot[j],
+     * then j := i.  Stops at the first empty slot or after a full
+     * cycle.  This preserves the invariant "every slot in [home(k),
+     * pos(k)] is occupied" so lookup's stop-on-empty stays correct. */
+    i = j;
+    for (p = 1; p < NSPA_RT_MAP_SIZE; p++)
+    {
+        i = (i + 1) % NSPA_RT_MAP_SIZE;
+        if (i == j) break;
+        if (!nspa_rt_map[i].handle) break;
+        home = nspa_rt_map_hash( nspa_rt_map[i].handle );
+        dj_h = (home + NSPA_RT_MAP_SIZE - j) % NSPA_RT_MAP_SIZE;
+        dj_i = (i    + NSPA_RT_MAP_SIZE - j) % NSPA_RT_MAP_SIZE;
+        if (dj_h > 0 && dj_h <= dj_i) continue;
+        nspa_rt_map[j] = nspa_rt_map[i];
+        j = i;
+    }
+    nspa_rt_map[j].handle = NULL;
+    nspa_rt_map[j].unix_tid = 0;
     pi_mutex_unlock( &nspa_rt_map_lock );
 }
 

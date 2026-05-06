@@ -67,6 +67,7 @@ SOURCES = \
 	unix/nspa/sched_rt_probe.c \
 	unix/nspa/process_shm.c \
 	unix/nspa/server_disconnect.c \
+	unix/nspa/shared_obj_reader.c \
 	unix/nspa/thread_shm.c \
 	unix/process.c \
 	unix/registry.c \

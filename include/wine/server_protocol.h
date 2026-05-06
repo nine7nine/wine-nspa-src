@@ -1386,6 +1386,7 @@ typedef volatile struct
     int                  exit_code;
     timeout_t            start_time;
     timeout_t            end_time;
+    client_ptr_t         peb;
     process_id_t         id;
     process_id_t         parent_id;
     process_id_t         group_id;
@@ -1748,6 +1749,21 @@ struct get_thread_shm_request
     obj_handle_t handle;
 };
 struct get_thread_shm_reply
+{
+    struct reply_header __header;
+    struct obj_locator locator;
+};
+
+
+/* NSPA: locate the per-process shared-memory snapshot for client-side
+ * seqlock reads of NtQueryInformationProcess fields.  Same pattern as
+ * get_thread_shm. */
+struct get_process_shm_request
+{
+    struct request_header __header;
+    obj_handle_t handle;
+};
+struct get_process_shm_reply
 {
     struct reply_header __header;
     struct obj_locator locator;
@@ -6904,6 +6920,7 @@ enum request
     REQ_get_thread_info,
     REQ_get_thread_times,
     REQ_get_thread_shm,
+    REQ_get_process_shm,
     REQ_set_thread_info,
     REQ_suspend_thread,
     REQ_resume_thread,
@@ -7235,6 +7252,7 @@ union generic_request
     struct get_thread_info_request get_thread_info_request;
     struct get_thread_times_request get_thread_times_request;
     struct get_thread_shm_request get_thread_shm_request;
+    struct get_process_shm_request get_process_shm_request;
     struct set_thread_info_request set_thread_info_request;
     struct suspend_thread_request suspend_thread_request;
     struct resume_thread_request resume_thread_request;
@@ -7564,6 +7582,7 @@ union generic_reply
     struct get_thread_info_reply get_thread_info_reply;
     struct get_thread_times_reply get_thread_times_reply;
     struct get_thread_shm_reply get_thread_shm_reply;
+    struct get_process_shm_reply get_process_shm_reply;
     struct set_thread_info_reply set_thread_info_reply;
     struct suspend_thread_reply suspend_thread_reply;
     struct resume_thread_reply resume_thread_reply;
@@ -7874,6 +7893,6 @@ union generic_reply
     struct nspa_unregister_inproc_event_reply nspa_unregister_inproc_event_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 965
+#define SERVER_PROTOCOL_VERSION 967
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

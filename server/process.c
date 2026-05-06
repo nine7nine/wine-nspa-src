@@ -783,6 +783,7 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
         shared->exit_code     = process->exit_code;
         shared->start_time    = process->start_time;
         shared->end_time      = process->end_time;
+        shared->peb           = process->peb;
         shared->id            = process->id;
         shared->parent_id     = process->parent_id;
         shared->group_id      = process->group_id;
@@ -1612,6 +1613,13 @@ DECL_HANDLER(get_startup_info)
     }
     SHARED_WRITE_END;
     process->peb = req->peb;
+    /* NSPA: publish peb into per-process shared snapshot.  get_startup_info
+     * is the canonical site for setting process->peb. */
+    SHARED_WRITE_BEGIN( process->shared, process_shm_t )
+    {
+        shared->peb = process->peb;
+    }
+    SHARED_WRITE_END;
     init_process_tracing( process );
 
     if (!info) return;
@@ -1743,6 +1751,22 @@ DECL_HANDLER(get_process_image_name)
     }
     else set_error( STATUS_INVALID_HANDLE );
     release_object( process );
+}
+
+/* NSPA: return the obj_locator for process->shared so the client can
+ * resolve the per-process shared-memory snapshot through the session
+ * mapping and read NtQueryInformationProcess fields without round-
+ * tripping to the server.  See dlls/ntdll/unix/nspa/process_shm.c for
+ * the reader. */
+DECL_HANDLER(get_process_shm)
+{
+    struct process *process;
+
+    if ((process = get_process_from_handle( req->handle, PROCESS_QUERY_LIMITED_INFORMATION )))
+    {
+        if (process->shared) reply->locator = get_shared_object_locator( process->shared );
+        release_object( process );
+    }
 }
 
 /* retrieve information about a process memory usage */

@@ -1372,6 +1372,8 @@ typedef volatile struct
     timeout_t            exit_time;         /* thread exit time */
     client_ptr_t         teb;               /* TEB address */
     client_ptr_t         entry_point;       /* entry point */
+    thread_id_t          id;                /* this thread's NT tid (write-once at create) */
+    process_id_t         process_id;        /* owning process's NT pid (write-once at create) */
     int                  unix_pid;          /* Unix pid; -1 once process is gone */
     int                  unix_tid;          /* Unix tid; -1 once process is gone */
     unsigned int         suspend;           /* suspend count */

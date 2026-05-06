@@ -325,21 +325,42 @@ static const shared_object_t *resolve_thread_object( HANDLE handle, object_id_t 
     return object;
 }
 
-NTSTATUS nspa_thread_shm_query_affinity( HANDLE handle, ULONG_PTR *out )
+BOOL nspa_thread_shm_snapshot_is_terminated( const struct nspa_thread_shm_snapshot *s )
+{
+    return !!(s->flags & THREAD_SHM_FLAG_TERMINATED);
+}
+
+BOOL nspa_thread_shm_snapshot_is_dbg_hidden( const struct nspa_thread_shm_snapshot *s )
+{
+    return !!(s->flags & THREAD_SHM_FLAG_DBG_HIDDEN);
+}
+
+BOOL nspa_thread_shm_snapshot_is_disable_boost( const struct nspa_thread_shm_snapshot *s )
+{
+    return !!(s->flags & THREAD_SHM_FLAG_DISABLE_BOOST);
+}
+
+NTSTATUS nspa_thread_shm_query( HANDLE handle, struct nspa_thread_shm_snapshot *out )
 {
     const shared_object_t *object;
     object_id_t locator_id, cur_id;
     UINT64 seq;
-    affinity_t affinity;
+    struct nspa_thread_shm_snapshot snap;
 
     if (!nspa_thread_shm_enabled()) return STATUS_NOT_SUPPORTED;
     if (!(object = resolve_thread_object( handle, &locator_id ))) return STATUS_NOT_SUPPORTED;
 
+    /* Single seqlock cycle pulls every cached field; callers pick the
+     * one they need.  Cost is the same as a single-field read because
+     * the seqlock retry dominates over the field copies. */
     do
     {
         shm_acquire_seqlock( object, &seq );
-        cur_id   = object->id;
-        affinity = object->shm.thread.affinity;
+        cur_id          = object->id;
+        snap.affinity    = (ULONG_PTR)object->shm.thread.affinity;
+        snap.entry_point = object->shm.thread.entry_point;
+        snap.suspend     = (ULONG)object->shm.thread.suspend;
+        snap.flags       = (ULONG)object->shm.thread.flags;
     } while (!shm_release_seqlock( object, seq ));
 
     /* Slot recycling: if id no longer matches the locator we cached, the
@@ -356,6 +377,6 @@ NTSTATUS nspa_thread_shm_query_affinity( HANDLE handle, ULONG_PTR *out )
         return STATUS_NOT_SUPPORTED;
     }
 
-    *out = (ULONG_PTR)affinity;
+    *out = snap;
     return STATUS_SUCCESS;
 }

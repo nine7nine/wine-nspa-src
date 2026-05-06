@@ -221,11 +221,13 @@ void nspa_process_shm_init(void)
 
     if (ReadNoFence( &gate_state ) != GATE_UNINIT) return;
 
-    /* Default OFF for now: process_shm is in A/B bring-up.  Set
-     * NSPA_PROCESS_SHM=1 to enable.  Polarity flips after A/B
-     * validation, mirroring the thread_shm rollout. */
+    /* Default ON; NSPA_PROCESS_SHM=0 is the explicit escape hatch.
+     * A/B validated bit-identical with the get_process_info RPC
+     * fallback across all 6 covered query classes (stable fields —
+     * pid + create_time legitimately vary across wine process
+     * instances), so the fast path is the standing default. */
     env = getenv( "NSPA_PROCESS_SHM" );
-    next = (env && !strcmp( env, "1" )) ? GATE_ON : GATE_OFF;
+    next = (env && !strcmp( env, "0" )) ? GATE_OFF : GATE_ON;
 
     InterlockedCompareExchange( &gate_state, next, expected );
 }

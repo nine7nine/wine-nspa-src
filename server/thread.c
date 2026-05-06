@@ -2251,6 +2251,21 @@ DECL_HANDLER(get_thread_times)
     }
 }
 
+/* NSPA: return the obj_locator for thread->shared so the client can
+ * resolve the per-thread shared-memory snapshot through the session
+ * mapping and read NtQueryInformationThread fields without round-tripping
+ * to the server.  See dlls/ntdll/unix/nspa/thread_shm.c for the reader. */
+DECL_HANDLER(get_thread_shm)
+{
+    struct thread *thread;
+
+    if ((thread = get_thread_from_handle( req->handle, THREAD_QUERY_LIMITED_INFORMATION )))
+    {
+        if (thread->shared) reply->locator = get_shared_object_locator( thread->shared );
+        release_object( thread );
+    }
+}
+
 /* set information about a thread */
 DECL_HANDLER(set_thread_info)
 {

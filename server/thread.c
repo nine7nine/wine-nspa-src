@@ -654,6 +654,31 @@ struct thread *create_thread( int fd, struct process *process, unsigned int flag
      * thread without a publication path, which client readers can't safely
      * fall back from. */
     if (!(thread->shared = alloc_shared_object( sizeof(*thread->shared) ))) goto error;
+    /* NSPA: initial publish.  alloc_shared_object marks the page
+     * uninitialized; readers won't consume it until commit 3 ships, but
+     * we must establish a coherent snapshot from the post-init_thread_structure
+     * + post-process-inherit field state so subsequent SHARED_WRITE_BEGIN
+     * mutators always see a fully populated published copy.  unix_pid/tid,
+     * teb, entry_point are still placeholders (-1/0) here; they become
+     * real in init_process / init_thread / get_startup_info handlers,
+     * each of which wraps its own write. */
+    SHARED_WRITE_BEGIN( thread->shared, thread_shm_t )
+    {
+        shared->priority      = thread->priority;
+        shared->base_priority = thread->base_priority;
+        shared->affinity      = thread->affinity;
+        shared->exit_code     = thread->exit_code;
+        shared->creation_time = thread->creation_time;
+        shared->exit_time     = thread->exit_time;
+        shared->teb           = thread->teb;
+        shared->entry_point   = thread->entry_point;
+        shared->unix_pid      = thread->unix_pid;
+        shared->unix_tid      = thread->unix_tid;
+        shared->suspend       = thread->suspend;
+        shared->flags         = (thread->dbg_hidden    ? THREAD_SHM_FLAG_DBG_HIDDEN    : 0)
+                              | (thread->disable_boost ? THREAD_SHM_FLAG_DISABLE_BOOST : 0);
+    }
+    SHARED_WRITE_END;
 
 #ifdef __linux__
     /* NSPA: allocate the per-thread request_shm region used as the
@@ -681,8 +706,22 @@ struct thread *create_thread( int fd, struct process *process, unsigned int flag
     if (is_sched) process->sched_thread = (struct thread *)grab_object( thread );
     else add_process_thread( process, thread );
 
-    if (flags & THREAD_CREATE_FLAGS_CREATE_SUSPENDED) thread->suspend++;
+    if (flags & THREAD_CREATE_FLAGS_CREATE_SUSPENDED)
+    {
+        thread->suspend++;
+        SHARED_WRITE_BEGIN( thread->shared, thread_shm_t )
+        {
+            shared->suspend = thread->suspend;
+        }
+        SHARED_WRITE_END;
+    }
     thread->dbg_hidden = !!(flags & THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER);
+    SHARED_WRITE_BEGIN( thread->shared, thread_shm_t )
+    {
+        shared->flags = thread->dbg_hidden ? (shared->flags | THREAD_SHM_FLAG_DBG_HIDDEN)
+                                           : (shared->flags & ~THREAD_SHM_FLAG_DBG_HIDDEN);
+    }
+    SHARED_WRITE_END;
     thread->bypass_proc_suspend = !!(flags & THREAD_CREATE_FLAGS_BYPASS_PROCESS_FREEZE);
     return thread;
 
@@ -946,7 +985,15 @@ int set_thread_affinity( struct thread *thread, affinity_t affinity )
         ret = sched_setaffinity( thread->unix_tid, sizeof(set), &set );
     }
 #endif
-    if (!ret) thread->affinity = affinity;
+    if (!ret)
+    {
+        thread->affinity = affinity;
+        SHARED_WRITE_BEGIN( thread->shared, thread_shm_t )
+        {
+            shared->affinity = affinity;
+        }
+        SHARED_WRITE_END;
+    }
     return ret;
 }
 
@@ -989,6 +1036,11 @@ unsigned int set_thread_priority( struct thread *thread, int priority )
     if (priority_class != PROCESS_PRIOCLASS_REALTIME && priority >= LOW_REALTIME_PRIORITY) return STATUS_PRIVILEGE_NOT_HELD;
 
     thread->priority = priority;
+    SHARED_WRITE_BEGIN( thread->shared, thread_shm_t )
+    {
+        shared->priority = priority;
+    }
+    SHARED_WRITE_END;
 
     /* if thread is gone or hasn't started yet, this will be called again from init_thread with a unix_tid */
     if (thread->state == RUNNING && thread->unix_tid != -1) apply_thread_priority( thread );
@@ -1015,6 +1067,11 @@ unsigned int set_thread_base_priority( struct thread *thread, int base_priority 
     }
 
     thread->base_priority = base_priority;
+    SHARED_WRITE_BEGIN( thread->shared, thread_shm_t )
+    {
+        shared->base_priority = base_priority;
+    }
+    SHARED_WRITE_END;
 
     switch (base_priority)
     {
@@ -1035,6 +1092,12 @@ unsigned int set_thread_base_priority( struct thread *thread, int base_priority 
 void set_thread_disable_boost( struct thread *thread, int disable_boost )
 {
     thread->disable_boost = disable_boost;
+    SHARED_WRITE_BEGIN( thread->shared, thread_shm_t )
+    {
+        shared->flags = disable_boost ? (shared->flags | THREAD_SHM_FLAG_DISABLE_BOOST)
+                                      : (shared->flags & ~THREAD_SHM_FLAG_DISABLE_BOOST);
+    }
+    SHARED_WRITE_END;
     apply_thread_priority( thread );
 }
 
@@ -1073,9 +1136,23 @@ static void set_thread_info( struct thread *thread,
     if (req->mask & SET_THREAD_INFO_TOKEN)
         security_set_thread_token( thread, req->token );
     if (req->mask & SET_THREAD_INFO_ENTRYPOINT)
+    {
         thread->entry_point = req->entry_point;
+        SHARED_WRITE_BEGIN( thread->shared, thread_shm_t )
+        {
+            shared->entry_point = req->entry_point;
+        }
+        SHARED_WRITE_END;
+    }
     if (req->mask & SET_THREAD_INFO_DBG_HIDDEN)
+    {
         thread->dbg_hidden = 1;
+        SHARED_WRITE_BEGIN( thread->shared, thread_shm_t )
+        {
+            shared->flags |= THREAD_SHM_FLAG_DBG_HIDDEN;
+        }
+        SHARED_WRITE_END;
+    }
     if (req->mask & SET_THREAD_INFO_DISABLE_BOOST)
         set_thread_disable_boost( thread, req->disable_boost );
     if (req->mask & SET_THREAD_INFO_DESCRIPTION)
@@ -1119,6 +1196,11 @@ int suspend_thread( struct thread *thread )
     {
         if (!is_thread_suspended( thread )) stop_thread( thread );
         thread->suspend++;
+        SHARED_WRITE_BEGIN( thread->shared, thread_shm_t )
+        {
+            shared->suspend = thread->suspend;
+        }
+        SHARED_WRITE_END;
     }
     else set_error( STATUS_SUSPEND_COUNT_EXCEEDED );
     return old_count;
@@ -1130,10 +1212,31 @@ int resume_thread( struct thread *thread )
     int old_count = thread->suspend;
     if (thread->suspend > 0)
     {
-        if (!(--thread->suspend)) resume_delayed_debug_events( thread );
+        unsigned int new_count = --thread->suspend;
+        SHARED_WRITE_BEGIN( thread->shared, thread_shm_t )
+        {
+            shared->suspend = new_count;
+        }
+        SHARED_WRITE_END;
+        if (!new_count) resume_delayed_debug_events( thread );
         if (!is_thread_suspended( thread )) wake_thread( thread );
     }
     return old_count;
+}
+
+/* NSPA: cross-file exit_code writer.  Routes the four out-of-thread.c
+ * exit_code writers (request.c shutdown / handler error / legacy socket
+ * error paths + process.c process-exit cascade) through a single
+ * SHARED_WRITE_BEGIN-wrapped store, so the per-thread shared snapshot
+ * stays coherent with thread->exit_code on the death paths. */
+void thread_set_exit_code( struct thread *thread, int exit_code )
+{
+    thread->exit_code = exit_code;
+    SHARED_WRITE_BEGIN( thread->shared, thread_shm_t )
+    {
+        shared->exit_code = exit_code;
+    }
+    SHARED_WRITE_END;
 }
 
 /* add a thread to an object wait queue; return 1 if OK, 0 on error */
@@ -1785,6 +1888,12 @@ void kill_thread( struct thread *thread, int violent_death )
     if (thread->state == TERMINATED) return;  /* already killed */
     thread->state = TERMINATED;
     thread->exit_time = current_time;
+    SHARED_WRITE_BEGIN( thread->shared, thread_shm_t )
+    {
+        shared->flags    |= THREAD_SHM_FLAG_TERMINATED;
+        shared->exit_time = thread->exit_time;
+    }
+    SHARED_WRITE_END;
     if (current == thread) current = NULL;
     if (debug_level)
         fprintf( stderr,"%04x: *killed* exit_code=%d\n",
@@ -1929,10 +2038,29 @@ DECL_HANDLER(init_process)
 
     current->unix_pid = process->unix_pid = req->unix_pid;
     current->unix_tid = req->unix_tid;
+    /* NSPA: publish the freshly-set thread unix_pid/tid pair into the
+     * per-thread shared snapshot (initial publish at create_thread had only
+     * the -1 placeholders).  process->unix_pid is process scope and is
+     * handled when process_shm_t lands in a later commit. */
+    SHARED_WRITE_BEGIN( current->shared, thread_shm_t )
+    {
+        shared->unix_pid = current->unix_pid;
+        shared->unix_tid = current->unix_tid;
+    }
+    SHARED_WRITE_END;
     process->start_time = current_time;
 
     if (!process->parent_id)
-        process->affinity = current->affinity = get_thread_affinity( current );
+    {
+        affinity_t aff = get_thread_affinity( current );
+        process->affinity   = aff;
+        current->affinity   = aff;
+        SHARED_WRITE_BEGIN( current->shared, thread_shm_t )
+        {
+            shared->affinity = aff;
+        }
+        SHARED_WRITE_END;
+    }
     else
         set_thread_affinity( current, current->affinity );
 
@@ -1998,6 +2126,17 @@ DECL_HANDLER(init_thread)
     current->unix_tid = req->unix_tid;
     current->teb      = req->teb;
     current->entry_point = req->entry;
+    /* NSPA: publish thread identity fields into the per-thread shared
+     * snapshot.  Initial publish at create_thread carried only the -1/0
+     * placeholders set in init_thread_structure. */
+    SHARED_WRITE_BEGIN( current->shared, thread_shm_t )
+    {
+        shared->unix_pid    = current->unix_pid;
+        shared->unix_tid    = current->unix_tid;
+        shared->teb         = current->teb;
+        shared->entry_point = current->entry_point;
+    }
+    SHARED_WRITE_END;
 
     init_thread_context( current );
     if (current == first_thread) generate_startup_debug_events( current->process );
@@ -2033,7 +2172,7 @@ DECL_HANDLER(terminate_thread)
 
     if ((thread = get_thread_from_handle( req->handle, THREAD_TERMINATE )))
     {
-        thread->exit_code = req->exit_code;
+        thread_set_exit_code( thread, req->exit_code );
         if (thread != current) kill_thread( thread, 1 );
         else reply->self = 1;
         cancel_terminating_thread_asyncs( thread );

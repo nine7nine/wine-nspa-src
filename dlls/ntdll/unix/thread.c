@@ -2174,10 +2174,11 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
     {
         const ULONG_PTR affinity_mask = get_system_affinity_mask();
         ULONG_PTR affinity = 0;
+        struct nspa_thread_shm_snapshot snap;
 
         /* NSPA: shmem fast path.  STATUS_NOT_SUPPORTED → fall back to RPC. */
-        status = nspa_thread_shm_query_affinity( handle, &affinity );
-        if (status == STATUS_SUCCESS) affinity &= affinity_mask;
+        status = nspa_thread_shm_query( handle, &snap );
+        if (status == STATUS_SUCCESS) affinity = snap.affinity & affinity_mask;
         else
         {
             SERVER_START_REQ( get_thread_info )
@@ -2262,19 +2263,28 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
 
     case ThreadQuerySetWin32StartAddress:
     {
-        SERVER_START_REQ( get_thread_info )
+        PRTL_THREAD_START_ROUTINE entry = NULL;
+        struct nspa_thread_shm_snapshot snap;
+
+        /* NSPA: shmem fast path. */
+        status = nspa_thread_shm_query( handle, &snap );
+        if (status == STATUS_SUCCESS) entry = wine_server_get_ptr( snap.entry_point );
+        else
         {
-            req->handle = wine_server_obj_handle( handle );
-            req->access = THREAD_QUERY_INFORMATION;
-            status = wine_server_call( req );
-            if (status == STATUS_SUCCESS)
+            SERVER_START_REQ( get_thread_info )
             {
-                PRTL_THREAD_START_ROUTINE entry = wine_server_get_ptr( reply->entry_point );
-                if (data) memcpy( data, &entry, min( length, sizeof(entry) ) );
-                if (ret_len) *ret_len = min( length, sizeof(entry) );
+                req->handle = wine_server_obj_handle( handle );
+                req->access = THREAD_QUERY_INFORMATION;
+                status = wine_server_call( req );
+                if (status == STATUS_SUCCESS) entry = wine_server_get_ptr( reply->entry_point );
             }
+            SERVER_END_REQ;
         }
-        SERVER_END_REQ;
+        if (status == STATUS_SUCCESS)
+        {
+            if (data) memcpy( data, &entry, min( length, sizeof(entry) ) );
+            if (ret_len) *ret_len = min( length, sizeof(entry) );
+        }
         return status;
     }
 
@@ -2282,16 +2292,23 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
     {
         const ULONG_PTR affinity_mask = get_system_affinity_mask();
         GROUP_AFFINITY affinity;
+        struct nspa_thread_shm_snapshot snap;
 
         memset( &affinity, 0, sizeof(affinity) );
         affinity.Group = 0; /* Wine only supports max 64 processors */
 
-        SERVER_START_REQ( get_thread_info )
+        /* NSPA: shmem fast path. */
+        status = nspa_thread_shm_query( handle, &snap );
+        if (status == STATUS_SUCCESS) affinity.Mask = snap.affinity & affinity_mask;
+        else
         {
-            req->handle = wine_server_obj_handle( handle );
-            if (!(status = wine_server_call( req ))) affinity.Mask = reply->affinity & affinity_mask;
+            SERVER_START_REQ( get_thread_info )
+            {
+                req->handle = wine_server_obj_handle( handle );
+                if (!(status = wine_server_call( req ))) affinity.Mask = reply->affinity & affinity_mask;
+            }
+            SERVER_END_REQ;
         }
-        SERVER_END_REQ;
         if (status == STATUS_SUCCESS)
         {
             if (data) memcpy( data, &affinity, min( length, sizeof(affinity) ));
@@ -2310,15 +2327,22 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
 
     case ThreadIsTerminated:
     {
-        ULONG terminated;
+        ULONG terminated = 0;
+        struct nspa_thread_shm_snapshot snap;
 
         if (length != sizeof(ULONG)) return STATUS_INFO_LENGTH_MISMATCH;
-        SERVER_START_REQ( get_thread_info )
+        /* NSPA: shmem fast path. */
+        status = nspa_thread_shm_query( handle, &snap );
+        if (status == STATUS_SUCCESS) terminated = nspa_thread_shm_snapshot_is_terminated( &snap );
+        else
         {
-            req->handle = wine_server_obj_handle( handle );
-            if (!(status = wine_server_call( req ))) terminated = !!(reply->flags & GET_THREAD_INFO_FLAG_TERMINATED);
+            SERVER_START_REQ( get_thread_info )
+            {
+                req->handle = wine_server_obj_handle( handle );
+                if (!(status = wine_server_call( req ))) terminated = !!(reply->flags & GET_THREAD_INFO_FLAG_TERMINATED);
+            }
+            SERVER_END_REQ;
         }
-        SERVER_END_REQ;
         if (!status)
         {
             *(ULONG *)data = terminated;
@@ -2328,16 +2352,26 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
     }
 
     case ThreadSuspendCount:
+    {
+        struct nspa_thread_shm_snapshot snap;
+
         if (length != sizeof(ULONG)) return STATUS_INFO_LENGTH_MISMATCH;
         if (!data) return STATUS_ACCESS_VIOLATION;
 
-        SERVER_START_REQ( get_thread_info )
+        /* NSPA: shmem fast path. */
+        status = nspa_thread_shm_query( handle, &snap );
+        if (status == STATUS_SUCCESS) *(ULONG *)data = snap.suspend;
+        else
         {
-            req->handle = wine_server_obj_handle( handle );
-            if (!(status = wine_server_call( req ))) *(ULONG *)data = reply->suspend_count;
+            SERVER_START_REQ( get_thread_info )
+            {
+                req->handle = wine_server_obj_handle( handle );
+                if (!(status = wine_server_call( req ))) *(ULONG *)data = reply->suspend_count;
+            }
+            SERVER_END_REQ;
         }
-        SERVER_END_REQ;
         return status;
+    }
 
     case ThreadNameInformation:
     {
@@ -2373,6 +2407,9 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
         return get_thread_wow64_context( handle, data, length );
 
     case ThreadHideFromDebugger:
+    {
+        struct nspa_thread_shm_snapshot snap;
+
         /* TP Shell Service depends on ThreadHideFromDebugger returning
          * STATUS_ACCESS_VIOLATION if *ret_len is not writable, before
          * any other checks. Despite the status, the variable does not
@@ -2381,32 +2418,49 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
 
         if (length != sizeof(BOOLEAN)) return STATUS_INFO_LENGTH_MISMATCH;
         if (!data) return STATUS_ACCESS_VIOLATION;
-        SERVER_START_REQ( get_thread_info )
+        /* NSPA: shmem fast path. */
+        status = nspa_thread_shm_query( handle, &snap );
+        if (status == STATUS_SUCCESS) *(BOOLEAN*)data = nspa_thread_shm_snapshot_is_dbg_hidden( &snap );
+        else
         {
-            req->handle = wine_server_obj_handle( handle );
-            req->access = THREAD_QUERY_INFORMATION;
-            if ((status = wine_server_call( req ))) return status;
-            *(BOOLEAN*)data = !!(reply->flags & GET_THREAD_INFO_FLAG_DBG_HIDDEN);
+            SERVER_START_REQ( get_thread_info )
+            {
+                req->handle = wine_server_obj_handle( handle );
+                req->access = THREAD_QUERY_INFORMATION;
+                if ((status = wine_server_call( req ))) return status;
+                *(BOOLEAN*)data = !!(reply->flags & GET_THREAD_INFO_FLAG_DBG_HIDDEN);
+            }
+            SERVER_END_REQ;
         }
-        SERVER_END_REQ;
         if (ret_len) *ret_len = sizeof(BOOLEAN);
         return STATUS_SUCCESS;
+    }
 
     case ThreadPriorityBoost:
     {
+        ULONG disable_boost = 0;
+        struct nspa_thread_shm_snapshot snap;
+
         if (length != sizeof(ULONG)) return STATUS_INFO_LENGTH_MISMATCH;
-        SERVER_START_REQ( get_thread_info )
+        /* NSPA: shmem fast path. */
+        status = nspa_thread_shm_query( handle, &snap );
+        if (status == STATUS_SUCCESS) disable_boost = nspa_thread_shm_snapshot_is_disable_boost( &snap );
+        else
         {
-            req->handle = wine_server_obj_handle( handle );
-            status = wine_server_call( req );
-            if (status == STATUS_SUCCESS)
+            SERVER_START_REQ( get_thread_info )
             {
-                ULONG disable_boost = !!(reply->flags & GET_THREAD_INFO_FLAG_DISABLE_BOOST);
-                if (data) memcpy( data, &disable_boost, sizeof(disable_boost) );
-                if (ret_len) *ret_len = sizeof(disable_boost);
+                req->handle = wine_server_obj_handle( handle );
+                status = wine_server_call( req );
+                if (status == STATUS_SUCCESS)
+                    disable_boost = !!(reply->flags & GET_THREAD_INFO_FLAG_DISABLE_BOOST);
             }
+            SERVER_END_REQ;
         }
-        SERVER_END_REQ;
+        if (status == STATUS_SUCCESS)
+        {
+            if (data) memcpy( data, &disable_boost, sizeof(disable_boost) );
+            if (ret_len) *ret_len = sizeof(disable_boost);
+        }
         return status;
     }
 

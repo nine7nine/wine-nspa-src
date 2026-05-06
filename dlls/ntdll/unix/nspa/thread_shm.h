@@ -26,6 +26,27 @@
 #define __NSPA_THREAD_SHM_H
 
 #include "winternl.h"
+#include "wine/server_protocol.h"  /* client_ptr_t */
+
+/* Snapshot of the fields in thread_shm_t that callers actually read.
+ * Filled atomically by nspa_thread_shm_query under one seqlock cycle;
+ * callers pick the field they need.  flags are the THREAD_SHM_FLAG_*
+ * bits defined in server/protocol.def — kept opaque here so callers
+ * stay decoupled from the wire format. */
+struct nspa_thread_shm_snapshot
+{
+    ULONG_PTR    affinity;     /* ULONG_PTR-cast affinity mask */
+    client_ptr_t entry_point;  /* Win32 entry point */
+    ULONG        suspend;      /* current suspend count */
+    ULONG        flags;        /* THREAD_SHM_FLAG_* — see thread_shm.c bit accessors */
+};
+
+/* Bit accessors for snapshot.flags.  Keep these in sync with
+ * server/protocol.def THREAD_SHM_FLAG_* values; the wire format is
+ * not exposed in this header so callers stay decoupled. */
+extern BOOL nspa_thread_shm_snapshot_is_terminated   ( const struct nspa_thread_shm_snapshot *s );
+extern BOOL nspa_thread_shm_snapshot_is_dbg_hidden   ( const struct nspa_thread_shm_snapshot *s );
+extern BOOL nspa_thread_shm_snapshot_is_disable_boost( const struct nspa_thread_shm_snapshot *s );
 
 /* Read NSPA_THREAD_SHM env-gate and lazily set up shared-session
  * mapping primitives.  Idempotent; safe to call multiple times. */
@@ -35,10 +56,10 @@ extern void nspa_thread_shm_init(void);
  * read the cached static — branchy but trivially predictable. */
 extern BOOL nspa_thread_shm_enabled(void);
 
-/* Read the current affinity mask for the given thread handle from the
- * shared snapshot.  Returns STATUS_SUCCESS on hit; STATUS_NOT_SUPPORTED
- * if the gate is off or the shmem path can't satisfy the read (caller
- * falls back to the get_thread_info RPC). */
-extern NTSTATUS nspa_thread_shm_query_affinity( HANDLE handle, ULONG_PTR *out );
+/* Read all snapshot fields for the given thread handle atomically
+ * under one seqlock cycle.  Returns STATUS_SUCCESS on hit;
+ * STATUS_NOT_SUPPORTED if the gate is off or the shmem path can't
+ * satisfy the read (caller falls back to the get_thread_info RPC). */
+extern NTSTATUS nspa_thread_shm_query( HANDLE handle, struct nspa_thread_shm_snapshot *out );
 
 #endif /* __NSPA_THREAD_SHM_H */

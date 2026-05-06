@@ -2050,6 +2050,13 @@ DECL_HANDLER(map_image_view)
             SHARED_WRITE_END;
             current->process->machine = (view->image.image_flags & IMAGE_FLAGS_ComPlusNativeReady) ?
                                          native_machine : req->machine;
+            /* NSPA: publish process machine into the per-process shared snapshot.
+             * Image-load (.NET-aware) path is a cross-file writer of process state. */
+            SHARED_WRITE_BEGIN( current->process->shared, process_shm_t )
+            {
+                shared->machine = current->process->machine;
+            }
+            SHARED_WRITE_END;
         }
 
         if (view->base != (mapping->image.map_addr ? mapping->image.map_addr : mapping->image.base) + req->offset)
@@ -2101,6 +2108,13 @@ DECL_HANDLER(map_builtin_view)
             }
             SHARED_WRITE_END;
             current->process->machine = image->machine;
+            /* NSPA: publish process machine into the per-process shared snapshot.
+             * Builtin-image-load path is a cross-file writer of process state. */
+            SHARED_WRITE_BEGIN( current->process->shared, process_shm_t )
+            {
+                shared->machine = current->process->machine;
+            }
+            SHARED_WRITE_END;
         }
     }
 }

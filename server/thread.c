@@ -2049,6 +2049,13 @@ DECL_HANDLER(init_process)
     }
     SHARED_WRITE_END;
     process->start_time = current_time;
+    /* NSPA: publish start_time into per-process shared snapshot.  init_process
+     * is the canonical site for setting process->start_time. */
+    SHARED_WRITE_BEGIN( process->shared, process_shm_t )
+    {
+        shared->start_time = process->start_time;
+    }
+    SHARED_WRITE_END;
 
     if (!process->parent_id)
     {
@@ -2056,6 +2063,15 @@ DECL_HANDLER(init_process)
         process->affinity   = aff;
         current->affinity   = aff;
         SHARED_WRITE_BEGIN( current->shared, thread_shm_t )
+        {
+            shared->affinity = aff;
+        }
+        SHARED_WRITE_END;
+        /* NSPA: publish process affinity into per-process shared snapshot.
+         * This branch only fires when there's no parent (first process); the
+         * else branch goes through set_thread_affinity which doesn't touch
+         * process->affinity. */
+        SHARED_WRITE_BEGIN( process->shared, process_shm_t )
         {
             shared->affinity = aff;
         }

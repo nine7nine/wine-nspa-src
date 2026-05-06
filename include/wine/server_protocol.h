@@ -1368,6 +1368,38 @@ typedef volatile struct
 #define THREAD_SHM_FLAG_TERMINATED     0x00000002
 #define THREAD_SHM_FLAG_DISABLE_BOOST  0x00000004
 
+/* NSPA: server-published per-process state for client-side seqlock reads.
+ * Read by NtQueryInformationProcess fast paths + ThreadBasicInformation's
+ * pid lookup; written by server in SHARED_WRITE_BEGIN blocks at every
+ * process-state mutator.  Same publication model as thread_shm_t — see
+ * bypass-extension-plan-20260506.md §6 + thread-process-shm-mutator-audit-20260506.md.
+ *
+ * Excluded from the cached set:
+ *   - running_threads: written on every thread create/exit, low value as cached read
+ *   - unix_pid:        used by SIGKILL machinery, not by NtQueryInformationProcess
+ *   - token:           full security descriptor, too complex for shmem publishing */
+typedef volatile struct
+{
+    int                  priority;
+    int                  base_priority;
+    affinity_t           affinity;
+    int                  exit_code;
+    timeout_t            start_time;
+    timeout_t            end_time;
+    process_id_t         id;
+    process_id_t         parent_id;
+    process_id_t         group_id;
+    unsigned int         session_id;
+    unsigned int         suspend;
+    unsigned int         thread_flags;
+    unsigned short       machine;
+    unsigned int         flags;
+} process_shm_t;
+
+/* process_shm_t->flags bits.  Bit numbering must match across builds; new
+ * bits append, never reuse. */
+#define PROCESS_SHM_FLAG_DISABLE_BOOST 0x00000001
+
 typedef volatile union
 {
     desktop_shm_t        desktop;
@@ -1376,6 +1408,7 @@ typedef volatile union
     class_shm_t          class;
     window_shm_t         window;
     thread_shm_t         thread;
+    process_shm_t        process;
 } object_shm_t;
 
 typedef volatile struct
@@ -7841,6 +7874,6 @@ union generic_reply
     struct nspa_unregister_inproc_event_reply nspa_unregister_inproc_event_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 964
+#define SERVER_PROTOCOL_VERSION 965
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

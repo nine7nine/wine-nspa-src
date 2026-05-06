@@ -181,6 +181,10 @@ extern void set_thread_disable_boost( struct thread *thread, int disable_boost )
 extern int set_thread_affinity( struct thread *thread, affinity_t affinity );
 extern int suspend_thread( struct thread *thread );
 extern int resume_thread( struct thread *thread );
+/* NSPA: cross-file exit_code writer.  Mirrors thread->exit_code into
+ * thread->shared->exit_code under the seqlock.  Used by request.c shutdown
+ * + handler error paths and process.c process-exit cascade. */
+extern void thread_set_exit_code( struct thread *thread, int exit_code );
 
 /* ptrace functions */
 

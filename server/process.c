@@ -968,7 +968,7 @@ static void terminate_process( struct process *process, struct thread *skip, int
 restart:
     LIST_FOR_EACH_ENTRY( thread, &process->thread_list, struct thread, proc_entry )
     {
-        if (exit_code) thread->exit_code = exit_code;
+        if (exit_code) thread_set_exit_code( thread, exit_code );
         if (thread == skip) continue;
         if (thread->state == TERMINATED) continue;
         kill_thread( thread, 1 );
@@ -1530,6 +1530,14 @@ DECL_HANDLER(get_startup_info)
     data_size_t size;
 
     current->teb = req->teb;
+    /* NSPA: publish teb into per-thread shared snapshot.  get_startup_info
+     * is the canonical site for setting current->teb on threads not routed
+     * through init_thread (e.g. process bootstrap path). */
+    SHARED_WRITE_BEGIN( current->shared, thread_shm_t )
+    {
+        shared->teb = current->teb;
+    }
+    SHARED_WRITE_END;
     process->peb = req->peb;
     init_process_tracing( process );
 

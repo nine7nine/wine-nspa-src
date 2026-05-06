@@ -78,7 +78,19 @@ static int open_proc_lwpctl( struct thread *thread )
     if ((fd = open( buffer, O_WRONLY )) == -1)
     {
         if (errno == ENOENT)  /* probably got killed */
+        {
             thread->unix_pid = thread->unix_tid = -1;
+            /* NSPA: mirror the death stamp into the per-thread shared
+             * snapshot.  USE_PROCFS is Solaris-only; this path doesn't
+             * compile on Linux so it is effectively a no-op for the
+             * primary NSPA target, but kept correct for completeness. */
+            SHARED_WRITE_BEGIN( thread->shared, thread_shm_t )
+            {
+                shared->unix_pid = -1;
+                shared->unix_tid = -1;
+            }
+            SHARED_WRITE_END;
+        }
         else
             file_set_error();
     }

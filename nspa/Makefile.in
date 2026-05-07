@@ -29,6 +29,8 @@ SOURCES = \
 	tests/test-cross-boost.c \
 	tests/test-event-set-pi.c \
 	tests/test-event-set-pi-stress.c \
+	tests/test-huge-decommit.c \
+	tests/test-huge-decommit.sh \
 	tests/test-mixed-load-stress.c \
 	tests/test-mutex-pi-stress.c \
 	tests/test-wait-rejects-channel.c
@@ -48,6 +50,8 @@ INSTALL_LIB = \
 	tests/test-cross-boost.c \
 	tests/test-event-set-pi.c \
 	tests/test-event-set-pi-stress.c \
+	tests/test-huge-decommit.c \
+	tests/test-huge-decommit.sh \
 	tests/test-mixed-load-stress.c \
 	tests/test-mutex-pi-stress.c \
 	tests/test-wait-rejects-channel.c

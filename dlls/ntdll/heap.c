@@ -1059,7 +1059,7 @@ static void *allocate_region( struct heap *heap, ULONG flags, SIZE_T *region_siz
     *commit_size = ROUND_SIZE( *commit_size, align - 1 );
 
     /* NSPA Phase 3: opportunistic hugetlb arena backing.  Eligible when:
-     *   - global gate active (NSPA_HEAP_HUGEPAGE_ARENAS or NSPA_RT_PRIO);
+     *   - global gate active (NSPA_RT_PRIO presence);
      *   - heap is growable (no hard caller-set max_size constraint);
      *   - protection is PAGE_READWRITE only (excludes EXEC heaps);
      *   - rounded-up region fits in a sensible margin (skip if the

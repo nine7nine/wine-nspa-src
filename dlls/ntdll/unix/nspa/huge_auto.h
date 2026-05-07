@@ -15,10 +15,13 @@
  *   3. No exotic flags — type & ~(MEM_RESERVE|MEM_COMMIT|MEM_TOP_DOWN) == 0.
  *   4. Kernel-chosen placement — base == NULL.
  *   5. Size ≥ LargePageMinimum AND multiple of LargePageMinimum.
- *   6. Protection is PAGE_READWRITE only (excludes JIT/RX/COW/EXEC patterns).
+ *   6. Protection is PAGE_READWRITE or PAGE_EXECUTE_READWRITE.  RW
+ *      catches data arenas (Phase 3 heap) and W^X JIT initial alloc.
+ *      RWX catches emit-and-execute JIT engines that skip the W^X
+ *      round-trip.
  *
- * Excluded patterns: every JIT pattern, every file-backed mapping,
- * every fixed-address allocation, every RX/COW/EXEC/WRITECOPY/GUARD.
+ * Excluded patterns: file-backed mappings, fixed-address allocations,
+ * RX-only/COW/WRITECOPY/GUARD/PAGE_NOACCESS.
  *
  * Companion to Phase 3 (heap.c arena round-up) — Phase 3 reshapes
  * heap.c's arena allocations into single-shot RES+COMMIT requests

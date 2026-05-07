@@ -116,6 +116,28 @@ extern BOOL     nspa_try_pop_own_timer_ring( HWND filter_hwnd, UINT first, UINT 
 extern HANDLE nspa_get_own_server_queue_handle( void );
 extern void   nspa_process_sent_messages( void );
 
+/* peek_message filter — moved here so the NSPA Phase C empty-poll cache
+ * (nspa/get_msg_cache.c) can share the type with peek_message().  Matches
+ * the original definition in message.c.  All fields participate in
+ * filter_eq()'s collision-safe match. */
+struct peek_message_filter
+{
+    HWND hwnd;
+    UINT first;
+    UINT last;
+    UINT mask;
+    UINT flags;
+    BOOL internal;
+};
+
+/* NSPA Phase C: empty-poll cache for get_message RPC (nspa/get_msg_cache.c).
+ * Per-thread cache of "filter F returned empty at queue_shm seq N" entries.
+ * Default-OFF behind NSPA_GETMSG_EMPTY_CACHE=1.  See file comment for
+ * bug-class checklist (MR1/MR4/multi-source-wake-bit). */
+extern BOOL nspa_getmsg_cache_enabled( void );
+extern BOOL nspa_getmsg_cache_lookup( const struct peek_message_filter *filter, UINT64 cur_seq );
+extern void nspa_getmsg_cache_record_empty( const struct peek_message_filter *filter, UINT64 seq );
+
 /* cursoricon.c */
 extern BOOL process_wine_setcursor( HWND hwnd, HWND window, HCURSOR handle );
 extern HICON alloc_cursoricon_handle( BOOL is_icon );

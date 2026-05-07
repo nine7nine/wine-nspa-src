@@ -1302,6 +1302,17 @@ typedef volatile struct
     unsigned int         changed_bits;
     unsigned int         internal_bits;
     int                  hooks_count[NB_HOOKS];
+    /* NSPA Phase C empty-poll cache infrastructure (Phase A: server bumps,
+     * no client consumer yet).  Monotonically advances on every server-side
+     * wake-bit-set (set_queue_bits funnel) — covers QS_INPUT, QS_PAINT,
+     * QS_TIMER, QS_HOTKEY, QS_POSTMESSAGE, QS_SENDMESSAGE, QS_DRIVER, etc.
+     * NSPA same-process ring publishers (msg_ring, redraw_ring, local_timer)
+     * have their own per-ring change_seq already; Phase C client cache will
+     * track BOTH queue-level and per-ring seqs.  Multi-source-wake-bit
+     * lesson from range_publish failure 2026-04-28: missing a bump site =
+     * silent message drop.  The bump is inside the existing seqlock block
+     * so the new field stays consistent with wake_bits. */
+    unsigned __int64     nspa_change_seq;
 } queue_shm_t;
 
 typedef volatile struct
@@ -7896,6 +7907,6 @@ union generic_reply
     struct nspa_unregister_inproc_event_reply nspa_unregister_inproc_event_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 969
+#define SERVER_PROTOCOL_VERSION 971
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

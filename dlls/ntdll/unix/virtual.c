@@ -2435,30 +2435,56 @@ done:
  * of map_view above).
  */
 static NTSTATUS map_view_large_pages( struct file_view **view_ret, void *base, size_t size,
-                                      unsigned int vprot, enum large_pages_type type )
+                                      unsigned int vprot, enum large_pages_type type,
+                                      BOOL auto_promoted )
 {
     int unix_prot = get_unix_prot( vprot );
-    int flags = MAP_PRIVATE | MAP_ANON | mmap_large_pages_flags( type );
+    int large_flags = MAP_PRIVATE | MAP_ANON | mmap_large_pages_flags( type );
     void *ptr;
+    BOOL fallback = FALSE;
     NTSTATUS status;
 
     /* Windows MEM_LARGE_PAGES allocations are never executable. */
     unix_prot &= ~PROT_EXEC;
 
-    ptr = mmap( base, size, unix_prot, flags, -1, 0 );
+    ptr = mmap( base, size, unix_prot, large_flags, -1, 0 );
+    if (ptr == MAP_FAILED && errno == ENOMEM && auto_promoted)
+    {
+        /* NSPA: hugetlb pool exhausted on an auto-promoted alloc.  The
+         * caller didn't ask for MEM_LARGE_PAGES — NSPA Phase 2 picked
+         * huge pages opportunistically.  Falling back to regular pages
+         * is preferable to failing the alloc; we lose the dTLB benefit
+         * for this view but the app continues.  Explicit user
+         * MEM_LARGE_PAGES requests still fail with STATUS_NO_MEMORY
+         * to match Windows semantics (apps that ask for it expect the
+         * privilege guarantee + fail fast on pool pressure).
+         *
+         * The view is NOT tagged SEC_LARGE_PAGES on fallback, so
+         * QueryWorkingSetEx reports it correctly and the auto-promote
+         * tagging in NtAllocateVirtualMemory (which gates on
+         * SEC_LARGE_PAGES) skips VPROT_NSPA_HUGE_AUTO. */
+        WARN( "large-pages mmap ENOMEM (hugetlb pool exhausted); falling back "
+              "to regular pages, size %p type %d\n", (void *)size, type );
+        ptr = mmap( base, size, unix_prot, MAP_PRIVATE | MAP_ANON, -1, 0 );
+        fallback = TRUE;
+    }
     if (ptr == MAP_FAILED)
     {
-        ERR( "large-pages mmap failed: %s, size %p, type %d\n",
+        ERR( "%smmap failed: %s, size %p, type %d\n",
+             fallback ? "fallback " : "large-pages ",
              strerror(errno), (void *)size, type );
         if (errno == ENOMEM)  return STATUS_NO_MEMORY;
         if (errno == EINVAL)  return STATUS_INVALID_PARAMETER;
         return STATUS_NO_MEMORY;
     }
 
-    /* MAP_LOCKED already locks the pages (when supported), but call
-     * mlock too as belt-and-suspenders, and to surface EPERM as a
-     * meaningful error rather than silently leaving pages unlocked. */
-    if (mlock( ptr, size ) == -1)
+    /* mlock only on the actual hugetlb path.  MAP_LOCKED on the huge
+     * mmap already locks (when supported); the explicit mlock call is
+     * belt-and-suspenders and surfaces EPERM cleanly.  Skip it on
+     * fallback: regular-page allocs don't pre-lock, and pushing an
+     * already-pressured system over RLIMIT_MEMLOCK turns a graceful
+     * fallback back into a failure. */
+    if (!fallback && mlock( ptr, size ) == -1)
     {
         int saved = errno;
         ERR( "mlock failed for large-pages mapping at %p size %p: %s\n",
@@ -2467,14 +2493,16 @@ static NTSTATUS map_view_large_pages( struct file_view **view_ret, void *base, s
         return (saved == EPERM) ? STATUS_ACCESS_DENIED : STATUS_NO_MEMORY;
     }
 
-    /* Mark the view as large-pages-backed. The flag is read by
-     * QueryWorkingSetEx to set VirtualAttributes.LargePage. */
-    vprot |= SEC_LARGE_PAGES;
+    /* SEC_LARGE_PAGES tags actual huge-page-backed views only.  The
+     * flag is read by QueryWorkingSetEx to set
+     * VirtualAttributes.LargePage and by the auto-promote tagging in
+     * the caller. */
+    if (!fallback) vprot |= SEC_LARGE_PAGES;
 
     status = create_view( view_ret, ptr, size, vprot );
     if (status != STATUS_SUCCESS)
     {
-        munlock( ptr, size );
+        if (!fallback) munlock( ptr, size );
         munmap( ptr, size );
     }
     return status;
@@ -5497,7 +5525,7 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
              * placement via MAP_HUGETLB; we just create the view from the
              * resulting pointer. */
             else if (lp_type != LARGE_PAGES_NONE)
-                status = map_view_large_pages( &view, base, size, vprot, lp_type );
+                status = map_view_large_pages( &view, base, size, vprot, lp_type, lp_auto_promoted );
             else status = map_view( &view, base, size, type, vprot, limit_low, limit_high,
                                     align ? align - 1 : granularity_mask );
 
@@ -5508,8 +5536,12 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
                 /* NSPA Phase 2: tag auto-promoted views so partial-op
                  * handlers can distinguish them from app-requested
                  * MEM_LARGE_PAGES (relevant for the demote path in
-                 * Phase 2.5). */
-                if (lp_auto_promoted) view->protect |= VPROT_NSPA_HUGE_AUTO;
+                 * Phase 2.5).  Also gate on SEC_LARGE_PAGES so views
+                 * that fell back from hugetlb to regular pages don't
+                 * get tagged — they aren't actually huge-backed and
+                 * shouldn't go through the demote path. */
+                if (lp_auto_promoted && (view->protect & SEC_LARGE_PAGES))
+                    view->protect |= VPROT_NSPA_HUGE_AUTO;
             }
         }
     }

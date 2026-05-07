@@ -87,15 +87,8 @@ static UINT64 get_tick_count(void)
 
 #define MAX_PACK_COUNT 4
 
-struct peek_message_filter
-{
-    HWND hwnd;
-    UINT first;
-    UINT last;
-    UINT mask;
-    UINT flags;
-    BOOL internal;
-};
+/* struct peek_message_filter moved to win32u_private.h so the Phase C
+ * empty-poll cache can share the type. */
 
 /* info about the message currently being received by the current thread */
 struct received_message_info
@@ -2913,15 +2906,21 @@ static BOOL process_hardware_message( MSG *msg, UINT hw_id, const struct hardwar
  * returns FALSE if we need to make a server request to update the queue masks or bits
  */
 static BOOL check_queue_bits( UINT wake_mask, UINT changed_mask, UINT signal_bits, UINT clear_bits,
-                              UINT *wake_bits, UINT *changed_bits, BOOL internal )
+                              UINT *wake_bits, UINT *changed_bits, BOOL internal,
+                              UINT64 *out_change_seq )
 {
     struct object_lock lock = OBJECT_LOCK_INIT;
     const queue_shm_t *queue_shm;
     BOOL skip = FALSE;
     UINT status;
 
+    if (out_change_seq) *out_change_seq = 0;
+
     while ((status = get_shared_queue( &lock, &queue_shm )) == STATUS_PENDING)
     {
+        /* NSPA Phase C: capture nspa_change_seq for the empty-poll cache.
+         * Inside the seqlock loop so the read is consistent with wake_bits. */
+        if (out_change_seq) *out_change_seq = queue_shm->nspa_change_seq;
         const nspa_queue_bypass_shm_t *queue_bypass = get_queue_bypass_shm( queue_shm );
         UINT ring_total = queue_bypass ?
                           __atomic_load_n( &queue_bypass->nspa_msg_ring.pending_count, __ATOMIC_ACQUIRE ) : 0;
@@ -3038,8 +3037,9 @@ static int peek_message( MSG *msg, const struct peek_message_filter *filter )
         thread_info->client_info.msg_source = prev_source;
         wake_mask = filter->mask & (QS_SENDMESSAGE | QS_SMRESULT);
 
+        UINT64 nspa_change_seq = 0;
         if (check_queue_bits( wake_mask, filter->mask, wake_mask | signal_bits, filter->mask | clear_bits,
-                              &wake_bits, &changed_bits, filter->internal ))
+                              &wake_bits, &changed_bits, filter->internal, &nspa_change_seq ))
             res = STATUS_PENDING;
         else
         {
@@ -3127,6 +3127,16 @@ static int peek_message( MSG *msg, const struct peek_message_filter *filter )
                 info.nspa_reply_gen   = pop_gen;
                 hw_id                 = 0;
             }
+            /* NSPA Phase C: empty-poll cache check (default-OFF behind
+             * NSPA_GETMSG_EMPTY_CACHE=1).  If we cached this filter
+             * shape's last empty result at the same nspa_change_seq the
+             * server has now, the RPC would return STATUS_PENDING again.
+             * Skip it.  Cache miss falls through to the authoritative
+             * server path. */
+            else if (nspa_getmsg_cache_lookup( filter, nspa_change_seq ))
+            {
+                res = STATUS_PENDING;
+            }
             else SERVER_START_REQ( get_message )
             {
                 req->internal  = filter->internal;
@@ -3157,6 +3167,14 @@ static int peek_message( MSG *msg, const struct peek_message_filter *filter )
                 else buffer_size = reply->total;
             }
             SERVER_END_REQ;
+
+            /* NSPA Phase C: record empty result so subsequent peeks at
+             * the same nspa_change_seq with the same filter skip the
+             * RPC.  We use the seq we captured BEFORE the RPC; if seq
+             * advanced during the RPC, next lookup will see the new
+             * seq, miss, and re-RPC (conservative — no silent drop). */
+            if (res == STATUS_PENDING)
+                nspa_getmsg_cache_record_empty( filter, nspa_change_seq );
         }
 
         if (res)
@@ -3963,7 +3981,7 @@ static void wait_message_reply( UINT flags )
         UINT wake_bits, changed_bits;
 
         if (check_queue_bits( wake_mask, wake_mask, wake_mask, wake_mask,
-                              &wake_bits, &changed_bits, FALSE ))
+                              &wake_bits, &changed_bits, FALSE, NULL ))
             wake_bits = wake_bits & wake_mask;
         else SERVER_START_REQ( set_queue_mask )
         {

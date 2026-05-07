@@ -820,6 +820,13 @@ static inline void set_queue_bits( struct msg_queue *queue, unsigned int bits )
         shared->wake_bits |= bits;
         shared->changed_bits |= bits;
         shared->internal_bits |= internal;
+        /* NSPA Phase A: advance change_seq on every wake-bit-set.  Phase C
+         * empty-poll cache will read this to skip get_message RPCs when
+         * neither queue_shm nor any NSPA ring has advanced since the last
+         * empty result.  Single write inside the existing seqlock block —
+         * no extra sync overhead.  See protocol.def queue_shm_t comment
+         * for the multi-source-wake-bit audit rationale. */
+        shared->nspa_change_seq++;
     }
     SHARED_WRITE_END;
 

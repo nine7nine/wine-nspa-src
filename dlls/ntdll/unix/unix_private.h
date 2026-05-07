@@ -636,7 +636,19 @@ extern void ntdll_io_uring_process_completions(void);
 extern int  ntdll_io_uring_get_eventfd(void);
 extern void ntdll_client_poll_set( int unix_fd );
 extern void ntdll_client_poll_clear( int unix_fd );
-extern void ntdll_io_uring_flush_deferred(void);
+/* NSPA: deferred-completion infrastructure left dormant by 36a6a51 (the
+ * Apr 15 overlapped-bypass revert) and rendered redundant by the
+ * direct-ioctl completion path in complete_uring_op (io_uring.c:408+).
+ * defer_socket_poll has zero callers, so the deferred queue stays
+ * empty.  Expose a TLS counter so sync.c call sites can early-out
+ * without paying the function-call cost on every NtWait* return on
+ * the audio path — measured 0.82% of audio thread time pre-fix. */
+extern __thread unsigned int ntdll_io_uring_deferred_count;
+extern void ntdll_io_uring_flush_deferred_slow(void);
+static inline void ntdll_io_uring_flush_deferred(void)
+{
+    if (ntdll_io_uring_deferred_count) ntdll_io_uring_flush_deferred_slow();
+}
 extern void ntdll_signal_event_direct( HANDLE event );
 extern int  ntdll_resolve_event_sync_fd( HANDLE event );
 extern int  ntdll_io_uring_submit_socket_poll( int unix_fd, short events,

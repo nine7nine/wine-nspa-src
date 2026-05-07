@@ -5579,7 +5579,34 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
     else if (type & MEM_RESET)
     {
         if (!(view = find_view( base, size ))) status = STATUS_NOT_MAPPED_VIEW;
-        else madvise( base, size, MADV_DONTNEED );
+        else
+        {
+            /* NSPA: under nspa_mlock_ws_init's mlockall(MCL_CURRENT|
+             * MCL_FUTURE|MCL_ONFAULT), every page is mlocked and
+             * MADV_DONTNEED is a no-op — the kernel cannot drop locked
+             * pages.  Munlock the range first so the advice can take
+             * effect: pages get reclaimed and re-fault to zero on next
+             * access (matching MEM_RESET semantics: "OS may discard
+             * contents at any time, app must not read until rewriting").
+             *
+             * The VMA-level VM_LOCKONFAULT flag (set by MCL_FUTURE +
+             * MCL_ONFAULT) is sticky — the next access re-locks the
+             * page.  Net effect: a transient reclaim window between
+             * MEM_RESET and the next access where the kernel can
+             * legitimately reuse the physical page elsewhere.  For
+             * apps that MEM_RESET-then-leave-cold (released sample
+             * data, plugin caches, GUI buffers post-redraw) this gives
+             * meaningful RAM back.  For apps that immediately re-touch,
+             * the cost is the re-fault — acceptable.
+             *
+             * munlock on hugetlb-backed views is a no-op safely (huge-
+             * pages aren't subject to the same mlock semantics, but
+             * the call returns 0 / harmless).  No type discriminator
+             * needed.  Both syscalls together cost ~2 µs; called only
+             * on app-driven MEM_RESET, not on the audio path. */
+            munlock( base, size );
+            madvise( base, size, MADV_DONTNEED );
+        }
     }
     else  /* commit the pages */
     {

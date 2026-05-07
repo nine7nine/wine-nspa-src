@@ -36,15 +36,6 @@
 #include "shared_obj_reader.h"
 #include "thread_shm.h"
 
-enum gate_state
-{
-    GATE_UNINIT = 0,
-    GATE_OFF,
-    GATE_ON,
-};
-
-static LONG gate_state;
-
 /* Per-handle resolved-object cache.  `locator_id` is captured at
  * resolve time and re-checked on every read: if the server-side slot
  * was freed and recycled, the slot's id field is incremented inside
@@ -102,33 +93,6 @@ static void cache_evict( HANDLE handle )
     }
 }
 
-void nspa_thread_shm_init(void)
-{
-    LONG expected = GATE_UNINIT;
-    LONG next;
-    const char *env;
-
-    if (ReadNoFence( &gate_state ) != GATE_UNINIT) return;
-
-    /* Default ON; NSPA_THREAD_SHM=0 is the explicit escape hatch.
-     * A/B validated bit-identical with the get_thread_info RPC
-     * fallback across all 7 covered query classes. */
-    env = getenv( "NSPA_THREAD_SHM" );
-    next = (env && !strcmp( env, "0" )) ? GATE_OFF : GATE_ON;
-
-    InterlockedCompareExchange( &gate_state, next, expected );
-}
-
-BOOL nspa_thread_shm_enabled(void)
-{
-    LONG state = ReadNoFence( &gate_state );
-    if (state == GATE_UNINIT)
-    {
-        nspa_thread_shm_init();
-        state = ReadNoFence( &gate_state );
-    }
-    return state == GATE_ON;
-}
 
 /* Resolve the shared object for a given thread handle, returning the
  * object pointer + the locator id captured at resolve time.  Lazy:
@@ -210,7 +174,6 @@ NTSTATUS nspa_thread_shm_query( HANDLE handle, struct nspa_thread_shm_snapshot *
     UINT64 seq;
     struct nspa_thread_shm_snapshot snap;
 
-    if (!nspa_thread_shm_enabled()) return STATUS_NOT_SUPPORTED;
     if (!(object = resolve_thread_object( handle, &locator_id ))) return STATUS_NOT_SUPPORTED;
 
     /* Single seqlock cycle pulls every cached field; callers pick the

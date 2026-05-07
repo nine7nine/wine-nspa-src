@@ -470,21 +470,13 @@ static void *dispatcher_main( void *arg )
 
 static BOOL nspa_local_timer_sched_active(void)
 {
+    /* NSPA_SCHED_USE_FOR_LOCAL_TIMER env-gate dropped after Ableton
+     * validation per the NSPA convention "no A/B gating crap on default-on
+     * features".  Migration runs whenever the RT instance is available;
+     * absence of RT (no NSPA_RT_PRIO) falls back to the legacy pthread
+     * dispatcher via the existing fallback path. */
     if (local_timer_use_sched == -1)
-    {
-        /* Default ON since 2026-05-02 night — local_timer migration
-         * Ableton-validated alongside wm_timer (both timer dispatchers
-         * now consolidated onto the shared wine-sched-rt thread).
-         * Set NSPA_SCHED_USE_FOR_LOCAL_TIMER=0 to force OFF (legacy
-         * pthread path) for diagnostic A/B. */
-        const char *env = getenv( "NSPA_SCHED_USE_FOR_LOCAL_TIMER" );
-        if (env && env[0] == '0' && env[1] == 0)
-            local_timer_use_sched = 0;
-        else if (nspa_sched_rt_available())
-            local_timer_use_sched = 1;
-        else
-            local_timer_use_sched = 0;  /* RT not available → fall back */
-    }
+        local_timer_use_sched = nspa_sched_rt_available() ? 1 : 0;
     return local_timer_use_sched == 1;
 }
 

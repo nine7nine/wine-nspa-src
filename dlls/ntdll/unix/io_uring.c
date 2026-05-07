@@ -163,6 +163,10 @@ struct deferred_completion
 static __thread struct deferred_completion *deferred_head;
 static __thread struct deferred_completion *deferred_free;
 
+/* TLS counter for unix_private.h's inline ntdll_io_uring_flush_deferred
+ * fast-path.  Bumped by defer_socket_poll, zeroed by flush_deferred_slow. */
+__thread unsigned int ntdll_io_uring_deferred_count;
+
 static BOOL ensure_ring(void)
 {
     struct io_uring_params params;
@@ -266,14 +270,19 @@ void ntdll_io_uring_defer_socket_poll( struct uring_async_op *op, int poll_reven
     dc->poll_revents = poll_revents;
     dc->next = deferred_head;
     deferred_head = dc;
+    ntdll_io_uring_deferred_count++;
 }
 
 /* Flush deferred completions — called from NtWaitForSingleObject /
- * NtWaitForMultipleObjects AFTER inproc_wait returns. Safe context:
- * fully outside the ntsync ioctl stack. */
+ * NtWaitForMultipleObjects AFTER inproc_wait returns via the inline
+ * ntdll_io_uring_flush_deferred() in unix_private.h, which gates on
+ * ntdll_io_uring_deferred_count to skip the call when the queue is
+ * empty (the steady-state condition since complete_uring_op completes
+ * socket polls inline).  Safe context: fully outside the ntsync ioctl
+ * stack. */
 extern void ntdll_complete_socket_poll( struct uring_async_op *op, int poll_revents );
 
-void ntdll_io_uring_flush_deferred(void)
+void ntdll_io_uring_flush_deferred_slow(void)
 {
     struct deferred_completion *dc;
 
@@ -284,6 +293,7 @@ void ntdll_io_uring_flush_deferred(void)
         dc->next = deferred_free;
         deferred_free = dc;
     }
+    ntdll_io_uring_deferred_count = 0;
 }
 
 
@@ -863,7 +873,8 @@ void ntdll_io_uring_cleanup(void) { }
 int  ntdll_io_uring_poll( int fd, short events, int timeout_ms ) { return -ENOSYS; }
 void ntdll_io_uring_process_completions(void) { }
 int  ntdll_io_uring_get_eventfd(void) { return -1; }
-void ntdll_io_uring_flush_deferred(void) { }
+__thread unsigned int ntdll_io_uring_deferred_count;
+void ntdll_io_uring_flush_deferred_slow(void) { }
 
 int ntdll_io_uring_submit_socket_poll( int unix_fd, short events,
                                        HANDLE handle, HANDLE wait_handle,

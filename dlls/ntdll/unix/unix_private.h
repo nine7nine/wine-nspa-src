@@ -633,7 +633,13 @@ extern BOOL ntdll_io_uring_enabled(void);
 extern void ntdll_io_uring_cleanup(void);
 extern int  ntdll_io_uring_poll( int fd, short events, int timeout_ms );
 extern void ntdll_io_uring_process_completions(void);
-extern int  ntdll_io_uring_get_eventfd(void);
+/* Inlined: per-thread io_uring eventfd, or -1 if unavailable.
+ * Audio-path callers (sync.c inproc_wait) hit this every wait return. */
+extern __thread int ntdll_io_uring_ring_efd;
+static inline int ntdll_io_uring_get_eventfd(void)
+{
+    return ntdll_io_uring_ring_efd;
+}
 extern void ntdll_client_poll_set( int unix_fd );
 extern void ntdll_client_poll_clear( int unix_fd );
 /* NSPA: deferred-completion infrastructure left dormant by 36a6a51 (the

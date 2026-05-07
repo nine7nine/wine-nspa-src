@@ -796,10 +796,45 @@ static void jack_process_capture(struct jack_stream *s, jack_nframes_t nframes)
     }
 }
 
+/* NSPA: opt-in JACK callback timing probe (env-gated NSPA_JACK_PROFILE=1).
+ *
+ * Four timing points capture where time goes per callback:
+ *   T0: callback entry
+ *   T1: just before CAPTURE_READY -> play_thread (Wine handoff start)
+ *   T2: just after OUTPUT_READY returns           (Wine handoff end)
+ *   T3: callback exit
+ *
+ * Bucket means: cb_total = T3-T0 (total period consumed); cb_bufsw = T2-T1
+ * (Wine bufferSwitch wall time, what Ableton's DSP meter approximates);
+ * cb_jack = (T1-T0) + (T3-T2) (JACK-side memcpy + setup).
+ *
+ * Dumps to stderr every 4096 callbacks (~40s at 100 buf/s).  Cost when
+ * disabled: a single load + branch (the env check happens once).  Cost
+ * when enabled: 4 × clock_gettime (VDSO, ~10 ns) per callback. */
+static int      jack_profile_active = -1;            /* tri-state cache */
+static unsigned jack_profile_calls;
+static UINT64   jack_profile_total_sum, jack_profile_total_max, jack_profile_total_min = ~(UINT64)0;
+static UINT64   jack_profile_bufsw_sum, jack_profile_bufsw_max, jack_profile_bufsw_min = ~(UINT64)0;
+static UINT64   jack_profile_jack_sum,  jack_profile_jack_max,  jack_profile_jack_min  = ~(UINT64)0;
+
+static inline UINT64 jack_mono_ns(void)
+{
+    struct timespec ts;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    return (UINT64)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
 static int jack_audio_process_cb(jack_nframes_t nframes, void *arg)
 {
     int i;
+    UINT64 t0 = 0, t1 = 0, t2 = 0;
+    BOOL profile;
     (void)arg;
+
+    if (jack_profile_active == -1)
+        jack_profile_active = (getenv( "NSPA_JACK_PROFILE" ) != NULL);
+    profile = jack_profile_active;
+    if (profile) t0 = jack_mono_ns();
 
     /* ── Phase F: ASIO synchronous callback path ──
      *
@@ -826,6 +861,7 @@ static int jack_audio_process_cb(jack_nframes_t nframes, void *arg)
         }
 
         /* 2. CAS: IDLE → CAPTURE_READY, wake play_thread */
+        if (profile) t1 = jack_mono_ns();
         expected = ASIO_FUTEX_IDLE;
         if (__atomic_compare_exchange_n(&reg->signal_futex, &expected,
                                          ASIO_FUTEX_CAPTURE_READY, 0,
@@ -849,6 +885,7 @@ static int jack_audio_process_cb(jack_nframes_t nframes, void *arg)
                     break;
             }
         }
+        if (profile) t2 = jack_mono_ns();
 
         /* 4. Copy ASIO output → JACK render ports (same period!) */
         if (__atomic_load_n(&reg->signal_futex, __ATOMIC_ACQUIRE) == ASIO_FUTEX_OUTPUT_READY)
@@ -910,6 +947,44 @@ static int jack_audio_process_cb(jack_nframes_t nframes, void *arg)
     if (jack_midi_available)
         jack_midi_process(nframes);
 
+    if (profile)
+    {
+        UINT64 t3 = jack_mono_ns();
+        UINT64 total = t3 - t0;
+        UINT64 bufsw = (t2 > t1) ? (t2 - t1) : 0;
+        UINT64 jackt = total - bufsw;
+
+        jack_profile_total_sum += total;
+        if (total > jack_profile_total_max) jack_profile_total_max = total;
+        if (total < jack_profile_total_min) jack_profile_total_min = total;
+        jack_profile_bufsw_sum += bufsw;
+        if (bufsw > jack_profile_bufsw_max) jack_profile_bufsw_max = bufsw;
+        if (bufsw < jack_profile_bufsw_min) jack_profile_bufsw_min = bufsw;
+        jack_profile_jack_sum += jackt;
+        if (jackt > jack_profile_jack_max) jack_profile_jack_max = jackt;
+        if (jackt < jack_profile_jack_min) jack_profile_jack_min = jackt;
+
+        if ((++jack_profile_calls & 0xFFF) == 0)
+        {
+            UINT64 period_ns = (UINT64)nframes * 1000000000ULL / jack_rate;
+            unsigned n = jack_profile_calls;
+            fprintf( stderr,
+                     "NSPA RT:JACK profile: n=%u period=%luus  "
+                     "total avg=%luus max=%luus min=%luus  "
+                     "bufsw avg=%luus max=%luus min=%luus  "
+                     "jack-side avg=%luus max=%luus min=%luus\n",
+                     n, (unsigned long)(period_ns / 1000),
+                     (unsigned long)(jack_profile_total_sum / n / 1000),
+                     (unsigned long)(jack_profile_total_max / 1000),
+                     (unsigned long)(jack_profile_total_min / 1000),
+                     (unsigned long)(jack_profile_bufsw_sum / n / 1000),
+                     (unsigned long)(jack_profile_bufsw_max / 1000),
+                     (unsigned long)(jack_profile_bufsw_min / 1000),
+                     (unsigned long)(jack_profile_jack_sum / n / 1000),
+                     (unsigned long)(jack_profile_jack_max / 1000),
+                     (unsigned long)(jack_profile_jack_min / 1000) );
+        }
+    }
     return 0;
 }
 

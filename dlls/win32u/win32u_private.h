@@ -130,11 +130,9 @@ struct peek_message_filter
     BOOL internal;
 };
 
-/* NSPA Phase C: empty-poll cache for get_message RPC (nspa/get_msg_cache.c).
+/* NSPA empty-poll cache for get_message RPC (nspa/get_msg_cache.c).
  * Per-thread cache of "filter F returned empty at queue_shm seq N" entries.
- * Default-OFF behind NSPA_GETMSG_EMPTY_CACHE=1.  See file comment for
- * bug-class checklist (MR1/MR4/multi-source-wake-bit). */
-extern BOOL nspa_getmsg_cache_enabled( void );
+ * See file comment for bug-class checklist (MR1/MR4/multi-source-wake-bit). */
 extern BOOL nspa_getmsg_cache_lookup( const struct peek_message_filter *filter, UINT64 cur_seq );
 extern void nspa_getmsg_cache_record_empty( const struct peek_message_filter *filter, UINT64 seq );
 

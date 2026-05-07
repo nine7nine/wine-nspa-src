@@ -148,7 +148,10 @@ static void op_pool_free( struct uring_async_op *op )
 static __thread struct io_uring thread_ring;
 static __thread BOOL ring_initialized;
 static __thread BOOL ring_init_failed;
-static __thread int  ring_efd = -1;   /* eventfd for CQE notification (ntsync integration) */
+/* Exposed via unix_private.h's static-inline ntdll_io_uring_get_eventfd
+ * so audio-path callers (sync.c inproc_wait) avoid the per-wait function
+ * call.  Visible name: ntdll_io_uring_ring_efd. */
+__thread int  ntdll_io_uring_ring_efd = -1;
 
 /* Deferred completion queue — for completions that can't be delivered
  * from inside the CQ drain (e.g. overlapped socket completions that
@@ -206,14 +209,14 @@ static BOOL ensure_ring(void)
      * the kernel writes to this eventfd.  The ntsync uring_fd extension
      * watches it so that threads blocked in ntsync waits wake on I/O
      * completion.  EFD_NONBLOCK avoids blocking reads in the drain path. */
-    ring_efd = eventfd( 0, EFD_NONBLOCK | EFD_CLOEXEC );
-    if (ring_efd >= 0)
+    ntdll_io_uring_ring_efd = eventfd( 0, EFD_NONBLOCK | EFD_CLOEXEC );
+    if (ntdll_io_uring_ring_efd >= 0)
     {
-        if (io_uring_register_eventfd( &thread_ring, ring_efd ) < 0)
+        if (io_uring_register_eventfd( &thread_ring, ntdll_io_uring_ring_efd ) < 0)
         {
             WARN( "io_uring_register_eventfd failed: %s\n", strerror( errno ) );
-            close( ring_efd );
-            ring_efd = -1;
+            close( ntdll_io_uring_ring_efd );
+            ntdll_io_uring_ring_efd = -1;
         }
     }
 
@@ -222,7 +225,7 @@ static BOOL ensure_ring(void)
         static LONG once;
         if (!InterlockedExchange( &once, 1 ))
             fprintf( stderr, "wine: NSPA RT:io_uring: ring active (sq=%u cq=%u flags=0x%x efd=%d) — file I/O bypasses wineserver\n",
-                     params.sq_entries, params.cq_entries, params.flags, ring_efd );
+                     params.sq_entries, params.cq_entries, params.flags, ntdll_io_uring_ring_efd );
     }
 
     TRACE( "io_uring ring initialized (sq=%u cq=%u flags=0x%x) for thread %04x\n",
@@ -241,17 +244,14 @@ void ntdll_io_uring_cleanup(void)
 
     ntdll_io_uring_process_completions();
     io_uring_queue_exit( &thread_ring );
-    if (ring_efd >= 0) { close( ring_efd ); ring_efd = -1; }
+    if (ntdll_io_uring_ring_efd >= 0) { close( ntdll_io_uring_ring_efd ); ntdll_io_uring_ring_efd = -1; }
     ring_initialized = FALSE;
     TRACE( "io_uring ring cleaned up\n" );
 }
 
-/* Return the io_uring eventfd for this thread, or -1 if unavailable.
- * Used by sync.c to pass to ntsync uring_fd for CQE wakeup. */
-int ntdll_io_uring_get_eventfd(void)
-{
-    return ring_efd;
-}
+/* ntdll_io_uring_get_eventfd lives as a static inline in unix_private.h
+ * to avoid a per-wait function call on the audio hot path.  The TLS
+ * variable ntdll_io_uring_ring_efd is the actual storage. */
 
 /* Queue a deferred socket poll completion — saves the entire op + revents.
  * Called from complete_uring_op when the socket poll is overlapped
@@ -872,7 +872,7 @@ BOOL ntdll_io_uring_enabled(void) { return FALSE; }
 void ntdll_io_uring_cleanup(void) { }
 int  ntdll_io_uring_poll( int fd, short events, int timeout_ms ) { return -ENOSYS; }
 void ntdll_io_uring_process_completions(void) { }
-int  ntdll_io_uring_get_eventfd(void) { return -1; }
+__thread int ntdll_io_uring_ring_efd = -1;
 __thread unsigned int ntdll_io_uring_deferred_count;
 void ntdll_io_uring_flush_deferred_slow(void) { }
 

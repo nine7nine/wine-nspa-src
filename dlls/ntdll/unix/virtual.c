@@ -2455,8 +2455,11 @@ static NTSTATUS map_view_large_pages( struct file_view **view_ret, void *base, s
     BOOL fallback = FALSE;
     NTSTATUS status;
 
-    /* Windows MEM_LARGE_PAGES allocations are never executable. */
-    unix_prot &= ~PROT_EXEC;
+    /* Windows MEM_LARGE_PAGES allocations are never executable.
+     * NSPA Phase 2 auto-promote is opportunistic — if the caller
+     * passed PAGE_EXECUTE_READWRITE (a JIT code blob), preserve
+     * PROT_EXEC.  Linux MAP_HUGETLB+MAP_LOCKED+RWX is supported. */
+    if (!auto_promoted) unix_prot &= ~PROT_EXEC;
 
     ptr = mmap( base, size, unix_prot, large_flags, -1, 0 );
     if (ptr == MAP_FAILED && errno == ENOMEM && auto_promoted)

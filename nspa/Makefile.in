@@ -31,6 +31,8 @@ SOURCES = \
 	tests/test-event-set-pi-stress.c \
 	tests/test-huge-decommit.c \
 	tests/test-huge-decommit.sh \
+	tests/test-huge-rwx.c \
+	tests/test-huge-rwx.sh \
 	tests/test-mixed-load-stress.c \
 	tests/test-mutex-pi-stress.c \
 	tests/test-wait-rejects-channel.c
@@ -52,6 +54,8 @@ INSTALL_LIB = \
 	tests/test-event-set-pi-stress.c \
 	tests/test-huge-decommit.c \
 	tests/test-huge-decommit.sh \
+	tests/test-huge-rwx.c \
+	tests/test-huge-rwx.sh \
 	tests/test-mixed-load-stress.c \
 	tests/test-mutex-pi-stress.c \
 	tests/test-wait-rejects-channel.c

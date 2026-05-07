@@ -170,7 +170,16 @@ BOOL nspa_huge_auto_eligible( ULONG type, ULONG protect,
     if (!(type & MEM_RESERVE) || !(type & MEM_COMMIT)) return FALSE;
     if (type & ~(MEM_RESERVE | MEM_COMMIT | MEM_TOP_DOWN)) return FALSE;
     if (base) return FALSE;
-    if (protect != PAGE_READWRITE) return FALSE;
+    /* Accept PAGE_READWRITE (data arenas, Phase 3 heap) and
+     * PAGE_EXECUTE_READWRITE (JIT code blobs).  RWX-style JITs
+     * (emit-and-execute without W^X round-trips) get iTLB+dTLB wins
+     * from hugepage backing.  Linux MAP_HUGETLB | MAP_LOCKED with
+     * PROT_READ|WRITE|EXEC is supported (verified on 6.x kernels).
+     * W^X-style JITs that allocate RW then VirtualProtect to RX still
+     * auto-promote the initial RW; the protect flip falls into
+     * nspa_huge_auto_demote (sub-hugepage mprotect can't split a
+     * hugetlb VMA — see C1 fix in virtual.c). */
+    if (protect != PAGE_READWRITE && protect != PAGE_EXECUTE_READWRITE) return FALSE;
 
     /* Pool watermark check last: cheaper predicates short-circuit first.
      * When the kernel's 2 MiB free count is below 10% of total, refuse

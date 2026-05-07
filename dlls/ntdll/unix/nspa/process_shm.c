@@ -36,14 +36,6 @@
 #include "shared_obj_reader.h"
 #include "process_shm.h"
 
-enum gate_state
-{
-    GATE_UNINIT = 0,
-    GATE_OFF,
-    GATE_ON,
-};
-
-static LONG gate_state;
 
 struct handle_cache_entry
 {
@@ -96,33 +88,6 @@ static void cache_evict( HANDLE handle )
     }
 }
 
-void nspa_process_shm_init(void)
-{
-    LONG expected = GATE_UNINIT;
-    LONG next;
-    const char *env;
-
-    if (ReadNoFence( &gate_state ) != GATE_UNINIT) return;
-
-    /* Default ON; NSPA_PROCESS_SHM=0 is the explicit escape hatch.
-     * A/B validated bit-identical with the get_process_info RPC
-     * fallback across all 6 covered query classes (stable fields). */
-    env = getenv( "NSPA_PROCESS_SHM" );
-    next = (env && !strcmp( env, "0" )) ? GATE_OFF : GATE_ON;
-
-    InterlockedCompareExchange( &gate_state, next, expected );
-}
-
-BOOL nspa_process_shm_enabled(void)
-{
-    LONG state = ReadNoFence( &gate_state );
-    if (state == GATE_UNINIT)
-    {
-        nspa_process_shm_init();
-        state = ReadNoFence( &gate_state );
-    }
-    return state == GATE_ON;
-}
 
 static const shared_object_t *resolve_process_object( HANDLE handle, object_id_t *locator_id )
 {
@@ -189,7 +154,6 @@ NTSTATUS nspa_process_shm_query( HANDLE handle, struct nspa_process_shm_snapshot
     UINT64 seq;
     struct nspa_process_shm_snapshot snap;
 
-    if (!nspa_process_shm_enabled()) return STATUS_NOT_SUPPORTED;
     if (!(object = resolve_process_object( handle, &locator_id ))) return STATUS_NOT_SUPPORTED;
 
     /* Single seqlock cycle pulls every cached field. */

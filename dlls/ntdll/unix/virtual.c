@@ -2085,6 +2085,18 @@ static NTSTATUS set_protection( struct file_view *view, void *base, SIZE_T size,
         if ((view->protect & access) != access) return STATUS_INVALID_PAGE_PROTECTION;
     }
 
+    /* NSPA Phase 2: sub-hugepage mprotect on a hugetlb-backed view
+     * EINVALs in the kernel; the per-page vprot byte updates regardless,
+     * leaving Wine and kernel state inconsistent.  Demote the view to
+     * regular pages on the first partial protect.  See decommit_pages
+     * for the same-shape fix and huge_auto.c for the demote helper. */
+    if ((view->protect & VPROT_NSPA_HUGE_AUTO)
+        && (base != view->base || size != view->size)
+        && nspa_huge_auto_demote( view->base, view->size ) == 0)
+    {
+        view->protect &= ~(SEC_LARGE_PAGES | VPROT_NSPA_HUGE_AUTO);
+    }
+
     if (!set_vprot( view, base, size, vprot | VPROT_COMMITTED )) return STATUS_ACCESS_DENIED;
     return STATUS_SUCCESS;
 }
@@ -2650,6 +2662,24 @@ static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size 
     }
     else host_end = ROUND_ADDR( base + size, host_page_mask );
 
+    /* NSPA Phase 2: hugetlb-backed views (auto-promoted from
+     * VirtualAlloc(MEM_RESERVE|MEM_COMMIT|RW)) reject sub-2 MiB
+     * MAP_FIXED replacement with EINVAL; the decommit silently fails,
+     * vprot bookkeeping says "uncommitted" but the original data
+     * survives, and the next MEM_COMMIT returns stale contents instead
+     * of zero — an NT-semantics violation.  Demote the whole view to
+     * regular pages on the first sub-view op so the rest of this
+     * function (and any subsequent partial op) operates on regular
+     * pages with normal MAP_FIXED semantics.  The view stays one
+     * contiguous range; the SEC_LARGE_PAGES + VPROT_NSPA_HUGE_AUTO
+     * tags clear so QueryWorkingSetEx reports truthfully. */
+    if ((view->protect & VPROT_NSPA_HUGE_AUTO)
+        && (base != view->base || size != view->size)
+        && nspa_huge_auto_demote( view->base, view->size ) == 0)
+    {
+        view->protect &= ~(SEC_LARGE_PAGES | VPROT_NSPA_HUGE_AUTO);
+    }
+
     if (host_start < host_end) anon_mmap_fixed( host_start, host_end - host_start, PROT_NONE, 0 );
     set_page_vprot_bits( base, size, 0, VPROT_COMMITTED );
     if (host_start < host_end) kernel_writewatch_register_range( view, host_start, host_end - host_start );
@@ -2759,6 +2789,17 @@ static NTSTATUS free_pages( struct file_view *view, char *base, size_t size )
         assert( base == view->base );
         delete_view( view );
         return STATUS_SUCCESS;
+    }
+
+    /* NSPA Phase 2: sub-view munmap of a hugetlb VMA EINVALs at the
+     * kernel level on sub-2 MiB ranges; Wine's view metadata would
+     * still split, leaving the view pointing at a half-deleted hugetlb
+     * region.  Demote first so the partial unmap below proceeds on
+     * regular pages.  See decommit_pages / set_protection. */
+    if (view->protect & VPROT_NSPA_HUGE_AUTO
+        && nspa_huge_auto_demote( view->base, view->size ) == 0)
+    {
+        view->protect &= ~(SEC_LARGE_PAGES | VPROT_NSPA_HUGE_AUTO);
     }
 
     /* new view needs to start on page boundary */

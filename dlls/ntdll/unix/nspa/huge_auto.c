@@ -18,8 +18,11 @@
 
 #include "config.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -162,4 +165,33 @@ BOOL nspa_huge_auto_eligible( ULONG type, ULONG protect,
     if (huge_pool_low()) return FALSE;
 
     return TRUE;
+}
+
+int nspa_huge_auto_demote( void *base, SIZE_T size )
+{
+    void *scratch, *replaced;
+
+    scratch = mmap( NULL, size, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANON, -1, 0 );
+    if (scratch == MAP_FAILED) return errno;
+
+    memcpy( scratch, base, size );
+
+    /* MAP_FIXED over the hugetlb VMA at view granularity: kernel
+     * replaces the whole-hugepage(s) range with regular anon pages.
+     * Linux requires the range to be a multiple of the underlying
+     * hugepage size; map_view_large_pages already enforces that the
+     * view is a 2 MiB-aligned multiple, so this always succeeds. */
+    replaced = mmap( base, size, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0 );
+    if (replaced == MAP_FAILED)
+    {
+        int saved = errno;
+        munmap( scratch, size );
+        return saved;
+    }
+
+    memcpy( base, scratch, size );
+    munmap( scratch, size );
+    return 0;
 }

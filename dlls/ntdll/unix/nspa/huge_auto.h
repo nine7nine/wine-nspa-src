@@ -60,4 +60,22 @@ extern BOOL nspa_huge_auto_eligible( ULONG type, ULONG protect,
                                       void *base, SIZE_T size,
                                       ULONG attributes, SIZE_T lp_unit );
 
+/* Demote an auto-promoted hugetlb-backed view to regular pages.
+ *
+ * Required before any sub-hugepage partial-op (MEM_DECOMMIT,
+ * MEM_RELEASE, mprotect at non-2MB-aligned granularity) — Linux
+ * MAP_FIXED replacement and mprotect both EINVAL on sub-hugepage
+ * slices of a hugetlb VMA.  Demote replaces the entire view's backing
+ * with regular anon pages, preserving contents.
+ *
+ * Caller must hold virtual_mutex.  On failure, view backing is
+ * unchanged; caller should fail the requesting NT op accordingly.
+ *
+ * Cost: O(size) memcpy x 2 + transient size-bytes scratch mmap.
+ * Rare path — only fires on first sub-hugepage op against an
+ * auto-promoted view.
+ *
+ * Returns 0 on success, non-zero (errno-style) on failure. */
+extern int nspa_huge_auto_demote( void *base, SIZE_T size );
+
 #endif /* __NSPA_HUGE_AUTO_H */

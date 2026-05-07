@@ -187,8 +187,6 @@ void nspa_sched_obs_init( void )
     int interval_ms;
     char path[ 64 ];
 
-    if (!nspa_sched_enabled()) return;
-
     env = getenv( "NSPA_SCHED_OBS_INTERVAL_MS" );
     if (!env) return;                       /* default OFF */
     interval_ms = atoi( env );

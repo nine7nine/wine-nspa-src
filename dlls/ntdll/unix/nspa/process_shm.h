@@ -56,17 +56,10 @@ struct nspa_process_shm_snapshot
 /* Bit accessors for snapshot.flags. */
 extern BOOL nspa_process_shm_snapshot_is_disable_boost( const struct nspa_process_shm_snapshot *s );
 
-/* Read NSPA_PROCESS_SHM env-gate and lazily set up shared-session
- * mapping primitives.  Idempotent; safe to call multiple times. */
-extern void nspa_process_shm_init(void);
-
-/* TRUE iff init succeeded and the env-gate is on. */
-extern BOOL nspa_process_shm_enabled(void);
-
 /* Read all snapshot fields for the given process handle atomically
  * under one seqlock cycle.  Returns STATUS_SUCCESS on hit;
- * STATUS_NOT_SUPPORTED if the gate is off or the shmem path can't
- * satisfy the read (caller falls back to the get_process_info RPC). */
+ * STATUS_NOT_SUPPORTED if the shmem path can't satisfy the read
+ * (caller falls back to the get_process_info RPC). */
 extern NTSTATUS nspa_process_shm_query( HANDLE handle, struct nspa_process_shm_snapshot *out );
 
 #endif /* __NSPA_PROCESS_SHM_H */

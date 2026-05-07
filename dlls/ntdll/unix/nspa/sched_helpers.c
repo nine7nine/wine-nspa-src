@@ -35,26 +35,6 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(sched);
 
-/* Cached value: 0 = unknown, 1 = explicitly OFF, 2 = ON.  Three states
- * so a concurrent first call can't re-read the env (cheap monotonic
- * transition, no lock needed since the env is process-wide constant). */
-static int nspa_sched_enabled_cached;
-
-BOOL nspa_sched_enabled(void)
-{
-    int v = __atomic_load_n( &nspa_sched_enabled_cached, __ATOMIC_ACQUIRE );
-    if (!v)
-    {
-        /* Default ON since 2026-05-02 night — Phase 3 LF close queue
-         * shipped + Ableton-validated.  Set NSPA_USE_SCHED_THREAD=0 to
-         * force OFF (kept as an env switch for diagnostic A/B). */
-        const char *env = getenv( "NSPA_USE_SCHED_THREAD" );
-        v = (env && env[0] == '0' && env[1] == 0) ? 1 : 2;
-        __atomic_store_n( &nspa_sched_enabled_cached, v, __ATOMIC_RELEASE );
-    }
-    return v == 2;
-}
-
 int nspa_sched_submit_async( void (*cb)( void *arg ), void *arg )
 {
     /* Adapt to ntdll_sched_async signature: it takes async_callback which
@@ -115,11 +95,6 @@ static void rt_init_once_fn( void )
     pthread_t tid;
     int err, prio;
 
-    if (!nspa_sched_enabled())
-    {
-        rt_unavailable = 1;
-        return;
-    }
     /* NSPA RT probe runs lazily on first SetThreadPriority — but our
      * caller may need RT BEFORE any app code has run.  Trigger the
      * probe explicitly so nspa_rt_prio_base reflects the env. */

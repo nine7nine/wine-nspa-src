@@ -140,7 +140,6 @@ BOOL nspa_close_queue_push( HANDLE server_handle, int unix_fd )
     struct close_entry *e;
     int need_arm = 0;
 
-    if (!nspa_sched_enabled()) return FALSE;
     if (!server_handle && unix_fd < 0) return TRUE;     /* nothing to do */
 
     /* Check current depth without holding the lock first — fast bailout

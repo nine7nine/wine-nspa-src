@@ -54,18 +54,10 @@ extern BOOL nspa_thread_shm_snapshot_is_terminated   ( const struct nspa_thread_
 extern BOOL nspa_thread_shm_snapshot_is_dbg_hidden   ( const struct nspa_thread_shm_snapshot *s );
 extern BOOL nspa_thread_shm_snapshot_is_disable_boost( const struct nspa_thread_shm_snapshot *s );
 
-/* Read NSPA_THREAD_SHM env-gate and lazily set up shared-session
- * mapping primitives.  Idempotent; safe to call multiple times. */
-extern void nspa_thread_shm_init(void);
-
-/* TRUE iff init succeeded and the env-gate is on.  Hot-path callers
- * read the cached static — branchy but trivially predictable. */
-extern BOOL nspa_thread_shm_enabled(void);
-
 /* Read all snapshot fields for the given thread handle atomically
  * under one seqlock cycle.  Returns STATUS_SUCCESS on hit;
- * STATUS_NOT_SUPPORTED if the gate is off or the shmem path can't
- * satisfy the read (caller falls back to the get_thread_info RPC). */
+ * STATUS_NOT_SUPPORTED if the shmem path can't satisfy the read
+ * (caller falls back to the get_thread_info RPC). */
 extern NTSTATUS nspa_thread_shm_query( HANDLE handle, struct nspa_thread_shm_snapshot *out );
 
 #endif /* __NSPA_THREAD_SHM_H */

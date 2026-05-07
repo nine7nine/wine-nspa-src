@@ -163,8 +163,6 @@ static const shared_object_t *resolve_thread_object( HANDLE handle, object_id_t 
     }
     SERVER_END_REQ;
 
-    if (status) return NULL;
-
     pi_mutex_lock( &cache_lock );
     if ((entry = cache_lookup( handle )))    /* re-check after lock re-acq */
     {
@@ -173,12 +171,17 @@ static const shared_object_t *resolve_thread_object( HANDLE handle, object_id_t 
     }
     else
     {
-        object = nspa_shared_obj_resolve( locator );
-        if (object)
-        {
-            cache_insert( handle, locator, object );
-            *locator_id = locator.id;
-        }
+        /* Resolve may fail because the handle lacks
+         * THREAD_QUERY_LIMITED_INFORMATION (server returned empty
+         * locator), shmem mapping is unavailable, or the slot got
+         * recycled before we resolved.  Cache a NEGATIVE entry so
+         * subsequent queries on the same handle skip the RPC + resolve
+         * work and fall through to the caller's RPC fallback
+         * immediately.  Without this, every miss-prone call burns a
+         * fresh get_thread_shm RPC. */
+        object = (status == STATUS_SUCCESS) ? nspa_shared_obj_resolve( locator ) : NULL;
+        cache_insert( handle, locator, object );
+        *locator_id = object ? locator.id : 0;
     }
     pi_mutex_unlock( &cache_lock );
 

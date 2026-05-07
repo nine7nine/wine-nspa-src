@@ -736,7 +736,11 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
         goto error;
     }
     if (!(process->msg_fd = create_anonymous_fd( &process_fd_ops, fd, &process->obj, 0 ))) goto error;
-    if (!(process->sync = create_internal_sync( 1, 0 ))) goto error;
+    /* NSPA: process->sync uses create_process_sync (not create_internal_sync)
+     * so its inproc_sync gets INPROC_SYNC_PROCESS tag — lets client-side
+     * inproc_wait recognize the handle as a process and short-circuit
+     * timeout=0 polls via process_shm. */
+    if (!(process->sync = create_process_sync( 1, 0 ))) goto error;
 
     /* create the handle table */
     if (!parent)

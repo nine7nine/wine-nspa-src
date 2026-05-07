@@ -97,9 +97,19 @@ static BOOL huge_pool_low( void )
     if (now - last < HUGE_POOL_CACHE_TTL_NS)
         return __atomic_load_n( &huge_pool_low_cached, __ATOMIC_RELAXED ) != 0;
 
-    /* No 2 MiB pool configured at all: treat as low so eligibility
-     * refuses immediately instead of letting every alloc try mmap then
-     * fall back. */
+    /* Re-read nr_hugepages when total is 0: covers the case where the
+     * kernel pool was sysctl'd up after Wine started (e.g. boot-order
+     * race between systemd-sysctl and a daemon that pre-launches Wine).
+     * Without this, total==0 latches forever and auto-promote stays
+     * permanently disabled even after the pool comes online. */
+    if (huge_pool_total == 0)
+    {
+        int total = read_sys_int( "/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages" );
+        if (total > 0) huge_pool_total = (SIZE_T)total;
+    }
+
+    /* Still no pool: treat as low so eligibility refuses immediately
+     * instead of letting every alloc try mmap then fall back. */
     if (huge_pool_total == 0)
     {
         __atomic_store_n( &huge_pool_low_cached, 1, __ATOMIC_RELAXED );
@@ -123,8 +133,11 @@ static void huge_auto_init( void )
 {
     int total;
 
-    if (huge_auto_init_done) return;
-    huge_auto_init_done = 1;
+    /* Order matters under concurrent first-callers: state must be visible
+     * before init_done is observable, otherwise a thread that sees
+     * init_done==1 may read huge_auto_active==FALSE and miss the first
+     * eligibility check.  Use release/acquire to enforce the ordering. */
+    if (__atomic_load_n( &huge_auto_init_done, __ATOMIC_ACQUIRE )) return;
 
     /* Single gate: NSPA_RT_PRIO presence.  RT processes get RT defaults. */
     if (getenv( "NSPA_RT_PRIO" ))
@@ -133,10 +146,13 @@ static void huge_auto_init( void )
         TRACE( "huge auto-promote active (NSPA_RT_PRIO set)\n" );
     }
 
-    /* Cache total once.  Read failures or 0-page configs leave total at
-     * 0 and huge_pool_low() will refuse auto-promote across the board. */
+    /* Cache total.  Zero-config or read failure leaves total==0; the
+     * cold-path check in huge_pool_low() will retry the read in case
+     * the pool comes online later. */
     total = read_sys_int( "/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages" );
     huge_pool_total = (total > 0) ? (SIZE_T)total : 0;
+
+    __atomic_store_n( &huge_auto_init_done, 1, __ATOMIC_RELEASE );
 }
 
 BOOL nspa_huge_auto_eligible( ULONG type, ULONG protect,

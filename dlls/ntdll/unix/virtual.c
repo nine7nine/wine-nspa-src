@@ -2490,20 +2490,12 @@ static NTSTATUS map_view_large_pages( struct file_view **view_ret, void *base, s
         return STATUS_NO_MEMORY;
     }
 
-    /* mlock only on the actual hugetlb path.  MAP_LOCKED on the huge
-     * mmap already locks (when supported); the explicit mlock call is
-     * belt-and-suspenders and surfaces EPERM cleanly.  Skip it on
-     * fallback: regular-page allocs don't pre-lock, and pushing an
-     * already-pressured system over RLIMIT_MEMLOCK turns a graceful
-     * fallback back into a failure. */
-    if (!fallback && mlock( ptr, size ) == -1)
-    {
-        int saved = errno;
-        ERR( "mlock failed for large-pages mapping at %p size %p: %s\n",
-             ptr, (void *)size, strerror( saved ) );
-        munmap( ptr, size );
-        return (saved == EPERM) ? STATUS_ACCESS_DENIED : STATUS_NO_MEMORY;
-    }
+    /* MAP_LOCKED already pre-faults and locks the hugetlb pages at mmap
+     * time; an explicit mlock() on hugetlb pages is a no-op on Linux,
+     * and RLIMIT_MEMLOCK enforcement (if any) was checked at the mmap.
+     * The pre-existing mlock here was belt-and-suspenders for an EPERM
+     * surface that can't fire — drop the syscall and the matching
+     * cleanup-path munlock. */
 
     /* SEC_LARGE_PAGES tags actual huge-page-backed views only.  The
      * flag is read by QueryWorkingSetEx to set
@@ -2512,11 +2504,7 @@ static NTSTATUS map_view_large_pages( struct file_view **view_ret, void *base, s
     if (!fallback) vprot |= SEC_LARGE_PAGES;
 
     status = create_view( view_ret, ptr, size, vprot );
-    if (status != STATUS_SUCCESS)
-    {
-        if (!fallback) munlock( ptr, size );
-        munmap( ptr, size );
-    }
+    if (status != STATUS_SUCCESS) munmap( ptr, size );
     return status;
 }
 

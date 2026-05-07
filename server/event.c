@@ -116,6 +116,17 @@ struct object *create_internal_sync( int manual, int signaled )
     return (struct object *)create_server_internal_sync( manual, signaled );
 }
 
+/* NSPA: process->sync needs INPROC_SYNC_PROCESS tag so client-side
+ * inproc_wait can recognize "this is a process handle" without burning
+ * a speculative get_process_shm RPC.  Falls back to server_internal_sync
+ * on non-ntsync builds (no type-tag distinction available there, but
+ * fast path is also unreachable without ntsync). */
+struct object *create_process_sync( int manual, int signaled )
+{
+    if (get_inproc_device_fd() >= 0) return (struct object *)create_inproc_process_sync( manual, signaled );
+    return (struct object *)create_server_internal_sync( manual, signaled );
+}
+
 static void event_sync_dump( struct object *obj, int verbose )
 {
     struct event_sync *event = (struct event_sync *)obj;

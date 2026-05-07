@@ -89,6 +89,7 @@ struct ntsync_event_set_pi_args
 #include "wine/server.h"
 #include "wine/debug.h"
 #include "unix_private.h"
+#include "nspa/process_shm.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(sync);
 
@@ -896,6 +897,11 @@ extern NTSTATUS check_signal_access( struct inproc_sync *sync )
     switch (sync->type)
     {
     case INPROC_SYNC_INTERNAL:
+    case INPROC_SYNC_PROCESS:
+        /* Internal sync objects (incl. NSPA-tagged process->sync) can't be
+         * signaled by user APIs — those go through type-specific paths
+         * (SetEvent, ReleaseMutex, etc.).  process->sync is signaled only
+         * by the server on process exit. */
         return STATUS_OBJECT_TYPE_MISMATCH;
     case INPROC_SYNC_EVENT:
         if (!(sync->access & EVENT_MODIFY_STATE)) return STATUS_ACCESS_DENIED;
@@ -1543,6 +1549,26 @@ static NTSTATUS inproc_wait( DWORD count, const HANDLE *handles, WAIT_TYPE type,
             return ret;
         }
         objs[i] = syncs[i]->fd;
+    }
+
+    /* NSPA: timeout=0 poll of a process handle.  exit_code is published
+     * to process_shm in remove_process_thread's last-thread-out cascade
+     * (server commit 3477041722f) BEFORE process->sync gets signaled
+     * (which happens later in process_killed cleanup), so this fast path
+     * is at-least-as-responsive as the ntsync ioctl path AND closes the
+     * brief Wine-specific race between GetExitCodeProcess and
+     * WaitForSingleObject(0).  Saves the ntsync ioctl syscall; falls
+     * through to the existing path on any miss (shmem disabled,
+     * unmapped, or recycled slot). */
+    if (count == 1 && timeout && !timeout->QuadPart && !alertable &&
+        syncs[0]->type == INPROC_SYNC_PROCESS)
+    {
+        struct nspa_process_shm_snapshot snap;
+        if (nspa_process_shm_query( handles[0], &snap ) == STATUS_SUCCESS)
+        {
+            release_inproc_sync( syncs[0] );
+            return (snap.exit_code != STILL_ACTIVE) ? STATUS_WAIT_0 : STATUS_TIMEOUT;
+        }
     }
 
     if (alertable) alert_fd = get_inproc_alert_fd();

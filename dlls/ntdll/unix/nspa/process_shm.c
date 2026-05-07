@@ -149,8 +149,6 @@ static const shared_object_t *resolve_process_object( HANDLE handle, object_id_t
     }
     SERVER_END_REQ;
 
-    if (status) return NULL;
-
     pi_mutex_lock( &cache_lock );
     if ((entry = cache_lookup( handle )))
     {
@@ -159,12 +157,20 @@ static const shared_object_t *resolve_process_object( HANDLE handle, object_id_t
     }
     else
     {
-        object = nspa_shared_obj_resolve( locator );
-        if (object)
-        {
-            cache_insert( handle, locator, object );
-            *locator_id = locator.id;
-        }
+        /* Resolve may fail because the handle lacks
+         * PROCESS_QUERY_LIMITED_INFORMATION (server returned empty
+         * locator), shmem mapping is unavailable, or the slot got
+         * recycled before we resolved.  In all those cases we cache a
+         * NEGATIVE entry so subsequent queries on the same handle
+         * skip the RPC + resolve work and fall through to the caller's
+         * RPC fallback immediately.  Without this, every poll burns a
+         * fresh get_process_shm RPC — a real regression vs. the
+         * existing ntsync path.  Slot recycling on a previously-
+         * positive entry still goes through the existing eviction
+         * path in nspa_process_shm_query. */
+        object = (status == STATUS_SUCCESS) ? nspa_shared_obj_resolve( locator ) : NULL;
+        cache_insert( handle, locator, object );
+        *locator_id = object ? locator.id : 0;
     }
     pi_mutex_unlock( &cache_lock );
 

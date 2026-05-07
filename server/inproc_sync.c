@@ -115,6 +115,29 @@ struct inproc_sync *create_inproc_internal_sync( int manual, int signaled )
     return event;
 }
 
+/* NSPA: identical to create_inproc_internal_sync but tags the resulting
+ * inproc_sync with INPROC_SYNC_PROCESS so the client-side fast path in
+ * dlls/ntdll/unix/sync.c:inproc_wait can recognize "this is a process
+ * handle" without burning a speculative RPC.  Used by create_process. */
+struct inproc_sync *create_inproc_process_sync( int manual, int signaled )
+{
+    struct ntsync_event_args args = {.signaled = signaled, .manual = manual};
+    struct inproc_sync *event;
+
+    if (!(event = alloc_object( &inproc_sync_ops ))) return NULL;
+    event->type = INPROC_SYNC_PROCESS;
+    event->fd   = ioctl( get_inproc_device_fd(), NTSYNC_IOC_CREATE_EVENT, &args );
+    list_init( &event->entry );
+
+    if (event->fd == -1)
+    {
+        set_error( STATUS_TOO_MANY_OPENED_FILES );
+        release_object( event );
+        return NULL;
+    }
+    return event;
+}
+
 struct inproc_sync *create_inproc_event_sync( int manual, int signaled )
 {
     struct ntsync_event_args args = {.signaled = signaled, .manual = manual};
@@ -198,7 +221,8 @@ static int inproc_sync_signal( struct object *obj, unsigned int access, int sign
     struct inproc_sync *sync = (struct inproc_sync *)obj;
     assert( obj->ops == &inproc_sync_ops );
 
-    assert( sync->type == INPROC_SYNC_INTERNAL || sync->type == INPROC_SYNC_EVENT ); /* never called for mutex / semaphore */
+    assert( sync->type == INPROC_SYNC_INTERNAL || sync->type == INPROC_SYNC_EVENT
+            || sync->type == INPROC_SYNC_PROCESS ); /* never called for mutex / semaphore */
     assert( signal == 0 || signal == 1 ); /* never called from signal_object */
 
     if (signal) signal_inproc_sync( sync );

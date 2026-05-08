@@ -51,6 +51,7 @@
 #include "wine/unixlib.h"
 
 #include "unixlib.h"
+#include <rtpi.h>
 
 struct midi_dest
 {
@@ -79,7 +80,7 @@ struct midi_src
     int                 fd;
 };
 
-static pthread_mutex_t in_buffer_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pi_mutex_t in_buffer_mutex = PI_MUTEX_INIT(0);
 
 static unsigned int num_dests, num_srcs, seq_refs;
 static struct midi_dest *dests;
@@ -90,9 +91,9 @@ static unsigned int num_midi_in_started;
 static int rec_cancel_pipe[2];
 static pthread_t rec_thread_id;
 
-static pthread_mutex_t notify_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t notify_read_cond = PTHREAD_COND_INITIALIZER;
-static pthread_cond_t notify_write_cond = PTHREAD_COND_INITIALIZER;
+static pi_mutex_t notify_mutex = PI_MUTEX_INIT(0);
+static pi_cond_t notify_read_cond = PI_COND_INIT(0);
+static pi_cond_t notify_write_cond = PI_COND_INIT(0);
 static BOOL notify_quit;
 #define NOTIFY_BUFFER_SIZE 64 + 1 /* + 1 for the sentinel */
 static struct notify_context notify_buffer[NOTIFY_BUFFER_SIZE];
@@ -171,12 +172,12 @@ static int oss_to_win_device_type(int type)
 
 static void in_buffer_lock(void)
 {
-    pthread_mutex_lock(&in_buffer_mutex);
+    pi_mutex_lock(&in_buffer_mutex);
 }
 
 static void in_buffer_unlock(void)
 {
-    pthread_mutex_unlock(&in_buffer_mutex);
+    pi_mutex_unlock(&in_buffer_mutex);
 }
 
 static uint64_t get_time_msec(void)
@@ -235,19 +236,19 @@ static BOOL notify_buffer_remove(struct notify_context *notify)
 
 static void notify_post(struct notify_context *notify)
 {
-    pthread_mutex_lock(&notify_mutex);
+    pi_mutex_lock(&notify_mutex);
 
     if (notify)
     {
         while (notify_buffer_full())
-            pthread_cond_wait(&notify_write_cond, &notify_mutex);
+            pi_cond_wait(&notify_write_cond, &notify_mutex);
 
         notify_buffer_add(notify);
     }
     else notify_quit = TRUE;
-    pthread_cond_signal(&notify_read_cond);
+    pi_cond_signal(&notify_read_cond, &notify_mutex);
 
-    pthread_mutex_unlock(&notify_mutex);
+    pi_mutex_unlock(&notify_mutex);
 }
 
 static void set_in_notify(struct notify_context *notify, struct midi_src *src, WORD dev_id, WORD msg,
@@ -1772,18 +1773,18 @@ NTSTATUS oss_midi_notify_wait(void *args)
 {
     struct midi_notify_wait_params *params = args;
 
-    pthread_mutex_lock(&notify_mutex);
+    pi_mutex_lock(&notify_mutex);
 
     while (!notify_quit && notify_buffer_empty())
-        pthread_cond_wait(&notify_read_cond, &notify_mutex);
+        pi_cond_wait(&notify_read_cond, &notify_mutex);
 
     *params->quit = notify_quit;
     if (!notify_quit)
     {
         notify_buffer_remove(params->notify);
-        pthread_cond_signal(&notify_write_cond);
+        pi_cond_signal(&notify_write_cond, &notify_mutex);
     }
-    pthread_mutex_unlock(&notify_mutex);
+    pi_mutex_unlock(&notify_mutex);
 
     return STATUS_SUCCESS;
 }

@@ -43,6 +43,7 @@
 #include "wine/unixlib.h"
 #include "wine/rbtree.h"
 #include "wine/debug.h"
+#include <rtpi.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(font);
 
@@ -460,7 +461,7 @@ static const struct nls_update_font_list
     }
 };
 
-static pthread_mutex_t font_lock = PTHREAD_MUTEX_INITIALIZER;
+static pi_mutex_t font_lock = PI_MUTEX_INIT(0);
 
 #ifdef WORDS_BIGENDIAN
 #define GET_BE_WORD(x) (x)
@@ -1076,7 +1077,7 @@ static int remove_font( const WCHAR *file, DWORD flags )
     struct gdi_font_face *face, *face_next;
     int count = 0;
 
-    pthread_mutex_lock( &font_lock );
+    pi_mutex_lock( &font_lock );
     WINE_RB_FOR_EACH_ENTRY_DESTRUCTOR( family, family_next, &family_name_tree, struct gdi_font_family, name_entry )
     {
         family->refcount++;
@@ -1093,7 +1094,7 @@ static int remove_font( const WCHAR *file, DWORD flags )
 	}
         release_family( family );
     }
-    pthread_mutex_unlock( &font_lock );
+    pi_mutex_unlock( &font_lock );
     return count;
 }
 
@@ -2885,7 +2886,7 @@ static void release_gdi_font( struct gdi_font *font )
     TRACE( "font %p\n", font );
 
     /* add it to the unused list */
-    pthread_mutex_lock( &font_lock );
+    pi_mutex_lock( &font_lock );
     if (!--font->refcount)
     {
         list_add_head( &unused_gdi_font_list, &font->unused_entry );
@@ -2899,7 +2900,7 @@ static void release_gdi_font( struct gdi_font *font )
         }
         else unused_font_count++;
     }
-    pthread_mutex_unlock( &font_lock );
+    pi_mutex_unlock( &font_lock );
 }
 
 static void add_font_list(HKEY hkey, const struct nls_update_font_list *fl, int dpi)
@@ -3431,9 +3432,9 @@ static BOOL enum_face_charsets( const struct gdi_font_family *family, struct gdi
                elf.elfLogFont.lfCharSet, type, debugstr_w(elf.elfScript),
                elf.elfLogFont.lfItalic, elf.elfLogFont.lfWeight, ntm.ntmTm.ntmFlags );
         /* release section before callback (FIXME) */
-        pthread_mutex_unlock( &font_lock );
+        pi_mutex_unlock( &font_lock );
         if (!proc( &elf.elfLogFont, (TEXTMETRICW *)&ntm, type, lparam )) return FALSE;
-        pthread_mutex_lock( &font_lock );
+        pi_mutex_lock( &font_lock );
     }
     return TRUE;
 }
@@ -3452,7 +3453,7 @@ static BOOL font_EnumFonts( PHYSDEV dev, LOGFONTW *lf, font_enum_proc proc, LPAR
 
     count = create_enum_charset_list( charset, enum_charsets );
 
-    pthread_mutex_lock( &font_lock );
+    pi_mutex_lock( &font_lock );
 
     if (lf && lf->lfFaceName[0])
     {
@@ -3488,7 +3489,7 @@ static BOOL font_EnumFonts( PHYSDEV dev, LOGFONTW *lf, font_enum_proc proc, LPAR
                 return FALSE; /* enum_face_charsets() unlocked font_lock */
 	}
     }
-    pthread_mutex_unlock( &font_lock );
+    pi_mutex_unlock( &font_lock );
     return TRUE;
 }
 
@@ -3835,13 +3836,13 @@ static BOOL font_GetCharABCWidths( PHYSDEV dev, UINT first, UINT count, WCHAR *c
 
     TRACE( "%p, %u, %u, %p\n", physdev->font, first, count, buffer );
 
-    pthread_mutex_lock( &font_lock );
+    pi_mutex_lock( &font_lock );
     for (i = 0; i < count; i++)
     {
         c = chars ? chars[i] : first + i;
         get_glyph_outline( physdev->font, c, GGO_METRICS, NULL, &buffer[i], 0, NULL, NULL );
     }
-    pthread_mutex_unlock( &font_lock );
+    pi_mutex_unlock( &font_lock );
     return TRUE;
 }
 
@@ -3862,11 +3863,11 @@ static BOOL font_GetCharABCWidthsI( PHYSDEV dev, UINT first, UINT count, WORD *g
 
     TRACE( "%p, %u, %u, %p\n", physdev->font, first, count, buffer );
 
-    pthread_mutex_lock( &font_lock );
+    pi_mutex_lock( &font_lock );
     for (c = 0; c < count; c++, buffer++)
         get_glyph_outline( physdev->font, gi ? gi[c] : first + c, GGO_METRICS | GGO_GLYPH_INDEX,
                            NULL, buffer, 0, NULL, NULL );
-    pthread_mutex_unlock( &font_lock );
+    pi_mutex_unlock( &font_lock );
     return TRUE;
 }
 
@@ -3888,7 +3889,7 @@ static BOOL font_GetCharWidth( PHYSDEV dev, UINT first, UINT count, const WCHAR 
 
     TRACE( "%p, %d, %d, %p\n", physdev->font, first, count, buffer );
 
-    pthread_mutex_lock( &font_lock );
+    pi_mutex_lock( &font_lock );
     for (i = 0; i < count; i++)
     {
         c = chars ? chars[i] : i + first;
@@ -3897,7 +3898,7 @@ static BOOL font_GetCharWidth( PHYSDEV dev, UINT first, UINT count, const WCHAR 
         else
             buffer[i] = abc.abcA + abc.abcB + abc.abcC;
     }
-    pthread_mutex_unlock( &font_lock );
+    pi_mutex_unlock( &font_lock );
     return TRUE;
 }
 
@@ -4022,7 +4023,7 @@ static DWORD font_GetGlyphIndices( PHYSDEV dev, const WCHAR *str, INT count, WOR
         got_default = TRUE;
     }
 
-    pthread_mutex_lock( &font_lock );
+    pi_mutex_lock( &font_lock );
 
     for (i = 0; i < count; i++)
     {
@@ -4051,7 +4052,7 @@ static DWORD font_GetGlyphIndices( PHYSDEV dev, const WCHAR *str, INT count, WOR
         else gi[i] = get_GSUB_vert_glyph( physdev->font, glyph );
     }
 
-    pthread_mutex_unlock( &font_lock );
+    pi_mutex_unlock( &font_lock );
     return count;
 }
 
@@ -4070,9 +4071,9 @@ static DWORD font_GetGlyphOutline( PHYSDEV dev, UINT glyph, UINT format,
         dev = GET_NEXT_PHYSDEV( dev, pGetGlyphOutline );
         return dev->funcs->pGetGlyphOutline( dev, glyph, format, gm, buflen, buf, mat );
     }
-    pthread_mutex_lock( &font_lock );
+    pi_mutex_lock( &font_lock );
     ret = get_glyph_outline( physdev->font, glyph, format, gm, NULL, buflen, buf, mat );
-    pthread_mutex_unlock( &font_lock );
+    pi_mutex_unlock( &font_lock );
     return ret;
 }
 
@@ -4090,11 +4091,11 @@ static DWORD font_GetKerningPairs( PHYSDEV dev, DWORD count, KERNINGPAIR *pairs 
         return dev->funcs->pGetKerningPairs( dev, count, pairs );
     }
 
-    pthread_mutex_lock( &font_lock );
+    pi_mutex_lock( &font_lock );
     if (physdev->font->kern_count == -1)
         physdev->font->kern_count = font_funcs->get_kerning_pairs( physdev->font,
                                                                    &physdev->font->kern_pairs );
-    pthread_mutex_unlock( &font_lock );
+    pi_mutex_unlock( &font_lock );
 
     if (count && pairs)
     {
@@ -4187,7 +4188,7 @@ static UINT font_GetOutlineTextMetrics( PHYSDEV dev, UINT size, OUTLINETEXTMETRI
 
     if (!physdev->font->scalable) return 0;
 
-    pthread_mutex_lock( &font_lock );
+    pi_mutex_lock( &font_lock );
     if (font_funcs->set_outline_text_metrics( physdev->font ))
     {
 	ret = physdev->font->otm.otmSize;
@@ -4209,7 +4210,7 @@ static UINT font_GetOutlineTextMetrics( PHYSDEV dev, UINT size, OUTLINETEXTMETRI
             scale_outline_font_metrics( physdev->font, metrics );
         }
     }
-    pthread_mutex_unlock( &font_lock );
+    pi_mutex_unlock( &font_lock );
     return ret;
 }
 
@@ -4248,14 +4249,14 @@ static BOOL font_GetTextExtentExPoint( PHYSDEV dev, const WCHAR *str, INT count,
 
     TRACE( "%p, %s, %d\n", physdev->font, debugstr_wn(str, count), count );
 
-    pthread_mutex_lock( &font_lock );
+    pi_mutex_lock( &font_lock );
     for (i = pos = 0; i < count; i++)
     {
         get_glyph_outline( physdev->font, str[i], GGO_METRICS, NULL, &abc, 0, NULL, NULL );
         pos += abc.abcA + abc.abcB + abc.abcC;
         dxs[i] = pos;
     }
-    pthread_mutex_unlock( &font_lock );
+    pi_mutex_unlock( &font_lock );
     return TRUE;
 }
 
@@ -4277,7 +4278,7 @@ static BOOL font_GetTextExtentExPointI( PHYSDEV dev, const WORD *indices, INT co
 
     TRACE( "%p, %p, %d\n", physdev->font, indices, count );
 
-    pthread_mutex_lock( &font_lock );
+    pi_mutex_lock( &font_lock );
     for (i = pos = 0; i < count; i++)
     {
         get_glyph_outline( physdev->font, indices[i], GGO_METRICS | GGO_GLYPH_INDEX,
@@ -4285,7 +4286,7 @@ static BOOL font_GetTextExtentExPointI( PHYSDEV dev, const WORD *indices, INT co
         pos += abc.abcA + abc.abcB + abc.abcC;
         dxs[i] = pos;
     }
-    pthread_mutex_unlock( &font_lock );
+    pi_mutex_unlock( &font_lock );
     return TRUE;
 }
 
@@ -4374,7 +4375,7 @@ static BOOL font_GetTextMetrics( PHYSDEV dev, TEXTMETRICW *metrics )
         return dev->funcs->pGetTextMetrics( dev, metrics );
     }
 
-    pthread_mutex_lock( &font_lock );
+    pi_mutex_lock( &font_lock );
     if (font_funcs->set_outline_text_metrics( physdev->font ) ||
         font_funcs->set_bitmap_text_metrics( physdev->font ))
     {
@@ -4382,7 +4383,7 @@ static BOOL font_GetTextMetrics( PHYSDEV dev, TEXTMETRICW *metrics )
         scale_font_metrics( physdev->font, metrics );
         ret = TRUE;
     }
-    pthread_mutex_unlock( &font_lock );
+    pi_mutex_unlock( &font_lock );
     return ret;
 }
 
@@ -4580,7 +4581,7 @@ static HFONT font_SelectFont( PHYSDEV dev, HFONT hfont, UINT *aa_flags )
         }
         TRACE( "DC transform %f %f %f %f\n", dcmat.eM11, dcmat.eM12, dcmat.eM21, dcmat.eM22 );
 
-        pthread_mutex_lock( &font_lock );
+        pi_mutex_lock( &font_lock );
 
         font = select_font( &lf, dcmat, can_use_bitmap );
 
@@ -4597,7 +4598,7 @@ static HFONT font_SelectFont( PHYSDEV dev, HFONT hfont, UINT *aa_flags )
             *aa_flags = font_funcs->get_aa_flags( font, *aa_flags, antialias_fakes );
         }
         TRACE( "%p %s %d aa %x\n", hfont, debugstr_w(lf.lfFaceName), lf.lfHeight, *aa_flags );
-        pthread_mutex_unlock( &font_lock );
+        pi_mutex_unlock( &font_lock );
     }
     physdev->font = font;
     if (prev) release_gdi_font( prev );
@@ -6264,7 +6265,7 @@ ULONG WINAPI NtGdiMakeFontDir( DWORD embed, BYTE *buffer, UINT size, const WCHAR
     if (path[len / sizeof(WCHAR) - 1]) return 0;
     if (wcslen( path ) != len / sizeof(WCHAR) - 1) return 0;
 
-    pthread_mutex_lock( &font_lock );
+    pi_mutex_lock( &font_lock );
     if (!(font = alloc_gdi_font( path, NULL, 0 ))) goto done;
     font->lf.lfHeight = 100;
     if (!font_funcs->load_font( font )) goto done;
@@ -6298,12 +6299,12 @@ ULONG WINAPI NtGdiMakeFontDir( DWORD embed, BYTE *buffer, UINT size, const WCHAR
 
     memcpy( buffer, &fontdir, sizeof(fontdir) );
     free_gdi_font( font );
-    pthread_mutex_unlock( &font_lock );
+    pi_mutex_unlock( &font_lock );
     return fontdir.dfFace + pos;
 
 done:
     if (font) free_gdi_font( font );
-    pthread_mutex_unlock( &font_lock );
+    pi_mutex_unlock( &font_lock );
     return 0;
 }
 
@@ -6397,16 +6398,16 @@ static int add_system_font_resource( const WCHAR *file, DWORD flags )
 
     /* try in %WINDIR%/fonts, needed for Fotobuch Designer */
     get_fonts_win_dir_path( file, path );
-    pthread_mutex_lock( &font_lock );
+    pi_mutex_lock( &font_lock );
     ret = font_funcs->add_font( path, flags );
-    pthread_mutex_unlock( &font_lock );
+    pi_mutex_unlock( &font_lock );
     /* try in datadir/fonts (or builddir/fonts), needed for Magic the Gathering Online */
     if (!ret)
     {
         get_fonts_data_dir_path( file, path );
-        pthread_mutex_lock( &font_lock );
+        pi_mutex_lock( &font_lock );
         ret = font_funcs->add_font( path, flags );
-        pthread_mutex_unlock( &font_lock );
+        pi_mutex_unlock( &font_lock );
     }
     return ret;
 }
@@ -6434,9 +6435,9 @@ static int add_font_resource( LPCWSTR file, DWORD flags )
         DWORD addfont_flags = ADDFONT_ALLOW_BITMAP | ADDFONT_ADD_RESOURCE;
 
         if (!(flags & FR_PRIVATE)) addfont_flags |= ADDFONT_ADD_TO_CACHE;
-        pthread_mutex_lock( &font_lock );
+        pi_mutex_lock( &font_lock );
         ret = font_funcs->add_font( file, addfont_flags );
-        pthread_mutex_unlock( &font_lock );
+        pi_mutex_unlock( &font_lock );
     }
     else if (!wcschr( file, '\\' ))
         ret = add_system_font_resource( file, ADDFONT_ALLOW_BITMAP | ADDFONT_ADD_RESOURCE );
@@ -6816,9 +6817,9 @@ HANDLE WINAPI NtGdiAddFontMemResourceEx( void *ptr, DWORD size, void *dv, ULONG 
     if (!(copy = malloc( size ))) return NULL;
     memcpy( copy, ptr, size );
 
-    pthread_mutex_lock( &font_lock );
+    pi_mutex_lock( &font_lock );
     num_fonts = font_funcs->add_mem_font( copy, size, ADDFONT_ALLOW_BITMAP | ADDFONT_ADD_RESOURCE );
-    pthread_mutex_unlock( &font_lock );
+    pi_mutex_unlock( &font_lock );
 
     if (!num_fonts)
     {
@@ -6956,7 +6957,7 @@ BOOL WINAPI NtGdiGetFontFileData( DWORD instance_id, DWORD file_index, UINT64 *o
     BOOL ret = FALSE;
 
     if (!font_funcs) return FALSE;
-    pthread_mutex_lock( &font_lock );
+    pi_mutex_lock( &font_lock );
     if ((font = get_font_from_handle( instance_id )))
     {
         if (font->ttc_item_offset) tag = MS_TTCF_TAG;
@@ -6966,7 +6967,7 @@ BOOL WINAPI NtGdiGetFontFileData( DWORD instance_id, DWORD file_index, UINT64 *o
         else
             RtlSetLastWin32Error( ERROR_INVALID_PARAMETER );
     }
-    pthread_mutex_unlock( &font_lock );
+    pi_mutex_unlock( &font_lock );
     return ret;
 }
 
@@ -6980,7 +6981,7 @@ BOOL WINAPI NtGdiGetFontFileInfo( DWORD instance_id, DWORD file_index, struct fo
     struct gdi_font *font;
     BOOL ret = FALSE;
 
-    pthread_mutex_lock( &font_lock );
+    pi_mutex_lock( &font_lock );
 
     if ((font = get_font_from_handle( instance_id )))
     {
@@ -6995,7 +6996,7 @@ BOOL WINAPI NtGdiGetFontFileInfo( DWORD instance_id, DWORD file_index, struct fo
         else RtlSetLastWin32Error( ERROR_INSUFFICIENT_BUFFER );
     }
 
-    pthread_mutex_unlock( &font_lock );
+    pi_mutex_unlock( &font_lock );
     if (needed) *needed = required_size;
     return ret;
 }

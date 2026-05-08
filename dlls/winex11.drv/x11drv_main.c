@@ -51,6 +51,7 @@
 #include "wine/list.h"
 #include "wine/vulkan.h"
 #include "wine/vulkan_driver.h"
+#include <rtpi.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(x11drv);
 WINE_DECLARE_DEBUG_CHANNEL(synchronous);
@@ -92,7 +93,7 @@ static int (*old_error_handler)( Display *, XErrorEvent * );
 static BOOL use_xim = TRUE;
 static WCHAR input_style[20];
 
-static pthread_mutex_t error_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pi_mutex_t error_mutex = PI_MUTEX_INIT(0);
 
 #define IS_OPTION_TRUE(ch) \
     ((ch) == 'y' || (ch) == 'Y' || (ch) == 't' || (ch) == 'T' || (ch) == '1')
@@ -237,7 +238,7 @@ static inline BOOL ignore_error( Display *display, XErrorEvent *event )
  */
 void X11DRV_expect_error( Display *display, x11drv_error_callback callback, void *arg )
 {
-    pthread_mutex_lock( &error_mutex );
+    pi_mutex_lock( &error_mutex );
     XLockDisplay( display );
     err_callback         = callback;
     err_callback_display = display;
@@ -258,7 +259,7 @@ int X11DRV_check_error(void)
     int res = err_callback_result;
     err_callback = NULL;
     XUnlockDisplay( err_callback_display );
-    pthread_mutex_unlock( &error_mutex );
+    pi_mutex_unlock( &error_mutex );
     return res;
 }
 

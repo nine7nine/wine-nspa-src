@@ -84,12 +84,13 @@
 #endif
 
 #include "unix_private.h"
+#include <rtpi.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(hid);
 
 #ifdef HAVE_UDEV
 
-static pthread_mutex_t udev_cs = PTHREAD_MUTEX_INITIALIZER;
+static pi_mutex_t udev_cs = PI_MUTEX_INIT(0);
 
 static struct udev *udev_context = NULL;
 static struct udev_monitor *udev_monitor;
@@ -202,7 +203,7 @@ struct lnxev_device
     int button_count;
     BOOL is_gamepad;
 
-    pthread_cond_t haptics_cond;
+    pi_cond_t haptics_cond;
     pthread_t haptics_thread;
     struct ff_effect haptics;
 
@@ -295,9 +296,9 @@ static void hidraw_device_destroy(struct unix_device *iface)
 
 static NTSTATUS hidraw_device_start(struct unix_device *iface)
 {
-    pthread_mutex_lock(&udev_cs);
+    pi_mutex_lock(&udev_cs);
     start_polling_device(iface);
-    pthread_mutex_unlock(&udev_cs);
+    pi_mutex_unlock(&udev_cs);
     return STATUS_SUCCESS;
 }
 
@@ -305,10 +306,10 @@ static void hidraw_device_stop(struct unix_device *iface)
 {
     struct hidraw_device *impl = hidraw_impl_from_unix_device(iface);
 
-    pthread_mutex_lock(&udev_cs);
+    pi_mutex_lock(&udev_cs);
     stop_polling_device(iface);
     list_remove(&impl->base.unix_device.entry);
-    pthread_mutex_unlock(&udev_cs);
+    pi_mutex_unlock(&udev_cs);
 }
 
 static NTSTATUS hidraw_device_get_report_descriptor(struct unix_device *iface, BYTE *buffer,
@@ -707,16 +708,16 @@ static void *lnxev_device_haptics_thread(void *args)
     struct lnxev_device *impl = lnxev_impl_from_unix_device(args);
     struct ff_effect effect = {0};
 
-    pthread_mutex_lock(&udev_cs);
+    pi_mutex_lock(&udev_cs);
 
     for (;;)
     {
         while (!memcmp(&effect, &impl->haptics, sizeof(effect)))
-            pthread_cond_wait(&impl->haptics_cond, &udev_cs);
+            pi_cond_wait(&impl->haptics_cond, &udev_cs);
         if (impl->haptics.type == (uint16_t)-1) break;
 
         effect = impl->haptics;
-        pthread_mutex_unlock(&udev_cs);
+        pi_mutex_unlock(&udev_cs);
 
         if (effect.type && (effect.id == -1 || ioctl(impl->base.device_fd, EVIOCSFF, &effect) == -1))
         {
@@ -730,11 +731,11 @@ static void *lnxev_device_haptics_thread(void *args)
             write(impl->base.device_fd, &event, sizeof(event));
         }
 
-        pthread_mutex_lock(&udev_cs);
+        pi_mutex_lock(&udev_cs);
         impl->haptics.id = effect.id;
     }
 
-    pthread_mutex_unlock(&udev_cs);
+    pi_mutex_unlock(&udev_cs);
     return NULL;
 }
 
@@ -742,12 +743,12 @@ static NTSTATUS lnxev_device_start(struct unix_device *iface)
 {
     struct lnxev_device *impl = lnxev_impl_from_unix_device(iface);
 
-    pthread_mutex_lock(&udev_cs);
+    pi_mutex_lock(&udev_cs);
     start_polling_device(iface);
     impl->haptics.type = 0;
-    pthread_mutex_unlock(&udev_cs);
+    pi_mutex_unlock(&udev_cs);
 
-    pthread_cond_init(&impl->haptics_cond, NULL);
+    pi_cond_init(&impl->haptics_cond, 0);
     pthread_create(&impl->haptics_thread, NULL, lnxev_device_haptics_thread, iface);
     return STATUS_SUCCESS;
 }
@@ -756,15 +757,15 @@ static void lnxev_device_stop(struct unix_device *iface)
 {
     struct lnxev_device *impl = lnxev_impl_from_unix_device(iface);
 
-    pthread_mutex_lock(&udev_cs);
+    pi_mutex_lock(&udev_cs);
     stop_polling_device(iface);
     list_remove(&impl->base.unix_device.entry);
     impl->haptics.type = -1;
-    pthread_mutex_unlock(&udev_cs);
-    pthread_cond_signal(&impl->haptics_cond);
+    pi_mutex_unlock(&udev_cs);
+    pi_cond_signal(&impl->haptics_cond, &udev_cs);
 
     pthread_join(impl->haptics_thread, NULL);
-    pthread_cond_destroy(&impl->haptics_cond);
+    pi_cond_destroy(&impl->haptics_cond);
 }
 
 static void lnxev_device_read_report(struct unix_device *iface)
@@ -792,13 +793,13 @@ static NTSTATUS lnxev_device_haptics_start(struct unix_device *iface, UINT durat
     TRACE("iface %p, duration_ms %u, rumble_intensity %u, buzz_intensity %u, left_intensity %u, right_intensity %u.\n",
           iface, duration_ms, rumble_intensity, buzz_intensity, left_intensity, right_intensity);
 
-    pthread_mutex_lock(&udev_cs);
+    pi_mutex_lock(&udev_cs);
     impl->haptics.type = FF_RUMBLE;
     impl->haptics.replay.length = duration_ms;
     impl->haptics.u.rumble.strong_magnitude = rumble_intensity;
     impl->haptics.u.rumble.weak_magnitude = buzz_intensity;
-    pthread_mutex_unlock(&udev_cs);
-    pthread_cond_signal(&impl->haptics_cond);
+    pi_mutex_unlock(&udev_cs);
+    pi_cond_signal(&impl->haptics_cond, &udev_cs);
 
     return STATUS_SUCCESS;
 }
@@ -809,13 +810,13 @@ static NTSTATUS lnxev_device_haptics_stop(struct unix_device *iface)
 
     TRACE("iface %p.\n", iface);
 
-    pthread_mutex_lock(&udev_cs);
+    pi_mutex_lock(&udev_cs);
     impl->haptics.type = 0;
     impl->haptics.replay.length = 0;
     impl->haptics.u.rumble.strong_magnitude = 0;
     impl->haptics.u.rumble.weak_magnitude = 0;
-    pthread_mutex_unlock(&udev_cs);
-    pthread_cond_signal(&impl->haptics_cond);
+    pi_mutex_unlock(&udev_cs);
+    pi_cond_signal(&impl->haptics_cond, &udev_cs);
 
     return STATUS_SUCCESS;
 }
@@ -1803,16 +1804,16 @@ NTSTATUS udev_bus_wait(void *args)
     {
         if (bus_event_queue_pop(&event_queue, result)) return STATUS_PENDING;
 
-        pthread_mutex_lock(&udev_cs);
+        pi_mutex_lock(&udev_cs);
         while (close_count--) close(close_fds[close_count]);
         memcpy(pfd, poll_fds, poll_count * sizeof(*pfd));
         count = poll_count;
         close_count = 0;
-        pthread_mutex_unlock(&udev_cs);
+        pi_mutex_unlock(&udev_cs);
 
         while (poll(pfd, count, -1) <= 0) {}
 
-        pthread_mutex_lock(&udev_cs);
+        pi_mutex_lock(&udev_cs);
         if (pfd[0].revents)
         {
             if (udev_monitor) process_monitor_event(udev_monitor);
@@ -1827,7 +1828,7 @@ NTSTATUS udev_bus_wait(void *args)
             impl = find_device_from_fd(pfd[i].fd);
             if (impl) impl->read_report(&impl->unix_device);
         }
-        pthread_mutex_unlock(&udev_cs);
+        pi_mutex_unlock(&udev_cs);
     }
 
     TRACE("UDEV main loop exiting\n");

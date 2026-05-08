@@ -31,6 +31,7 @@
 #include "ntuser_private.h"
 #include "wine/server.h"
 #include "wine/debug.h"
+#include <rtpi.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(class);
 WINE_DECLARE_DEBUG_CHANNEL(win);
@@ -77,7 +78,7 @@ typedef struct tagWINDOWPROC
 
 static WINDOWPROC winproc_array[MAX_WINPROCS];
 static UINT winproc_used = NTUSER_NB_PROCS;
-static pthread_mutex_t winproc_lock = PTHREAD_MUTEX_INITIALIZER;
+static pi_mutex_t winproc_lock = PI_MUTEX_INIT(0);
 
 static struct list class_list = LIST_INIT( class_list );
 
@@ -130,7 +131,7 @@ static inline WINDOWPROC *alloc_winproc_ptr( WNDPROC func, BOOL ansi )
     if (!func) return NULL;
     if ((proc = get_winproc_ptr( func ))) return proc;
 
-    pthread_mutex_lock( &winproc_lock );
+    pi_mutex_lock( &winproc_lock );
 
     /* check if we already have a winproc for that function */
     if (!(proc = find_winproc( func, ansi )))
@@ -148,7 +149,7 @@ static inline WINDOWPROC *alloc_winproc_ptr( WNDPROC func, BOOL ansi )
     }
     else TRACE_(win)( "reusing %p for %p\n", proc_to_handle(proc), func );
 
-    pthread_mutex_unlock( &winproc_lock );
+    pi_mutex_unlock( &winproc_lock );
     return proc;
 }
 

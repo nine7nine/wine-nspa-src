@@ -31,6 +31,7 @@
 #include "wine/opengl_driver.h"
 #include "wine/server.h"
 #include "wine/debug.h"
+#include <rtpi.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(win);
 
@@ -50,7 +51,7 @@ static struct list dce_list = LIST_INIT(dce_list);
 #define DCE_CACHE_SIZE 64
 
 static struct list window_surfaces = LIST_INIT( window_surfaces );
-static pthread_mutex_t surfaces_lock = PTHREAD_MUTEX_INITIALIZER;
+static pi_mutex_t surfaces_lock = PI_MUTEX_INIT(0);
 
 /*******************************************************************
  * Dummy window surface for windows that shouldn't get painted.
@@ -86,7 +87,7 @@ struct window_surface dummy_surface =
     .funcs = &dummy_surface_funcs,
     .ref = 1,
     .rect = {.right = 1, .bottom = 1},
-    .mutex = PTHREAD_MUTEX_INITIALIZER,
+    .mutex = PI_MUTEX_INIT(0),
 };
 
 /*******************************************************************
@@ -568,7 +569,7 @@ struct window_surface *window_surface_create( UINT size, const struct window_sur
         return NULL;
     }
 
-    pthread_mutex_init( &surface->mutex, NULL );
+    pi_mutex_init(&surface->mutex, 0);
 
     memset( window_surface_get_color( surface, info ), 0xff, info->bmiHeader.biSizeImage );
 
@@ -586,7 +587,7 @@ void window_surface_release( struct window_surface *surface )
     ULONG ret = InterlockedDecrement( &surface->ref );
     if (!ret)
     {
-        if (surface != &dummy_surface) pthread_mutex_destroy( &surface->mutex );
+        if (surface != &dummy_surface) pi_mutex_destroy( &surface->mutex );
         if (surface->clip_region) NtGdiDeleteObjectApp( surface->clip_region );
         if (surface->color_bitmap) NtGdiDeleteObjectApp( surface->color_bitmap );
         if (surface->shape_bitmap) NtGdiDeleteObjectApp( surface->shape_bitmap );
@@ -598,13 +599,13 @@ void window_surface_release( struct window_surface *surface )
 void window_surface_lock( struct window_surface *surface )
 {
     if (surface == &dummy_surface) return;
-    pthread_mutex_lock( &surface->mutex );
+    pi_mutex_lock( &surface->mutex );
 }
 
 void window_surface_unlock( struct window_surface *surface )
 {
     if (surface == &dummy_surface) return;
-    pthread_mutex_unlock( &surface->mutex );
+    pi_mutex_unlock( &surface->mutex );
 }
 
 void window_surface_flush( struct window_surface *surface )
@@ -736,10 +737,10 @@ void register_window_surface( struct window_surface *old, struct window_surface 
     if (old == &dummy_surface) old = NULL;
     if (new == &dummy_surface) new = NULL;
     if (old == new) return;
-    pthread_mutex_lock( &surfaces_lock );
+    pi_mutex_lock( &surfaces_lock );
     if (old) list_remove( &old->entry );
     if (new) list_add_tail( &window_surfaces, &new->entry );
-    pthread_mutex_unlock( &surfaces_lock );
+    pi_mutex_unlock( &surfaces_lock );
 }
 
 /*******************************************************************
@@ -753,7 +754,7 @@ void flush_window_surfaces( BOOL idle )
     DWORD now;
     struct window_surface *surface;
 
-    pthread_mutex_lock( &surfaces_lock );
+    pi_mutex_lock( &surfaces_lock );
     now = NtGetTickCount();
     if (idle) last_idle = now;
     /* if not idle, we only flush if there's evidence that the app never goes idle */
@@ -762,7 +763,7 @@ void flush_window_surfaces( BOOL idle )
     LIST_FOR_EACH_ENTRY( surface, &window_surfaces, struct window_surface, entry )
         window_surface_flush( surface );
 done:
-    pthread_mutex_unlock( &surfaces_lock );
+    pi_mutex_unlock( &surfaces_lock );
 }
 
 /***********************************************************************

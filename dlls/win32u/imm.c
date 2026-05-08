@@ -30,6 +30,7 @@
 #include "ntuser_private.h"
 #include "immdev.h"
 #include "wine/debug.h"
+#include <rtpi.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(imm);
 
@@ -64,7 +65,7 @@ struct imm_thread_data
 };
 
 static struct list thread_data_list = LIST_INIT( thread_data_list );
-static pthread_mutex_t imm_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pi_mutex_t imm_mutex = PI_MUTEX_INIT(0);
 static struct list ime_updates = LIST_INIT( ime_updates );
 static BOOL disable_ime;
 
@@ -264,9 +265,9 @@ static struct imm_thread_data *get_imm_thread_data(void)
         if (!(data = calloc( 1, sizeof( *data )))) return NULL;
         data->thread_id = GetCurrentThreadId();
 
-        pthread_mutex_lock( &imm_mutex );
+        pi_mutex_lock( &imm_mutex );
         list_add_tail( &thread_data_list, &data->entry );
-        pthread_mutex_unlock( &imm_mutex );
+        pi_mutex_unlock( &imm_mutex );
 
         thread_info->imm_thread_data = data;
     }
@@ -348,7 +349,7 @@ BOOL WINAPI NtUserDisableThreadIme( DWORD thread_id )
     {
         disable_ime = TRUE;
 
-        pthread_mutex_lock( &imm_mutex );
+        pi_mutex_lock( &imm_mutex );
         LIST_FOR_EACH_ENTRY( thread_data, &thread_data_list, struct imm_thread_data, entry )
         {
             if (thread_data->thread_id == GetCurrentThreadId()) continue;
@@ -356,7 +357,7 @@ BOOL WINAPI NtUserDisableThreadIme( DWORD thread_id )
             NtUserMessageCall( thread_data->default_hwnd, WM_WINE_DESTROYWINDOW, 0, 0,
                                0, NtUserSendNotifyMessage, FALSE );
         }
-        pthread_mutex_unlock( &imm_mutex );
+        pi_mutex_unlock( &imm_mutex );
     }
     else if (!thread_id || thread_id == GetCurrentThreadId())
     {
@@ -384,14 +385,14 @@ HWND get_default_ime_window( HWND hwnd )
 
         if (!(thread_id = get_window_thread( hwnd, NULL ))) return 0;
 
-        pthread_mutex_lock( &imm_mutex );
+        pi_mutex_lock( &imm_mutex );
         LIST_FOR_EACH_ENTRY( thread_data, &thread_data_list, struct imm_thread_data, entry )
         {
             if (thread_data->thread_id != thread_id) continue;
             ret = thread_data->default_hwnd;
             break;
         }
-        pthread_mutex_unlock( &imm_mutex );
+        pi_mutex_unlock( &imm_mutex );
     }
     else if ((thread_data = get_user_thread_info()->imm_thread_data))
     {
@@ -408,9 +409,9 @@ void cleanup_imm_thread(void)
 
     if (thread_info->imm_thread_data)
     {
-        pthread_mutex_lock( &imm_mutex );
+        pi_mutex_lock( &imm_mutex );
         list_remove( &thread_info->imm_thread_data->entry );
-        pthread_mutex_unlock( &imm_mutex );
+        pi_mutex_unlock( &imm_mutex );
         free( thread_info->imm_thread_data );
         thread_info->imm_thread_data = NULL;
     }
@@ -483,12 +484,12 @@ static void post_ime_update( HWND hwnd, UINT cursor_pos, WCHAR *comp_str, WCHAR 
 
     if (!(update->vkey = data->ime_process_vkey))
     {
-        pthread_mutex_lock( &imm_mutex );
+        pi_mutex_lock( &imm_mutex );
         id = update->scan = ++ime_update_count;
         update->vkey = VK_PROCESSKEY;
         update->key_consumed = TRUE;
         list_add_tail( &ime_updates, &update->entry );
-        pthread_mutex_unlock( &imm_mutex );
+        pi_mutex_unlock( &imm_mutex );
 
         NtUserPostMessage( hwnd, WM_WINE_IME_NOTIFY, IMN_WINE_SET_COMP_STRING, id );
     }
@@ -564,11 +565,11 @@ static UINT ime_to_tascii_ex( UINT vkey, UINT lparam, const BYTE *state, COMPOSI
 
     TRACE( "vkey %#x, lparam %#x, state %p, compstr %p, himc %p\n", vkey, lparam, state, compstr, himc );
 
-    pthread_mutex_lock( &imm_mutex );
+    pi_mutex_lock( &imm_mutex );
 
     if (!(update = find_ime_update( vkey, lparam )))
     {
-        pthread_mutex_unlock( &imm_mutex );
+        pi_mutex_unlock( &imm_mutex );
         return STATUS_NOT_FOUND;
     }
 
@@ -603,12 +604,12 @@ static UINT ime_to_tascii_ex( UINT vkey, UINT lparam, const BYTE *state, COMPOSI
     if (compstr->dwSize < needed)
     {
         compstr->dwSize = needed;
-        pthread_mutex_unlock( &imm_mutex );
+        pi_mutex_unlock( &imm_mutex );
         return STATUS_BUFFER_TOO_SMALL;
     }
 
     list_remove( &update->entry );
-    pthread_mutex_unlock( &imm_mutex );
+    pi_mutex_unlock( &imm_mutex );
 
     memset( compstr, 0, sizeof(*compstr) );
     compstr->dwSize = sizeof(*compstr);
@@ -676,9 +677,9 @@ LRESULT ime_driver_call( HWND hwnd, enum wine_ime_call call, WPARAM wparam, LPAR
             if (data->update)
             {
                 data->update->key_consumed = !res;
-                pthread_mutex_lock( &imm_mutex );
+                pi_mutex_lock( &imm_mutex );
                 list_add_tail( &ime_updates, &data->update->entry );
-                pthread_mutex_unlock( &imm_mutex );
+                pi_mutex_unlock( &imm_mutex );
                 data->update = NULL;
                 res = STATUS_SUCCESS;
             }

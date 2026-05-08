@@ -80,6 +80,7 @@
 #include "wine/asm.h"
 #include "unix_private.h"
 #include "wine/debug.h"
+#include <rtpi.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(ntdll);
 
@@ -261,7 +262,7 @@ static SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *logical_proc_info_ex;
 static unsigned int logical_proc_info_ex_size, logical_proc_info_ex_alloc_size;
 static ULONG_PTR system_cpu_mask;
 
-static pthread_mutex_t timezone_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pi_mutex_t timezone_mutex = PI_MUTEX_INIT(0);
 
 static const char default_tzinfo_dir[] = "/usr/share/zoneinfo";
 static const WCHAR Time_ZonesW[] = { '\\','R','e','g','i','s','t','r','y','\\',

@@ -39,10 +39,11 @@
 
 #include "wine/opengl_driver.h"
 #include "wine/debug.h"
+#include <rtpi.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(dc);
 
-static pthread_mutex_t dc_attr_lock = PTHREAD_MUTEX_INITIALIZER;
+static pi_mutex_t dc_attr_lock = PI_MUTEX_INIT(0);
 
 struct dc_attr_bucket
 {
@@ -89,7 +90,7 @@ static DC_ATTR *alloc_dc_attr(void)
     struct dc_attr_bucket *bucket;
     DC_ATTR *dc_attr = NULL;
 
-    pthread_mutex_lock( &dc_attr_lock );
+    pi_mutex_lock( &dc_attr_lock );
 
     LIST_FOR_EACH_ENTRY( bucket, &dc_attr_buckets, struct dc_attr_bucket, entry )
     {
@@ -124,7 +125,7 @@ static DC_ATTR *alloc_dc_attr(void)
 
     if (dc_attr) memset( dc_attr, 0, sizeof( *dc_attr ));
 
-    pthread_mutex_unlock( &dc_attr_lock );
+    pi_mutex_unlock( &dc_attr_lock );
 
     return dc_attr;
 }
@@ -134,7 +135,7 @@ static void free_dc_attr( DC_ATTR *dc_attr )
 {
     struct dc_attr_bucket *bucket;
 
-    pthread_mutex_lock( &dc_attr_lock );
+    pi_mutex_lock( &dc_attr_lock );
 
     LIST_FOR_EACH_ENTRY( bucket, &dc_attr_buckets, struct dc_attr_bucket, entry )
     {
@@ -144,7 +145,7 @@ static void free_dc_attr( DC_ATTR *dc_attr )
         break;
     }
 
-    pthread_mutex_unlock( &dc_attr_lock );
+    pi_mutex_unlock( &dc_attr_lock );
 }
 
 

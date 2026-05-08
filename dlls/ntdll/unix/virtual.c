@@ -90,6 +90,7 @@
 #include "wine/rbtree.h"
 #include "unix_private.h"
 #include "wine/debug.h"
+#include <rtpi.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(virtual);
 WINE_DECLARE_DEBUG_CHANNEL(module);
@@ -166,7 +167,7 @@ static const BYTE VIRTUAL_Win32Flags[16] =
 };
 
 static struct wine_rb_tree views_tree;
-static pthread_mutex_t virtual_mutex;
+static pi_mutex_t virtual_mutex;
 pthread_key_t thread_data_key = 0;
 
 static const UINT page_shift = 12;
@@ -3660,7 +3661,7 @@ void virtual_init(void)
 
     pthread_mutexattr_init( &attr );
     pthread_mutexattr_settype( &attr, PTHREAD_MUTEX_RECURSIVE );
-    pthread_mutex_init( &virtual_mutex, &attr );
+    pi_mutex_init(&virtual_mutex, NSPA_RTPI_MUTEX_RECURSIVE);
     pthread_mutexattr_destroy( &attr );
 
 #ifdef __aarch64__

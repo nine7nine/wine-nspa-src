@@ -87,6 +87,7 @@
 #include "wine/unixlib.h"
 
 #include "unix_private.h"
+#include <rtpi.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(nsi);
 
@@ -103,7 +104,7 @@ struct if_entry
 };
 
 static struct list if_list = LIST_INIT( if_list );
-static pthread_mutex_t if_list_lock = PTHREAD_MUTEX_INITIALIZER;
+static pi_mutex_t if_list_lock = PI_MUTEX_INIT(0);
 
 static struct if_entry *find_entry_from_index( UINT index )
 {
@@ -506,7 +507,7 @@ static NTSTATUS ifinfo_enumerate_all( void *key_data, UINT key_size, void *rw_da
     TRACE( "%p %d %p %d %p %d %p %d %p\n", key_data, key_size, rw_data, rw_size,
            dynamic_data, dynamic_size, static_data, static_size, count );
 
-    pthread_mutex_lock( &if_list_lock );
+    pi_mutex_lock( &if_list_lock );
 
     update_if_table();
 
@@ -523,7 +524,7 @@ static NTSTATUS ifinfo_enumerate_all( void *key_data, UINT key_size, void *rw_da
         num++;
     }
 
-    pthread_mutex_unlock( &if_list_lock );
+    pi_mutex_unlock( &if_list_lock );
 
     if (!want_data || num <= *count) *count = num;
     else status = STATUS_BUFFER_OVERFLOW;
@@ -541,7 +542,7 @@ static NTSTATUS ifinfo_get_all_parameters( const void *key, UINT key_size, void 
     TRACE( "%p %d %p %d %p %d %p %d\n", key, key_size, rw_data, rw_size,
            dynamic_data, dynamic_size, static_data, static_size );
 
-    pthread_mutex_lock( &if_list_lock );
+    pi_mutex_lock( &if_list_lock );
 
     if (!(entry = find_entry_from_luid( (const NET_LUID *)key )))
     {
@@ -554,7 +555,7 @@ static NTSTATUS ifinfo_get_all_parameters( const void *key, UINT key_size, void 
         status = STATUS_SUCCESS;
     }
 
-    pthread_mutex_unlock( &if_list_lock );
+    pi_mutex_unlock( &if_list_lock );
 
     return status;
 }
@@ -605,7 +606,7 @@ static NTSTATUS ifinfo_get_parameter( const void *key, UINT key_size, UINT param
 
     TRACE( "%p %d %d %p %d %d\n", key, key_size, param_type, data, data_size, data_offset );
 
-    pthread_mutex_lock( &if_list_lock );
+    pi_mutex_lock( &if_list_lock );
 
     if (!(entry = find_entry_from_luid( (const NET_LUID *)key )))
     {
@@ -625,7 +626,7 @@ static NTSTATUS ifinfo_get_parameter( const void *key, UINT key_size, UINT param
         }
     }
 
-    pthread_mutex_unlock( &if_list_lock );
+    pi_mutex_unlock( &if_list_lock );
 
     return status;
 }
@@ -641,7 +642,7 @@ static NTSTATUS index_luid_get_parameter( const void *key, UINT key_size, UINT p
     if (param_type != NSI_PARAM_TYPE_STATIC || data_size != sizeof(NET_LUID) || data_offset != 0)
         return STATUS_INVALID_PARAMETER;
 
-    pthread_mutex_lock( &if_list_lock );
+    pi_mutex_lock( &if_list_lock );
 
     if (!(entry = find_entry_from_index( *(UINT *)key )))
     {
@@ -653,7 +654,7 @@ static NTSTATUS index_luid_get_parameter( const void *key, UINT key_size, UINT p
         *(NET_LUID *)data = entry->if_luid;
         status = STATUS_SUCCESS;
     }
-    pthread_mutex_unlock( &if_list_lock );
+    pi_mutex_unlock( &if_list_lock );
     return status;
 }
 
@@ -663,7 +664,7 @@ BOOL convert_unix_name_to_luid( const char *unix_name, NET_LUID *luid )
     BOOL ret = FALSE;
     int updated = 0;
 
-    pthread_mutex_lock( &if_list_lock );
+    pi_mutex_lock( &if_list_lock );
 
     do
     {
@@ -679,7 +680,7 @@ BOOL convert_unix_name_to_luid( const char *unix_name, NET_LUID *luid )
     } while (!updated++ && update_if_table());
 
 done:
-    pthread_mutex_unlock( &if_list_lock );
+    pi_mutex_unlock( &if_list_lock );
 
     return ret;
 }
@@ -690,7 +691,7 @@ BOOL convert_luid_to_unix_name( const NET_LUID *luid, const char **unix_name )
     BOOL ret = FALSE;
     int updated = 0;
 
-    pthread_mutex_lock( &if_list_lock );
+    pi_mutex_lock( &if_list_lock );
 
     do
     {
@@ -706,7 +707,7 @@ BOOL convert_luid_to_unix_name( const NET_LUID *luid, const char **unix_name )
     } while (!updated++ && update_if_table());
 
 done:
-    pthread_mutex_unlock( &if_list_lock );
+    pi_mutex_unlock( &if_list_lock );
 
     return ret;
 }

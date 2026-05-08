@@ -79,6 +79,7 @@
 #include "wine/debug.h"
 #include "unix_private.h"
 #include "ddk/wdm.h"
+#include <rtpi.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(server);
 WINE_DECLARE_DEBUG_CHANNEL(syscall);
@@ -103,7 +104,7 @@ sigset_t server_block_set;  /* signals to block during server calls */
 static int fd_socket = -1;  /* socket to exchange file descriptors with the server */
 static int initial_cwd = -1;
 static pid_t server_pid;
-pthread_mutex_t fd_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+pi_mutex_t fd_cache_mutex = PI_MUTEX_INIT(0);
 
 /* atomically exchange a 64-bit value */
 static inline LONG64 interlocked_xchg64( LONG64 *dest, LONG64 val )
@@ -325,7 +326,7 @@ NTSTATUS unixcall_wine_server_call( void *args )
 /***********************************************************************
  *           server_enter_uninterrupted_section
  */
-void server_enter_uninterrupted_section( pthread_mutex_t *mutex, sigset_t *sigset )
+void server_enter_uninterrupted_section( pi_mutex_t *mutex, sigset_t *sigset )
 {
     pthread_sigmask( SIG_BLOCK, &server_block_set, sigset );
     mutex_lock( mutex );
@@ -335,7 +336,7 @@ void server_enter_uninterrupted_section( pthread_mutex_t *mutex, sigset_t *sigse
 /***********************************************************************
  *           server_leave_uninterrupted_section
  */
-void server_leave_uninterrupted_section( pthread_mutex_t *mutex, sigset_t *sigset )
+void server_leave_uninterrupted_section( pi_mutex_t *mutex, sigset_t *sigset )
 {
     mutex_unlock( mutex );
     pthread_sigmask( SIG_SETMASK, sigset, NULL );

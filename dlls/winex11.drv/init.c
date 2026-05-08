@@ -33,6 +33,7 @@
 #include "x11drv.h"
 #include "xcomposite.h"
 #include "wine/debug.h"
+#include <rtpi.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(x11drv);
 
@@ -48,13 +49,13 @@ static const struct user_driver_funcs x11drv_funcs;
 static const struct gdi_dc_funcs *xrender_funcs;
 
 
-void init_recursive_mutex( pthread_mutex_t *mutex )
+void init_recursive_mutex( pi_mutex_t *mutex )
 {
     pthread_mutexattr_t attr;
 
     pthread_mutexattr_init( &attr );
     pthread_mutexattr_settype( &attr, PTHREAD_MUTEX_RECURSIVE );
-    pthread_mutex_init( mutex, &attr );
+    pi_mutex_init(mutex, NSPA_RTPI_MUTEX_RECURSIVE);
     pthread_mutexattr_destroy( &attr );
 }
 

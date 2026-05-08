@@ -41,6 +41,7 @@
 #include "wine/unixlib.h"
 
 #include "unixlib.h"
+#include <rtpi.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(alsa);
 
@@ -78,7 +79,7 @@ struct alsa_stream
     LONG32 getbuf_last; /* <0 when using tmp_buffer */
     float *vols;
 
-    pthread_mutex_t lock;
+    pi_mutex_t lock;
 };
 
 #define EXTRA_SAFE_RT 40000
@@ -208,12 +209,12 @@ static int muldiv( int a, int b, int c )
 
 static void alsa_lock(struct alsa_stream *stream)
 {
-    pthread_mutex_lock(&stream->lock);
+    pi_mutex_lock(&stream->lock);
 }
 
 static void alsa_unlock(struct alsa_stream *stream)
 {
-    pthread_mutex_unlock(&stream->lock);
+    pi_mutex_unlock(&stream->lock);
 }
 
 static NTSTATUS alsa_unlock_result(struct alsa_stream *stream,
@@ -1011,7 +1012,7 @@ static NTSTATUS alsa_create_stream(void *args)
     stream->share = params->share;
     stream->flags = params->flags;
 
-    pthread_mutex_init(&stream->lock, NULL);
+    pi_mutex_init(&stream->lock, 0);
 
     TRACE("ALSA period: %lu frames\n", stream->alsa_period_frames);
     TRACE("ALSA buffer: %lu frames\n", stream->alsa_bufsize_frames);
@@ -1066,7 +1067,7 @@ static NTSTATUS alsa_release_stream(void *args)
     free(stream->hw_params);
     free(stream->fmt);
     free(stream->vols);
-    pthread_mutex_destroy(&stream->lock);
+    pi_mutex_destroy(&stream->lock);
     free(stream);
 
     params->result = S_OK;

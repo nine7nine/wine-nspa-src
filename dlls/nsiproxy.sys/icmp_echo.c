@@ -55,6 +55,7 @@
 #include "wine/debug.h"
 
 #include "nsiproxy_private.h"
+#include <rtpi.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(nsi);
 
@@ -144,7 +145,7 @@ struct icmp_data
 
 #define MAX_HANDLES 256 /* Max number of simultaneous pings - could become dynamic if need be */
 static struct icmp_data *handle_table[MAX_HANDLES];
-static pthread_mutex_t handle_lock = PTHREAD_MUTEX_INITIALIZER;
+static pi_mutex_t handle_lock = PI_MUTEX_INIT(0);
 static struct icmp_data **next_free, **next_unused = handle_table;
 
 static icmp_handle handle_alloc( struct icmp_data *data )
@@ -152,19 +153,19 @@ static icmp_handle handle_alloc( struct icmp_data *data )
     struct icmp_data **entry;
     icmp_handle h;
 
-    pthread_mutex_lock( &handle_lock );
+    pi_mutex_lock( &handle_lock );
     entry = next_free;
     if (entry) next_free = *(struct icmp_data ***)entry;
     else if (next_unused < handle_table + MAX_HANDLES) entry = next_unused++;
     else
     {
-        pthread_mutex_unlock( &handle_lock );
+        pi_mutex_unlock( &handle_lock );
         FIXME( "Exhausted icmp handle count\n" );
         return 0;
     }
     *entry = data;
     h = entry - handle_table + 1;
-    pthread_mutex_unlock( &handle_lock );
+    pi_mutex_unlock( &handle_lock );
     TRACE( "returning handle %x\n", h );
     return h;
 }
@@ -192,14 +193,14 @@ static void handle_free( icmp_handle h )
     struct icmp_data **entry;
 
     TRACE( "%x\n", h );
-    pthread_mutex_lock( &handle_lock );
+    pi_mutex_lock( &handle_lock );
     entry = handle_entry( h );
     if (entry)
     {
         *(struct icmp_data ***)entry = next_free;
         next_free = entry;
     }
-    pthread_mutex_unlock( &handle_lock );
+    pi_mutex_unlock( &handle_lock );
 }
 
 static void ipv4_init_icmp_hdr( struct icmp_data *data, struct icmp_hdr *icmp_hdr )

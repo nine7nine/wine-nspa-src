@@ -40,6 +40,7 @@
 #include "x11drv.h"
 #include "winternl.h"
 #include "wine/debug.h"
+#include <rtpi.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(xrender);
 
@@ -194,7 +195,7 @@ MAKE_FUNCPTR(XRenderQueryExtension)
 
 #undef MAKE_FUNCPTR
 
-static pthread_mutex_t xrender_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pi_mutex_t xrender_mutex = PI_MUTEX_INIT(0);
 
 #define MS_MAKE_TAG( _x1, _x2, _x3, _x4 ) \
           ( ( (ULONG)_x4 << 24 ) |     \
@@ -563,7 +564,7 @@ static Picture get_no_alpha_mask(void)
     static Pixmap pixmap;
     static Picture pict;
 
-    pthread_mutex_lock( &xrender_mutex );
+    pi_mutex_lock( &xrender_mutex );
     if (!pict)
     {
         XRenderPictureAttributes pa;
@@ -578,7 +579,7 @@ static Picture get_no_alpha_mask(void)
         col.alpha = 0;
         pXRenderFillRectangle( gdi_display, PictOpSrc, pict, &col, 0, 0, 1, 1 );
     }
-    pthread_mutex_unlock( &xrender_mutex );
+    pi_mutex_unlock( &xrender_mutex );
     return pict;
 }
 
@@ -868,11 +869,11 @@ static HFONT xrenderdrv_SelectFont( PHYSDEV dev, HFONT hfont, UINT *aa_flags )
 
     lfsz_calc_hash(&lfsz);
 
-    pthread_mutex_lock( &xrender_mutex );
+    pi_mutex_lock( &xrender_mutex );
     if (physdev->cache_index != -1)
         dec_ref_cache( physdev->cache_index );
     physdev->cache_index = GetCacheEntry( &lfsz );
-    pthread_mutex_unlock( &xrender_mutex );
+    pi_mutex_unlock( &xrender_mutex );
     return ret;
 }
 
@@ -960,9 +961,9 @@ static BOOL xrenderdrv_DeleteDC( PHYSDEV dev )
 
     free_xrender_picture( physdev );
 
-    pthread_mutex_lock( &xrender_mutex );
+    pi_mutex_lock( &xrender_mutex );
     if (physdev->cache_index != -1) dec_ref_cache( physdev->cache_index );
-    pthread_mutex_unlock( &xrender_mutex );
+    pi_mutex_unlock( &xrender_mutex );
 
     free( physdev );
     return TRUE;
@@ -1347,7 +1348,7 @@ static BOOL xrenderdrv_ExtTextOut( PHYSDEV dev, INT x, INT y, UINT flags,
 
     if(count == 0) return TRUE;
 
-    pthread_mutex_lock( &xrender_mutex );
+    pi_mutex_lock( &xrender_mutex );
 
     entry = glyphsetCache + physdev->cache_index;
     formatEntry = entry->format[type][aa_type_from_flags( physdev->aa_flags )];
@@ -1364,7 +1365,7 @@ static BOOL xrenderdrv_ExtTextOut( PHYSDEV dev, INT x, INT y, UINT flags,
     if (!formatEntry)
     {
         WARN("could not upload requested glyphs\n");
-        pthread_mutex_unlock( &xrender_mutex );
+        pi_mutex_unlock( &xrender_mutex );
         return FALSE;
     }
 
@@ -1435,7 +1436,7 @@ static BOOL xrenderdrv_ExtTextOut( PHYSDEV dev, INT x, INT y, UINT flags,
                             0, 0, 0, 0, elts, count);
     free( elts );
 
-    pthread_mutex_unlock( &xrender_mutex );
+    pi_mutex_unlock( &xrender_mutex );
     add_device_bounds( physdev->x11dev, &bounds );
     return TRUE;
 }
@@ -1553,7 +1554,7 @@ static void xrender_mono_blit( Picture src_pict, Picture dst_pict,
      * contains a 1x1 picture for tiling. The source data effectively acts as an alpha channel to
      * the tile data.
      */
-    pthread_mutex_lock( &xrender_mutex );
+    pi_mutex_lock( &xrender_mutex );
     color = *bg;
     color.alpha = 0xffff;  /* tile pict needs 100% alpha */
     tile_pict = get_tile_pict( dst_format, &color );
@@ -1577,7 +1578,7 @@ static void xrender_mono_blit( Picture src_pict, Picture dst_pict,
     }
     pXRenderComposite(gdi_display, PictOpOver, tile_pict, src_pict, dst_pict,
                       0, 0, x_offset, y_offset, x_dst, y_dst, width_dst, height_dst );
-    pthread_mutex_unlock( &xrender_mutex );
+    pi_mutex_unlock( &xrender_mutex );
 
     /* force the alpha channel for background pixels, it has been set to 100% by the tile */
     if (bg->alpha != 0xffff && (dst_format == WXR_FORMAT_A8R8G8B8 || dst_format == WXR_FORMAT_B8G8R8A8))
@@ -1915,7 +1916,7 @@ static DWORD xrenderdrv_BlendImage( PHYSDEV dev, BITMAPINFO *info, const struct 
 
         dst_pict = get_xrender_picture( physdev, 0, &dst->visrect );
 
-        pthread_mutex_lock( &xrender_mutex );
+        pi_mutex_lock( &xrender_mutex );
         mask_pict = get_mask_pict( func.SourceConstantAlpha * 257 );
 
         xrender_blit( PictOpOver, src_pict, mask_pict, dst_pict,
@@ -1927,7 +1928,7 @@ static DWORD xrenderdrv_BlendImage( PHYSDEV dev, BITMAPINFO *info, const struct 
         pXRenderFreePicture( gdi_display, src_pict );
         XFreePixmap( gdi_display, src_pixmap );
 
-        pthread_mutex_unlock( &xrender_mutex );
+        pi_mutex_unlock( &xrender_mutex );
         add_device_bounds( physdev->x11dev, &dst->visrect );
     }
     return ret;
@@ -2004,7 +2005,7 @@ static BOOL xrenderdrv_AlphaBlend( PHYSDEV dst_dev, struct bitblt_coords *dst,
 
     if (tmp_pict) src_pict = tmp_pict;
 
-    pthread_mutex_lock( &xrender_mutex );
+    pi_mutex_lock( &xrender_mutex );
     mask_pict = get_mask_pict( blendfn.SourceConstantAlpha * 257 );
 
     xrender_blit( PictOpOver, src_pict, mask_pict, dst_pict,
@@ -2018,7 +2019,7 @@ static BOOL xrenderdrv_AlphaBlend( PHYSDEV dst_dev, struct bitblt_coords *dst,
     if (tmp_pict) pXRenderFreePicture( gdi_display, tmp_pict );
     if (tmp_pixmap) XFreePixmap( gdi_display, tmp_pixmap );
 
-    pthread_mutex_unlock( &xrender_mutex );
+    pi_mutex_unlock( &xrender_mutex );
     add_device_bounds( physdev_dst->x11dev, &dst->visrect );
     return TRUE;
 }

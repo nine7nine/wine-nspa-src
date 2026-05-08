@@ -34,6 +34,7 @@
 #include "unix_private.h"
 
 #include "wine/list.h"
+#include <rtpi.h>
 
 typedef struct
 {
@@ -52,8 +53,8 @@ typedef struct
 {
     GstAllocator parent;
 
-    pthread_mutex_t mutex;
-    pthread_cond_t release_cond;
+    pi_mutex_t mutex;
+    pi_cond_t release_cond;
     struct list memory_list;
 
     struct wg_sample *next_sample;
@@ -89,7 +90,7 @@ static void release_memory_sample(WgAllocator *allocator, WgMemory *memory, bool
     while (sample->refcount > 1)
     {
         GST_WARNING("Waiting for sample %p to be unmapped", sample);
-        pthread_cond_wait(&allocator->release_cond, &allocator->mutex);
+        pi_cond_wait(&allocator->release_cond, &allocator->mutex);
     }
     InterlockedDecrement(&sample->refcount);
 
@@ -113,7 +114,7 @@ static gpointer wg_allocator_map(GstMemory *gst_memory, GstMapInfo *info, gsize 
 
     GST_LOG("memory %p, info %p, maxsize %#zx", memory, info, maxsize);
 
-    pthread_mutex_lock(&allocator->mutex);
+    pi_mutex_lock(&allocator->mutex);
 
     if (!memory->sample)
         info->data = get_unix_memory_data(memory);
@@ -125,7 +126,7 @@ static gpointer wg_allocator_map(GstMemory *gst_memory, GstMapInfo *info, gsize 
     if (info->flags & GST_MAP_WRITE)
         memory->written = max(memory->written, maxsize);
 
-    pthread_mutex_unlock(&allocator->mutex);
+    pi_mutex_unlock(&allocator->mutex);
 
     GST_INFO("Mapped memory %p to %p", memory, info->data);
     return info->data;
@@ -141,15 +142,15 @@ static void wg_allocator_unmap(GstMemory *gst_memory, GstMapInfo *info)
 
     GST_LOG("memory %p, info %p", memory, info);
 
-    pthread_mutex_lock(&allocator->mutex);
+    pi_mutex_lock(&allocator->mutex);
 
     if (memory->sample && info->data == wg_sample_data(memory->sample))
     {
         InterlockedDecrement(&memory->sample->refcount);
-        pthread_cond_signal(&allocator->release_cond);
+        pi_cond_signal(&allocator->release_cond, &allocator->mutex);
     }
 
-    pthread_mutex_unlock(&allocator->mutex);
+    pi_mutex_unlock(&allocator->mutex);
 }
 
 static void wg_allocator_init(WgAllocator *allocator)
@@ -163,8 +164,8 @@ static void wg_allocator_init(WgAllocator *allocator)
 
     GST_OBJECT_FLAG_SET(allocator, GST_ALLOCATOR_FLAG_CUSTOM_ALLOC);
 
-    pthread_mutex_init(&allocator->mutex, NULL);
-    pthread_cond_init(&allocator->release_cond, NULL);
+    pi_mutex_init(&allocator->mutex, 0);
+    pi_cond_init(&allocator->release_cond, 0);
     list_init(&allocator->memory_list);
 }
 
@@ -174,8 +175,8 @@ static void wg_allocator_finalize(GObject *object)
 
     GST_LOG("allocator %p", allocator);
 
-    pthread_cond_destroy(&allocator->release_cond);
-    pthread_mutex_destroy(&allocator->mutex);
+    pi_cond_destroy(&allocator->release_cond);
+    pi_mutex_destroy(&allocator->mutex);
 
     G_OBJECT_CLASS(wg_allocator_parent_class)->finalize(object);
 }
@@ -193,7 +194,7 @@ static GstMemory *wg_allocator_alloc(GstAllocator *gst_allocator, gsize size,
             NULL, size, 0, 0, size);
     memory->alloc_params = *params;
 
-    pthread_mutex_lock(&allocator->mutex);
+    pi_mutex_lock(&allocator->mutex);
 
     memory->sample = allocator->next_sample;
     allocator->next_sample = NULL;
@@ -203,7 +204,7 @@ static GstMemory *wg_allocator_alloc(GstAllocator *gst_allocator, gsize size,
 
     list_add_tail(&allocator->memory_list, &memory->entry);
 
-    pthread_mutex_unlock(&allocator->mutex);
+    pi_mutex_unlock(&allocator->mutex);
 
     GST_INFO("Allocated memory %p, sample %p", memory, memory->sample);
     return (GstMemory *)memory;
@@ -216,7 +217,7 @@ static void wg_allocator_free(GstAllocator *gst_allocator, GstMemory *gst_memory
 
     GST_LOG("allocator %p, memory %p", allocator, memory);
 
-    pthread_mutex_lock(&allocator->mutex);
+    pi_mutex_lock(&allocator->mutex);
 
     if (memory->sample)
         InterlockedDecrement(&memory->sample->refcount);
@@ -224,7 +225,7 @@ static void wg_allocator_free(GstAllocator *gst_allocator, GstMemory *gst_memory
 
     list_remove(&memory->entry);
 
-    pthread_mutex_unlock(&allocator->mutex);
+    pi_mutex_unlock(&allocator->mutex);
 
     if (memory->unix_memory)
     {
@@ -263,10 +264,10 @@ void wg_allocator_destroy(GstAllocator *gst_allocator)
 
     GST_LOG("allocator %p", allocator);
 
-    pthread_mutex_lock(&allocator->mutex);
+    pi_mutex_lock(&allocator->mutex);
     LIST_FOR_EACH_ENTRY(memory, &allocator->memory_list, WgMemory, entry)
         release_memory_sample(allocator, memory, true);
-    pthread_mutex_unlock(&allocator->mutex);
+    pi_mutex_unlock(&allocator->mutex);
 
     g_object_unref(allocator);
 
@@ -294,10 +295,10 @@ void wg_allocator_provide_sample(GstAllocator *gst_allocator, struct wg_sample *
     if (sample)
         InterlockedIncrement(&sample->refcount);
 
-    pthread_mutex_lock(&allocator->mutex);
+    pi_mutex_lock(&allocator->mutex);
     previous = allocator->next_sample;
     allocator->next_sample = sample;
-    pthread_mutex_unlock(&allocator->mutex);
+    pi_mutex_unlock(&allocator->mutex);
 
     if (previous)
         InterlockedDecrement(&previous->refcount);
@@ -311,10 +312,10 @@ void wg_allocator_release_sample(GstAllocator *gst_allocator, struct wg_sample *
 
     GST_LOG("allocator %p, sample %p, discard_data %u", allocator, sample, discard_data);
 
-    pthread_mutex_lock(&allocator->mutex);
+    pi_mutex_lock(&allocator->mutex);
     if ((memory = find_sample_memory(allocator, sample)))
         release_memory_sample(allocator, memory, discard_data);
     else if (sample->refcount)
         GST_ERROR("Couldn't find memory for sample %p", sample);
-    pthread_mutex_unlock(&allocator->mutex);
+    pi_mutex_unlock(&allocator->mutex);
 }

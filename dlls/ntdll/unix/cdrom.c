@@ -42,6 +42,7 @@
 #endif
 #include <sys/types.h>
 #include <sys/ioctl.h>
+#include <rtpi.h>
 #ifdef HAVE_SCSI_SG_H
 # include <scsi/sg.h>
 #endif
@@ -293,7 +294,7 @@ struct cdrom_cache {
 #define MAX_CACHE_ENTRIES       5
 static struct cdrom_cache cdrom_cache[MAX_CACHE_ENTRIES];
 
-static pthread_mutex_t cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pi_mutex_t cache_mutex = PI_MUTEX_INIT(0);
 
 /* Proposed media change function: not really needed at this time */
 /* This is a 1 or 0 type of function */

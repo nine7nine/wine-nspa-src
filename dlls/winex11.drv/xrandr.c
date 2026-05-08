@@ -34,6 +34,7 @@
 #include <dlfcn.h>
 #include "x11drv.h"
 #include "wine/debug.h"
+#include <rtpi.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(xrandr);
 #ifdef HAVE_XRRGETPROVIDERRESOURCES
@@ -404,15 +405,15 @@ static struct current_mode
 } *current_modes;
 static int current_mode_count;
 
-static pthread_mutex_t xrandr_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pi_mutex_t xrandr_mutex = PI_MUTEX_INIT(0);
 
 static void xrandr14_invalidate_current_mode_cache(void)
 {
-    pthread_mutex_lock( &xrandr_mutex );
+    pi_mutex_lock( &xrandr_mutex );
     free( current_modes);
     current_modes = NULL;
     current_mode_count = 0;
-    pthread_mutex_unlock( &xrandr_mutex );
+    pi_mutex_unlock( &xrandr_mutex );
 }
 
 static XRRScreenResources *xrandr_get_screen_resources(void)
@@ -1268,12 +1269,12 @@ static BOOL xrandr14_get_id( const WCHAR *device_name, BOOL is_primary, x11drv_s
         return FALSE;
 
     /* Update cache */
-    pthread_mutex_lock( &xrandr_mutex );
+    pi_mutex_lock( &xrandr_mutex );
     if (!current_modes)
     {
         if (!xrandr14_get_gpus( &gpus, &gpu_count, FALSE ))
         {
-            pthread_mutex_unlock( &xrandr_mutex );
+            pi_mutex_unlock( &xrandr_mutex );
             return FALSE;
         }
 
@@ -1310,12 +1311,12 @@ static BOOL xrandr14_get_id( const WCHAR *device_name, BOOL is_primary, x11drv_s
 
     if (display_idx >= current_mode_count)
     {
-        pthread_mutex_unlock( &xrandr_mutex );
+        pi_mutex_unlock( &xrandr_mutex );
         return FALSE;
     }
 
     id->id = current_modes[display_idx].id;
-    pthread_mutex_unlock( &xrandr_mutex );
+    pi_mutex_unlock( &xrandr_mutex );
     return TRUE;
 }
 
@@ -1462,7 +1463,7 @@ static BOOL xrandr14_get_current_mode( x11drv_settings_id id, DEVMODEW *mode )
     RECT primary;
     INT mode_idx;
 
-    pthread_mutex_lock( &xrandr_mutex );
+    pi_mutex_lock( &xrandr_mutex );
     for (mode_idx = 0; mode_idx < current_mode_count; ++mode_idx)
     {
         if (current_modes[mode_idx].id != id.id)
@@ -1475,7 +1476,7 @@ static BOOL xrandr14_get_current_mode( x11drv_settings_id id, DEVMODEW *mode )
         }
 
         memcpy( mode, &current_modes[mode_idx].mode, sizeof(*mode) );
-        pthread_mutex_unlock( &xrandr_mutex );
+        pi_mutex_unlock( &xrandr_mutex );
         return TRUE;
     }
 
@@ -1546,7 +1547,7 @@ done:
         mode_ptr->mode.dmDriverExtra = 0;
         mode_ptr->loaded = TRUE;
     }
-    pthread_mutex_unlock( &xrandr_mutex );
+    pi_mutex_unlock( &xrandr_mutex );
     if (crtc_info)
         pXRRFreeCrtcInfo( crtc_info );
     if (output_info)

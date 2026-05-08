@@ -52,6 +52,7 @@
 
 #include "wine/debug.h"
 #include "wine/server.h"
+#include <rtpi.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(x11drv);
 WINE_DECLARE_DEBUG_CHANNEL(systray);
@@ -147,7 +148,7 @@ static const char *debugstr_monitor_indices( const struct monitor_indices *monit
     return wine_dbg_sprintf( "%ld,%ld,%ld,%ld", monitors->indices[0], monitors->indices[1], monitors->indices[2], monitors->indices[3] );
 }
 
-static pthread_mutex_t win_data_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pi_mutex_t win_data_mutex = PI_MUTEX_INIT(0);
 
 static void host_window_add_ref( struct host_window *win )
 {
@@ -423,7 +424,7 @@ static struct x11drv_win_data *alloc_win_data( Display *display, HWND hwnd )
         data->vis = default_visual;
         data->hwnd = hwnd;
         data->user_time = -1;
-        pthread_mutex_lock( &win_data_mutex );
+        pi_mutex_lock( &win_data_mutex );
         XSaveContext( gdi_display, (XID)hwnd, win_data_context, (char *)data );
     }
     return data;
@@ -2788,10 +2789,10 @@ struct x11drv_win_data *get_win_data( HWND hwnd )
     char *data;
 
     if (!hwnd) return NULL;
-    pthread_mutex_lock( &win_data_mutex );
+    pi_mutex_lock( &win_data_mutex );
     if (!XFindContext( gdi_display, (XID)hwnd, win_data_context, &data ))
         return (struct x11drv_win_data *)data;
-    pthread_mutex_unlock( &win_data_mutex );
+    pi_mutex_unlock( &win_data_mutex );
     return NULL;
 }
 
@@ -2803,7 +2804,7 @@ struct x11drv_win_data *get_win_data( HWND hwnd )
  */
 void release_win_data( struct x11drv_win_data *data )
 {
-    if (data) pthread_mutex_unlock( &win_data_mutex );
+    if (data) pi_mutex_unlock( &win_data_mutex );
 }
 
 /* update the whole window parent host window, must be called from the window's owner thread */

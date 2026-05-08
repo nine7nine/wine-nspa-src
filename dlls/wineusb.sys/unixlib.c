@@ -36,6 +36,7 @@
 #include "wine/list.h"
 
 #include "unixlib.h"
+#include <rtpi.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(wineusb);
 
@@ -55,7 +56,7 @@ static volatile bool thread_shutdown;
 static struct usb_event *usb_events;
 static size_t usb_event_count, usb_events_capacity;
 
-static pthread_mutex_t device_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pi_mutex_t device_mutex = PI_MUTEX_INIT(0);
 
 static struct list device_list = LIST_INIT(device_list);
 
@@ -129,9 +130,9 @@ static void add_usb_device(libusb_device *libusb_device)
     }
     unix_device->refcount = 1;
 
-    pthread_mutex_lock(&device_mutex);
+    pi_mutex_lock(&device_mutex);
     list_add_tail(&device_list, &unix_device->entry);
-    pthread_mutex_unlock(&device_mutex);
+    pi_mutex_unlock(&device_mutex);
 
     usb_event.type = USB_EVENT_ADD_DEVICE;
     usb_event.u.added_device.device = unix_device;
@@ -198,9 +199,9 @@ static void add_usb_device(libusb_device *libusb_device)
                 unix_iface->refcount = 1;
                 unix_iface->handle = unix_device->handle;
                 unix_iface->parent = unix_device;
-                pthread_mutex_lock(&device_mutex);
+                pi_mutex_lock(&device_mutex);
                 list_add_tail(&device_list, &unix_iface->entry);
-                pthread_mutex_unlock(&device_mutex);
+                pi_mutex_unlock(&device_mutex);
 
                 usb_event.u.added_device.device = unix_iface;
                 usb_event.u.added_device.class = iface_desc->bInterfaceClass;
@@ -613,17 +614,17 @@ static NTSTATUS usb_cancel_transfer(void *args)
 
 static void decref_device(struct unix_device *device)
 {
-    pthread_mutex_lock(&device_mutex);
+    pi_mutex_lock(&device_mutex);
 
     if (--device->refcount)
     {
-        pthread_mutex_unlock(&device_mutex);
+        pi_mutex_unlock(&device_mutex);
         return;
     }
 
     list_remove(&device->entry);
 
-    pthread_mutex_unlock(&device_mutex);
+    pi_mutex_unlock(&device_mutex);
 
     if (device->parent)
         decref_device(device->parent);

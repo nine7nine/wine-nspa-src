@@ -28,6 +28,7 @@
 #include "dibdrv.h"
 
 #include "wine/debug.h"
+#include <rtpi.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(dib);
 
@@ -60,7 +61,7 @@ struct cached_font
 
 static struct list font_cache = LIST_INIT( font_cache );
 
-static pthread_mutex_t font_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+static pi_mutex_t font_cache_lock = PI_MUTEX_INIT(0);
 
 
 static BOOL brush_rect( dibdrv_physdev *pdev, dib_brush *brush, const RECT *rect, HRGN clip )
@@ -569,7 +570,7 @@ static struct cached_font *add_cached_font( DC *dc, HFONT hfont, UINT aa_flags )
     font.aa_flags = aa_flags;
     font.hash = font_cache_hash( &font );
 
-    pthread_mutex_lock( &font_cache_lock );
+    pi_mutex_lock( &font_cache_lock );
     LIST_FOR_EACH_ENTRY( ptr, &font_cache, struct cached_font, entry )
     {
         if (!font_cache_cmp( &font, ptr ))
@@ -602,7 +603,7 @@ static struct cached_font *add_cached_font( DC *dc, HFONT hfont, UINT aa_flags )
     }
     else if (!(ptr = malloc( sizeof(*ptr) )))
     {
-        pthread_mutex_unlock( &font_cache_lock );
+        pi_mutex_unlock( &font_cache_lock );
         return NULL;
     }
 
@@ -611,7 +612,7 @@ static struct cached_font *add_cached_font( DC *dc, HFONT hfont, UINT aa_flags )
     memset( ptr->glyphs, 0, sizeof(ptr->glyphs) );
 done:
     list_add_head( &font_cache, &ptr->entry );
-    pthread_mutex_unlock( &font_cache_lock );
+    pi_mutex_unlock( &font_cache_lock );
     TRACE( "%d %s -> %p\n", ptr->lf.lfHeight, debugstr_w(ptr->lf.lfFaceName), ptr );
     return ptr;
 }

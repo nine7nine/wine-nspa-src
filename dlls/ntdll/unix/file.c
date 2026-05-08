@@ -124,6 +124,7 @@
 #include "wine/list.h"
 #include "wine/debug.h"
 #include "unix_private.h"
+#include <rtpi.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(file);
 WINE_DECLARE_DEBUG_CHANNEL(winediag);
@@ -252,8 +253,8 @@ static const WCHAR unix_prefixW[] = {'\\','?','?','\\','u','n','i','x'};
 /* at some point we may want to allow Winelib apps to set this */
 static const BOOL is_case_sensitive = FALSE;
 
-static pthread_mutex_t dir_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t mnt_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pi_mutex_t dir_mutex = PI_MUTEX_INIT(0);
+static pi_mutex_t mnt_mutex = PI_MUTEX_INIT(0);
 
 /* check if a given Unicode char is OK in a DOS short name */
 static inline BOOL is_invalid_dos_char( WCHAR ch )
@@ -2321,7 +2322,7 @@ static unsigned int server_open_file_object( HANDLE *handle, ACCESS_MASK access,
 /* retrieve device/inode number for all the drives */
 static unsigned int get_drives_info( struct file_identity info[MAX_DOS_DRIVES] )
 {
-    static pthread_mutex_t cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+    static pi_mutex_t cache_mutex = PI_MUTEX_INIT(0);
     static struct file_identity cache[MAX_DOS_DRIVES];
     static time_t last_update;
     static unsigned int nb_drives;

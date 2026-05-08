@@ -1978,7 +1978,7 @@ size_t server_init_process(void)
             fatal_error( "WINEARCH set to %s but '%s' is a 32-bit installation.\n", arch, config_dir );
     }
 
-    set_thread_id( data );
+    set_thread_id( NtCurrentTeb(), pid, data->tid );
 
     for (i = 0; i < supported_machines_count; i++)
         if (supported_machines[i] == current_machine) return info_size;
@@ -2005,8 +2005,8 @@ void server_start_main_thread(void)
      * send exceptions to the debugger before the create process event that
      * is sent by init_process_done */
     signal_init_process();
-    teb_data->syscall_table = KeServiceDescriptorTable;
-    teb_data->syscall_trace = TRACE_ON(syscall);
+    thread_data->syscall_table = KeServiceDescriptorTable;
+    thread_data->syscall_trace = TRACE_ON(syscall);
 
     status = NtCreateThreadEx( &handle, THREAD_ALL_ACCESS, NULL, NtCurrentProcess(),
                                main_image_info.TransferAddress, peb, 0, 0, 0, 0, NULL );

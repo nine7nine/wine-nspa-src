@@ -1188,18 +1188,17 @@ void *get_cpu_area( USHORT machine )
 /***********************************************************************
  *           set_thread_id
  */
-void set_thread_id( struct thread_data *data )
+void set_thread_id( TEB *teb, DWORD pid, DWORD tid )
 {
-    TEB *teb = data->teb;
     WOW_TEB *wow_teb = get_wow_teb( teb );
 
     teb->ClientId.UniqueProcess = ULongToHandle( pid );
-    teb->ClientId.UniqueThread  = ULongToHandle( data->tid );
+    teb->ClientId.UniqueThread  = ULongToHandle( tid );
     teb->RealClientId = teb->ClientId;
     if (wow_teb)
     {
         wow_teb->ClientId.UniqueProcess = pid;
-        wow_teb->ClientId.UniqueThread  = data->tid;
+        wow_teb->ClientId.UniqueThread  = tid;
         wow_teb->RealClientId = wow_teb->ClientId;
     }
 }
@@ -1443,7 +1442,7 @@ NTSTATUS WINAPI NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATT
     }
 
     data->tid = tid;
-    set_thread_id( data );
+    set_thread_id( teb, pid, tid );
 
     teb->SkipThreadAttach = !!(flags & THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH);
     teb->SkipLoaderInit = !!(flags & THREAD_CREATE_FLAGS_SKIP_LOADER_INIT);

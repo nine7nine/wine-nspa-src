@@ -652,12 +652,14 @@ static NTSTATUS linux_wait_objs( int device, DWORD count, const int *objs, WAIT_
  * (rounded up by C array layout rules); each entry gets its own
  * cacheline and thread accesses to different handles don't ping-pong.
  *
- * Memory footprint unchanged: INPROC_SYNC_CACHE_BLOCK_SIZE auto-
- * recomputes as 65536/64 = 1024 entries (was 4096), each block stays
- * 64KB.  Total cacheable handles drops 524k → 131k — still way above
- * realistic process handle counts (typical <10k, Ableton-with-plugins
- * <50k).  Cache miss falls back to server lookup; correctness
- * preserved. */
+ * Block-bytes scaled 4x (64KB → 256KB) to preserve the original
+ * 524288-entry capacity after sizeof grew 4x.  Initial block in .bss
+ * grows from 64KB → 256KB (+192KB per process — negligible); dynamic
+ * blocks via mmap are 256KB each, allocated only when handle indices
+ * exceed the initial block.  Without the scale-up, total cacheable
+ * handles would drop 524k → 131k — close to plausible heavy-workload
+ * peaks (100 plugins × ~1000 sync objs).  Restoring the original
+ * capacity costs essentially nothing and avoids the slow-path overflow. */
 struct inproc_sync
 {
     LONG           refcount;  /* reference count of the sync object */
@@ -667,7 +669,8 @@ struct inproc_sync
     unsigned short closed;    /* fd has been closed but sync is still referenced */
 } __attribute__((aligned(64)));
 
-#define INPROC_SYNC_CACHE_BLOCK_SIZE  (65536 / sizeof(struct inproc_sync))
+#define INPROC_SYNC_CACHE_BLOCK_BYTES (256 * 1024)
+#define INPROC_SYNC_CACHE_BLOCK_SIZE  (INPROC_SYNC_CACHE_BLOCK_BYTES / sizeof(struct inproc_sync))
 #define INPROC_SYNC_CACHE_ENTRIES     128
 #define INPROC_SYNC_CACHE_TOTAL       (INPROC_SYNC_CACHE_BLOCK_SIZE * INPROC_SYNC_CACHE_ENTRIES)
 

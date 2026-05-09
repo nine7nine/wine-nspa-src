@@ -645,7 +645,13 @@ struct thread *create_thread( int fd, struct process *process, unsigned int flag
         return NULL;
     }
     if (!(thread->request_fd = create_anonymous_fd( &thread_fd_ops, fd, &thread->obj, 0 ))) goto error;
-    if (!(thread->sync = create_internal_sync( 1, 0 ))) goto error;
+    /* NSPA: thread->sync uses create_thread_sync (not create_internal_sync)
+     * so the resulting inproc_sync gets the INPROC_SYNC_THREAD type tag.
+     * Lets dlls/ntdll/unix/sync.c:inproc_wait short-circuit timeout=0 polls
+     * via thread_shm THREAD_SHM_FLAG_TERMINATED.  Subordinate per-thread
+     * syncs (apc->sync, context->sync) intentionally stay INTERNAL — only
+     * the user-handle sync gets the THREAD tag. */
+    if (!(thread->sync = create_thread_sync( 1, 0 ))) goto error;
     if (get_inproc_device_fd() >= 0 && !(thread->alert_sync = create_inproc_internal_sync( 1, 0 ))) goto error;
     /* NSPA: allocate per-thread shared-memory object for client-side seqlock
      * reads.  Mutator-wrap commit (commit 2) populates fields via

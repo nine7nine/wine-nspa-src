@@ -138,6 +138,33 @@ struct inproc_sync *create_inproc_process_sync( int manual, int signaled )
     return event;
 }
 
+/* NSPA: identical to create_inproc_internal_sync but tags the resulting
+ * inproc_sync with INPROC_SYNC_THREAD so the client-side fast path in
+ * dlls/ntdll/unix/sync.c:inproc_wait can short-circuit timeout=0 polls
+ * via thread_shm THREAD_SHM_FLAG_TERMINATED.  Used by create_thread.
+ *
+ * Predicate uses the TERMINATED flag (not exit_code != 0) because
+ * thread_shm.exit_code initialises to 0 — a legitimate user exit code —
+ * unlike process_shm.exit_code which initialises to STILL_ACTIVE. */
+struct inproc_sync *create_inproc_thread_sync( int manual, int signaled )
+{
+    struct ntsync_event_args args = {.signaled = signaled, .manual = manual};
+    struct inproc_sync *event;
+
+    if (!(event = alloc_object( &inproc_sync_ops ))) return NULL;
+    event->type = INPROC_SYNC_THREAD;
+    event->fd   = ioctl( get_inproc_device_fd(), NTSYNC_IOC_CREATE_EVENT, &args );
+    list_init( &event->entry );
+
+    if (event->fd == -1)
+    {
+        set_error( STATUS_TOO_MANY_OPENED_FILES );
+        release_object( event );
+        return NULL;
+    }
+    return event;
+}
+
 struct inproc_sync *create_inproc_event_sync( int manual, int signaled )
 {
     struct ntsync_event_args args = {.signaled = signaled, .manual = manual};
@@ -222,7 +249,7 @@ static int inproc_sync_signal( struct object *obj, unsigned int access, int sign
     assert( obj->ops == &inproc_sync_ops );
 
     assert( sync->type == INPROC_SYNC_INTERNAL || sync->type == INPROC_SYNC_EVENT
-            || sync->type == INPROC_SYNC_PROCESS ); /* never called for mutex / semaphore */
+            || sync->type == INPROC_SYNC_PROCESS || sync->type == INPROC_SYNC_THREAD ); /* never called for mutex / semaphore */
     assert( signal == 0 || signal == 1 ); /* never called from signal_object */
 
     if (signal) signal_inproc_sync( sync );

@@ -90,6 +90,7 @@ struct ntsync_event_set_pi_args
 #include "wine/debug.h"
 #include "unix_private.h"
 #include "nspa/process_shm.h"
+#include "nspa/thread_shm.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(sync);
 
@@ -898,10 +899,12 @@ extern NTSTATUS check_signal_access( struct inproc_sync *sync )
     {
     case INPROC_SYNC_INTERNAL:
     case INPROC_SYNC_PROCESS:
-        /* Internal sync objects (incl. NSPA-tagged process->sync) can't be
-         * signaled by user APIs — those go through type-specific paths
-         * (SetEvent, ReleaseMutex, etc.).  process->sync is signaled only
-         * by the server on process exit. */
+    case INPROC_SYNC_THREAD:
+        /* Internal sync objects (incl. NSPA-tagged process->sync and
+         * thread->sync) can't be signaled by user APIs — those go through
+         * type-specific paths (SetEvent, ReleaseMutex, etc.).  process->sync
+         * is signaled only by the server on process exit; thread->sync only
+         * on thread exit. */
         return STATUS_OBJECT_TYPE_MISMATCH;
     case INPROC_SYNC_EVENT:
         if (!(sync->access & EVENT_MODIFY_STATE)) return STATUS_ACCESS_DENIED;
@@ -1568,6 +1571,30 @@ static NTSTATUS inproc_wait( DWORD count, const HANDLE *handles, WAIT_TYPE type,
         {
             release_inproc_sync( syncs[0] );
             return (snap.exit_code != STILL_ACTIVE) ? STATUS_WAIT_0 : STATUS_TIMEOUT;
+        }
+    }
+
+    /* NSPA: timeout=0 poll of a thread handle.  THREAD_SHM_FLAG_TERMINATED
+     * is set in kill_thread (server/thread.c:1893-1898) inside a
+     * SHARED_WRITE_BEGIN block BEFORE either signal_sync(thread->sync)
+     * (clean death, line 1917) or the deferred check_terminated path
+     * (violent death, line 1882) — verified across all four exit
+     * cascades (process.c:1009, request.c:140/414/463, thread.c:2193).
+     * Same publish-order guarantee as process_shm; same brief responsive-
+     * ness win between GetExitCodeThread and WaitForSingleObject(0).
+     *
+     * Predicate is the TERMINATED flag (NOT exit_code != 0): thread_shm
+     * exit_code initialises to 0 at thread.c:478, which is a legitimate
+     * user exit code, unlike process_shm.exit_code which initialises to
+     * STILL_ACTIVE. */
+    if (count == 1 && timeout && !timeout->QuadPart && !alertable &&
+        syncs[0]->type == INPROC_SYNC_THREAD)
+    {
+        struct nspa_thread_shm_snapshot snap;
+        if (nspa_thread_shm_query( handles[0], &snap ) == STATUS_SUCCESS)
+        {
+            release_inproc_sync( syncs[0] );
+            return nspa_thread_shm_snapshot_is_terminated( &snap ) ? STATUS_WAIT_0 : STATUS_TIMEOUT;
         }
     }
 

@@ -6396,6 +6396,7 @@ enum inproc_sync_type
     INPROC_SYNC_MUTEX     = 3,
     INPROC_SYNC_SEMAPHORE = 4,
     INPROC_SYNC_PROCESS   = 5,
+    INPROC_SYNC_THREAD    = 6,
 };
 
 
@@ -7907,6 +7908,6 @@ union generic_reply
     struct nspa_unregister_inproc_event_reply nspa_unregister_inproc_event_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 971
+#define SERVER_PROTOCOL_VERSION 972
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

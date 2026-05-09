@@ -8,11 +8,13 @@
  * Replaces a subset of SERVER_START_REQ(get_thread_info) round-trips
  * in NtQueryInformationThread for the read-mostly query classes whose
  * fields are already published in thread_shm_t (see protocol.def).
+ * Also short-circuits Wait(thread, 0) polls via the THREAD_SHM_FLAG_TERMINATED
+ * predicate (see dlls/ntdll/unix/sync.c:inproc_wait fast path).
  *
- * Validation env-gate: NSPA_THREAD_SHM=1 enables the shmem fast path;
- * any other value (default) keeps callers on the existing RPC fallback.
- * The gate exists for A/B bring-up and is intended to be removed once
- * the shmem path has been validated default-on.
+ * Default-on, no env-gate: the shmem path is always live when the
+ * shared mapping is available, falling back to the RPC on resolve
+ * failure or slot-recycle detection.  An earlier validation gate
+ * (NSPA_THREAD_SHM) was stripped post-Ableton-soak.
  *
  * Copyright 2026 NSPA contributors
  *

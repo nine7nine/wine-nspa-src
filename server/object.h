@@ -225,6 +225,7 @@ struct keyed_event;
 extern struct event_sync *create_server_internal_sync( int manual, int signaled );
 extern struct object *create_internal_sync( int manual, int signaled );
 extern struct object *create_process_sync( int manual, int signaled );
+extern struct object *create_thread_sync( int manual, int signaled );
 extern void signal_sync( struct object *sync );
 extern void reset_sync( struct object *sync );
 
@@ -250,6 +251,7 @@ extern int get_inproc_device_fd(void);
 extern int get_inproc_sync_fd( struct inproc_sync *sync );
 extern struct inproc_sync *create_inproc_internal_sync( int manual, int signaled );
 extern struct inproc_sync *create_inproc_process_sync( int manual, int signaled );
+extern struct inproc_sync *create_inproc_thread_sync( int manual, int signaled );
 extern struct inproc_sync *create_inproc_event_sync( int manual, int signaled );
 extern struct inproc_sync *create_inproc_semaphore_sync( unsigned int initial, unsigned int max );
 extern struct inproc_sync *create_inproc_mutex_sync( thread_id_t owner, unsigned int count );

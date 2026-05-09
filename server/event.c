@@ -127,6 +127,16 @@ struct object *create_process_sync( int manual, int signaled )
     return (struct object *)create_server_internal_sync( manual, signaled );
 }
 
+/* NSPA: thread->sync sibling of create_process_sync — tags the inproc_sync
+ * with INPROC_SYNC_THREAD so client-side inproc_wait can short-circuit
+ * timeout=0 polls via thread_shm.  Same fallback shape on non-ntsync
+ * builds. */
+struct object *create_thread_sync( int manual, int signaled )
+{
+    if (get_inproc_device_fd() >= 0) return (struct object *)create_inproc_thread_sync( manual, signaled );
+    return (struct object *)create_server_internal_sync( manual, signaled );
+}
+
 static void event_sync_dump( struct object *obj, int verbose )
 {
     struct event_sync *event = (struct event_sync *)obj;

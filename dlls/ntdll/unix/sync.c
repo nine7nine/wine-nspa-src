@@ -641,6 +641,23 @@ static NTSTATUS linux_wait_objs( int device, DWORD count, const int *objs, WAIT_
  * the same handle immediately reallocated to a different object. This should be
  * a very rare situation, and in that case we simply don't cache the handle.
  */
+/* NSPA: cacheline-align each entry to avoid false sharing on adjacent
+ * entries' refcount LOCK ops.  Without this, sizeof was 16 bytes — four
+ * entries fit per 64-byte cacheline, so when threads A/B/C/D do
+ * interlocked_inc_if_nonzero(&cache->refcount) on different handles
+ * whose cache positions happen to be colocated, every LOCK invalidates
+ * the cacheline on the other CPUs.  At ~6M LOCK ops/sec across all
+ * threads (NtSetEvent + NtWaitForMultipleObjects + ... bpftrace data),
+ * this is real coherence traffic.  aligned(64) makes sizeof become 64
+ * (rounded up by C array layout rules); each entry gets its own
+ * cacheline and thread accesses to different handles don't ping-pong.
+ *
+ * Memory footprint unchanged: INPROC_SYNC_CACHE_BLOCK_SIZE auto-
+ * recomputes as 65536/64 = 1024 entries (was 4096), each block stays
+ * 64KB.  Total cacheable handles drops 524k → 131k — still way above
+ * realistic process handle counts (typical <10k, Ableton-with-plugins
+ * <50k).  Cache miss falls back to server lookup; correctness
+ * preserved. */
 struct inproc_sync
 {
     LONG           refcount;  /* reference count of the sync object */
@@ -648,7 +665,7 @@ struct inproc_sync
     unsigned int   access;    /* handle access rights */
     unsigned short type;      /* enum inproc_sync_type as short to save space */
     unsigned short closed;    /* fd has been closed but sync is still referenced */
-};
+} __attribute__((aligned(64)));
 
 #define INPROC_SYNC_CACHE_BLOCK_SIZE  (65536 / sizeof(struct inproc_sync))
 #define INPROC_SYNC_CACHE_ENTRIES     128

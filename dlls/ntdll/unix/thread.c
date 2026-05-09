@@ -22,6 +22,14 @@
 #pragma makedep unix
 #endif
 
+/* NSPA: this TU defines the exported NtCurrentTeb function symbol that
+ * external callers (anything resolving via dlsym on ntdll.so) may use.
+ * Setting WINE_NT_CURRENT_TEB_DEFINING before winnt.h is pulled in
+ * suppresses the static FORCEINLINE in winnt.h's WINE_UNIX_LIB branch,
+ * giving us the extern declaration that matches our non-static
+ * definition further down. */
+#define WINE_NT_CURRENT_TEB_DEFINING
+
 #include "config.h"
 
 #include <assert.h>
@@ -1131,6 +1139,20 @@ static void start_thread( struct thread_data *data )
     BOOL suspend;
 
     data->pthread_id = pthread_self();
+
+    /* NSPA: enable inline NtCurrentTeb (gs:0x30 read) and inline
+     * get_thread_data (TEB backpointer) BEFORE any code that depends
+     * on either.  Order matters:
+     *   1. Set GS_BASE so gs:0x30 returns this thread's teb.
+     *   2. Set unix_thread_data backpointer so get_thread_data inline
+     *      returns this thread's data via the now-valid NtCurrentTeb.
+     *   3. Update legacy pthread fallback (kept for compat).
+     * The existing arch_prctl in init_syscall_frame later sets GS to
+     * the same value — redundant, harmless. */
+#if defined(__linux__) && defined(__x86_64__)
+    nspa_set_thread_gs_base( data->teb );
+#endif
+    teb_data->unix_thread_data = data;
     pthread_setspecific( thread_data_key, data );
 
     teb_data->syscall_table = KeServiceDescriptorTable;
@@ -1658,10 +1680,20 @@ NTSTATUS WINAPI NtRaiseException( EXCEPTION_RECORD *rec, CONTEXT *context, BOOL 
 
 /**********************************************************************
  *           NtCurrentTeb   (NTDLL.@)
+ *
+ * NSPA: this exported function exists for any external caller resolving
+ * the symbol via dlsym (rare).  Most callers see the static FORCEINLINE
+ * in winnt.h instead (gs:0x30 read).  We CANNOT call get_thread_data()
+ * here — get_thread_data's inline now reads via NtCurrentTeb, which
+ * inside this TU resolves to this very function (because we set
+ * WINE_NT_CURRENT_TEB_DEFINING to suppress the inline declaration).
+ * That would be infinite recursion.  Use pthread_getspecific directly
+ * to bypass the inline get_thread_data; same path the function used
+ * before the inline conversion.
  */
 TEB * WINAPI NtCurrentTeb(void)
 {
-    struct thread_data *data = get_thread_data();
+    struct thread_data *data = pthread_getspecific( thread_data_key );
     return data ? data->teb : NULL;
 }
 

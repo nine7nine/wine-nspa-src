@@ -144,13 +144,6 @@ struct thread_data
     /* char kernel_stack[] */
 };
 
-extern pthread_key_t thread_data_key;
-
-static inline struct thread_data *get_thread_data(void)
-{
-    return pthread_getspecific( thread_data_key );
-}
-
 /* thread private data, stored in NtCurrentTeb()->GdiTebBatch */
 struct teb_data
 {
@@ -166,6 +159,13 @@ struct teb_data
                                                        * nspa_rt_apply_tid on self (tid==0). */
     int                       nspa_rt_cached_prio;    /* NSPA v2.5: cached sched_priority.
                                                        * 0 = not RT / uninitialized. */
+    struct thread_data       *unix_thread_data;       /* NSPA: TEB backpointer to unix-side
+                                                       * struct thread_data, set in
+                                                       * virtual_alloc_first_teb / start_thread
+                                                       * BEFORE any get_thread_data caller can
+                                                       * run.  Replaces pthread_getspecific in
+                                                       * get_thread_data fast path; saves a libc
+                                                       * function call per access. */
 };
 
 C_ASSERT( sizeof(struct teb_data) <= sizeof(((TEB *)0)->GdiTebBatch) );
@@ -187,9 +187,34 @@ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct teb_data, syscall_trac
  * build fails and both sides need updating in sync. */
 #ifdef _WIN64
 C_ASSERT( offsetof( struct teb_data, nspa_unix_tid ) == 0x94 );
+C_ASSERT( offsetof( struct teb_data, unix_thread_data ) == 0xa0 );
 #else
 C_ASSERT( offsetof( struct teb_data, nspa_unix_tid ) == 0x4c );
+C_ASSERT( offsetof( struct teb_data, unix_thread_data ) == 0x58 );
 #endif
+
+/* NSPA: early GS_BASE setup helper; defined in signal_x86_64.c.  Called
+ * from virtual_alloc_first_teb (loader thread) and start_thread (app
+ * threads) before any inline NtCurrentTeb caller runs.  See winnt.h's
+ * WINE_UNIX_LIB branch + reference_pe_unix_inline_optimization_pattern
+ * for context. */
+#if defined(__linux__) && defined(__x86_64__)
+extern void nspa_set_thread_gs_base( TEB *teb );
+#endif
+
+extern pthread_key_t thread_data_key;  /* legacy fallback; get_thread_data uses TEB backpointer */
+
+static inline struct thread_data *get_thread_data(void)
+{
+    /* NSPA: read the unix-side struct thread_data pointer via the TEB
+     * backpointer.  NtCurrentTeb on x86_64+GCC is inlined to a single
+     * gs:0x30 read (see winnt.h WINE_UNIX_LIB branch); GdiTebBatch+0xa0
+     * is the unix_thread_data field.  Two TEB-relative loads, no libc
+     * function call.  Returns NULL during the startup window before
+     * the field is set — old pthread_getspecific path returned NULL
+     * too, so the failure mode for early callers is unchanged. */
+    return ((struct teb_data *)&NtCurrentTeb()->GdiTebBatch)->unix_thread_data;
+}
 
 /* NSPA: compat alias for code that uses the old wine-11.6 struct name.
  * The new wine-11.8 layout split fields between struct thread_data

@@ -2577,7 +2577,28 @@ typedef struct _NT_TIB64
 struct _TEB;
 
 #ifdef WINE_UNIX_LIB
-# ifdef __GNUC__
+/* NSPA: on Linux x86_64, the unix-side TEB pointer is reachable via the
+ * GS segment register at teb+0x30 (the standard Windows TEB self-
+ * pointer).  Wine maintains GS_BASE = teb on the unix side too —
+ * arch_prctl(ARCH_SET_GS, teb) is called early in thread setup via
+ * nspa_set_thread_gs_base (virtual_alloc_first_teb for the loader
+ * thread, start_thread for spawned threads) BEFORE any inline
+ * NtCurrentTeb caller runs.  Inline avoids the cross-DSO PLT call to
+ * ntdll.so + the pthread_getspecific inside that function — measured
+ * ~1.32% CPU saved on Ableton playback (332k unix-side calls/sec).
+ *
+ * The exported NtCurrentTeb function in dlls/ntdll/unix/thread.c stays
+ * for any external caller that may resolve it via dlsym; that unit
+ * sets WINE_NT_CURRENT_TEB_DEFINING before include so it sees the
+ * extern declaration that matches its non-static definition. */
+# if defined(__x86_64__) && defined(__GNUC__) && !defined(WINE_NT_CURRENT_TEB_DEFINING)
+static FORCEINLINE struct _TEB * WINAPI NtCurrentTeb(void)
+{
+    struct _TEB *teb;
+    __asm__("movq %%gs:0x30,%0" : "=r" (teb));
+    return teb;
+}
+# elif defined(__GNUC__)
 NTSYSAPI struct _TEB * WINAPI NtCurrentTeb(void) __attribute__((pure));
 # else
 NTSYSAPI struct _TEB * WINAPI NtCurrentTeb(void);

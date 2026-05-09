@@ -102,6 +102,22 @@ static USHORT fs32_sel;  /* selector for %fs in 32-bit mode */
 #include <asm/prctl.h>
 static inline int arch_prctl( int func, void *ptr ) { return syscall( __NR_arch_prctl, func, ptr ); }
 
+/* NSPA: early GS_BASE setup at thread creation.  Called from
+ * virtual.c:virtual_alloc_first_teb (loader thread) and
+ * thread.c:start_thread (app threads) before any code that depends
+ * on the inline NtCurrentTeb (gs:0x30 read in winnt.h's WINE_UNIX_LIB
+ * branch).  Without this, gs:0x30 reads garbage during the startup
+ * window between pthread_setspecific and the existing
+ * arch_prctl(ARCH_SET_GS) in init_syscall_frame.  Wrapping the syscall
+ * here keeps the asm/prctl.h include scoped to this TU.
+ *
+ * The existing init_syscall_frame:arch_prctl call still runs later;
+ * it sets GS_BASE to the same value, so the redundancy is harmless. */
+void nspa_set_thread_gs_base( TEB *teb )
+{
+    arch_prctl( ARCH_SET_GS, teb );
+}
+
 extern int alloc_fs_sel( int sel, void *base );
 __ASM_GLOBAL_FUNC( alloc_fs_sel,
                    /* switch to 32-bit stack */

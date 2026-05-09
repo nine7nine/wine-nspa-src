@@ -4413,6 +4413,21 @@ TEB *virtual_alloc_first_teb(void)
     thread_data->teb = teb;
     list_add_head( &teb_list, &thread_data->entry );
     pthread_key_create( &thread_data_key, NULL );
+
+    /* NSPA: enable inline NtCurrentTeb (gs:0x30) + inline get_thread_data
+     * (TEB backpointer) on the loader thread BEFORE any caller runs.
+     * Same order as start_thread:
+     *   1. GS_BASE = teb so gs:0x30 returns teb.
+     *   2. unix_thread_data backpointer so get_thread_data inline works.
+     *   3. Legacy pthread fallback (kept for compat).
+     * The existing arch_prctl in init_syscall_frame runs later for
+     * application threads but never for this loader/sched thread —
+     * which is the exact reason this call is needed here.  See
+     * reference_pe_unix_inline_optimization_pattern for the design. */
+#if defined(__linux__) && defined(__x86_64__)
+    nspa_set_thread_gs_base( teb );
+#endif
+    ((struct teb_data *)&teb->GdiTebBatch)->unix_thread_data = thread_data;
     pthread_setspecific( thread_data_key, thread_data );
     return teb;
 }

@@ -87,21 +87,23 @@ struct nspa_cache_entry
     size_t               mapped_size;    /* for munmap on clear */
 };
 
-/* Per-thread cache via pthread_key + lazy heap allocation.
+/* Per-thread cache.  HOT path reads via TEB backpointer in
+ * struct user_thread_info (TEB->Win32ClientInfo); pthread_key is kept
+ * JUST for the destructor side-effect (free'ing the calloc'd cache on
+ * thread exit).  ~30ns pthread_getspecific call replaced by ~3ns
+ * TEB-relative load on every message lookup.
  *
- * ELF __thread TLS was tried first, but PE-created threads in Ableton
- * (DWM-Sync, AudioCalc, VST hosts) fault on their first access to a
- * __thread static declared inside win32u — the dynamic-TLS block for
- * this module isn't set up for every PE-spawned thread by the time it
- * enters win32u.  The fault is swallowed by PE-side SEH and the thread
- * retries on the next message, burning 100% CPU without surfacing any
- * error (see project_msg_bypass_tls_fault.md).
+ * Background: the original pthread-based design replaced an earlier
+ * `__thread`-static attempt that faulted on PE-created threads in
+ * Ableton (DWM-Sync, AudioCalc, VST hosts) because the dynamic-TLS
+ * block for win32u wasn't set up for every PE-spawned thread by the
+ * time it entered win32u — see project_msg_bypass_tls_fault.md.
  *
- * pthread TLS is initialised by glibc at pthread_create (which Wine
- * uses to back CreateThread), so pthread_getspecific is safe on any
- * thread that the process's scheduler can dispatch, regardless of
- * which TEB/loader layer created it.  Lazy heap allocation on first
- * access keeps cost to one calloc per message-sending thread.
+ * The TEB backpointer pattern bypasses both: TEB->Win32ClientInfo is
+ * allocated as part of the TEB itself (zero-initialised at thread
+ * creation) and reachable from any thread that has a TEB.  Lazy heap
+ * allocation on first access is unchanged; only the per-thread pointer
+ * lookup mechanism moved.
  */
 static pthread_key_t nspa_cache_tls_key;
 static pthread_once_t nspa_cache_tls_once = PTHREAD_ONCE_INIT;
@@ -120,21 +122,26 @@ static void nspa_cache_tls_init_once( void )
  * Returns NULL if allocation failed — caller must fall back to server. */
 static struct nspa_cache_entry *nspa_cache_get( void )
 {
+    struct user_thread_info *info = get_user_thread_info();
     struct nspa_cache_entry *cache;
 
-    pthread_once( &nspa_cache_tls_once, nspa_cache_tls_init_once );
+    /* HOT PATH: single TEB-relative load via inline NtCurrentTeb. */
+    if ((cache = info->nspa_msg_cache)) return cache;
 
-    cache = pthread_getspecific( nspa_cache_tls_key );
-    if (cache) return cache;
-
+    /* SLOW PATH: allocate + register pthread destructor + set TEB field.
+     * Order matters: pthread_setspecific must succeed BEFORE we set the
+     * TEB field, so a destructor is always registered for any cache that
+     * the TEB field points to. */
     cache = calloc( NSPA_CACHE_SLOTS, sizeof(*cache) );
     if (!cache) return NULL;
 
+    pthread_once( &nspa_cache_tls_once, nspa_cache_tls_init_once );
     if (pthread_setspecific( nspa_cache_tls_key, cache ) != 0)
     {
         free( cache );
         return NULL;
     }
+    info->nspa_msg_cache = cache;
     return cache;
 }
 
@@ -898,24 +905,19 @@ BOOL nspa_try_post_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
  *   (void *)-1    = queried, server had no bypass (negative cache)
  *   valid ptr     = queried, positive — points at mmap'd ring
  */
-static pthread_key_t nspa_own_tls_key;
-static pthread_once_t nspa_own_tls_once = PTHREAD_ONCE_INIT;
+/* NSPA_OWN_NEG: sentinel stored in TEB->Win32ClientInfo->nspa_own_bypass
+ * to distinguish "queried, server has no bypass" (negative cache) from
+ * "never queried" (zero-initialised NULL).  Same tri-state semantics as
+ * the previous pthread_setspecific(nspa_own_tls_key, NSPA_OWN_NEG) design. */
 #define NSPA_OWN_NEG ((const nspa_queue_bypass_shm_t *)(intptr_t)-1)
 
-static void nspa_own_tls_destructor( void *p )
-{
-    /* Note: mmap is shared across threads so we don't munmap on thread
-     * exit.  The server-side fd owner (the queue) is what controls ring
-     * lifetime; thread exit just drops this cache. */
-}
-
-static void nspa_own_tls_init_once( void )
-{
-    pthread_key_create( &nspa_own_tls_key, nspa_own_tls_destructor );
-}
-
+/* HOT path reads via TEB backpointer in struct user_thread_info.  No
+ * pthread_key needed: the destructor was a no-op (mmap is shared across
+ * threads, server-side queue owns ring lifetime), so cache state simply
+ * stays in the TEB and disappears with the thread's TEB at exit. */
 static const nspa_queue_bypass_shm_t *nspa_get_own_bypass_shm( void )
 {
+    struct user_thread_info *info = get_user_thread_info();
     const nspa_queue_bypass_shm_t *cached;
     int fd_sent = 0;
     NTSTATUS status;
@@ -933,9 +935,8 @@ static const nspa_queue_bypass_shm_t *nspa_get_own_bypass_shm( void )
      * 2. Reply slot reservation for SEND-class bypass (nspa_try_send_ring).
      */
 
-    pthread_once( &nspa_own_tls_once, nspa_own_tls_init_once );
-
-    cached = pthread_getspecific( nspa_own_tls_key );
+    /* HOT PATH: single TEB-relative load via inline NtCurrentTeb. */
+    cached = info->nspa_own_bypass;
     if (cached == NSPA_OWN_NEG) return NULL;
     if (cached) return cached;
 
@@ -949,7 +950,7 @@ static const nspa_queue_bypass_shm_t *nspa_get_own_bypass_shm( void )
 
     if (status || !fd_sent)
     {
-        pthread_setspecific( nspa_own_tls_key, (void *)NSPA_OWN_NEG );
+        info->nspa_own_bypass = (void *)NSPA_OWN_NEG;
         return NULL;
     }
 
@@ -958,7 +959,7 @@ static const nspa_queue_bypass_shm_t *nspa_get_own_bypass_shm( void )
         fd = wine_server_receive_fd( &fd_token );
         if (fd == -1)
         {
-            pthread_setspecific( nspa_own_tls_key, (void *)NSPA_OWN_NEG );
+            info->nspa_own_bypass = (void *)NSPA_OWN_NEG;
             return NULL;
         }
 
@@ -967,7 +968,7 @@ static const nspa_queue_bypass_shm_t *nspa_get_own_bypass_shm( void )
 
         if (map == MAP_FAILED)
         {
-            pthread_setspecific( nspa_own_tls_key, (void *)NSPA_OWN_NEG );
+            info->nspa_own_bypass = (void *)NSPA_OWN_NEG;
             return NULL;
         }
 
@@ -975,7 +976,7 @@ static const nspa_queue_bypass_shm_t *nspa_get_own_bypass_shm( void )
             TRACE_(nspa_bypass)( "own-bypass mlock failed; continuing unpinned\n" );
     }
 
-    pthread_setspecific( nspa_own_tls_key, map );
+    info->nspa_own_bypass = map;
     return (const nspa_queue_bypass_shm_t *)map;
 }
 

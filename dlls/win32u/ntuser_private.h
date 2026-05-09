@@ -109,6 +109,8 @@ struct mouse_tracking_info
     POINT last_mouse_message_pos;
 };
 
+struct nspa_cache_entry;  /* defined in nspa/msg_ring.c — opaque pointer here */
+
 /* this is the structure stored in TEB->Win32ClientInfo */
 /* no attempt is made to keep the layout compatible with the Windows one */
 struct user_thread_info
@@ -130,6 +132,14 @@ struct user_thread_info
     DWORD                         clipping_reset;         /* time when clipping was last reset */
     struct session_thread_data   *session_data;           /* shared session thread data */
     struct mouse_tracking_info   *mouse_tracking_info;    /* NtUserTrackMouseEvent handling */
+    /* NSPA: TEB backpointer fields for per-thread caches that previously
+     * used pthread_getspecific.  Hot-path read is one TEB-relative load
+     * via NtCurrentTeb (inlined as gs:0x30) + offset into Win32ClientInfo
+     * — replaces ~30ns pthread_getspecific function call with ~3ns memory
+     * load.  Replaces nspa_cache_tls_key + nspa_own_tls_key in
+     * dlls/win32u/nspa/msg_ring.c. */
+    struct nspa_cache_entry      *nspa_msg_cache;         /* peer msg-bypass cache (calloc'd; freed via pthread destructor at thread exit) */
+    void                         *nspa_own_bypass;        /* own-bypass shmem ring (nspa_queue_bypass_shm_t * or NSPA_OWN_NEG sentinel) */
 };
 
 C_ASSERT( sizeof(struct user_thread_info) <= sizeof(((TEB *)0)->Win32ClientInfo) );

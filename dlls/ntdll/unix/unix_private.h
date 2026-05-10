@@ -308,6 +308,35 @@ extern pi_mutex_t fd_cache_mutex;
 extern struct _KUSER_SHARED_DATA *user_shared_data;
 extern ULONG process_cookie;
 
+/* NSPA: inline PsGetCurrentThreadId / PsGetCurrentProcessId / RtlGetCurrentPeb
+ * for unix-side TUs.  The exported function symbols in env.c stay (PE-side
+ * resolves them via PLT, dlsym callers work).  env.c sets
+ * WINE_NSPA_INLINE_PS_RTL_DEFINING before this header so its own function
+ * definitions don't get macro-redirected onto themselves.
+ *
+ * Hot caller is sync.c — every ntsync mutex op did
+ *   HandleToULong(PsGetCurrentThreadId())          // PLT thunk
+ * via the WINE_UNIX_LIB GetCurrentThreadId macro in winbase.h.  The macro
+ * still expands to PsGetCurrentThreadId(); the redirect below makes that
+ * resolve to a TEB-relative load chain instead of a function call. */
+#ifndef WINE_NSPA_INLINE_PS_RTL_DEFINING
+static inline PEB * WINAPI nspa_inline_RtlGetCurrentPeb(void)
+{
+    return peb;
+}
+static inline HANDLE WINAPI nspa_inline_PsGetCurrentProcessId(void)
+{
+    return ULongToHandle( pid );
+}
+static inline HANDLE WINAPI nspa_inline_PsGetCurrentThreadId(void)
+{
+    return ULongToHandle( get_thread_data()->tid );
+}
+#define RtlGetCurrentPeb()      nspa_inline_RtlGetCurrentPeb()
+#define PsGetCurrentProcessId() nspa_inline_PsGetCurrentProcessId()
+#define PsGetCurrentThreadId()  nspa_inline_PsGetCurrentThreadId()
+#endif
+
 extern void init_environment(void);
 extern void init_startup_info( SIZE_T info_size );
 

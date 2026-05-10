@@ -23,6 +23,12 @@
 #pragma makedep unix
 #endif
 
+/* NSPA: this TU defines the exported RtlGetCurrentPeb / PsGetCurrentProcessId /
+ * PsGetCurrentThreadId function symbols.  Setting this gate before
+ * unix_private.h is pulled in suppresses the macro redirect there, so the
+ * function definitions resolve to themselves rather than the inlines. */
+#define WINE_NSPA_INLINE_PS_RTL_DEFINING
+
 #include "config.h"
 
 #include <assert.h>

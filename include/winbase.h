@@ -2649,8 +2649,17 @@ extern WCHAR * CDECL wine_get_dos_file_name( const char * ) __WINE_DEALLOC(HeapF
 
 #define GetCurrentProcess()   NtCurrentProcess()
 #define GetCurrentThread()    NtCurrentThread()
-#define GetCurrentProcessId() HandleToULong(PsGetCurrentProcessId())
-#define GetCurrentThreadId()  HandleToULong(PsGetCurrentThreadId())
+/* NSPA: read ClientId straight from the TEB instead of going through
+ * PsGetCurrent*Id.  Mirrors the PE-side __WINESRC__ inlines below
+ * (TEB[8] = ClientId.UniqueProcess, TEB[9] = ClientId.UniqueThread).
+ * After the NtCurrentTeb / PsGetCurrent*Id inline landings, the existing
+ * macro chain compiles to a get_thread_data()->tid load via the TEB
+ * backpointer; this skips one extra indirection.  TEB->ClientId is
+ * populated in lockstep with unix_thread_data->tid (thread.c:1466-1467
+ * for app threads, server.c:1878+1981 for the loader thread), so the
+ * value returned is identical at every callsite. */
+#define GetCurrentProcessId() HandleToULong( ((HANDLE *)NtCurrentTeb())[8] )
+#define GetCurrentThreadId()  HandleToULong( ((HANDLE *)NtCurrentTeb())[9] )
 
 #elif defined(__WINESRC__)
 

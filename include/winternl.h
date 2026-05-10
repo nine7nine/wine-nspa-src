@@ -4816,7 +4816,30 @@ NTSYSAPI NTSTATUS  WINAPI NtGetNextProcess(HANDLE,ACCESS_MASK,ULONG,ULONG,HANDLE
 NTSYSAPI NTSTATUS  WINAPI NtGetNextThread(HANDLE,HANDLE,ACCESS_MASK,ULONG,ULONG,HANDLE*);
 NTSYSAPI NTSTATUS  WINAPI NtGetNlsSectionPtr(ULONG,ULONG,void*,void**,SIZE_T*);
 NTSYSAPI NTSTATUS  WINAPI NtGetPlugPlayEvent(ULONG,ULONG,PVOID,ULONG);
+/* NSPA: KUSER_SHARED_DATA is mapped at the Windows-ABI fixed address
+ * 0x7ffe0000 (Wine maintains this on Linux too — virtual.c maps it as
+ * MEM_RESERVE|COMMIT|PAGE_READONLY at the same address used by every
+ * NT process).  TickCount.LowPart sits at offset 0x320 inside the
+ * struct (see ddk/wdm.h: KUSER_SHARED_DATA::TickCount is the start of
+ * the KSYSTEM_TIME at 0x320 and KSYSTEM_TIME::LowPart is offset 0).
+ * The PE-side and unix-side bodies of NtGetTickCount are both just
+ * `return user_shared_data->TickCount.LowPart;` — inline that read
+ * directly to avoid the cross-DSO PLT call + function frame on the
+ * 3M-call/sec path observed under Ableton.  Volatile read prevents the
+ * compiler from hoisting it out of polling loops.
+ *
+ * The defining TUs (dlls/ntdll/time.c PE-side, dlls/ntdll/unix/sync.c
+ * unix-side) set WINE_NT_GETTICKCOUNT_DEFINING before this header so
+ * their non-static function definitions resolve against an extern
+ * declaration rather than collide with the static-inline. */
+#if defined(__GNUC__) && !defined(WINE_NT_GETTICKCOUNT_DEFINING)
+static FORCEINLINE ULONG WINAPI NtGetTickCount(void)
+{
+    return *(volatile ULONG *)0x7ffe0320;
+}
+#else
 NTSYSAPI ULONG     WINAPI NtGetTickCount(VOID);
+#endif
 NTSYSAPI NTSTATUS  WINAPI NtGetWriteWatch(HANDLE,ULONG,PVOID,SIZE_T,PVOID*,ULONG_PTR*,ULONG*);
 NTSYSAPI NTSTATUS  WINAPI NtImpersonateAnonymousToken(HANDLE);
 NTSYSAPI NTSTATUS  WINAPI NtImpersonateClientOfPort(HANDLE,PLPC_MESSAGE);

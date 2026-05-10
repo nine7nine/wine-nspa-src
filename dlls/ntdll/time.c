@@ -32,6 +32,10 @@
 
 #include "ntstatus.h"
 #include "windef.h"
+/* NSPA: this TU defines the exported NtGetTickCount; suppress the static
+ * inline declared in winternl.h so the function definition below resolves
+ * against the extern fallback. */
+#define WINE_NT_GETTICKCOUNT_DEFINING
 #include "winternl.h"
 #include "ddk/wdm.h"
 #include "wine/exception.h"

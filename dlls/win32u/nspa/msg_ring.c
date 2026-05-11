@@ -1506,7 +1506,7 @@ BOOL nspa_try_send_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
 
     /* Wait for reply via futex on the reply slot's state field.  This is
      * targeted: only wakes when the receiver writes the reply (which calls
-     * FUTEX_WAKE_PRIVATE on the same address).  No false wakes from
+     * FUTEX_WAKE on the same address).  No false wakes from
      * unrelated queue traffic — the previous NtWaitForSingleObject on
      * queue->sync was woken by every incoming message, causing waits++ to
      * advance much faster than the nominal 10 ms tick and the "5 s timeout"

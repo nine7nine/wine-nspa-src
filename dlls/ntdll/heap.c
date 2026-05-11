@@ -267,8 +267,18 @@ C_ASSERT( BIN_SIZE_STEP_7 + 3 * BLOCK_ALIGN <= FIELD_MAX( struct block, tail_siz
 static BYTE affinity_mapping[] = {20,6,31,15,14,29,27,4,18,24,26,13,0,9,2,30,17,7,23,25,10,19,12,3,22,21,5,16,1,28,11,8};
 static LONG next_thread_affinity;
 
-/* a bin, tracking heap blocks of a certain size */
-struct bin
+/* a bin, tracking heap blocks of a certain size.
+ *
+ * NSPA cacheline-pads to 64 bytes via DECLSPEC_ALIGN(64).  heap->bins
+ * is a dense array of struct bin and the LFH counters
+ * (count_alloc / count_freed / enabled / group_alloc / group_freed /
+ * group_max) see Interlocked atomic ops from concurrent threads
+ * working on different bin sizes.  Without the alignment struct bin
+ * is <64 bytes and adjacent bins false-share their counters across
+ * the 64-byte cacheline boundary.  Memory cost is bounded:
+ * ≤ (64 - natural_sizeof) bytes × BLOCK_SIZE_BIN_COUNT per heap.
+ */
+struct DECLSPEC_ALIGN(64) bin
 {
     /* counters for LFH activation */
     LONG count_alloc;
@@ -288,6 +298,7 @@ struct bin
      */
     struct group **affinity_group_base;
 };
+C_ASSERT( sizeof(struct bin) % 64 == 0 );
 
 static inline struct group **bin_get_affinity_group( struct bin *bin, BYTE affinity )
 {

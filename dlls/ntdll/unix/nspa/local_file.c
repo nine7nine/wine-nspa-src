@@ -1253,6 +1253,28 @@ int nspa_local_file_is_local_handle( HANDLE h )
  * library populates, demo song plays.  ~24% of wineserver handler
  * time retired. */
 
+/* Sync-parity: server/fd.c::nspa_finalise_opened_fd applies the
+ * POSIX_FADV_* hint for FILE_SEQUENTIAL_ONLY / FILE_RANDOM_ACCESS
+ * opens.  LF bypass opens the fd client-side and never round-trips
+ * through the server, so the hint has to be applied here.  Switch
+ * shape matches server/fd.c exactly.  Errors ignored — advisory. */
+static inline void nspa_lf_apply_fadvise_hint( int fd, ULONG options )
+{
+#ifdef HAVE_POSIX_FADVISE
+    switch (options & (FILE_SEQUENTIAL_ONLY | FILE_RANDOM_ACCESS))
+    {
+    case FILE_SEQUENTIAL_ONLY:
+        posix_fadvise( fd, 0, 0, POSIX_FADV_SEQUENTIAL );
+        break;
+    case FILE_RANDOM_ACCESS:
+        posix_fadvise( fd, 0, 0, POSIX_FADV_RANDOM );
+        break;
+    }
+#else
+    (void)fd; (void)options;
+#endif
+}
+
 /* Bypass dispatch.  Returns STATUS_SUCCESS + sets *handle on bypass
  * success (caller skips the regular create_file RPC).  Returns
  * STATUS_NOT_SUPPORTED if bypass is gated off, the file isn't a regular
@@ -1346,6 +1368,7 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
             if (errno == EEXIST) return STATUS_OBJECT_NAME_COLLISION;
             return STATUS_NOT_SUPPORTED;   /* fall back to server */
         }
+        nspa_lf_apply_fadvise_hint( unix_fd, options );
 
         if (fstat( unix_fd, &st ) != 0)
         {
@@ -1461,6 +1484,7 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
             {
                 return STATUS_NOT_SUPPORTED;
             }
+            nspa_lf_apply_fadvise_hint( unix_fd, options );
 
             h = nspa_lf_alloc_handle();
             if (!h)
@@ -1538,6 +1562,7 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
                                        (unsigned long long)st.st_ino );
         return STATUS_NOT_SUPPORTED;
     }
+    nspa_lf_apply_fadvise_hint( unix_fd, options );
 
     h = nspa_lf_alloc_handle();
     if (!h)

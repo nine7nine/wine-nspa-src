@@ -26,10 +26,11 @@
 #include "winnls.h"
 
 /* NSPA: enable AVX2 SIMD fast-paths for the utf8_* converters below.
- * Only locale_private.h consumers (currently dlls/ntdll/locale.c PE-side
- * and dlls/ntdll/unix/env.c unix-side, 2 TUs total) pull in the
- * immintrin.h cost.  Pattern matches dlls/winex11.drv/bitblt.c. */
-#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+ * Unix-side only: __builtin_cpu_supports("avx2") lowers to a libgcc
+ * __cpu_model reference, which the PE/mingw winecrt0 link surface
+ * cannot resolve.  PE-side dlls/ntdll/locale.c stays on the scalar
+ * path; unix-side dlls/ntdll/unix/env.c gets the SIMD. */
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__)) && !defined(__WINE_PE_BUILD)
 # include <immintrin.h>
 # define NSPA_HAVE_X86_AVX2_TARGET 1
 #endif

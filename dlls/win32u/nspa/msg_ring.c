@@ -36,13 +36,6 @@
 #include <time.h>
 #include <unistd.h>
 
-#ifndef FUTEX_WAIT_PRIVATE
-#define FUTEX_WAIT_PRIVATE (FUTEX_WAIT | FUTEX_PRIVATE_FLAG)
-#endif
-#ifndef FUTEX_WAKE_PRIVATE
-#define FUTEX_WAKE_PRIVATE (FUTEX_WAKE | FUTEX_PRIVATE_FLAG)
-#endif
-
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
 #include "winternl.h"

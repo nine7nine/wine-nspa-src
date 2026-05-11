@@ -370,6 +370,15 @@ static BOOL nspa_heap_huge_arenas_enabled( void )
     return nspa_heap_huge_arenas_state > 0;
 }
 
+/* NSPA decommit hysteresis: amount of committed-but-free space kept
+ * on a subheap tail before MEM_DECOMMIT fires.  Upstream uses
+ * REGION_ALIGN (64 KB).  Under the NSPA_RT_PRIO gate we keep a
+ * larger tail so tail-shrink frees stop hammering
+ * NtFreeVirtualMemory(MEM_DECOMMIT) under heap->cs on workloads
+ * that incrementally trim heap tails.  HeapFree makes no
+ * decommit-threshold guarantee, so over-keeping is NT-conformant. */
+#define NSPA_DECOMMIT_HYSTERESIS  0x100000  /* 1 MB */
+
 #define HEAP_INITIAL_SIZE      0x10000
 #define HEAP_INITIAL_GROW_SIZE 0x100000
 #define HEAP_MAX_GROW_SIZE     0xfd0000
@@ -1011,8 +1020,15 @@ static NTSTATUS heap_free_block( struct heap *heap, ULONG flags, struct block *b
     block_init_free( block, flags, subheap, block_size );
     insert_free_block( heap, flags, subheap, block );
 
-    /* keep room for a full committed block as hysteresis */
-    if (!next) subheap_decommit( heap, subheap, (char *)((struct entry *)block + 1) + REGION_ALIGN );
+    /* keep room for a full committed block as hysteresis (REGION_ALIGN);
+     * under the NSPA huge-arenas gate bump to NSPA_DECOMMIT_HYSTERESIS
+     * to amortize MEM_DECOMMIT syscalls under heap->cs across more
+     * tail-shrink frees. */
+    if (!next)
+    {
+        SIZE_T hyst = nspa_heap_huge_arenas_enabled() ? NSPA_DECOMMIT_HYSTERESIS : REGION_ALIGN;
+        subheap_decommit( heap, subheap, (char *)((struct entry *)block + 1) + hyst );
+    }
 
     return STATUS_SUCCESS;
 }

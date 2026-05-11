@@ -379,6 +379,17 @@ static BOOL nspa_heap_huge_arenas_enabled( void )
  * decommit-threshold guarantee, so over-keeping is NT-conformant. */
 #define NSPA_DECOMMIT_HYSTERESIS  0x100000  /* 1 MB */
 
+/* NSPA commit hysteresis: alignment grain used by subheap_commit to
+ * round up the requested commit range on the heap-grow path.
+ * Upstream grows in REGION_ALIGN (64 KB) steps.  Under the
+ * NSPA_RT_PRIO gate grow in 1 MB steps so
+ * NtAllocateVirtualMemory(MEM_COMMIT) syscalls under heap->cs
+ * amortize across more allocs.  Phase 3 hugetlb subheaps are fully
+ * committed at create and short-circuit inside subheap_commit, so
+ * this affects only non-Phase-3 subheaps (small heaps under the
+ * Phase 3 floor, executable heaps, max_size-capped heaps). */
+#define NSPA_COMMIT_HYSTERESIS    0x100000  /* 1 MB */
+
 #define HEAP_INITIAL_SIZE      0x10000
 #define HEAP_INITIAL_GROW_SIZE 0x100000
 #define HEAP_MAX_GROW_SIZE     0xfd0000
@@ -872,11 +883,12 @@ static SUBHEAP *find_subheap( const struct heap *heap, const struct block *block
 static inline BOOL subheap_commit( const struct heap *heap, SUBHEAP *subheap, const struct block *block, SIZE_T block_size )
 {
     const char *end = (char *)subheap_base( subheap ) + subheap_size( subheap ), *commit_end;
+    SIZE_T align = nspa_heap_huge_arenas_enabled() ? NSPA_COMMIT_HYSTERESIS : REGION_ALIGN;
     SIZE_T size;
     void *addr;
 
     commit_end = (char *)block + block_size + sizeof(struct entry);
-    commit_end = ROUND_ADDR( (char *)commit_end + REGION_ALIGN - 1, REGION_ALIGN - 1 );
+    commit_end = ROUND_ADDR( (char *)commit_end + align - 1, align - 1 );
 
     if (commit_end > end) commit_end = end;
     if (commit_end <= (char *)subheap_commit_end( subheap )) return TRUE;

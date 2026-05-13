@@ -2188,6 +2188,24 @@ NTSTATUS WINAPI NtDuplicateObject( HANDLE source_process, HANDLE source, HANDLE 
         if (promoted) source = promoted;
     }
 
+    /* NSPA inproc_sync client-range DuplicateHandle.  Anonymous sync
+     * objects (semaphores, events, mutexes) live entirely in ntdll's
+     * inproc_sync cache and are invisible to the wineserver — the
+     * dup_handle RPC would return STATUS_INVALID_HANDLE.  Same-process
+     * dup is satisfiable purely client-side via dup() on the ntsync fd
+     * + a new client-range slot; the kernel's fd refcount handles
+     * underlying-object lifetime.  Inheritance and cross-process dups
+     * require server-visible handles and fall through to the legacy
+     * path (which fails with INVALID_HANDLE for these — same behavior
+     * as before this change; no new regression). */
+    if (source_process == NtCurrentProcess() && dest_process == NtCurrentProcess()
+        && !(attributes & OBJ_INHERIT))
+    {
+        unsigned int dup_status = nspa_inproc_sync_try_dup( source, access,
+                                                            attributes, options, dest );
+        if (dup_status != STATUS_NOT_IMPLEMENTED) return dup_status;
+    }
+
     /* hold fd_cache_mutex to prevent the fd from being added again between the
      * call to remove_fd_from_cache and close_handle */
     server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );

@@ -755,6 +755,14 @@ extern BOOL is_client_handle( HANDLE handle );
 extern void close_client_inproc_sync( HANDLE handle );
 extern void abandon_client_mutexes( DWORD tid );
 
+/* NSPA: client-side DuplicateHandle for inproc_sync client-range handles.
+ * Caller (NtDuplicateObject) must verify same-process and !OBJ_INHERIT
+ * before calling.  Returns STATUS_NOT_IMPLEMENTED if `source` is not a
+ * client-range handle (caller falls through to the legacy server path). */
+extern NTSTATUS nspa_inproc_sync_try_dup( HANDLE source, ACCESS_MASK access,
+                                          ULONG attributes, ULONG options,
+                                          HANDLE *dest );
+
 extern NTSTATUS call_user_apc_dispatcher( CONTEXT *context_ptr, unsigned int flags, ULONG_PTR arg1, ULONG_PTR arg2,
                                           ULONG_PTR arg3, PNTAPCFUNC func, NTSTATUS status );
 extern NTSTATUS call_user_exception_dispatcher( EXCEPTION_RECORD *rec, CONTEXT *context );

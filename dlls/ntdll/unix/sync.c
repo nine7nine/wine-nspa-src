@@ -1323,6 +1323,141 @@ void nspa_unregister_inproc_event_with_server( HANDLE handle )
     SERVER_END_REQ;
 }
 
+/*
+ * NSPA: client-side NtDuplicateObject for inproc_sync client-range handles.
+ *
+ * Anonymous sync objects (semaphores, events, mutexes) created via the
+ * client-range path live entirely in ntdll's inproc_sync cache — their
+ * fds come direct from /dev/ntsync ioctls, and the wineserver has no
+ * record of the handles.  NtDuplicateObject's normal path RPCs the
+ * wineserver and gets STATUS_INVALID_HANDLE because the handle isn't in
+ * the server's process handle table.
+ *
+ * `DuplicateHandle` is fundamentally a same-process fd-refcount bump at
+ * the kernel level — same as `dup(2)` on the underlying ntsync fd.
+ * That can be done purely client-side: dup() the fd (kernel refcounts
+ * the struct file), allocate a new client-range slot, cache the new
+ * (handle, fd) pair, return the new handle.  Both source and dup
+ * remain valid as independent client-range handles; ops on either
+ * route through ntsync to the same kernel object.
+ *
+ * Constraints — caller (NtDuplicateObject) must verify before calling:
+ *   - source_process == dest_process == NtCurrentProcess()
+ *   - !(attributes & OBJ_INHERIT)  — inheritance requires server-side
+ *     handle visibility, which client-range handles don't have.
+ *
+ * Returns STATUS_NOT_IMPLEMENTED when source isn't a client-range
+ * handle (caller falls through to legacy server path).
+ *
+ * Event/mutex specials mirror the create paths:
+ *   - INPROC_SYNC_EVENT: Phase 4.6 wineserver-side fd registration is
+ *     done for the new handle too, so server async-completion paths
+ *     can signal the duplicate.
+ *   - INPROC_SYNC_MUTEX: new entry added to client_mutex_list so the
+ *     dup is auto-abandoned if its owning thread dies.
+ */
+NTSTATUS nspa_inproc_sync_try_dup( HANDLE source, ACCESS_MASK access,
+                                   ULONG attributes, ULONG options,
+                                   HANDLE *dest )
+{
+    struct inproc_sync *src;
+    int new_fd = -1;
+    HANDLE new_handle = 0;
+    ACCESS_MASK new_access;
+    enum inproc_sync_type src_type;
+    NTSTATUS status;
+    sigset_t sigset;
+    BOOL cached_ok = FALSE;
+
+    (void)attributes;  /* caller has filtered OBJ_INHERIT */
+
+    if (!is_client_handle( source )) return STATUS_NOT_IMPLEMENTED;
+
+    server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );
+
+    src = get_cached_inproc_sync( source );
+    if (!src)
+    {
+        server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
+        /* Was a client-range handle but no live cache entry — either closed
+         * concurrently or never properly cached.  Surface as INVALID_HANDLE
+         * to the caller (same as the wineserver path would). */
+        return STATUS_INVALID_HANDLE;
+    }
+    src_type = src->type;
+    new_access = (options & DUPLICATE_SAME_ACCESS) ? src->access : access;
+    new_fd = dup( src->fd );
+    release_inproc_sync( src );
+
+    if (new_fd < 0)
+    {
+        status = errno_to_status( errno );
+        goto fail_locked;
+    }
+    /* Match the create-path convention — ntsync ioctls return fds without
+     * FD_CLOEXEC; ensure the dup'd fd doesn't survive an exec either. */
+    fcntl( new_fd, F_SETFD, FD_CLOEXEC );
+
+    new_handle = alloc_client_handle();
+    if (!new_handle)
+    {
+        status = STATUS_NO_MEMORY;
+        goto fail_locked;
+    }
+
+    if ((status = cache_client_inproc_sync( new_handle, new_fd, src_type, new_access )))
+        goto fail_locked;
+    cached_ok = TRUE;
+
+    /* Mutex tracking — under the cache mutex, matches create_inproc_mutex_local.
+     * malloc failure is non-fatal: the source handle's mentry still tracks
+     * the same kernel mutex (via a different fd), so abandonment still works
+     * for that thread, just not via this dup's fd. */
+    if (src_type == INPROC_SYNC_MUTEX)
+    {
+        struct client_mutex_entry *mentry = malloc( sizeof(*mentry) );
+        if (mentry)
+        {
+            mentry->fd     = new_fd;
+            mentry->handle = new_handle;
+            list_add_tail( &client_mutex_list, &mentry->entry );
+        }
+    }
+
+    server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
+
+    /* Event registration runs outside the cache mutex — server RPC can block.
+     * If registration fails, undo the dup to avoid a half-functional event. */
+    if (src_type == INPROC_SYNC_EVENT)
+    {
+        if ((status = nspa_register_inproc_event_with_server( new_handle, new_fd )))
+        {
+            server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );
+            close_client_inproc_sync( new_handle );
+            server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
+            return status;
+        }
+    }
+
+    /* DUPLICATE_CLOSE_SOURCE: close the original after dup is fully set up.
+     * NtClose acquires fd_cache_mutex itself for client-range handles, so
+     * we must not be holding it here. */
+    if (options & DUPLICATE_CLOSE_SOURCE) NtClose( source );
+
+    *dest = new_handle;
+    return STATUS_SUCCESS;
+
+fail_locked:
+    if (new_handle)
+    {
+        if (cached_ok) close_client_inproc_sync( new_handle );
+        else free_client_handle( new_handle );
+    }
+    if (new_fd >= 0 && !cached_ok) close( new_fd );
+    server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
+    return status;
+}
+
 static NTSTATUS inproc_release_semaphore( HANDLE handle, ULONG count, ULONG *prev_count )
 {
     struct inproc_sync stack, *sync;

@@ -1066,11 +1066,23 @@ typedef volatile struct
     unsigned char data[NSPA_MSG_INLINE_MAX];
 } nspa_msg_slot_t;
 
+/* NSPA-2026-05-16: head and tail cacheline-isolated to eliminate the
+ * producer/consumer false-sharing on the main IPC fast path.  Upstream
+ * layout packed both 32-bit indices 4 bytes apart in one cacheline; the
+ * producer's MPSC head CAS (ring_reserve_slot) and the consumer's tail
+ * store (nspa_client_advance_own_ring_tail and the server's consume
+ * path in queue.c) then ping-pong each other's cachelines on every
+ * send/receive.
+ *
+ * The remaining state fields stay co-located on a third cacheline.
+ * pending_count / pending_send_count are themselves mixed-write (both
+ * producer fetch_add and consumer fetch_sub) — that's a separate false-
+ * sharing class addressed separately, not part of this commit. */
 typedef volatile struct
 {
-    unsigned int head;              /* producer index (monotonic, wraps mod NSPA_MSG_RING_SLOTS) */
-    unsigned int tail;              /* consumer index */
-    unsigned int overflow;          /* count of fallback-to-server from ring-full */
+    unsigned int __attribute__((aligned(64))) head;  /* L1: producer-write (MPSC CAS) */
+    unsigned int __attribute__((aligned(64))) tail;  /* L2: consumer-write (client own-advance + server consume) */
+    unsigned int __attribute__((aligned(64))) overflow;  /* L3 start: rest of ring state */
     unsigned int active;            /* 0 = ring inactive (receiver not set up yet) */
     unsigned int pending_count;     /* total READY ring slots (posted + send combined) */
     unsigned int pending_send_count;/* subset that are SEND-type (ASCII/UNICODE/NOTIFY) */
@@ -1078,7 +1090,7 @@ typedef volatile struct
     unsigned int change_seq;        /* bumped once each time a READY ring post is published */
     unsigned int change_ack_seq;    /* last published change sequence acknowledged by owner */
     unsigned int __pad;
-    nspa_msg_slot_t slots[NSPA_MSG_RING_SLOTS];
+    nspa_msg_slot_t __attribute__((aligned(64))) slots[NSPA_MSG_RING_SLOTS];  /* L4+: data */
 } nspa_msg_ring_t;
 
 typedef volatile struct
@@ -1122,13 +1134,19 @@ typedef volatile struct
     unsigned int  __pad;
 } nspa_timer_slot_t;
 
+/* NSPA-2026-05-16: SPSC ring (per-process timer dispatcher producer,
+ * queue-owning thread consumer).  head and tail cacheline-isolated for
+ * the same reason as nspa_msg_ring_t — even though head advance is a
+ * plain atomic store (no CAS), the cross-thread cacheline bounce
+ * between producer and consumer stalls each access on the contended
+ * line. */
 typedef volatile struct
 {
-    unsigned int head;              /* producer (dispatcher) advances; wraps mod slots */
-    unsigned int tail;              /* consumer (pump) advances */
-    unsigned int overflow;          /* dropped events when ring was full */
+    unsigned int __attribute__((aligned(64))) head;   /* producer (dispatcher) advances; wraps mod slots */
+    unsigned int __attribute__((aligned(64))) tail;   /* consumer (pump) advances */
+    unsigned int __attribute__((aligned(64))) overflow;  /* dropped events when ring was full */
     unsigned int active;            /* 0 = consumer not set up yet */
-    nspa_timer_slot_t slots[NSPA_TIMER_RING_SLOTS];
+    nspa_timer_slot_t __attribute__((aligned(64))) slots[NSPA_TIMER_RING_SLOTS];
 } nspa_timer_ring_t;
 
 /* NSPA Tier 2 hook cache.  Each (queue, hook id) pair gets a bounded
@@ -1193,13 +1211,16 @@ typedef volatile struct
     struct rectangle  rects[NSPA_REDRAW_INLINE_RECTS];
 } nspa_redraw_slot_t;
 
+/* NSPA-2026-05-16: SPSC ring (queue-owning thread producer, wineserver
+ * main thread consumer).  head and tail cacheline-isolated for the
+ * same reason as nspa_msg_ring_t. */
 typedef volatile struct
 {
-    unsigned int           head;       /* producer (client) advances; mod slots */
-    unsigned int           tail;       /* consumer (server) advances */
-    unsigned int           overflow;   /* dropped on ring full */
+    unsigned int __attribute__((aligned(64))) head;       /* producer (client) advances; mod slots */
+    unsigned int __attribute__((aligned(64))) tail;       /* consumer (server) advances */
+    unsigned int __attribute__((aligned(64))) overflow;   /* dropped on ring full */
     unsigned int           active;     /* 0 = consumer not set up */
-    nspa_redraw_slot_t     slots[NSPA_REDRAW_RING_SLOTS];
+    nspa_redraw_slot_t __attribute__((aligned(64))) slots[NSPA_REDRAW_RING_SLOTS];
 } nspa_redraw_ring_t;
 
 /* NSPA empty-PEEK shortcut: per-class deliverable msg-id range published

@@ -1050,11 +1050,23 @@ typedef volatile struct
     unsigned char data[NSPA_MSG_INLINE_MAX];
 } nspa_msg_slot_t;
 
+/* NSPA-2026-05-16: head and tail cacheline-isolated to eliminate the
+ * producer/consumer false-sharing on the main IPC fast path.  Upstream
+ * layout packed both 32-bit indices 4 bytes apart in one cacheline; the
+ * producer's MPSC head CAS (ring_reserve_slot) and the consumer's tail
+ * store (nspa_client_advance_own_ring_tail and the server's consume
+ * path in queue.c) then ping-pong each other's cachelines on every
+ * send/receive.
+ *
+ * The remaining state fields stay co-located on a third cacheline.
+ * pending_count / pending_send_count are themselves mixed-write (both
+ * producer fetch_add and consumer fetch_sub) — that's a separate false-
+ * sharing class addressed separately, not part of this commit. */
 typedef volatile struct
 {
-    unsigned int head;
-    unsigned int tail;
-    unsigned int overflow;
+    unsigned int __attribute__((aligned(64))) head;
+    unsigned int __attribute__((aligned(64))) tail;
+    unsigned int __attribute__((aligned(64))) overflow;
     unsigned int active;
     unsigned int pending_count;
     unsigned int pending_send_count;
@@ -1062,7 +1074,7 @@ typedef volatile struct
     unsigned int change_seq;
     unsigned int change_ack_seq;
     unsigned int __pad;
-    nspa_msg_slot_t slots[NSPA_MSG_RING_SLOTS];
+    nspa_msg_slot_t __attribute__((aligned(64))) slots[NSPA_MSG_RING_SLOTS];
 } nspa_msg_ring_t;
 
 typedef volatile struct
@@ -1106,13 +1118,19 @@ typedef volatile struct
     unsigned int  __pad;
 } nspa_timer_slot_t;
 
+/* NSPA-2026-05-16: SPSC ring (per-process timer dispatcher producer,
+ * queue-owning thread consumer).  head and tail cacheline-isolated for
+ * the same reason as nspa_msg_ring_t — even though head advance is a
+ * plain atomic store (no CAS), the cross-thread cacheline bounce
+ * between producer and consumer stalls each access on the contended
+ * line. */
 typedef volatile struct
 {
-    unsigned int head;
-    unsigned int tail;
-    unsigned int overflow;
+    unsigned int __attribute__((aligned(64))) head;
+    unsigned int __attribute__((aligned(64))) tail;
+    unsigned int __attribute__((aligned(64))) overflow;
     unsigned int active;
-    nspa_timer_slot_t slots[NSPA_TIMER_RING_SLOTS];
+    nspa_timer_slot_t __attribute__((aligned(64))) slots[NSPA_TIMER_RING_SLOTS];
 } nspa_timer_ring_t;
 
 /* NSPA Tier 2 hook cache.  Each (queue, hook id) pair gets a bounded
@@ -1177,13 +1195,16 @@ typedef volatile struct
     struct rectangle  rects[NSPA_REDRAW_INLINE_RECTS];
 } nspa_redraw_slot_t;
 
+/* NSPA-2026-05-16: SPSC ring (queue-owning thread producer, wineserver
+ * main thread consumer).  head and tail cacheline-isolated for the
+ * same reason as nspa_msg_ring_t. */
 typedef volatile struct
 {
-    unsigned int           head;
-    unsigned int           tail;
-    unsigned int           overflow;
+    unsigned int __attribute__((aligned(64))) head;
+    unsigned int __attribute__((aligned(64))) tail;
+    unsigned int __attribute__((aligned(64))) overflow;
     unsigned int           active;
-    nspa_redraw_slot_t     slots[NSPA_REDRAW_RING_SLOTS];
+    nspa_redraw_slot_t __attribute__((aligned(64))) slots[NSPA_REDRAW_RING_SLOTS];
 } nspa_redraw_ring_t;
 
 /* NSPA empty-PEEK shortcut: per-class deliverable msg-id range published
@@ -7908,6 +7929,6 @@ union generic_reply
     struct nspa_unregister_inproc_event_reply nspa_unregister_inproc_event_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 972
+#define SERVER_PROTOCOL_VERSION 973
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

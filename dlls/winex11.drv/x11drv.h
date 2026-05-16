@@ -623,7 +623,14 @@ enum x11drv_window_messages
     /* wine-nspa: atomic embed of this HWND's wine_x11_window under an
      * external X11 parent.  WPARAM = (Window) parent X11 window.
      * See dlls/winex11.drv/window.c::X11DRV_WindowMessage. */
-    WM_X11DRV_NSPA_EMBED_WINDOW
+    WM_X11DRV_NSPA_EMBED_WINDOW,
+    /* wine-nspa: posted (via NtUserPostMessage) to the embedded HWND
+     * once the embed handler has reparented + mapped wine_x11_window
+     * and the X11 server has flushed the wm_state cycle.  Consumers
+     * can use this as a "embed handshake settled" signal instead of
+     * guessing timing or watching X11 events themselves.  No payload
+     * (wparam/lparam = 0). */
+    WM_X11DRV_NSPA_EMBED_DONE
 };
 
 /* _NET_WM_STATE properties that we keep track of */

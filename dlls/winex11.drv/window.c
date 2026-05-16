@@ -3700,6 +3700,12 @@ LRESULT X11DRV_WindowMessage( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
             }
             release_win_data( data );
         }
+        /* wine-nspa: post completion signal so consumers can synchronize
+         * format-specific attach hooks (effEditOpen / IPlugView::attached /
+         * CLAP set_parent) on the embed handshake being settled, instead of
+         * timing it heuristically.  Posted async via the HWND's message
+         * queue — landed-by-next-pump semantics. */
+        NtUserPostMessage( hwnd, WM_X11DRV_NSPA_EMBED_DONE, 0, 0 );
         return 0;
     }
     default:

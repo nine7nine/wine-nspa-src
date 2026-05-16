@@ -26,6 +26,46 @@ AC_ARG_ENABLE(sast,  AS_HELP_STRING([--enable-sast],[enable static application s
 AC_ARG_ENABLE(silent-rules, AS_HELP_STRING([--enable-silent-rules],[use silent build rules (override: "make V=1")]))
 AC_ARG_ENABLE(werror, AS_HELP_STRING([--enable-werror],[treat compilation warnings as errors]))
 
+dnl NSPA: opt-in x86_64 microarch uplift for PE and ELF compile flags.
+dnl Adds -march=<LEVEL> -ffp-contract=off to both halves of the build.
+dnl Default: disabled (no behavioural change for upstream builds).
+dnl
+dnl -ffp-contract=off is bundled to preserve bit-exact FP math; FMA
+dnl contraction (enabled by default with -march>=haswell) silently
+dnl changes the LSB of single-expression a*b+c sequences and would
+dnl perturb fdlibm-style math in msvcrt/math.c plus break the
+dnl bit-exact expectations of some test suites.
+AC_ARG_ENABLE(nspa-arch,
+  AS_HELP_STRING([--enable-nspa-arch=LEVEL],
+                 [NSPA performance: target x86_64 microarch level
+                  (v2|v3|v4-narrow|v4|native).  Adds -march=<LEVEL>
+                  -ffp-contract=off to PE and ELF compile flags.
+                  v3 (AVX2+FMA, Haswell-era) is the conservative choice;
+                  v4-narrow exposes AVX-512 ISA features (16 registers,
+                  masking) while keeping 256-bit vector widths to
+                  minimise frequency-throttle exposure.  Default: disabled.]))
+
+nspa_arch_flags=
+case "$enable_nspa_arch" in
+  ""|no|off) : ;;
+  v2|x86-64-v2) nspa_arch_flags="-march=x86-64-v2 -ffp-contract=off" ;;
+  v3|x86-64-v3) nspa_arch_flags="-march=x86-64-v3 -ffp-contract=off" ;;
+  v4-narrow|x86-64-v4-narrow)
+    dnl AVX-512 ISA features (16 extra registers, mask/predicate support,
+    dnl better codegen flexibility) without forcing 512-bit vector widths.
+    dnl -mprefer-vector-width=256 keeps auto-vectorization at YMM, which
+    dnl avoids the bulk of the wide-vector frequency-throttle exposure
+    dnl while letting the compiler use AVX-512 ISA where it helps narrow.
+    nspa_arch_flags="-march=x86-64-v4 -mprefer-vector-width=256 -ffp-contract=off" ;;
+  v4|x86-64-v4)
+    nspa_arch_flags="-march=x86-64-v4 -ffp-contract=off"
+    AC_MSG_WARN([--enable-nspa-arch=v4 enables 512-bit AVX-512 vector widths.  On some client x86 microarchs (notably Skylake/Cannon Lake desktop and laptop variants), executing 512-bit AVX-512 instructions causes a per-core or per-socket frequency downclock for a refractory period.  Under RT-audio scheduling that can manifest as unpredictable xruns.  Behaviour varies significantly by microarch and workload; on Ice Lake and later mobile/Tiger Lake, the impact is much smaller.  Consider --enable-nspa-arch=v4-narrow to get the AVX-512 ISA features (more registers, masking) without 512-bit vector widths if you are unsure.]) ;;
+  native)
+    nspa_arch_flags="-march=native -ffp-contract=off"
+    AC_MSG_WARN([--enable-nspa-arch=native produces a CPU-specific binary that may not run on different hardware.]) ;;
+  *) AC_MSG_ERROR([--enable-nspa-arch: unknown LEVEL '$enable_nspa_arch' (valid: v2, v3, v4-narrow, v4, native)]) ;;
+esac
+
 AC_ARG_WITH(alsa,      AS_HELP_STRING([--without-alsa],[do not use the Alsa sound support]))
 AC_ARG_WITH(capi,      AS_HELP_STRING([--without-capi],[do not use CAPI (ISDN support)]))
 AC_ARG_WITH(coreaudio, AS_HELP_STRING([--without-coreaudio],[do not use the CoreAudio sound support]))
@@ -462,6 +502,13 @@ do
     AS_VAR_COPY([CXXFLAGS],[${wine_arch}_CXXFLAGS])
     AS_VAR_COPY([LDFLAGS],[${wine_arch}_LDFLAGS])
     AS_VAR_SET([${wine_arch}_EXTRACFLAGS],["-D__WINE_PE_BUILD -Wall"])
+
+    dnl NSPA: per-arch x86 microarch uplift (PE side)
+    if test -n "$nspa_arch_flags"; then
+        WINE_TRY_PE_CFLAGS([$nspa_arch_flags],
+            [AS_VAR_APPEND([${wine_arch}_EXTRACFLAGS],[" $nspa_arch_flags"])],
+            [AC_MSG_WARN([PE compiler for $wine_arch rejected '$nspa_arch_flags'; staying at baseline for $wine_arch])])
+    fi
 
     target=""
     set x $CC
@@ -1979,6 +2026,13 @@ then
 
   dnl GCC can't handle large files when -Wmisleading-indentation is enabled (https://gcc.gnu.org/bugzilla/show_bug.cgi?id=89549)
   WINE_TRY_CFLAGS([-flarge-source-files -Wmisleading-indentation],[EXTRACFLAGS="$EXTRACFLAGS -Wno-misleading-indentation"])
+
+  dnl NSPA: x86 microarch uplift (ELF side)
+  if test -n "$nspa_arch_flags"; then
+    WINE_TRY_CFLAGS([$nspa_arch_flags],
+                    [EXTRACFLAGS="$EXTRACFLAGS $nspa_arch_flags"],
+                    [AC_MSG_WARN([ELF compiler rejected '$nspa_arch_flags'; staying at baseline for ELF side])])
+  fi
 
   dnl Check for 64-bit compare-and-swap
   AC_CACHE_CHECK([for flags needed for 64-bit compare-and-swap support], wine_cv_64bit_compare_swap,
@@ -3836,6 +3890,10 @@ AC_OUTPUT
 if test "$no_create" = "yes"
 then
   exit 0
+fi
+
+if test -n "$nspa_arch_flags"; then
+  WINE_NOTICE([NSPA arch optimization enabled: $nspa_arch_flags])
 fi
 
 WINE_PRINT_MESSAGES

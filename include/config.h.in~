@@ -141,6 +141,9 @@
 /* Define to 1 if you have the <libprocstat.h> header file. */
 #undef HAVE_LIBPROCSTAT_H
 
+/* Define to 1 if you have the <liburing.h> header file. */
+#undef HAVE_LIBURING_H
+
 /* Define to 1 if you have the <libudev.h> header file. */
 #undef HAVE_LIBUDEV_H
 
@@ -812,6 +815,9 @@
 
 /* Define to the soname of the libXinerama library. */
 #undef SONAME_LIBXINERAMA
+
+/* Define to the soname of the libxkbregistry library. */
+#undef SONAME_LIBXKBREGISTRY
 
 /* Define to the soname of the libXrandr library. */
 #undef SONAME_LIBXRANDR

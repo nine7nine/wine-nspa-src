@@ -1418,6 +1418,22 @@ static void window_set_config( struct x11drv_win_data *data, RECT rect, BOOL abo
     {
         OffsetRect( new_rect, old_rect->left - new_rect->left, old_rect->top - new_rect->top );
     }
+    /* wine-nspa: nspa_embedded windows live under a winelib host that owns
+     * X11 sizing too — not just position.  Plugin resize callbacks
+     * (audioMasterSizeWindow / IPlugFrame::resizeView / CLAP request_resize)
+     * are the canonical signal; the host configures its own X11 windows
+     * accordingly.  Wine's own XConfigureWindow size emission on
+     * wine_x11_window is then either redundant (host already set the size)
+     * or actively harmful — some hosts subscribe to SubStructureNotify on
+     * the parent and misbehave when they see wine_window's internal resize
+     * events (Carla 2.3.1-class). Lock size to old_rect to keep Wine's
+     * internal win32 WND-rect bookkeeping intact (mouse hit-testing reads
+     * data->rects.visible) while suppressing the X11-side emission. */
+    if (data->nspa_embedded)
+    {
+        new_rect->right = old_rect->right;
+        new_rect->bottom = old_rect->bottom;
+    }
 
     data->desired_state.rect = *new_rect;
     data->desired_state.above = above;

@@ -34,7 +34,24 @@
  * pattern that winelib hosts (Element, yabridge, LinVst, ...) would
  * otherwise need to reimplement.
  *
- * Size changes still propagate to X11 normally.
+ * Size changes are NOT issued as XConfigureWindow on wine_x11_window
+ * for nspa-embedded windows either — the embedder also owns sizing.
+ * Bridges already get plugin resize signals via format-specific
+ * callbacks (audioMasterSizeWindow / IPlugFrame::resizeView / CLAP
+ * request_resize), so the X11 ConfigureNotify path was never the
+ * canonical signal anyway.  Suppressing it prevents resize-related
+ * misbehavior from hosts that subscribe to SubStructureNotify on the
+ * parent (e.g., older Carla versions).
+ *
+ * **Consumer contract:** because Wine no longer emits XConfigureWindow
+ * for size changes on wine_x11_window, hosts MUST drive X11 sizing
+ * themselves when they want the embedded surface to match the
+ * plugin's reported size.  Typically this means calling
+ * XMoveResizeWindow / xcb_configure_window directly on the wine
+ * X11 window using the size received via the format-specific resize
+ * callback.  JUCE's syncHwndScreenPosition and yabridge's
+ * Editor::resize already do this; new hosts should follow the same
+ * pattern.
  *
  * Reparent re-runs on each call (handles host peer-change scenarios
  * like alwaysOnTop reparent).  The embedded-flag flip happens once.

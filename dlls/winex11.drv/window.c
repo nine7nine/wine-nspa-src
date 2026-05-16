@@ -3619,6 +3619,41 @@ LRESULT X11DRV_WindowMessage( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
     case WM_X11DRV_ADD_TAB:
         taskbar_add_tab( hwnd );
         return 0;
+    case WM_X11DRV_NSPA_EMBED_WINDOW:
+    {
+        /* wine-nspa: atomic embed of wine_x11_window under an external
+         * X11 parent.  See <wine/nspa_x11_embed.h> for public docs.
+         *
+         * Uses Wine's existing make_window_embedded() helper to ensure
+         * all internal state transitions are consistent (override_
+         * redirect, wm_state, managed/embedded flags).  Caller must
+         * send this on an unmapped wine_x11_window — i.e. before any
+         * ShowWindow / WS_VISIBLE mapping.  make_window_embedded
+         * handles the WithdrawnState/NormalState cycle internally;
+         * doing it on an already-mapped window may briefly hide and
+         * remap the window which is visible to the user.
+         *
+         * Idempotent: if data->embedded is already TRUE, returns 0
+         * without re-running.  Note that this prevents re-embedding
+         * on host peer changes (alwaysOnTop reparent etc.) — host
+         * code is responsible for ensuring the HWND is only embedded
+         * once. */
+        Window parent = (Window)wp;
+        if (!parent) return 0;
+        if ((data = get_win_data( hwnd )))
+        {
+            if (data->whole_window && !data->embedded)
+            {
+                XReparentWindow( data->display, data->whole_window, parent, 0, 0 );
+                XSync( data->display, False );
+                data->embedder = parent;
+                set_window_parent( data, parent );
+                make_window_embedded( data );
+            }
+            release_win_data( data );
+        }
+        return 0;
+    }
     default:
         FIXME( "got window msg %x hwnd %p wp %lx lp %lx\n", msg, hwnd, (long)wp, lp );
         return 0;

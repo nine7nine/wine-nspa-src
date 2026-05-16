@@ -619,7 +619,11 @@ enum x11drv_window_messages
     WM_X11DRV_UPDATE_CLIPBOARD = WM_WINE_FIRST_DRIVER_MSG,
     WM_X11DRV_SET_WIN_REGION,
     WM_X11DRV_DELETE_TAB,
-    WM_X11DRV_ADD_TAB
+    WM_X11DRV_ADD_TAB,
+    /* wine-nspa: atomic embed of this HWND's wine_x11_window under an
+     * external X11 parent.  WPARAM = (Window) parent X11 window.
+     * See dlls/winex11.drv/window.c::X11DRV_WindowMessage. */
+    WM_X11DRV_NSPA_EMBED_WINDOW
 };
 
 /* _NET_WM_STATE properties that we keep track of */

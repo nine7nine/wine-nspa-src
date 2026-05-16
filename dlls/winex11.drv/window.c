@@ -1812,6 +1812,16 @@ static UINT window_update_client_config( struct x11drv_win_data *data )
         if (data->mwm_hints_serial) return 0; /* another MWM_HINT update is pending, wait for it to complete */
         if (data->configure_serial) return 0; /* another config update is pending, wait for it to complete */
     }
+    /* wine-nspa: freeze host-drag rect updates while a mouse button is
+     * held on this embedded child.  Plugin cursor save/restore math
+     * (GetWindowRect at mouse-down, SetCursorPos at mouse-up) assumes
+     * WND rect is stable across the click → drag → release window; a
+     * mid-click rect update introduces a round-trip offset that lands
+     * SetCursorPos at the wrong screen coords (cursor jumps to top-
+     * left on release).  X11DRV_ButtonRelease posts a fresh
+     * WM_WINE_WINDOW_STATE_CHANGED when the count drops to zero, so any
+     * deferred host-motion update flushes through immediately. */
+    else if (data->nspa_button_count) return 0;
 
     /* Ignore fullscreen config changes when it's still on the same monitor. This is needed because
      * adding __NET_WM_STATE_FULLSCREEN will make WMs move the window to cover exactly the monitor

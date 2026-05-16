@@ -674,6 +674,7 @@ struct x11drv_win_data
     UINT        managed : 1;    /* is window managed? */
     UINT        embedded : 1;   /* is window an XEMBED client? */
     UINT        nspa_embedded : 1; /* wine-nspa: scoped embed via WM_X11DRV_NSPA_EMBED_WINDOW (winelib hosts; enables host-drag rect propagation in X11DRV_GravityNotify) */
+    UINT        nspa_button_count : 4; /* wine-nspa: # of mouse buttons currently held down on this embedded child (gates host-drag rect updates so plugin SetCursorPos restore math stays consistent during a click→drag→release window) */
     UINT        shaped : 1;     /* is window using a custom region shape? */
     UINT        layered : 1;    /* is window layered and with valid attributes? */
     UINT        use_alpha : 1;  /* does window use an alpha channel? */

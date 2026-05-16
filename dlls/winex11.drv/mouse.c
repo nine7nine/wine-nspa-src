@@ -1380,10 +1380,40 @@ void X11DRV_SetCursor( HWND hwnd, HCURSOR handle )
 /***********************************************************************
  *		SetCursorPos (X11DRV.@)
  */
+/* wine-nspa: short suppression window armed by ButtonRelease on an
+ * nspa_embedded child, consumed by the next X11DRV_SetCursorPos.  VST2
+ * plugins commonly hide the cursor on mouse-down, process motion
+ * deltas during the drag, then SetCursorPos(saved_screen_pos) +
+ * show-cursor on release — but the saved coord goes wrong when (a)
+ * the WND rect moved mid-click, or (b) the plugin computes the save
+ * via a path that doesn't survive the embedded coord regime.  The
+ * symptom is a jarring cursor jump to a wrong (often top-of-window)
+ * position the moment the user lifts the button.  Since the user's
+ * natural expectation is "cursor stays where I released", we no-op
+ * the immediate post-release SetCursorPos and return success so the
+ * plugin's bookkeeping is unaffected.  Drag-time SetCursorPos calls
+ * (snap-to-center during knob hold) are untouched: they fire while a
+ * button is still held, so the suppression hasn't been armed yet. */
+static DWORD nspa_suppress_warp_until_tick = 0;
+
 BOOL X11DRV_SetCursorPos( INT x, INT y )
 {
     struct x11drv_thread_data *data = x11drv_init_thread_data();
     POINT pos = virtual_screen_to_root( x, y );
+
+    if (nspa_suppress_warp_until_tick &&
+        (int)(NtGetTickCount() - nspa_suppress_warp_until_tick) < 0)
+    {
+        /* wine-nspa: keep the arm active for the full window — VST2
+         * plugins commonly issue *two* SetCursorPos calls in their
+         * release path (an internal "park at window origin" followed
+         * by a "restore to saved coord"); observed the first warping
+         * to rects.window.left/top and the second's XGrabPointer
+         * dance silently failing.  Either way the natural UX is
+         * "cursor stays where the user released", so drop both and
+         * lie to the plugin so its bookkeeping is happy. */
+        return TRUE;
+    }
 
     if (keyboard_grabbed)
     {
@@ -1551,6 +1581,16 @@ BOOL X11DRV_ButtonPress( HWND hwnd, XEvent *xev )
     if ((data = get_win_data( hwnd )))
     {
         window_set_user_time( data, event->time, FALSE );
+        /* wine-nspa: freeze host-drag WND-rect updates while any mouse
+         * button is held on an embedded child.  Plugin cursor save/
+         * restore math (GetWindowRect at mouse-down, SetCursorPos at
+         * mouse-up) assumes WND rect is stable across the click; a
+         * mid-drag rect update from host motion / WM jitter introduces
+         * a round-trip offset that lands SetCursorPos at the wrong
+         * screen coords (typical symptom: cursor jumps to top-left
+         * on release).  Gate consumed in window_update_client_config. */
+        if (data->nspa_embedded && data->nspa_button_count < 0xf)
+            data->nspa_button_count++;
         release_win_data( data );
     }
 
@@ -1567,7 +1607,9 @@ BOOL X11DRV_ButtonRelease( HWND hwnd, XEvent *xev )
 {
     XButtonEvent *event = &xev->xbutton;
     int buttonNum = event->button - 1;
+    struct x11drv_win_data *data;
     INPUT input;
+    BOOL flush_state = FALSE;
 
     if (buttonNum >= NB_BUTTONS || !button_up_flags[buttonNum]) return FALSE;
 
@@ -1580,8 +1622,30 @@ BOOL X11DRV_ButtonRelease( HWND hwnd, XEvent *xev )
     input.mi.time        = EVENT_x11_time_to_win32_time( event->time );
     input.mi.dwExtraInfo = 0;
 
+    if ((data = get_win_data( hwnd )))
+    {
+        /* wine-nspa: complement of the press path — drop the count and,
+         * if no buttons remain down on this embedded child, flush any
+         * host-motion update that was deferred during the click. */
+        if (data->nspa_embedded && data->nspa_button_count > 0)
+        {
+            data->nspa_button_count--;
+            if (data->nspa_button_count == 0)
+            {
+                flush_state = TRUE;
+                /* wine-nspa: arm post-release SetCursorPos suppression.
+                 * 50ms covers X11→message-queue→plugin-WndProc latency
+                 * without lingering long enough to catch a legitimate
+                 * cursor warp from the user re-engaging another knob. */
+                nspa_suppress_warp_until_tick = NtGetTickCount() + 50;
+            }
+        }
+        release_win_data( data );
+    }
+
     map_event_coords( hwnd, event->window, event->root, event->x_root, event->y_root, &input );
     send_mouse_input( hwnd, event->window, event->state, &input );
+    if (flush_state) NtUserPostMessage( hwnd, WM_WINE_WINDOW_STATE_CHANGED, 0, 0 );
     return TRUE;
 }
 

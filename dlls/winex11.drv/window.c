@@ -1797,10 +1797,21 @@ static UINT window_update_client_config( struct x11drv_win_data *data )
     if (is_virtual_desktop()) return 0; /* ignore window manager config changes in virtual desktop mode */
     if (data->desired_state.wm_state != NormalState) return 0; /* ignore config changes on invisible/minimized windows */
 
-    if (data->wm_state_serial) return 0; /* another WM_STATE update is pending, wait for it to complete */
-    if (data->net_wm_state_serial) return 0; /* another _NET_WM_STATE update is pending, wait for it to complete */
-    if (data->mwm_hints_serial) return 0; /* another MWM_HINT update is pending, wait for it to complete */
-    if (data->configure_serial) return 0; /* another config update is pending, wait for it to complete */
+    /* wine-nspa: nspa-embedded windows live under a foreign X11 parent that
+     * isn't necessarily a real XEmbed embedder, so the WM_STATE/XEMBED_INFO
+     * PropertyNotify roundtrips that clear these serials don't reliably
+     * fire.  Without this bypass, the serials stay set forever after
+     * make_window_embedded's WithdrawnState/NormalState cycle, blocking
+     * host-drag rect propagation at line 1800.  current_state.rect IS
+     * being updated by window_configure_notify from GravityNotify; we just
+     * need to let the rest of the function consume it. */
+    if (!data->nspa_embedded)
+    {
+        if (data->wm_state_serial) return 0; /* another WM_STATE update is pending, wait for it to complete */
+        if (data->net_wm_state_serial) return 0; /* another _NET_WM_STATE update is pending, wait for it to complete */
+        if (data->mwm_hints_serial) return 0; /* another MWM_HINT update is pending, wait for it to complete */
+        if (data->configure_serial) return 0; /* another config update is pending, wait for it to complete */
+    }
 
     /* Ignore fullscreen config changes when it's still on the same monitor. This is needed because
      * adding __NET_WM_STATE_FULLSCREEN will make WMs move the window to cover exactly the monitor
@@ -3622,33 +3633,47 @@ LRESULT X11DRV_WindowMessage( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
     case WM_X11DRV_NSPA_EMBED_WINDOW:
     {
         /* wine-nspa: atomic embed of wine_x11_window under an external
-         * X11 parent.  See <wine/nspa_x11_embed.h> for public docs.
+         * X11 parent at a specified parent-relative position.  See
+         * <wine/nspa_x11_embed.h> for public docs.
          *
-         * Uses Wine's existing make_window_embedded() helper to ensure
-         * all internal state transitions are consistent (override_
-         * redirect, wm_state, managed/embedded flags).  Caller must
-         * send this on an unmapped wine_x11_window — i.e. before any
-         * ShowWindow / WS_VISIBLE mapping.  make_window_embedded
-         * handles the WithdrawnState/NormalState cycle internally;
-         * doing it on an already-mapped window may briefly hide and
-         * remap the window which is visible to the user.
+         * WPARAM = (Window) parent X11 window
+         * LPARAM = packed parent-relative position:
+         *           low 16 bits  = (int16_t) peerX
+         *           bits 16..31  = (int16_t) peerY
+         *         (Use MAKELPARAM-style packing; 0 = embed at parent
+         *          origin, equivalent to legacy behavior.)
          *
-         * Idempotent: if data->embedded is already TRUE, returns 0
-         * without re-running.  Note that this prevents re-embedding
-         * on host peer changes (alwaysOnTop reparent etc.) — host
-         * code is responsible for ensuring the HWND is only embedded
-         * once. */
+         * The position parameter is critical for Wine's embedded-mode
+         * position lock (window_set_config OffsetRect path at
+         * window.c:1417-1420): once data->embedded = TRUE, position
+         * changes via SetWindowPos are silently clamped to whatever
+         * pending_state.rect.position was at the moment the flag
+         * flipped.  Reparenting at the correct (peerX, peerY)
+         * BEFORE flipping the embed flag ensures the locked
+         * position matches the host's intended layout — otherwise
+         * a host that later moves the embedded child to a different
+         * peer-relative position (e.g. dropping a toolbar reservation)
+         * gets a vertical offset between Wine's WND rect and where
+         * the X11 window actually is.
+         *
+         * Reparent re-runs on every call (for host peer-change
+         * scenarios like alwaysOnTop reparent).  Embedded-flag flip +
+         * override_redirect change happens once. */
         Window parent = (Window)wp;
+        int peerX = (int)(short)(lp & 0xFFFF);
+        int peerY = (int)(short)((lp >> 16) & 0xFFFF);
         if (!parent) return 0;
         if ((data = get_win_data( hwnd )))
         {
-            if (data->whole_window && !data->embedded)
+            if (data->whole_window)
             {
-                XReparentWindow( data->display, data->whole_window, parent, 0, 0 );
+                XReparentWindow( data->display, data->whole_window, parent, peerX, peerY );
                 XSync( data->display, False );
                 data->embedder = parent;
                 set_window_parent( data, parent );
-                make_window_embedded( data );
+                if (!data->embedded)
+                    make_window_embedded( data );
+                data->nspa_embedded = 1;
             }
             release_win_data( data );
         }

@@ -1137,6 +1137,7 @@ static BOOL X11DRV_GravityNotify( HWND hwnd, XEvent *xev )
 
     if (!hwnd) return FALSE;
     if (!(data = get_win_data( hwnd ))) return FALSE;
+
     rect = data->rects.window;
 
     /* update our view of the window tree for mouse event coordinate mapping */

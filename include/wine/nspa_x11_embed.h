@@ -1,31 +1,49 @@
 /*
  * wine-nspa: atomic X11 embedding for winelib hosts.
  *
- * Send WM_X11DRV_NSPA_EMBED_WINDOW to a top-level HWND with
- * WPARAM = X11 Window of the external parent.  Wine atomically:
+ * Send WM_X11DRV_NSPA_EMBED_WINDOW to a top-level HWND with:
+ *   WPARAM = X11 Window of the external parent
+ *   LPARAM = packed parent-relative position:
+ *             low  16 bits = (int16_t) peerX
+ *             bits 16..31  = (int16_t) peerY
+ *            (use MAKELPARAM-style packing; pass 0 to embed at
+ *             parent origin)
+ *
+ * Wine atomically:
  *   - XReparents the HWND's wine_x11_window under the given parent
+ *     at (peerX, peerY)
  *   - Flips managed=TRUE, embedded=TRUE, override_redirect=FALSE
  *   - Sets data->embedder and data->parent for XEMBED + host_window
  *     tracking
  *
- * After embedding, position changes via SetWindowPos() update Wine's
- * internal WND rect (so USER32 mouse hit-testing remains correct) but
- * are NOT issued as XConfigureWindow at the X11 level — the embedder
- * owns positioning.  This replaces the wrapper-window +
- * SubstructureRedirect + synthetic-ConfigureNotify pattern that
- * winelib hosts (Element, yabridge, LinVst, ...) would otherwise need
- * to reimplement.
+ * The position parameter is critical: Wine's embedded-mode position
+ * lock (window_set_config in dlls/winex11.drv/window.c) clamps
+ * subsequent SetWindowPos position changes to whatever pending_state.
+ * rect.position was when data->embedded flipped TRUE.  Reparenting at
+ * the correct (peerX, peerY) before the flag flip ensures the locked
+ * position matches the host's intended layout.  Passing 0 is fine
+ * only if you intend the embedded window to live at parent's origin
+ * for its full lifetime.
  *
- * Size changes still propagate to X11 normally; the embedder is
- * responsible for sizing its own parent window such that the embedded
- * wine_x11_window can render at the size the plugin reports.
+ * After embedding, position changes via SetWindowPos() update Wine's
+ * internal WND rect (so USER32 mouse hit-testing remains correct in
+ * its absolute-coords; the LOCKED position is what plugin GDI uses
+ * for its own coord math) but are NOT issued as XConfigureWindow at
+ * the X11 level — the embedder owns positioning.  This replaces the
+ * wrapper-window + SubstructureRedirect + synthetic-ConfigureNotify
+ * pattern that winelib hosts (Element, yabridge, LinVst, ...) would
+ * otherwise need to reimplement.
+ *
+ * Size changes still propagate to X11 normally.
+ *
+ * Reparent re-runs on each call (handles host peer-change scenarios
+ * like alwaysOnTop reparent).  The embedded-flag flip happens once.
  *
  * Example:
  *   HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, ..., WS_POPUP, ...);
  *   Window parent = (Window) juce_peer->getNativeHandle();
- *   SendMessageW(hwnd, WM_X11DRV_NSPA_EMBED_WINDOW, (WPARAM)parent, 0);
- *
- * Idempotent: a second call on an already-embedded HWND is a no-op.
+ *   LPARAM pos = MAKELPARAM(peerX, peerY);
+ *   SendMessageW(hwnd, WM_X11DRV_NSPA_EMBED_WINDOW, (WPARAM)parent, pos);
  *
  * Copyright 2026 Wine-NSPA contributors
  */

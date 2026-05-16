@@ -4656,7 +4656,22 @@ static BOOL process_message( struct send_message_info *info, DWORD_PTR *res_ptr,
 
     if (info->params && info->dest_tid == GetCurrentThreadId() &&
         !is_hooked( WH_CALLWNDPROC ) && !is_hooked( WH_CALLWNDPROCRET ) &&
-        thread_info->recursion_count <= MAX_WINPROC_RECURSION)
+        thread_info->recursion_count <= MAX_WINPROC_RECURSION &&
+        /* wine-nspa: don't take the client-side fast path for driver-
+         * private messages (WM_WINE_FIRST_DRIVER_MSG range).  The fast
+         * path defers to user32's WndProc, and DefWindowProcW does NOT
+         * route driver-private messages to user_driver->pWindowMessage
+         * — so PE-side SendMessage of e.g. WM_X11DRV_NSPA_EMBED_WINDOW
+         * silently falls through.  Falling through to the slow path
+         * (call_window_proc) below routes them correctly via
+         * handle_internal_message (line 2360-2361).  Internal Wine
+         * senders use send_internal_message_timeout which already
+         * routes via handle_internal_message; this closes the gap for
+         * PE-side winelib hosts (Element, yabridge, etc.) invoking
+         * driver-private operations like the NSPA embed mechanism. */
+        !((info->msg & 0x80000000) &&
+          info->msg >= WM_WINE_FIRST_DRIVER_MSG &&
+          info->msg <= WM_WINE_LAST_DRIVER_MSG))
     {
         /* if we're called from client side and need just a simple winproc call,
          * just fill dispatch params and let user32 do the rest */

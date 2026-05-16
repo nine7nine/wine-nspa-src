@@ -3684,6 +3684,19 @@ LRESULT X11DRV_WindowMessage( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
                 if (!data->embedded)
                     make_window_embedded( data );
                 data->nspa_embedded = 1;
+                /* wine-nspa: make_window_embedded's NormalState transition uses
+                 * set_xembed_flags(XEMBED_MAPPED) for embedded windows on the
+                 * assumption that the foreign parent is a real XEmbed embedder
+                 * that will read the property and map the child.  In our use
+                 * case (winelib hosts: JUCE/Element direct-peer, yabridge
+                 * wrapper, future Qt/GTK hosts) the foreign parent is NOT an
+                 * XEmbed embedder — nothing reads XEMBED_INFO, nothing maps
+                 * the child, and the user sees a black client area.  Force
+                 * the map explicitly here.  For real XEmbed scenarios (which
+                 * we never hit) the embedder's own map would have been
+                 * redundant after this — no harm. */
+                XMapWindow( data->display, data->whole_window );
+                XSync( data->display, False );
             }
             release_win_data( data );
         }

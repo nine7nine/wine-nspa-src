@@ -124,6 +124,7 @@
 #include "wine/list.h"
 #include "wine/debug.h"
 #include "unix_private.h"
+#include "nspa/pathattr_cache.h"
 #include <rtpi.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(file);
@@ -1725,6 +1726,8 @@ static int fd_get_file_info( HANDLE handle, int fd, unsigned int options,
 
 static int fd_set_dos_attrib( int fd, UINT attr, BOOL force_set )
 {
+    int ret;
+
     /* we only store the HIDDEN and SYSTEM attributes */
     attr &= XATTR_ATTRIBS_MASK;
     if (force_set || attr != 0)
@@ -1734,9 +1737,15 @@ static int fd_set_dos_attrib( int fd, UINT attr, BOOL force_set )
          * earlier format. */
         char data[11];
         int len = snprintf( data, sizeof(data), "0x%x", attr );
-        return xattr_fset( fd, SAMBA_XATTR_DOS_ATTRIB, data, len );
+        ret = xattr_fset( fd, SAMBA_XATTR_DOS_ATTRIB, data, len );
     }
-    else return xattr_fremove( fd, SAMBA_XATTR_DOS_ATTRIB );
+    else ret = xattr_fremove( fd, SAMBA_XATTR_DOS_ATTRIB );
+
+    /* NSPA: any DOSATTRIB write invalidates the path-attribute cache
+     * entry for this inode so the next get_file_info sees fresh data
+     * (no-op when NSPA RT gate is off). */
+    nspa_pathattr_invalidate_by_fd( fd );
+    return ret;
 }
 
 
@@ -1785,6 +1794,36 @@ static int get_file_info( const char *path, struct stat *st, ULONG *attr, ULONG 
     ret = lstat( path, st );
     if (ret == -1) return ret;
     if (reparse_tag) *reparse_tag = 0;
+
+    /* NSPA path-attribute cache fast path.
+     *
+     * Wraps the rest of get_file_info (the symlink-follow stat, parent-
+     * stat for mount-point detection, and two xattr_get lookups for
+     * WINEREPARSE / DOSATTRIB).  For stable system paths hit by every
+     * GDI text op (the u-he ACE settings overlay re-stats Windows\\Fonts
+     * on every WM_TIMER frame) those 4 syscalls go to zero on cache hit.
+     *
+     * lstat above still runs unconditionally — it's how we get the (dev,
+     * ino) cache key, and it's cheap (page-cache hit on hot paths).
+     *
+     * On cache hit we set *attr / *reparse_tag from the cached values
+     * and return.  Cache is NSPA-gated and TTL-bounded (50ms); falls
+     * through to upstream behaviour when the gate is off or the entry
+     * is stale.  Same-process attr-mutations call
+     * nspa_pathattr_invalidate{,_by_fd,_by_path} from their respective
+     * call sites; cross-process writes are picked up via TTL expiry. */
+    {
+        unsigned int cached_attr = 0, cached_rt = 0;
+        if (nspa_pathattr_lookup( (unsigned long long)st->st_dev,
+                                  (unsigned long long)st->st_ino,
+                                  &cached_attr, &cached_rt ))
+        {
+            *attr = cached_attr;
+            if (reparse_tag) *reparse_tag = cached_rt;
+            return ret;
+        }
+    }
+
     if (S_ISLNK( st->st_mode ))
     {
         ret = stat( path, st );
@@ -1828,16 +1867,20 @@ static int get_file_info( const char *path, struct stat *st, ULONG *attr, ULONG 
     {
         if (is_hidden_file( path ))
             *attr |= FILE_ATTRIBUTE_HIDDEN;
-        if (errno == ENOTSUP) return ret;
+        if (errno == ENOTSUP) goto cache_and_return;
 #ifdef ENODATA
-        if (errno == ENODATA) return ret;
+        if (errno == ENODATA) goto cache_and_return;
 #endif
 #ifdef ENOATTR
-        if (errno == ENOATTR) return ret;
+        if (errno == ENOATTR) goto cache_and_return;
 #endif
         WARN( "Failed to get extended attribute " SAMBA_XATTR_DOS_ATTRIB " from %s. errno %d (%s)\n",
               debugstr_a(path), errno, strerror( errno ) );
     }
+cache_and_return:
+    nspa_pathattr_store( (unsigned long long)st->st_dev,
+                         (unsigned long long)st->st_ino,
+                         *attr, reparse_tag ? *reparse_tag : 0 );
     return ret;
 }
 

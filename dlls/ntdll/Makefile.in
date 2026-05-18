@@ -60,6 +60,7 @@ SOURCES = \
 	unix/nspa/huge_auto.c \
 	unix/nspa/local_file.c \
 	unix/nspa/mlock_ws.c \
+	unix/nspa/pathattr_cache.c \
 	unix/nspa/rt.c \
 	unix/nspa/local_timer.c \
 	unix/nspa/sched_helpers.c \

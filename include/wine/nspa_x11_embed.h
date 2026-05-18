@@ -79,6 +79,28 @@
  *       // IPlugView::attached / CLAP set_parent).
  *       return 0;
  *
+ * **Consumer pump discipline:** the message pump that drains the
+ * embedded HWND's thread queue MUST be bounded — either by message
+ * count or by elapsed time — and SHOULD dispatch input messages
+ * (WM_MOUSEFIRST..WM_MOUSELAST, WM_KEYFIRST..WM_KEYLAST) ahead of
+ * the general drain on each pump invocation.  An unbounded
+ * `while (PeekMessage)` loop will deadlock the host's event-polling
+ * thread whenever a plugin's WM_TIMER handler is heavy enough that
+ * the handler runtime equals or exceeds the plugin's own SetTimer
+ * period: the queue never goes empty, the pump never returns, the
+ * host can't poll X11, and X11 mouse/key events queued at the WM
+ * never reach the plugin.  The symptom is a UI that appears frozen
+ * even though the plugin is happily redrawing at full tilt.
+ *
+ *   Reference implementations of the bounded pump:
+ *     - JUCE-NSPA WineHWNDEmbedComponent (juce_gui_extra) — 4ms
+ *       time-cap + input-first peek pass.
+ *     - yabridge HostBridge::handle_events (wine-host/bridges/
+ *       common.cpp) — 20 message count cap, JUCE-detected
+ *       8192-extension via WM_USER+123 heuristic.  Cap covers the
+ *       deadlock class; lacks input-first prioritization, so
+ *       redraw-heavy plugin pages can still feel laggy on input.
+ *
  * Copyright 2026 Wine-NSPA contributors
  */
 

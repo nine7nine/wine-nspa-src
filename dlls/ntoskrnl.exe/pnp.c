@@ -177,6 +177,52 @@ static NTSTATUS get_device_instance_id( DEVICE_OBJECT *device, WCHAR *buffer )
     return STATUS_SUCCESS;
 }
 
+/* Resolve a device's instance ID, caching the result on the wine_device
+ * object to avoid re-issuing IRP_MN_QUERY_ID for every property/registry
+ * lookup.  The cache field starts NULL (alloc_kernel_object zero-inits)
+ * and is freed by IoDeleteDevice; the device instance ID is immutable
+ * post-creation so the cache is valid for the lifetime of the device.
+ *
+ * buf must be a caller-provided MAX_DEVICE_ID_LEN WCHAR array; on success
+ * it contains the device instance ID (cache hit: copied from the cache;
+ * cache miss: filled by the IRP query and the cache is populated for the
+ * next caller).  On IRP failure the original status is returned and buf
+ * is left untouched.
+ *
+ * Thread-safety: the publish into wine_device->instance_id uses
+ * InterlockedCompareExchangePointer so concurrent first-callers race
+ * cleanly; the loser frees its allocation and the next call reads the
+ * winner's value via the fast path. */
+static NTSTATUS get_device_instance_id_cached( DEVICE_OBJECT *device, WCHAR *buf )
+{
+    struct wine_device *wine_device = CONTAINING_RECORD( device, struct wine_device, device_obj );
+    NTSTATUS status;
+    WCHAR *new_id;
+    SIZE_T size;
+
+    /* fast path: cache populated — copy to caller's buffer */
+    if (wine_device->instance_id)
+    {
+        lstrcpyW( buf, wine_device->instance_id );
+        return STATUS_SUCCESS;
+    }
+
+    /* slow path: IRP query (writes the result into buf) */
+    if ((status = get_device_instance_id( device, buf ))) return status;
+
+    /* publish to cache for future callers; alloc failure here is non-fatal
+     * (next call simply repeats the IRP query). */
+    size = (wcslen( buf ) + 1) * sizeof(WCHAR);
+    if ((new_id = HeapAlloc( GetProcessHeap(), 0, size )))
+    {
+        memcpy( new_id, buf, size );
+        if (InterlockedCompareExchangePointer( (void **)&wine_device->instance_id, new_id, NULL ))
+            HeapFree( GetProcessHeap(), 0, new_id ); /* lost race — discard */
+    }
+
+    return STATUS_SUCCESS;
+}
+
 static NTSTATUS get_device_caps( DEVICE_OBJECT *device, DEVICE_CAPABILITIES *caps )
 {
     IO_STACK_LOCATION *irpsp;
@@ -342,7 +388,7 @@ static void create_dyn_data_key( DEVICE_OBJECT *device )
     LSTATUS ret;
     HKEY key;
 
-    if (get_device_instance_id( device, device_instance_id ))
+    if (get_device_instance_id_cached( device, device_instance_id ))
         return;
 
     for (;;)
@@ -391,7 +437,7 @@ static void enumerate_new_device( DEVICE_OBJECT *device, HDEVINFO set )
     HKEY key;
     WCHAR *id;
 
-    if (get_device_instance_id( device, device_instance_id ))
+    if (get_device_instance_id_cached( device, device_instance_id ))
         return;
 
     if (!SetupDiCreateDeviceInfoW( set, device_instance_id, &GUID_NULL, NULL, NULL, 0, &sp_device )
@@ -603,7 +649,7 @@ NTSTATUS WINAPI IoGetDevicePropertyData( DEVICE_OBJECT *device, const DEVPROPKEY
     if (lcid == LOCALE_SYSTEM_DEFAULT || lcid == LOCALE_USER_DEFAULT) return STATUS_INVALID_PARAMETER;
     if (lcid != LOCALE_NEUTRAL) FIXME( "Only LOCALE_NEUTRAL is supported\n" );
 
-    status = get_device_instance_id( device, device_instance_id );
+    status = get_device_instance_id_cached( device, device_instance_id );
     if (status != STATUS_SUCCESS) return status;
 
     set = SetupDiCreateDeviceInfoList( &GUID_NULL, NULL );
@@ -758,7 +804,7 @@ NTSTATUS WINAPI IoGetDeviceProperty( DEVICE_OBJECT *device, DEVICE_REGISTRY_PROP
             return STATUS_NOT_IMPLEMENTED;
     }
 
-    if ((status = get_device_instance_id( device, device_instance_id )))
+    if ((status = get_device_instance_id_cached( device, device_instance_id )))
         return status;
 
     if ((set = SetupDiCreateDeviceInfoList( &GUID_NULL, NULL )) == INVALID_HANDLE_VALUE)
@@ -1095,7 +1141,7 @@ NTSTATUS WINAPI IoSetDevicePropertyData( DEVICE_OBJECT *device, const DEVPROPKEY
 
     if (lcid != LOCALE_NEUTRAL) FIXME( "only LOCALE_NEUTRAL is supported\n" );
 
-    if ((status = get_device_instance_id( device, device_instance_id ))) return status;
+    if ((status = get_device_instance_id_cached( device, device_instance_id ))) return status;
 
     if ((set = SetupDiCreateDeviceInfoList( &GUID_NULL, NULL )) == INVALID_HANDLE_VALUE)
     {
@@ -1141,7 +1187,7 @@ NTSTATUS WINAPI IoRegisterDeviceInterface(DEVICE_OBJECT *device, const GUID *cla
     TRACE("device %p, class_guid %s, refstr %s, symbolic_link %p.\n",
             device, debugstr_guid(class_guid), debugstr_us(refstr), symbolic_link);
 
-    if ((status = get_device_instance_id( device, device_instance_id )))
+    if ((status = get_device_instance_id_cached( device, device_instance_id )))
         return status;
 
     set = SetupDiGetClassDevsW( class_guid, NULL, NULL, DIGCF_DEVICEINTERFACE );
@@ -1275,7 +1321,7 @@ NTSTATUS WINAPI IoOpenDeviceRegistryKey( DEVICE_OBJECT *device, ULONG type, ACCE
 
     TRACE("device %p, type %#lx, access %#lx, key %p.\n", device, type, access, key);
 
-    if ((status = get_device_instance_id( device, device_instance_id )))
+    if ((status = get_device_instance_id_cached( device, device_instance_id )))
     {
         ERR("Failed to get device instance ID, error %#lx.\n", status);
         return status;

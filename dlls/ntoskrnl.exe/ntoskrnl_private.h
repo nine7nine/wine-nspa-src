@@ -133,5 +133,11 @@ struct wine_device
     DEVICE_OBJECT device_obj;
     DEVICE_RELATIONS *children;
     HKEY dyn_data_key;
+    /* Cached device instance ID (e.g. L"USB\\VID_046D&PID_C52B\\5&...").
+     * NULL until first successful lookup; thereafter immutable for the
+     * lifetime of the wine_device.  Set under InterlockedCompareExchangePointer
+     * to handle concurrent first-access from multiple driver threads; freed
+     * by IoDeleteDevice.  See get_device_instance_id_cached() in pnp.c. */
+    WCHAR *instance_id;
 };
 #endif

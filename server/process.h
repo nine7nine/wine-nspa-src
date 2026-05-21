@@ -95,6 +95,10 @@ struct process
     process_shm_t       *shared;          /* NSPA: shared-memory snapshot of process state for client-side seqlock reads.  Allocated in create_process, freed in process_destroy.  Mutators wrap field writes in SHARED_WRITE_BEGIN — see bypass-extension-plan-20260506.md §6. */
 #ifdef __linux__
     volatile unsigned char *client_poll_bitmap; /* NSPA E2: per-fd bitmap in first thread's request_shm tail */
+    void                *deferred_request_shm;  /* NSPA E2 lifetime: first thread's request_shm if it hosts the
+                                                 * client_poll_bitmap.  cleanup_thread transfers ownership here;
+                                                 * process_destroy munmaps once all socks/asyncs are gone.  See
+                                                 * cleanup_thread + process_destroy below for the why. */
     int                  request_channel_fd;    /* NSPA gamma: ntsync channel for shm-IPC */
     pthread_t            channel_dispatcher;    /* NSPA gamma: 1 pthread per process */
     int                  channel_dispatcher_running; /* NSPA gamma: lifecycle gate */

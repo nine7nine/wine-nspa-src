@@ -709,6 +709,7 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
     memset( &process->image_info, 0, sizeof(process->image_info) );
 #ifdef __linux__
     process->client_poll_bitmap = NULL;
+    process->deferred_request_shm = NULL;
     process->request_channel_fd = -1;
     process->channel_dispatcher_running = 0;
     process->nspa_inproc_event_table = NULL;
@@ -866,7 +867,27 @@ static void process_destroy( struct object *obj )
     free( process->rawinput_devices );
     free( process->dir_cache );
     free( process->image );
-    /* NSPA E2: client_poll_bitmap is inside request_shm — no separate cleanup. */
+#ifdef __linux__
+    /* NSPA E2: release the first thread's request_shm if it hosted the
+     * process-wide client_poll_bitmap.  The munmap was deferred from
+     * cleanup_thread because sock objects cache a raw pointer into
+     * this mapping (sock->client_poll_bitmap in sock.c) and may still
+     * be touched during cancel_async chains AFTER the first thread is
+     * destroyed but BEFORE process_destroy runs — see the lifetime
+     * note in cleanup_thread (server/thread.c).  By process_destroy
+     * the last reference to this process is being dropped, which means
+     * all of its sock objects + asyncs + handles are already gone,
+     * so the cached pointers can no longer be read.  (Cross-process
+     * sock duplicates that outlive this process are NOT covered by
+     * this deferral — the NSPA E2 cache is documented as per-process
+     * in sock.c:302 and that assumption stands.) */
+    if (process->deferred_request_shm)
+    {
+        munmap( process->deferred_request_shm, REQUEST_SHM_SIZE );
+        process->deferred_request_shm = NULL;
+    }
+    process->client_poll_bitmap = NULL;
+#endif
     free( process->thread_sd );
 }
 

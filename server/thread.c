@@ -787,9 +787,43 @@ static void cleanup_thread( struct thread *thread )
     if (thread->wait_fd) release_object( thread->wait_fd );
 #ifdef __linux__
     /* NSPA: tear down the per-thread request_shm region.  No dispatcher
-     * pthread to coordinate with under gamma — close fd + munmap directly. */
+     * pthread to coordinate with under gamma — close fd + munmap directly.
+     *
+     * NSPA E2 lifetime fix: the process-wide client_poll_bitmap lives in
+     * the tail of the first thread's request_shm (set in init_first_thread
+     * below — search for client_poll_bitmap in this file).  Sock objects
+     * cache a raw pointer to that bitmap in recv_socket/send_socket
+     * handlers (sock->client_poll_bitmap, server/sock.c).  If we munmap
+     * the first thread's request_shm here while other threads of the
+     * same dying process still have sock asyncs queued, the eventual
+     * process_killed → cancel_async → async_set_result → sock_reselect
+     * → sock_get_poll_events chain dereferences a freed bitmap and
+     * SIGSEGVs wineserver (seen at sock.c:1563).
+     *
+     * Fix: if this thread's request_shm hosts the bitmap, transfer
+     * ownership to the process and let process_destroy do the munmap.
+     * By process_destroy time all socks/asyncs of this process are
+     * torn down, so the cached pointers are dead.  Single-process
+     * design assumption matches sock.c:302 ("per-process bitmap"). */
     if (thread->request_shm_fd != -1) close( thread->request_shm_fd );
-    if (thread->request_shm) munmap( (void *)thread->request_shm, REQUEST_SHM_SIZE );
+    if (thread->request_shm)
+    {
+        struct process *process = thread->process;
+        const volatile unsigned char *bitmap = process ? process->client_poll_bitmap : NULL;
+        const char *shm_base = (const char *)thread->request_shm;
+
+        if (bitmap &&
+            (const char *)bitmap >= shm_base &&
+            (const char *)bitmap < shm_base + REQUEST_SHM_SIZE &&
+            !process->deferred_request_shm)
+        {
+            process->deferred_request_shm = (void *)thread->request_shm;
+        }
+        else
+        {
+            munmap( (void *)thread->request_shm, REQUEST_SHM_SIZE );
+        }
+    }
 #endif
     cleanup_clipboard_thread(thread);
     destroy_thread_windows( thread );

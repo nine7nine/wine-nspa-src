@@ -381,6 +381,7 @@ static const struct column col_pnpentity[] =
     { L"Manufacturer",         CIM_STRING },
     { L"Name",                 CIM_STRING|COL_FLAG_DYNAMIC },
     { L"Service",              CIM_STRING|COL_FLAG_DYNAMIC },
+    { L"PNPDeviceId",          CIM_STRING|COL_FLAG_DYNAMIC },
 };
 static const struct column col_printer[] =
 {
@@ -961,6 +962,7 @@ struct record_pnpentity
     const WCHAR *manufacturer;
     const WCHAR *name;
     const WCHAR *service;
+    const WCHAR *pnpdevice_id;
 };
 struct record_printer
 {
@@ -3673,6 +3675,7 @@ static enum fill_status fill_pnpentity( struct table *table, const struct expr *
         rec->manufacturer = entities[i].manufacturer;
         rec->name         = entities[i].name;
         rec->service      = entities[i].service;
+        rec->pnpdevice_id = entities[i].device_id;
         if (!match_row( table, row, cond, &status ))
         {
             free_row_values( table, row );

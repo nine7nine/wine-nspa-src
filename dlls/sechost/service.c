@@ -2095,8 +2095,73 @@ static DWORD WINAPI device_notify_proc( void *arg )
 
         if (err)
         {
-            ERR("failed to get event, error %lu\n", err);
-            break;
+            /* Recover from RPC faults in the listener loop.
+             *
+             * Upstream wine breaks the loop on any error, intending "server
+             * has shut down → exit thread."  That conflates a real shutdown
+             * with transient faults (RPC_S_CALL_FAILED from a server-side
+             * race, RPC_S_SERVER_UNAVAILABLE during a server restart, the
+             * NCA_S_FAULT_CONTEXT_MISMATCH that fires when the server lost
+             * track of our context handle, etc.).  Real Windows' sechost
+             * keeps the listener alive across transient faults and re-
+             * establishes the context handle when the server signals that
+             * the previous one is no longer valid — apps see a continuous
+             * notification stream rather than a one-shot listener that dies
+             * on the first hiccup.
+             *
+             * Apps that rely on I_ScRegisterDeviceNotification callbacks
+             * (Native Access, hardware-discovery loops, NI / RME / Focusrite
+             * control panels, any USB hot-plug consumer) hard-wedge on the
+             * upstream behavior: their callback never fires after the first
+             * fault and they busy-wait forever for device events that will
+             * never come.
+             *
+             * Two recovery paths:
+             *
+             * 1. ERROR_INVALID_HANDLE — map_exception_code() collapses
+             *    RPC_S_INVALID_BINDING and RPC_X_SS_IN_NULL_CONTEXT into
+             *    this, which is also where the server-fault path for
+             *    NCA_S_FAULT_CONTEXT_MISMATCH lands.  Our context handle
+             *    is gone server-side.  Unregister (best-effort), re-
+             *    register, resume the loop with the fresh handle.  If the
+             *    re-register itself fails, the binding is genuinely broken
+             *    and we exit.
+             *
+             * 2. Anything else (1726 RPC_S_CALL_FAILED, 1722 RPC_S_SERVER_-
+             *    UNAVAILABLE, etc.) — transient: brief sleep, retry. */
+            if (err == ERROR_INVALID_HANDLE)
+            {
+                plugplay_rpc_handle new_handle = NULL;
+
+                WARN("listener handle invalidated — re-registering\n");
+                __TRY
+                {
+                    plugplay_unregister_listener( handle );
+                }
+                __EXCEPT(rpc_filter)
+                {
+                }
+                __ENDTRY
+                __TRY
+                {
+                    new_handle = plugplay_register_listener();
+                }
+                __EXCEPT(rpc_filter)
+                {
+                }
+                __ENDTRY
+                if (!new_handle)
+                {
+                    ERR("failed to re-register listener — exiting\n");
+                    break;
+                }
+                handle = new_handle;
+                Sleep(1000);
+                continue;
+            }
+            WARN("failed to get event, error %lu — retrying after backoff\n", err);
+            Sleep(1000);
+            continue;
         }
 
         /* Make a copy to avoid a hang if a callback tries to register or unregister for notifications. */

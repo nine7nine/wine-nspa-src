@@ -43,7 +43,6 @@ static const struct user_driver_funcs waylanddrv_funcs =
     .pReleaseKbdTables = WAYLAND_ReleaseKbdTables,
     .pSetCursor = WAYLAND_SetCursor,
     .pSetCursorPos = WAYLAND_SetCursorPos,
-    .pGetWindowStyleMasks = WAYLAND_GetWindowStyleMasks,
     .pSetLayeredWindowAttributes = WAYLAND_SetLayeredWindowAttributes,
     .pSetWindowIcons = WAYLAND_SetWindowIcons,
     .pSetWindowStyle = WAYLAND_SetWindowStyle,

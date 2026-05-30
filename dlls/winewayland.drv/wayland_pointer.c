@@ -194,6 +194,21 @@ static void pointer_handle_enter(void *data, struct wl_pointer *wl_pointer,
      * lifetime of the object, so it's safe to access without locking. */
     hwnd = wl_surface_get_user_data(wl_surface);
 
+    /* wine-nspa: on a shared wayland connection (a winelib host like Element
+     * plus the in-process wine plugins) our wl_pointer also receives enter
+     * events for the HOST's surfaces.  Their user_data is not one of our HWNDs,
+     * so ignore them -- otherwise we steal pointer focus over the host window
+     * and mis-route clicks (e.g. a right-click on the host opens a plugin
+     * context menu instead).  Clear focus with an atomic pointer store (no lock
+     * -- NSPA RT uses librtpi, never a raw pthread mutex on these paths) and
+     * skip the cursor/motion handling, which belongs to the host. */
+    if (!NtUserIsWindow(hwnd))
+    {
+        InterlockedExchangePointer((void **)&pointer->focused_hwnd, NULL);
+        TRACE("ignoring enter on foreign (host) surface\n");
+        return;
+    }
+
     TRACE("hwnd=%p\n", hwnd);
 
     pthread_mutex_lock(&pointer->mutex);

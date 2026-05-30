@@ -800,6 +800,19 @@ static void keyboard_handle_enter(void *private, struct wl_keyboard *wl_keyboard
     hwnd = wl_surface_get_user_data(wl_surface);
     TRACE("serial=%u hwnd=%p\n", serial, hwnd);
 
+    /* wine-nspa: on a shared wayland connection (a winelib host like Element
+     * plus the in-process wine plugins) our wl_keyboard also receives enter
+     * events for the HOST's surfaces.  Their user_data is not one of our HWNDs,
+     * so ignore them -- otherwise we steal keyboard focus from the host.  Clear
+     * focus with an atomic pointer store (no lock -- NSPA RT uses librtpi, never
+     * a raw pthread mutex on these paths). */
+    if (!NtUserIsWindow(hwnd))
+    {
+        InterlockedExchangePointer((void **)&keyboard->focused_hwnd, NULL);
+        TRACE("ignoring enter on foreign (host) surface\n");
+        return;
+    }
+
     pthread_mutex_lock(&keyboard->mutex);
     keyboard->focused_hwnd = hwnd;
     pthread_mutex_unlock(&keyboard->mutex);

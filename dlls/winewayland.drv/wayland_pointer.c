@@ -114,9 +114,9 @@ static HWND wayland_pointer_get_focused_hwnd(void)
     struct wayland_pointer *pointer = &process_wayland.pointer;
     HWND hwnd;
 
-    pthread_mutex_lock(&pointer->mutex);
+    pi_mutex_lock(&pointer->mutex);
     hwnd = pointer->focused_hwnd;
-    pthread_mutex_unlock(&pointer->mutex);
+    pi_mutex_unlock(&pointer->mutex);
 
     return hwnd;
 }
@@ -211,10 +211,10 @@ static void pointer_handle_enter(void *data, struct wl_pointer *wl_pointer,
 
     TRACE("hwnd=%p\n", hwnd);
 
-    pthread_mutex_lock(&pointer->mutex);
+    pi_mutex_lock(&pointer->mutex);
     pointer->focused_hwnd = hwnd;
     pointer->enter_serial = serial;
-    pthread_mutex_unlock(&pointer->mutex);
+    pi_mutex_unlock(&pointer->mutex);
 
     /* The cursor is undefined at every enter, so we set it again with
      * the latest information we have. */
@@ -237,10 +237,10 @@ static void pointer_handle_leave(void *data, struct wl_pointer *wl_pointer,
 
     TRACE("hwnd=%p\n", wl_surface_get_user_data(wl_surface));
 
-    pthread_mutex_lock(&pointer->mutex);
+    pi_mutex_lock(&pointer->mutex);
     pointer->focused_hwnd = NULL;
     pointer->enter_serial = 0;
-    pthread_mutex_unlock(&pointer->mutex);
+    pi_mutex_unlock(&pointer->mutex);
 }
 
 static void pointer_handle_button(void *data, struct wl_pointer *wl_pointer,
@@ -277,10 +277,10 @@ static void pointer_handle_button(void *data, struct wl_pointer *wl_pointer,
 
     if (state == WL_POINTER_BUTTON_STATE_RELEASED) input.mi.dwFlags <<= 1;
 
-    pthread_mutex_lock(&pointer->mutex);
+    pi_mutex_lock(&pointer->mutex);
     pointer->button_serial = state == WL_POINTER_BUTTON_STATE_PRESSED ?
                              serial : 0;
-    pthread_mutex_unlock(&pointer->mutex);
+    pi_mutex_unlock(&pointer->mutex);
 
     TRACE("hwnd=%p button=%#x state=%u\n", hwnd, button, state);
 
@@ -390,7 +390,7 @@ static void relative_pointer_v1_relative_motion(void *private,
                                    &screen_x, &screen_y);
     wayland_win_data_release(data);
 
-    pthread_mutex_lock(&pointer->mutex);
+    pi_mutex_lock(&pointer->mutex);
 
     pointer->accum_x += screen_x;
     pointer->accum_y += screen_y;
@@ -403,7 +403,7 @@ static void relative_pointer_v1_relative_motion(void *private,
     pointer->accum_x -= input.mi.dx;
     pointer->accum_y -= input.mi.dy;
 
-    pthread_mutex_unlock(&pointer->mutex);
+    pi_mutex_unlock(&pointer->mutex);
 
     TRACE("hwnd=%p wayland_dxdy=%.2f,%.2f accum_dxdy=%d,%d\n",
           hwnd, wl_fixed_to_double(dx), wl_fixed_to_double(dy),
@@ -421,11 +421,11 @@ void wayland_pointer_init(struct wl_pointer *wl_pointer)
 {
     struct wayland_pointer *pointer = &process_wayland.pointer;
 
-    pthread_mutex_lock(&pointer->mutex);
+    pi_mutex_lock(&pointer->mutex);
     pointer->wl_pointer = wl_pointer;
     pointer->focused_hwnd = NULL;
     pointer->enter_serial = 0;
-    pthread_mutex_unlock(&pointer->mutex);
+    pi_mutex_unlock(&pointer->mutex);
     wl_pointer_add_listener(pointer->wl_pointer, &pointer_listener, NULL);
 }
 
@@ -433,7 +433,7 @@ void wayland_pointer_deinit(void)
 {
     struct wayland_pointer *pointer = &process_wayland.pointer;
 
-    pthread_mutex_lock(&pointer->mutex);
+    pi_mutex_lock(&pointer->mutex);
     if (pointer->zwp_confined_pointer_v1)
     {
         zwp_confined_pointer_v1_destroy(pointer->zwp_confined_pointer_v1);
@@ -458,7 +458,7 @@ void wayland_pointer_deinit(void)
     pointer->wl_pointer = NULL;
     pointer->focused_hwnd = NULL;
     pointer->enter_serial = 0;
-    pthread_mutex_unlock(&pointer->mutex);
+    pi_mutex_unlock(&pointer->mutex);
 }
 
 /***********************************************************************
@@ -794,7 +794,7 @@ static void wayland_set_cursor(HWND hwnd, HCURSOR hcursor, BOOL use_hcursor)
         scale = 1.0;
     }
 
-    pthread_mutex_lock(&pointer->mutex);
+    pi_mutex_lock(&pointer->mutex);
     if (pointer->focused_hwnd == hwnd)
     {
         if ((!use_hcursor && pointer->wp_cursor_shape_device_v1) ||
@@ -816,7 +816,7 @@ static void wayland_set_cursor(HWND hwnd, HCURSOR hcursor, BOOL use_hcursor)
         wl_display_flush(process_wayland.wl_display);
         reapply_clip = TRUE;
     }
-    pthread_mutex_unlock(&pointer->mutex);
+    pi_mutex_unlock(&pointer->mutex);
 
     /* Reapply cursor clip since cursor visibility affects pointer constraint
      * behavior. */
@@ -1035,14 +1035,14 @@ BOOL WAYLAND_SetCursorPos(INT x, INT y)
 {
     struct wayland_pointer *pointer = &process_wayland.pointer;
 
-    pthread_mutex_lock(&pointer->mutex);
+    pi_mutex_lock(&pointer->mutex);
     if (pointer->zwp_relative_pointer_v1)
     {
-        pthread_mutex_unlock(&pointer->mutex);
+        pi_mutex_unlock(&pointer->mutex);
         return FALSE;
     }
     pointer->pending_warp = TRUE;
-    pthread_mutex_unlock(&pointer->mutex);
+    pi_mutex_unlock(&pointer->mutex);
 
     TRACE("warping to %d,%d\n", x, y);
     reapply_cursor_clipping();
@@ -1082,7 +1082,7 @@ BOOL WAYLAND_ClipCursor(const RECT *clip, BOOL reset)
     }
     wayland_win_data_release(data);
 
-    pthread_mutex_lock(&pointer->mutex);
+    pi_mutex_lock(&pointer->mutex);
     if (wl_surface && pointer->pending_warp)
     {
         wayland_pointer_update_constraint(wl_surface, NULL, FALSE, TRUE);
@@ -1095,14 +1095,14 @@ BOOL WAYLAND_ClipCursor(const RECT *clip, BOOL reset)
                 pointer->zwp_locked_pointer_v1,
                 wl_fixed_from_int(warp_x),
                 wl_fixed_from_int(warp_y));
-        pthread_mutex_unlock(&pointer->mutex);
+        pi_mutex_unlock(&pointer->mutex);
 
         data = wayland_win_data_get(hwnd);
         wl_surface_commit(wl_surface);
         wayland_win_data_release(data);
         TRACE("position hint hwnd=%p wayland_xy=%d,%d screen_xy=%d,%d\n",
                 hwnd, warp_x, warp_y, cursor_pos.x, cursor_pos.y);
-        pthread_mutex_lock(&pointer->mutex);
+        pi_mutex_lock(&pointer->mutex);
     }
 
    /* Since we are running in the context of the foreground thread we know
@@ -1112,7 +1112,7 @@ BOOL WAYLAND_ClipCursor(const RECT *clip, BOOL reset)
                                       (clip && wl_surface) ? &confine_rect : NULL,
                                       covers_vscreen,
                                       FALSE);
-    pthread_mutex_unlock(&pointer->mutex);
+    pi_mutex_unlock(&pointer->mutex);
 
     wl_display_flush(process_wayland.wl_display);
 

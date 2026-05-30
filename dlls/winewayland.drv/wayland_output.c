@@ -133,7 +133,7 @@ static void wayland_output_done(struct wayland_output *output)
     struct wayland_output_mode *mode;
 
     /* Update current state from pending state. */
-    pthread_mutex_lock(&process_wayland.output_mutex);
+    pi_mutex_lock(&process_wayland.output_mutex);
 
     if (output->pending_flags & WAYLAND_OUTPUT_CHANGED_MODES)
     {
@@ -177,7 +177,7 @@ static void wayland_output_done(struct wayland_output *output)
         output->current.logical_h = output->current.current_mode->height;
     }
 
-    pthread_mutex_unlock(&process_wayland.output_mutex);
+    pi_mutex_unlock(&process_wayland.output_mutex);
 
     TRACE("name=%s logical=%d,%d+%dx%d\n",
           output->current.name, output->current.logical_x, output->current.logical_y,
@@ -343,9 +343,9 @@ BOOL wayland_output_create(uint32_t id, uint32_t version)
     if (process_wayland.zxdg_output_manager_v1)
         wayland_output_use_xdg_extension(output);
 
-    pthread_mutex_lock(&process_wayland.output_mutex);
+    pi_mutex_lock(&process_wayland.output_mutex);
     wl_list_insert(process_wayland.output_list.prev, &output->link);
-    pthread_mutex_unlock(&process_wayland.output_mutex);
+    pi_mutex_unlock(&process_wayland.output_mutex);
 
     return TRUE;
 
@@ -367,9 +367,9 @@ static void wayland_output_state_deinit(struct wayland_output_state *state)
  */
 void wayland_output_destroy(struct wayland_output *output)
 {
-    pthread_mutex_lock(&process_wayland.output_mutex);
+    pi_mutex_lock(&process_wayland.output_mutex);
     wl_list_remove(&output->link);
-    pthread_mutex_unlock(&process_wayland.output_mutex);
+    pi_mutex_unlock(&process_wayland.output_mutex);
 
     wayland_output_state_deinit(&output->pending);
     wayland_output_state_deinit(&output->current);

@@ -103,7 +103,7 @@ struct layout
     };
 };
 
-static pthread_mutex_t xkb_layouts_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pi_mutex_t xkb_layouts_mutex = PI_MUTEX_INIT(0);
 static struct list xkb_layouts = LIST_INIT(xkb_layouts);
 
 /* These are only used from the wayland event thread and don't need locking */
@@ -621,7 +621,7 @@ static void set_current_xkb_group(xkb_layout_index_t xkb_group)
     BOOL ime;
     HKL hkl;
 
-    pthread_mutex_lock(&xkb_layouts_mutex);
+    pi_mutex_lock(&xkb_layouts_mutex);
 
     LIST_FOR_EACH_ENTRY(layout, &xkb_layouts, struct layout, entry)
         if (layout->xkb_group == xkb_group) break;
@@ -633,14 +633,14 @@ static void set_current_xkb_group(xkb_layout_index_t xkb_group)
         hkl = keyboard_hkl;
     }
 
-    pthread_mutex_unlock(&xkb_layouts_mutex);
+    pi_mutex_unlock(&xkb_layouts_mutex);
 
     if (hkl == keyboard_hkl) return;
     keyboard_hkl = hkl;
 
-    pthread_mutex_lock(&text_input->mutex);
+    pi_mutex_lock(&text_input->mutex);
     ime = text_input->focused_hwnd == keyboard->focused_hwnd;
-    pthread_mutex_unlock(&text_input->mutex);
+    pi_mutex_unlock(&text_input->mutex);
 
     activate_keyboard_hkl(keyboard->focused_hwnd, ime);
 }
@@ -700,9 +700,9 @@ static HWND wayland_keyboard_get_focused_hwnd(void)
     struct wayland_keyboard *keyboard = &process_wayland.keyboard;
     HWND hwnd;
 
-    pthread_mutex_lock(&keyboard->mutex);
+    pi_mutex_lock(&keyboard->mutex);
     hwnd = keyboard->focused_hwnd;
-    pthread_mutex_unlock(&keyboard->mutex);
+    pi_mutex_unlock(&keyboard->mutex);
 
     return hwnd;
 }
@@ -740,7 +740,7 @@ static void keyboard_handle_keymap(void *data, struct wl_keyboard *wl_keyboard,
         return;
     }
 
-    pthread_mutex_lock(&xkb_layouts_mutex);
+    pi_mutex_lock(&xkb_layouts_mutex);
 
     LIST_FOR_EACH_ENTRY_SAFE(entry, next, &xkb_layouts, struct layout, entry)
     {
@@ -767,14 +767,14 @@ static void keyboard_handle_keymap(void *data, struct wl_keyboard *wl_keyboard,
         add_xkb_layout(buffer, xkb_keymap, xkb_group, lang);
     }
 
-    pthread_mutex_unlock(&xkb_layouts_mutex);
+    pi_mutex_unlock(&xkb_layouts_mutex);
 
     if ((xkb_state = xkb_state_new(xkb_keymap)))
     {
-        pthread_mutex_lock(&keyboard->mutex);
+        pi_mutex_lock(&keyboard->mutex);
         xkb_state_unref(keyboard->xkb_state);
         keyboard->xkb_state = xkb_state;
-        pthread_mutex_unlock(&keyboard->mutex);
+        pi_mutex_unlock(&keyboard->mutex);
 
         set_current_xkb_group(0);
     }
@@ -813,9 +813,9 @@ static void keyboard_handle_enter(void *private, struct wl_keyboard *wl_keyboard
         return;
     }
 
-    pthread_mutex_lock(&keyboard->mutex);
+    pi_mutex_lock(&keyboard->mutex);
     keyboard->focused_hwnd = hwnd;
-    pthread_mutex_unlock(&keyboard->mutex);
+    pi_mutex_unlock(&keyboard->mutex);
 
     NtUserPostMessage(keyboard->focused_hwnd, WM_INPUTLANGCHANGEREQUEST, 0 /*FIXME*/,
                       (LPARAM)keyboard_hkl);
@@ -850,10 +850,10 @@ static void keyboard_handle_leave(void *data, struct wl_keyboard *wl_keyboard,
     hwnd = wl_surface_get_user_data(wl_surface);
     TRACE("serial=%u hwnd=%p\n", serial, hwnd);
 
-    pthread_mutex_lock(&keyboard->mutex);
+    pi_mutex_lock(&keyboard->mutex);
     if (keyboard->focused_hwnd == hwnd)
         keyboard->focused_hwnd = NULL;
-    pthread_mutex_unlock(&keyboard->mutex);
+    pi_mutex_unlock(&keyboard->mutex);
 
     /* The spec for the leave event tells us to treat all keys as released,
      * and for any key repetition to stop. */
@@ -912,10 +912,10 @@ static void keyboard_handle_modifiers(void *data, struct wl_keyboard *wl_keyboar
     TRACE("serial=%u mods_depressed=%#x mods_latched=%#x mods_locked=%#x xkb_group=%d stub!\n",
           serial, mods_depressed, mods_latched, mods_locked, xkb_group);
 
-    pthread_mutex_lock(&keyboard->mutex);
+    pi_mutex_lock(&keyboard->mutex);
     xkb_state_update_mask(keyboard->xkb_state, mods_depressed, mods_latched,
                           mods_locked, 0, 0, xkb_group);
-    pthread_mutex_unlock(&keyboard->mutex);
+    pi_mutex_unlock(&keyboard->mutex);
 
     set_current_xkb_group(xkb_group);
 
@@ -972,10 +972,10 @@ void wayland_keyboard_init(struct wl_keyboard *wl_keyboard)
     }
 
     NtUserCallOneParam(TRUE, NtUserCallOneParam_SetKeyboardAutoRepeat);
-    pthread_mutex_lock(&keyboard->mutex);
+    pi_mutex_lock(&keyboard->mutex);
     keyboard->wl_keyboard = wl_keyboard;
     keyboard->xkb_context = xkb_context;
-    pthread_mutex_unlock(&keyboard->mutex);
+    pi_mutex_unlock(&keyboard->mutex);
     wl_keyboard_add_listener(keyboard->wl_keyboard, &keyboard_listener, NULL);
 }
 
@@ -986,7 +986,7 @@ void wayland_keyboard_deinit(void)
 {
     struct wayland_keyboard *keyboard = &process_wayland.keyboard;
 
-    pthread_mutex_lock(&keyboard->mutex);
+    pi_mutex_lock(&keyboard->mutex);
     if (keyboard->wl_keyboard)
     {
         wl_keyboard_destroy(keyboard->wl_keyboard);
@@ -1002,7 +1002,7 @@ void wayland_keyboard_deinit(void)
         xkb_state_unref(keyboard->xkb_state);
         keyboard->xkb_state = NULL;
     }
-    pthread_mutex_unlock(&keyboard->mutex);
+    pi_mutex_unlock(&keyboard->mutex);
 
     if (rxkb_context)
     {
@@ -1022,14 +1022,14 @@ const KBDTABLES *WAYLAND_KbdLayerDescriptor(HKL hkl)
 
     if (hkl == get_ime_hkl(LOWORD(hkl))) hkl = keyboard_hkl;
 
-    pthread_mutex_lock(&xkb_layouts_mutex);
+    pi_mutex_lock(&xkb_layouts_mutex);
 
     LIST_FOR_EACH_ENTRY(layout, &xkb_layouts, struct layout, entry)
         if (hkl == get_layout_hkl(layout, LOWORD(hkl))) break;
     if (&layout->entry == &xkb_layouts) layout = NULL;
     else xkb_layout_addref(layout);
 
-    pthread_mutex_unlock(&xkb_layouts_mutex);
+    pi_mutex_unlock(&xkb_layouts_mutex);
 
     if (!layout)
     {

@@ -332,11 +332,11 @@ static void data_control_source_cancelled(void *data,
 {
     struct wayland_data_device *data_device = data;
 
-    pthread_mutex_lock(&data_device->mutex);
+    pi_mutex_lock(&data_device->mutex);
     zwlr_data_control_source_v1_destroy(source);
     if (source == data_device->zwlr_data_control_source_v1)
         data_device->zwlr_data_control_source_v1 = NULL;
-    pthread_mutex_unlock(&data_device->mutex);
+    pi_mutex_unlock(&data_device->mutex);
 }
 
 static const struct zwlr_data_control_source_v1_listener data_control_source_listener =
@@ -556,7 +556,7 @@ static void handle_selection(struct wayland_data_device *data_device,
     NtUserCloseClipboard();
 
 done:
-    pthread_mutex_lock(&data_device->mutex);
+    pi_mutex_lock(&data_device->mutex);
     wayland_data_device_destroy_clipboard_data_offer(data_device);
     if (data_offer)
     {
@@ -565,7 +565,7 @@ done:
         else
             data_device->clipboard_wl_data_offer = data_offer->wl_data_offer;
     }
-    pthread_mutex_unlock(&data_device->mutex);
+    pi_mutex_unlock(&data_device->mutex);
 
 }
 
@@ -619,11 +619,11 @@ static void data_source_cancelled(void *data, struct wl_data_source *source)
 {
     struct wayland_data_device *data_device = data;
 
-    pthread_mutex_lock(&data_device->mutex);
+    pi_mutex_lock(&data_device->mutex);
     wl_data_source_destroy(source);
     if (source == data_device->wl_data_source)
         data_device->wl_data_source = NULL;
-    pthread_mutex_unlock(&data_device->mutex);
+    pi_mutex_unlock(&data_device->mutex);
 }
 
 static void data_source_dnd_drop_performed(void *data,
@@ -703,7 +703,7 @@ void wayland_data_device_init(void)
 
     TRACE("\n");
 
-    pthread_mutex_lock(&data_device->mutex);
+    pi_mutex_lock(&data_device->mutex);
     if (process_wayland.zwlr_data_control_manager_v1)
     {
         if (data_device->zwlr_data_control_device_v1)
@@ -733,7 +733,7 @@ void wayland_data_device_init(void)
                                         &data_device_listener, data_device);
         }
     }
-    pthread_mutex_unlock(&data_device->mutex);
+    pi_mutex_unlock(&data_device->mutex);
 
     for (; format->mime_type; ++format)
     {
@@ -758,9 +758,9 @@ static void clipboard_update(void)
     else
     {
         serial = InterlockedCompareExchange(&process_wayland.input_serial, 0, 0);
-        pthread_mutex_lock(&process_wayland.keyboard.mutex);
+        pi_mutex_lock(&process_wayland.keyboard.mutex);
         if (!process_wayland.keyboard.focused_hwnd) serial = 0;
-        pthread_mutex_unlock(&process_wayland.keyboard.mutex);
+        pi_mutex_unlock(&process_wayland.keyboard.mutex);
         if (process_wayland.wl_data_device_manager && serial)
         {
             wl_source = wl_data_device_manager_create_data_source(
@@ -819,7 +819,7 @@ static void clipboard_update(void)
         zwlr_data_control_source_v1_add_listener(zwlr_source, &data_control_source_listener, data_device);
     }
 
-    pthread_mutex_lock(&data_device->mutex);
+    pi_mutex_lock(&data_device->mutex);
     /* Destroy any previous source only after setting the new source, to
      * avoid spurious 'selection(nil)' events. */
     if (wl_source)
@@ -838,7 +838,7 @@ static void clipboard_update(void)
             zwlr_data_control_source_v1_destroy(data_device->zwlr_data_control_source_v1);
         data_device->zwlr_data_control_source_v1 = zwlr_source;
     }
-    pthread_mutex_unlock(&data_device->mutex);
+    pi_mutex_unlock(&data_device->mutex);
 
     wl_display_flush(process_wayland.wl_display);
 }
@@ -852,7 +852,7 @@ static void render_format(UINT clipboard_format)
 
     TRACE("clipboard_format=%u\n", clipboard_format);
 
-    pthread_mutex_lock(&data_device->mutex);
+    pi_mutex_lock(&data_device->mutex);
     if (process_wayland.zwlr_data_control_manager_v1 &&
         data_device->clipboard_zwlr_data_control_offer_v1)
     {
@@ -871,7 +871,7 @@ static void render_format(UINT clipboard_format)
     {
         import_fd = wayland_data_offer_get_import_fd(data_offer, format->mime_type);
     }
-    pthread_mutex_unlock(&data_device->mutex);
+    pi_mutex_unlock(&data_device->mutex);
 
     if (import_fd >= 0)
     {
@@ -891,9 +891,9 @@ static void destroy_clipboard(void)
 
     TRACE("\n");
 
-    pthread_mutex_lock(&data_device->mutex);
+    pi_mutex_lock(&data_device->mutex);
     wayland_data_device_destroy_clipboard_data_offer(data_device);
-    pthread_mutex_unlock(&data_device->mutex);
+    pi_mutex_unlock(&data_device->mutex);
 }
 
 static BOOL is_winewayland_clipboard_hwnd(HWND hwnd)
@@ -923,9 +923,9 @@ LRESULT WAYLAND_ClipboardWindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         }
         clipboard_hwnd = hwnd;
         NtUserAddClipboardFormatListener(hwnd);
-        pthread_mutex_lock(&process_wayland.seat.mutex);
+        pi_mutex_lock(&process_wayland.seat.mutex);
         if (process_wayland.seat.wl_seat) wayland_data_device_init();
-        pthread_mutex_unlock(&process_wayland.seat.mutex);
+        pi_mutex_unlock(&process_wayland.seat.mutex);
         return TRUE;
     case WM_CLIPBOARDUPDATE:
         if (NtUserGetClipboardOwner() == clipboard_hwnd) break;

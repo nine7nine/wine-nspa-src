@@ -88,7 +88,7 @@ static void text_input_enter(void *data, struct zwp_text_input_v3 *zwp_text_inpu
     hwnd = wl_surface_get_user_data(surface);
     TRACE("data %p, text_input %p, hwnd %p.\n", data, zwp_text_input_v3, hwnd);
 
-    pthread_mutex_lock(&text_input->mutex);
+    pi_mutex_lock(&text_input->mutex);
     text_input->focused_hwnd = hwnd;
     zwp_text_input_v3_enable(text_input->zwp_text_input_v3);
     zwp_text_input_v3_set_content_type(text_input->zwp_text_input_v3,
@@ -96,7 +96,7 @@ static void text_input_enter(void *data, struct zwp_text_input_v3 *zwp_text_inpu
             ZWP_TEXT_INPUT_V3_CONTENT_PURPOSE_NORMAL);
     zwp_text_input_v3_set_cursor_rectangle(text_input->zwp_text_input_v3, 0, 0, 0, 0);
     zwp_text_input_v3_commit(text_input->zwp_text_input_v3);
-    pthread_mutex_unlock(&text_input->mutex);
+    pi_mutex_unlock(&text_input->mutex);
 
     activate_keyboard_hkl(hwnd, TRUE);
 }
@@ -107,7 +107,7 @@ static void text_input_leave(void *data, struct zwp_text_input_v3 *zwp_text_inpu
     struct wayland_text_input *text_input = data;
     TRACE("data %p, text_input %p.\n", data, zwp_text_input_v3);
 
-    pthread_mutex_lock(&text_input->mutex);
+    pi_mutex_lock(&text_input->mutex);
     zwp_text_input_v3_disable(text_input->zwp_text_input_v3);
     zwp_text_input_v3_commit(text_input->zwp_text_input_v3);
     if (text_input->focused_hwnd)
@@ -116,7 +116,7 @@ static void text_input_leave(void *data, struct zwp_text_input_v3 *zwp_text_inpu
         text_input->focused_hwnd = NULL;
     }
     wayland_text_input_reset_all_state(text_input);
-    pthread_mutex_unlock(&text_input->mutex);
+    pi_mutex_unlock(&text_input->mutex);
 }
 
 static void text_input_preedit_string(void *data, struct zwp_text_input_v3 *zwp_text_input_v3,
@@ -135,11 +135,11 @@ static void text_input_preedit_string(void *data, struct zwp_text_input_v3 *zwp_
         if (cursor_end > 0) RtlUTF8ToUnicodeN(NULL, 0, &end, text, cursor_end);
     }
 
-    pthread_mutex_lock(&text_input->mutex);
+    pi_mutex_lock(&text_input->mutex);
     free(text_input->preedit.string);
     text_input->preedit.string = textW;
     text_input->preedit.cursor_pos = MAKELONG(begin / sizeof(WCHAR), end / sizeof(WCHAR));
-    pthread_mutex_unlock(&text_input->mutex);
+    pi_mutex_unlock(&text_input->mutex);
 }
 
 static void text_input_commit_string(void *data, struct zwp_text_input_v3 *zwp_text_input_v3,
@@ -148,10 +148,10 @@ static void text_input_commit_string(void *data, struct zwp_text_input_v3 *zwp_t
     struct wayland_text_input *text_input = data;
     TRACE("data %p, text_input %p, text %s.\n", data, zwp_text_input_v3, debugstr_a(text));
 
-    pthread_mutex_lock(&text_input->mutex);
+    pi_mutex_lock(&text_input->mutex);
     free(text_input->commit_string);
     text_input->commit_string = strdupUtoW(text);
-    pthread_mutex_unlock(&text_input->mutex);
+    pi_mutex_unlock(&text_input->mutex);
 }
 
 static void text_input_delete_surrounding_text(void *data,
@@ -165,7 +165,7 @@ static void text_input_done(void *data, struct zwp_text_input_v3 *zwp_text_input
     struct wayland_text_input *text_input = data;
     TRACE("data %p, text_input %p, serial %u.\n", data, zwp_text_input_v3, serial);
 
-    pthread_mutex_lock(&text_input->mutex);
+    pi_mutex_lock(&text_input->mutex);
     /* Some compositors will send a done event for every commit, regardless of
      * the focus state of the text input. This behavior is arguably out of spec,
      * but otherwise harmless, so just ignore the new state in such cases.
@@ -184,7 +184,7 @@ static void text_input_done(void *data, struct zwp_text_input_v3 *zwp_text_input
     text_input->current_preedit = text_input->preedit;
     text_input->preedit.string = NULL;
     wayland_text_input_reset_pending_state(text_input);
-    pthread_mutex_unlock(&text_input->mutex);
+    pi_mutex_unlock(&text_input->mutex);
 }
 
 static const struct zwp_text_input_v3_listener text_input_listener =
@@ -201,23 +201,23 @@ void wayland_text_input_init(void)
 {
     struct wayland_text_input *text_input = &process_wayland.text_input;
 
-    pthread_mutex_lock(&text_input->mutex);
+    pi_mutex_lock(&text_input->mutex);
     text_input->zwp_text_input_v3 = zwp_text_input_manager_v3_get_text_input(
             process_wayland.zwp_text_input_manager_v3, process_wayland.seat.wl_seat);
     zwp_text_input_v3_add_listener(text_input->zwp_text_input_v3, &text_input_listener, text_input);
-    pthread_mutex_unlock(&text_input->mutex);
+    pi_mutex_unlock(&text_input->mutex);
 };
 
 void wayland_text_input_deinit(void)
 {
     struct wayland_text_input *text_input = &process_wayland.text_input;
 
-    pthread_mutex_lock(&text_input->mutex);
+    pi_mutex_lock(&text_input->mutex);
     zwp_text_input_v3_destroy(text_input->zwp_text_input_v3);
     text_input->zwp_text_input_v3 = NULL;
     text_input->focused_hwnd = NULL;
     wayland_text_input_reset_all_state(text_input);
-    pthread_mutex_unlock(&text_input->mutex);
+    pi_mutex_unlock(&text_input->mutex);
 };
 
 /***********************************************************************
@@ -231,7 +231,7 @@ BOOL WAYLAND_SetIMECompositionRect(HWND hwnd, RECT rect)
     int cursor_x, cursor_y, cursor_width, cursor_height;
     TRACE("hwnd %p, rect %s.\n", hwnd, wine_dbgstr_rect(&rect));
 
-    pthread_mutex_lock(&text_input->mutex);
+    pi_mutex_lock(&text_input->mutex);
 
     if (!text_input->zwp_text_input_v3 || hwnd != text_input->focused_hwnd)
         goto err;
@@ -259,10 +259,10 @@ BOOL WAYLAND_SetIMECompositionRect(HWND hwnd, RECT rect)
             cursor_x, cursor_y, cursor_width, cursor_height);
     zwp_text_input_v3_commit(text_input->zwp_text_input_v3);
 
-    pthread_mutex_unlock(&text_input->mutex);
+    pi_mutex_unlock(&text_input->mutex);
     return TRUE;
 
 err:
-    pthread_mutex_unlock(&text_input->mutex);
+    pi_mutex_unlock(&text_input->mutex);
     return FALSE;
 }

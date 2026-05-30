@@ -190,7 +190,7 @@ err:
  */
 void wayland_surface_destroy(struct wayland_surface *surface)
 {
-    pthread_mutex_lock(&process_wayland.pointer.mutex);
+    pi_mutex_lock(&process_wayland.pointer.mutex);
     if (process_wayland.pointer.focused_hwnd == surface->hwnd)
     {
         process_wayland.pointer.focused_hwnd = NULL;
@@ -198,17 +198,17 @@ void wayland_surface_destroy(struct wayland_surface *surface)
     }
     if (process_wayland.pointer.constraint_hwnd == surface->hwnd)
         wayland_pointer_clear_constraint();
-    pthread_mutex_unlock(&process_wayland.pointer.mutex);
+    pi_mutex_unlock(&process_wayland.pointer.mutex);
 
-    pthread_mutex_lock(&process_wayland.keyboard.mutex);
+    pi_mutex_lock(&process_wayland.keyboard.mutex);
     if (process_wayland.keyboard.focused_hwnd == surface->hwnd)
         process_wayland.keyboard.focused_hwnd = NULL;
-    pthread_mutex_unlock(&process_wayland.keyboard.mutex);
+    pi_mutex_unlock(&process_wayland.keyboard.mutex);
 
-    pthread_mutex_lock(&process_wayland.text_input.mutex);
+    pi_mutex_lock(&process_wayland.text_input.mutex);
     if (process_wayland.text_input.focused_hwnd == surface->hwnd)
         process_wayland.text_input.focused_hwnd = NULL;
-    pthread_mutex_unlock(&process_wayland.text_input.mutex);
+    pi_mutex_unlock(&process_wayland.text_input.mutex);
 
     wayland_surface_clear_role(surface);
 

@@ -48,7 +48,7 @@ static int wayland_win_data_cmp_rb(const void *key,
     return 0;
 }
 
-static pthread_mutex_t win_data_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pi_mutex_t win_data_mutex = PI_MUTEX_INIT(0);
 static struct rb_tree win_data_rb = { wayland_win_data_cmp_rb };
 
 /***********************************************************************
@@ -72,7 +72,7 @@ static struct wayland_win_data *wayland_win_data_create(HWND hwnd, const struct 
     data->hwnd = hwnd;
     data->rects = *rects;
 
-    pthread_mutex_lock(&win_data_mutex);
+    pi_mutex_lock(&win_data_mutex);
 
     /* Check that another thread hasn't already created the wayland_win_data. */
     if ((rb_entry = rb_get(&win_data_rb, hwnd)))
@@ -97,7 +97,7 @@ static void wayland_win_data_destroy(struct wayland_win_data *data)
 
     rb_remove(&win_data_rb, &data->entry);
 
-    pthread_mutex_unlock(&win_data_mutex);
+    pi_mutex_unlock(&win_data_mutex);
 
     if (data->wayland_surface) wayland_surface_destroy(data->wayland_surface);
     if (data->window_contents) wayland_shm_buffer_unref(data->window_contents);
@@ -129,9 +129,9 @@ struct wayland_win_data *wayland_win_data_get(HWND hwnd)
 {
     struct wayland_win_data *data;
 
-    pthread_mutex_lock(&win_data_mutex);
+    pi_mutex_lock(&win_data_mutex);
     if ((data = wayland_win_data_get_nolock(hwnd))) return data;
-    pthread_mutex_unlock(&win_data_mutex);
+    pi_mutex_unlock(&win_data_mutex);
 
     return NULL;
 }
@@ -144,7 +144,7 @@ struct wayland_win_data *wayland_win_data_get(HWND hwnd)
 void wayland_win_data_release(struct wayland_win_data *data)
 {
     assert(data);
-    pthread_mutex_unlock(&win_data_mutex);
+    pi_mutex_unlock(&win_data_mutex);
 }
 
 static void wayland_win_data_get_config(struct wayland_win_data *data,
@@ -891,18 +891,18 @@ LRESULT WAYLAND_SysCommand(HWND hwnd, WPARAM wparam, LPARAM lparam, const POINT 
     TRACE("cmd=%lx hwnd=%p, %lx, %lx\n",
           (long)command, hwnd, (long)wparam, lparam);
 
-    pthread_mutex_lock(&process_wayland.pointer.mutex);
+    pi_mutex_lock(&process_wayland.pointer.mutex);
     if (process_wayland.pointer.focused_hwnd == hwnd)
         button_serial = process_wayland.pointer.button_serial;
     else
         button_serial = 0;
-    pthread_mutex_unlock(&process_wayland.pointer.mutex);
+    pi_mutex_unlock(&process_wayland.pointer.mutex);
 
     if (command == SC_MOVE || command == SC_SIZE)
     {
         if ((data = wayland_win_data_get(hwnd)))
         {
-            pthread_mutex_lock(&process_wayland.seat.mutex);
+            pi_mutex_lock(&process_wayland.seat.mutex);
             wl_seat = process_wayland.seat.wl_seat;
             if (wl_seat && (surface = data->wayland_surface) &&
                 wayland_surface_is_toplevel(surface) && button_serial)
@@ -917,7 +917,7 @@ LRESULT WAYLAND_SysCommand(HWND hwnd, WPARAM wparam, LPARAM lparam, const POINT 
                                         hittest_to_resize_edge(wparam & 0x0f));
                 }
             }
-            pthread_mutex_unlock(&process_wayland.seat.mutex);
+            pi_mutex_unlock(&process_wayland.seat.mutex);
             wayland_win_data_release(data);
             ret = 0;
         }

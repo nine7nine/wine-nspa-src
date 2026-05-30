@@ -26,6 +26,7 @@
 #endif
 
 #include <pthread.h>
+#include <rtpi.h> /* wine-nspa: PI mutexes (librtpi), like winex11.drv */
 #include <wayland-client.h>
 #include <xkbcommon/xkbcommon.h>
 #include <xkbcommon/xkbregistry.h>
@@ -98,7 +99,7 @@ struct wayland_keyboard
     struct xkb_context *xkb_context;
     struct xkb_state *xkb_state;
     HWND focused_hwnd;
-    pthread_mutex_t mutex;
+    pi_mutex_t mutex;
 };
 
 struct wayland_cursor
@@ -124,7 +125,7 @@ struct wayland_pointer
     struct wayland_cursor cursor;
     double accum_x;
     double accum_y;
-    pthread_mutex_t mutex;
+    pi_mutex_t mutex;
 };
 
 struct wayland_text_input
@@ -137,14 +138,14 @@ struct wayland_text_input
     } preedit, current_preedit;
     WCHAR *commit_string;
     HWND focused_hwnd;
-    pthread_mutex_t mutex;
+    pi_mutex_t mutex;
 };
 
 struct wayland_seat
 {
     struct wl_seat *wl_seat;
     uint32_t global_id;
-    pthread_mutex_t mutex;
+    pi_mutex_t mutex;
 };
 
 struct wayland_data_device
@@ -164,7 +165,7 @@ struct wayland_data_device
             struct wl_data_offer *clipboard_wl_data_offer;
         };
     };
-    pthread_mutex_t mutex;
+    pi_mutex_t mutex;
 };
 
 struct wayland
@@ -198,7 +199,7 @@ struct wayland
     struct wayland_data_device data_device;
     struct wl_list output_list;
     /* Protects the output_list and the wayland_output.current states. */
-    pthread_mutex_t output_mutex;
+    pi_mutex_t output_mutex;
     LONG input_serial;
 };
 

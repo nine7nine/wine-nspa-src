@@ -281,7 +281,7 @@ UINT WAYLAND_UpdateDisplayDevices(const struct gdi_device_manager *device_manage
 
     wl_array_init(&output_info_array);
 
-    pthread_mutex_lock(&process_wayland.output_mutex);
+    pi_mutex_lock(&process_wayland.output_mutex);
 
     wl_list_for_each(output, &process_wayland.output_list, link)
     {
@@ -327,7 +327,7 @@ UINT WAYLAND_UpdateDisplayDevices(const struct gdi_device_manager *device_manage
 
     wl_array_release(&output_info_array);
 
-    pthread_mutex_unlock(&process_wayland.output_mutex);
+    pi_mutex_unlock(&process_wayland.output_mutex);
 
     return STATUS_SUCCESS;
 }

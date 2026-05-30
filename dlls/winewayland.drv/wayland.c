@@ -36,13 +36,13 @@ WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
 
 struct wayland process_wayland =
 {
-    .seat.mutex = PTHREAD_MUTEX_INITIALIZER,
-    .keyboard.mutex = PTHREAD_MUTEX_INITIALIZER,
-    .pointer.mutex = PTHREAD_MUTEX_INITIALIZER,
-    .text_input.mutex = PTHREAD_MUTEX_INITIALIZER,
-    .data_device.mutex = PTHREAD_MUTEX_INITIALIZER,
+    .seat.mutex = PI_MUTEX_INIT(0),
+    .keyboard.mutex = PI_MUTEX_INIT(0),
+    .pointer.mutex = PI_MUTEX_INIT(0),
+    .text_input.mutex = PI_MUTEX_INIT(0),
+    .data_device.mutex = PI_MUTEX_INIT(0),
     .output_list = {&process_wayland.output_list, &process_wayland.output_list},
-    .output_mutex = PTHREAD_MUTEX_INITIALIZER
+    .output_mutex = PI_MUTEX_INIT(0)
 };
 
 /**********************************************************************
@@ -141,12 +141,12 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
             WARN("Only a single seat is currently supported, ignoring additional seats.\n");
             return;
         }
-        pthread_mutex_lock(&seat->mutex);
+        pi_mutex_lock(&seat->mutex);
         seat->wl_seat = wl_registry_bind(registry, id, &wl_seat_interface,
                                          version < 8 ? version : 8);
         seat->global_id = id;
         wl_seat_add_listener(seat->wl_seat, &seat_listener, NULL);
-        pthread_mutex_unlock(&seat->mutex);
+        pi_mutex_unlock(&seat->mutex);
         if (process_wayland.zwp_text_input_manager_v3) wayland_text_input_init();
         /* Recreate the data device for the new seat. */
         if (process_wayland.data_device.zwlr_data_control_device_v1 ||
@@ -228,11 +228,11 @@ static void registry_handle_global_remove(void *data, struct wl_registry *regist
         TRACE("removing seat\n");
         if (process_wayland.pointer.wl_pointer) wayland_pointer_deinit();
         if (process_wayland.text_input.zwp_text_input_v3) wayland_text_input_deinit();
-        pthread_mutex_lock(&seat->mutex);
+        pi_mutex_lock(&seat->mutex);
         wl_seat_release(seat->wl_seat);
         seat->wl_seat = NULL;
         seat->global_id = 0;
-        pthread_mutex_unlock(&seat->mutex);
+        pi_mutex_unlock(&seat->mutex);
     }
 }
 

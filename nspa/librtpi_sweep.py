@@ -79,6 +79,7 @@ DEFAULT_SCOPE = [
     'dlls/win32u',
     'dlls/winealsa.drv',
     'dlls/winex11.drv',
+    'dlls/winewayland.drv',
     'dlls/winegstreamer',
     'dlls/winepulse.drv',
     'dlls/winecoreaudio.drv',

@@ -25,6 +25,7 @@
 #include "config.h"
 
 #include <stdlib.h>
+#include <unistd.h>
 
 #include "ntstatus.h"
 
@@ -104,6 +105,12 @@ err:
 
 static NTSTATUS waylanddrv_unix_read_events(void *arg)
 {
+    /* wine-nspa: in host mode the wl_display is adopted lazily
+     * (wayland_ensure_init) on first window use; wait for it before dispatching
+     * our queue. */
+    while (process_wayland.host_mode && !process_wayland.initialized)
+        usleep(10000);
+
     while (wl_display_dispatch_queue(process_wayland.wl_display,
                                      process_wayland.wl_event_queue) != -1)
         continue;

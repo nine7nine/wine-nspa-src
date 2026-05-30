@@ -45,6 +45,11 @@
 #include "wine/gdi_driver.h"
 #include "wine/list.h"
 #include "wine/rbtree.h"
+/* wine-nspa: message-constant defines for the subsurface embed path.  The
+ * host-side helper (NSPA_WAYLAND_EMBED_NO_HELPER) is suppressed -- driver
+ * code only needs the constants. */
+#define NSPA_WAYLAND_EMBED_NO_HELPER
+#include "wine/nspa_wayland_embed.h"
 
 #include "unixlib.h"
 
@@ -67,6 +72,9 @@ enum wayland_window_message
     WM_WAYLAND_INIT_DISPLAY_DEVICES = WM_WINE_FIRST_DRIVER_MSG,
     WM_WAYLAND_CONFIGURE,
     WM_WAYLAND_SET_FOREGROUND,
+    /* wine-nspa subsurface embed (values fixed in include/wine/nspa_wayland_embed.h). */
+    WM_WAYLAND_NSPA_EMBED_WINDOW = WM_WAYLANDDRV_NSPA_EMBED_WINDOW,
+    WM_WAYLAND_NSPA_EMBED_DONE = WM_WAYLANDDRV_NSPA_EMBED_DONE,
 };
 
 enum wayland_surface_config_state
@@ -162,6 +170,11 @@ struct wayland_data_device
 struct wayland
 {
     BOOL initialized;
+    /* wine-nspa: host mode -- a winelib host (Element) owns the wayland
+     * connection and drives the event loop; we adopt its wl_display and run
+     * no reader thread.  When FALSE (the default / standalone), winewayland.drv
+     * behaves exactly as upstream. */
+    BOOL host_mode;
     struct wl_display *wl_display;
     struct wl_event_queue *wl_event_queue;
     struct wl_registry *wl_registry;
@@ -297,6 +310,11 @@ struct wayland_surface
  */
 
 BOOL wayland_process_init(void);
+/* wine-nspa: in host mode, complete the deferred wayland init by adopting the
+ * host's wl_display (idempotent; returns TRUE once initialized, FALSE while the
+ * host has not yet published a display).  No-op (returns TRUE) when not in host
+ * mode and already initialized. */
+BOOL wayland_ensure_init(void);
 
 /**********************************************************************
  *          Wayland output
@@ -315,6 +333,9 @@ void wayland_surface_destroy(struct wayland_surface *surface);
 void wayland_surface_make_toplevel(struct wayland_surface *surface);
 void wayland_surface_make_subsurface(struct wayland_surface *surface,
                                      struct wayland_surface *parent);
+void wayland_surface_make_subsurface_of_foreign(struct wayland_surface *surface,
+                                                struct wl_surface *foreign_parent,
+                                                int x, int y);
 void wayland_surface_clear_role(struct wayland_surface *surface);
 void wayland_surface_attach_shm(struct wayland_surface *surface,
                                 struct wayland_shm_buffer *shm_buffer,
@@ -373,6 +394,13 @@ struct wayland_win_data
     BOOL is_fullscreen;
     BOOL managed;
     BOOL layered_attribs_set;
+    /* wine-nspa: TRUE once this window's surface is a wl_subsurface of a
+     * foreign (host-owned) wl_surface.  When set, WindowPosChanged keeps the
+     * subsurface and skips xdg_toplevel role assignment / state churn; the
+     * host owns position (set once at embed) and size (buffer-driven). */
+    BOOL nspa_embedded;
+    struct wl_surface *nspa_foreign_parent;
+    int nspa_x, nspa_y;
 };
 
 struct wayland_win_data *wayland_win_data_get(HWND hwnd);

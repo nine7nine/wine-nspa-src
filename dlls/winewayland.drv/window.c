@@ -326,6 +326,73 @@ static void wayland_win_data_update_wayland_state(struct wayland_win_data *data)
     wl_display_flush(process_wayland.wl_display);
 }
 
+/***********************************************************************
+ *           wayland_win_data_make_nspa_embed
+ *
+ * wine-nspa: (re)create the window's wayland surface as a wl_subsurface of a
+ * foreign host-owned wl_surface (see include/wine/nspa_wayland_embed.h).
+ *
+ * Any existing surface is destroyed first so we start from a role-less
+ * surface: by embed time the plugin window has usually already been given
+ * the xdg_toplevel role by WindowPosChanged, and a wl_surface that held the
+ * toplevel role cannot be re-roled to a subsurface (the same constraint the
+ * rest of this driver works around by recreating surfaces on role change).
+ *
+ * Position is set once here (on the foreign parent's next commit, driven by
+ * the host's own rendering); size is buffer-driven by the plugin.  No xdg
+ * configure cycle is involved.
+ */
+static BOOL wayland_win_data_make_nspa_embed(struct wayland_win_data *data,
+                                             struct wl_surface *foreign_parent,
+                                             int x, int y)
+{
+    struct wayland_client_surface *client = data->client_surface;
+    struct wayland_surface *surface;
+
+    /* The foreign parent surface must live on OUR wayland connection for
+     * wl_subcompositor_get_subsurface to be legal -- which it is only when the
+     * host (JUCE) adopted winewayland.drv's wl_display.  If the host kept its
+     * own connection, foreign_parent is an object on a different client and
+     * get_subsurface would raise a fatal "bad_parent" protocol error that
+     * terminates the process.  Check connection identity directly (robust
+     * regardless of how the sharing was set up); refuse otherwise so the
+     * window just stays a normal toplevel (no crash). */
+    if (wl_proxy_get_display((struct wl_proxy *)foreign_parent) !=
+        process_wayland.wl_display)
+    {
+        ERR("nspa: refusing embed -- foreign parent %p is not on our wl_display %p "
+            "(host did not adopt our wayland connection)\n",
+            foreign_parent, process_wayland.wl_display);
+        return FALSE;
+    }
+
+    if (data->wayland_surface)
+    {
+        if (client) wayland_client_surface_attach(client, NULL);
+        wayland_surface_destroy(data->wayland_surface);
+        data->wayland_surface = NULL;
+    }
+
+    if (!(surface = wayland_surface_create(data->hwnd))) return FALSE;
+
+    wayland_surface_make_subsurface_of_foreign(surface, foreign_parent, x, y);
+
+    if (NtUserIsWindowVisible(data->hwnd) && client)
+        wayland_client_surface_attach(client, data->hwnd);
+
+    wayland_win_data_get_config(data, &surface->window);
+
+    data->wayland_surface = surface;
+    data->nspa_embedded = TRUE;
+    data->nspa_foreign_parent = foreign_parent;
+    data->nspa_x = x;
+    data->nspa_y = y;
+
+    TRACE("hwnd=%p surface=%p foreign_parent=%p pos=%d,%d\n",
+          data->hwnd, surface, foreign_parent, x, y);
+    return TRUE;
+}
+
 static BOOL is_managed(HWND hwnd)
 {
     struct wayland_win_data *data = wayland_win_data_get(hwnd);
@@ -429,7 +496,14 @@ void WAYLAND_DestroyWindow(HWND hwnd)
  */
 BOOL WAYLAND_WindowPosChanging(HWND hwnd, UINT swp_flags, BOOL shaped, const struct window_rects *rects)
 {
-    struct wayland_win_data *data = wayland_win_data_get(hwnd);
+    struct wayland_win_data *data;
+
+    /* wine-nspa: in host mode the wayland connection is adopted lazily from the
+     * host on first window use; bail out cleanly until the host has provided
+     * it (the window simply has no wayland surface yet). */
+    if (!wayland_ensure_init()) return FALSE;
+
+    data = wayland_win_data_get(hwnd);
 
     TRACE("hwnd %p, swp_flags %04x, shaped %u, rects %s\n", hwnd, swp_flags, shaped, debugstr_window_rects(rects));
 
@@ -466,6 +540,20 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     data->rects = *new_rects;
     data->is_fullscreen = fullscreen;
     data->managed = managed;
+
+    if (data->nspa_embedded)
+    {
+        /* wine-nspa: the host owns this subsurface's position (set once at
+         * embed) and size (buffer-driven by the plugin).  Do NOT recreate it
+         * as an xdg_toplevel or churn xdg state on SetWindowPos -- that would
+         * destroy the subsurface.  Keep it and just refresh its config so
+         * paint-driven reconfigure has current rects.  Re-positioning is done
+         * by re-sending WM_WAYLANDDRV_NSPA_EMBED_WINDOW, not via SetWindowPos. */
+        if (data->wayland_surface)
+            wayland_win_data_get_config(data, &data->wayland_surface->window);
+        wayland_win_data_release(data);
+        return;
+    }
 
     if (!surface)
     {
@@ -653,6 +741,37 @@ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_WAYLAND_SET_FOREGROUND:
         NtUserSetForegroundWindowInternal(hwnd);
         return 0;
+    case WM_WAYLAND_NSPA_EMBED_WINDOW:
+    {
+        /* wine-nspa: make this window a wl_subsurface of a foreign host
+         * wl_surface at a parent-relative position.  Mirrors the X11 path's
+         * WM_X11DRV_NSPA_EMBED_WINDOW.  See include/wine/nspa_wayland_embed.h.
+         *
+         *   WPARAM = (struct wl_surface *) host parent surface
+         *   LPARAM = packed parent-relative position:
+         *             low 16 bits = (int16_t) peerX
+         *             bits 16..31 = (int16_t) peerY
+         *
+         * Surface-role timing contract: the plugin's wl_surface must not have
+         * committed a buffer yet (the host sends this in componentPeerChanged,
+         * before IPlugView::attached / effEditOpen), so recreating it as a
+         * fresh subsurface is safe. */
+        struct wl_surface *parent = (struct wl_surface *)(UINT_PTR)wp;
+        int peerX = (int)(short)(lp & 0xFFFF);
+        int peerY = (int)(short)((lp >> 16) & 0xFFFF);
+        struct wayland_win_data *data;
+
+        if (!parent) return 0;
+        if ((data = wayland_win_data_get(hwnd)))
+        {
+            wayland_win_data_make_nspa_embed(data, parent, peerX, peerY);
+            wayland_win_data_release(data);
+        }
+        /* Post completion async so the consumer can synchronize format-specific
+         * attach hooks on the embed handshake being settled. */
+        NtUserPostMessage(hwnd, WM_WAYLAND_NSPA_EMBED_DONE, 0, 0);
+        return 0;
+    }
     default:
         FIXME("got window msg %x hwnd %p wp %lx lp %lx\n", msg, hwnd, (long)wp, lp);
         return 0;

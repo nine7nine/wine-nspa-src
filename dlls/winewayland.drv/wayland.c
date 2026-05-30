@@ -27,8 +27,10 @@
 #include "waylanddrv.h"
 
 #include "wine/debug.h"
+#include "wine/nspa_wayland_embed.h"
 
 #include <stdlib.h>
+#include <unistd.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
 
@@ -240,37 +242,54 @@ static const struct wl_registry_listener registry_listener = {
 };
 
 /**********************************************************************
- *          wayland_process_init
+ *          nspa_get_host_display
  *
- *  Initialise the per process wayland objects.
- *
+ *  wine-nspa: returns the host's wl_display when a winelib host (Element/JUCE)
+ *  has published one via WINE_NSPA_WAYLAND_DISPLAY.  Only consulted in host
+ *  mode.  The host and winewayland.drv share one process and one
+ *  libwayland-client.so, so the pointer is valid here.  NULL means the host
+ *  has not connected yet (we stay deferred).
  */
-BOOL wayland_process_init(void)
+static struct wl_display *nspa_get_host_display(void)
+{
+    const char *env = getenv(NSPA_WAYLAND_DISPLAY_ENV);
+    if (!env || !env[0]) return NULL;
+    return (struct wl_display *)(UINT_PTR)strtoull(env, NULL, 0);
+}
+
+/**********************************************************************
+ *          wayland_bind_globals
+ *
+ *  Create the registry, bind globals and verify the required ones, on the
+ *  already-set process_wayland.wl_display.  When process_wayland.wl_event_queue
+ *  is set (standalone), the registry lives on our own queue (dispatched by our
+ *  reader thread); when it is NULL (host mode), the registry lives on the
+ *  host display's DEFAULT queue, which the host's event loop dispatches.
+ */
+static BOOL wayland_bind_globals(void)
 {
     struct wl_display *wl_display_wrapper;
 
-    process_wayland.wl_display = wl_display_connect(NULL);
-    if (!process_wayland.wl_display)
-        return FALSE;
+    TRACE("wl_display=%p own_queue=%p\n",
+          process_wayland.wl_display, process_wayland.wl_event_queue);
 
-    TRACE("wl_display=%p\n", process_wayland.wl_display);
-
-    if (!(process_wayland.wl_event_queue = wl_display_create_queue(process_wayland.wl_display)))
+    if (process_wayland.wl_event_queue)
     {
-        ERR("Failed to create event queue\n");
-        return FALSE;
+        if (!(wl_display_wrapper = wl_proxy_create_wrapper(process_wayland.wl_display)))
+        {
+            ERR("Failed to create proxy wrapper for wl_display\n");
+            return FALSE;
+        }
+        wl_proxy_set_queue((struct wl_proxy *) wl_display_wrapper,
+                           process_wayland.wl_event_queue);
+        process_wayland.wl_registry = wl_display_get_registry(wl_display_wrapper);
+        wl_proxy_wrapper_destroy(wl_display_wrapper);
     }
-
-    if (!(wl_display_wrapper = wl_proxy_create_wrapper(process_wayland.wl_display)))
+    else
     {
-        ERR("Failed to create proxy wrapper for wl_display\n");
-        return FALSE;
+        /* Host mode: bind on the host display's default queue. */
+        process_wayland.wl_registry = wl_display_get_registry(process_wayland.wl_display);
     }
-    wl_proxy_set_queue((struct wl_proxy *) wl_display_wrapper,
-                       process_wayland.wl_event_queue);
-
-    process_wayland.wl_registry = wl_display_get_registry(wl_display_wrapper);
-    wl_proxy_wrapper_destroy(wl_display_wrapper);
     if (!process_wayland.wl_registry)
     {
         ERR("Failed to get to wayland registry\n");
@@ -282,8 +301,16 @@ BOOL wayland_process_init(void)
 
     /* We need two roundtrips. One to get and bind globals, one to handle all
      * initial events produced from registering the globals. */
-    wl_display_roundtrip_queue(process_wayland.wl_display, process_wayland.wl_event_queue);
-    wl_display_roundtrip_queue(process_wayland.wl_display, process_wayland.wl_event_queue);
+    if (process_wayland.wl_event_queue)
+    {
+        wl_display_roundtrip_queue(process_wayland.wl_display, process_wayland.wl_event_queue);
+        wl_display_roundtrip_queue(process_wayland.wl_display, process_wayland.wl_event_queue);
+    }
+    else
+    {
+        wl_display_roundtrip(process_wayland.wl_display);
+        wl_display_roundtrip(process_wayland.wl_display);
+    }
 
     /* Check for required protocol globals. */
     if (!process_wayland.wl_compositor)
@@ -336,4 +363,92 @@ BOOL wayland_process_init(void)
     process_wayland.initialized = TRUE;
 
     return TRUE;
+}
+
+/**********************************************************************
+ *          wayland_process_init
+ *
+ *  Initialise the per process wayland objects.
+ *
+ *  In host mode (a winelib host owns the connection) we DEFER: no connect, no
+ *  own queue, no reader thread.  The real init happens lazily in
+ *  wayland_ensure_init once the host has published its wl_display.  Standalone
+ *  (no host) is the upstream path: connect + own queue + bind.
+ */
+BOOL wayland_process_init(void)
+{
+    const char *host = getenv(NSPA_WAYLAND_HOST_ENV);
+
+    if (host && host[0])
+    {
+        process_wayland.host_mode = TRUE;
+        TRACE("nspa: host mode -- deferring wayland connection (host owns it)\n");
+        return TRUE;
+    }
+
+    process_wayland.wl_display = wl_display_connect(NULL);
+    if (!process_wayland.wl_display)
+        return FALSE;
+
+    if (!(process_wayland.wl_event_queue = wl_display_create_queue(process_wayland.wl_display)))
+    {
+        ERR("Failed to create event queue\n");
+        return FALSE;
+    }
+
+    return wayland_bind_globals();
+}
+
+/**********************************************************************
+ *          wayland_ensure_init
+ *
+ *  Complete the deferred host-mode init by adopting the host's wl_display.
+ *  Idempotent.  Returns TRUE once initialized; FALSE while the host has not
+ *  yet published a display (caller should treat wayland as unavailable for
+ *  now).  Outside host mode it just reports the existing init state.
+ */
+BOOL wayland_ensure_init(void)
+{
+    static pthread_mutex_t init_mutex = PTHREAD_MUTEX_INITIALIZER;
+    struct wl_display *host;
+    BOOL ret;
+
+    if (process_wayland.initialized) return TRUE;
+    if (!process_wayland.host_mode) return FALSE;
+
+    pthread_mutex_lock(&init_mutex);
+    if (process_wayland.initialized)
+    {
+        pthread_mutex_unlock(&init_mutex);
+        return TRUE;
+    }
+
+    if (!(host = nspa_get_host_display()))
+    {
+        pthread_mutex_unlock(&init_mutex);
+        TRACE("nspa: host display not published yet; staying deferred\n");
+        return FALSE;
+    }
+
+    /* Adopt the host's display, but keep our OWN event queue + reader thread
+     * (like standalone, just on the adopted connection).  This is essential:
+     * a plugin's modal loops (TrackPopupMenu, dialogs) bypass the host's event
+     * loop, so the host's reader is NOT pumping wayland while a menu is up --
+     * our own reader thread must keep dispatching our queue (winex11.drv reads
+     * X11 independently for exactly this reason).  Our reader and the host's
+     * loop coordinate via libwayland's prepare_read/read_events barrier and
+     * dispatch separate queues, so they coexist without wrong-thread handlers. */
+    process_wayland.wl_display = host;
+    if (!(process_wayland.wl_event_queue = wl_display_create_queue(host)))
+    {
+        pthread_mutex_unlock(&init_mutex);
+        ERR("nspa: failed to create event queue on adopted display\n");
+        return FALSE;
+    }
+    ERR("nspa: adopting host wl_display=%p (own queue + reader thread)\n",
+        (void *)host);
+
+    ret = wayland_bind_globals();
+    pthread_mutex_unlock(&init_mutex);
+    return ret;
 }

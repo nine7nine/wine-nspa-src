@@ -274,6 +274,11 @@ UINT WAYLAND_UpdateDisplayDevices(const struct gdi_device_manager *device_manage
 
     TRACE("\n");
 
+    /* wine-nspa: best-effort -- adopt the host display if it is available yet,
+     * so we can report its outputs.  Harmless no-op when not in host mode or
+     * the host has not published a display (output_list is simply empty). */
+    wayland_ensure_init();
+
     wl_array_init(&output_info_array);
 
     pthread_mutex_lock(&process_wayland.output_mutex);
@@ -284,6 +289,27 @@ UINT WAYLAND_UpdateDisplayDevices(const struct gdi_device_manager *device_manage
         output_info = wl_array_add(&output_info_array, sizeof(*output_info));
         if (output_info) output_info->output = &output->current;
         else ERR("Failed to allocate space for output_info\n");
+    }
+
+    /* wine-nspa: in host mode the wayland outputs may not be bound/ready yet
+     * when an early window or DPI query arrives (we adopt the host display
+     * lazily).  NEVER report zero monitors: a window placed on no monitor gets
+     * DPI 0, and wineserver's scale_dpi() then divides by zero -- SIGFPE in
+     * map_dpi_rect / req_get_window_rectangles, which crashes wineserver and
+     * tears down the whole wine session.  Report a default 1920x1080 @ 96dpi
+     * monitor (add_source uses the process system DPI, non-zero) until the real
+     * outputs arrive.  Gated on host mode so standalone wine is unchanged. */
+    if (process_wayland.host_mode && output_info_array.size == 0)
+    {
+        static struct wayland_output_mode fallback_mode =
+            { .width = 1920, .height = 1080, .refresh = 60000 };
+        static char fallback_name[] = "WaylandHostFallback";
+        static struct wayland_output_state fallback_output =
+            { .current_mode = &fallback_mode, .name = fallback_name,
+              .logical_w = 1920, .logical_h = 1080 };
+        WARN("nspa: no wayland outputs ready; reporting fallback monitor\n");
+        if ((output_info = wl_array_add(&output_info_array, sizeof(*output_info))))
+            output_info->output = &fallback_output;
     }
 
     output_info_array_arrange_physical_coords(&output_info_array);

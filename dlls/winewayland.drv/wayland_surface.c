@@ -328,6 +328,70 @@ err:
 }
 
 /**********************************************************************
+ *          wayland_surface_make_subsurface_of_foreign
+ *
+ * wine-nspa: gives the subsurface role to a plain wayland surface using a
+ * raw foreign wl_surface as the parent.  The parent is owned by a winelib
+ * host (Element) that shares this process's wayland connection, so there is
+ * no wine parent HWND -- toplevel_hwnd stays 0.  The subsurface is placed at
+ * (x, y) relative to the foreign parent and set to desync so the plugin
+ * presents independently of the host.
+ *
+ * The surface MUST be role-less.  A wl_surface that previously held the
+ * xdg_toplevel role cannot be re-roled to a subsurface (same rule the rest
+ * of this driver works around by recreating the surface on role change), so
+ * the caller is responsible for handing in a fresh surface.
+ */
+void wayland_surface_make_subsurface_of_foreign(struct wayland_surface *surface,
+                                                struct wl_surface *foreign_parent,
+                                                int x, int y)
+{
+    assert(!surface->role || surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE);
+
+    wayland_surface_clear_role(surface);
+    surface->role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
+
+    TRACE("surface=%p foreign_parent=%p x=%d y=%d\n", surface, foreign_parent, x, y);
+
+    surface->wl_subsurface =
+        wl_subcompositor_get_subsurface(process_wayland.wl_subcompositor,
+                                        surface->wl_surface,
+                                        foreign_parent);
+    if (!surface->wl_subsurface)
+    {
+        ERR("Failed to create foreign wl_subsurface\n");
+        goto err;
+    }
+
+    surface->role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
+    surface->toplevel_hwnd = 0; /* parent is a foreign (non-wine) surface */
+
+    wl_subsurface_set_position(surface->wl_subsurface, x, y);
+
+    /* Present contents independently of the parent surface. */
+    wl_subsurface_set_desync(surface->wl_subsurface);
+
+    /* A wl_subsurface is only added to the parent's sub-surface tree (and
+     * thus mapped) on the parent surface's NEXT commit -- get_subsurface
+     * alone just queues it.  Unlike the X11 reparent, which is immediate and
+     * self-contained, wayland needs an explicit parent commit, and the host
+     * (JUCE) does not know wine added a subsurface to its surface, so it will
+     * not commit on our behalf.  Mirror JUCE's own createWindow subsurface
+     * path (commit child, then commit parent) so the plugin actually
+     * composites into the host window. */
+    wl_surface_commit(surface->wl_surface);
+    wl_surface_commit(foreign_parent);
+
+    wl_display_flush(process_wayland.wl_display);
+
+    return;
+
+err:
+    wayland_surface_clear_role(surface);
+    ERR("Failed to assign foreign subsurface role to wayland surface\n");
+}
+
+/**********************************************************************
  *          wayland_surface_clear_role
  *
  * Clears the role related Wayland objects of a Wayland surface, making it a

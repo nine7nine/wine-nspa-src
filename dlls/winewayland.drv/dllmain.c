@@ -24,6 +24,8 @@
 #include "winuser.h"
 
 #include "wine/debug.h"
+#define NSPA_WAYLAND_EMBED_NO_HELPER
+#include "wine/nspa_wayland_embed.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
 
@@ -105,11 +107,24 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void *reserved)
     if (WAYLANDDRV_UNIX_CALL(init, NULL))
         return FALSE;
 
-    /* Read wayland events from a dedicated thread. */
-    CloseHandle(CreateThread(NULL, 0, wayland_read_events_thread, NULL, 0, &tid));
-    /* Handle clipboard events in a dedicated thread, if needed. */
-    if (!WAYLANDDRV_UNIX_CALL(init_clipboard, NULL))
-        CloseHandle(CreateThread(NULL, 0, clipboard_thread, NULL, 0, &tid));
+    {
+        char host_buf[8];
+        BOOL host_mode =
+            GetEnvironmentVariableA(NSPA_WAYLAND_HOST_ENV, host_buf, sizeof(host_buf)) > 0;
+
+        /* Read wayland events from a dedicated thread.  In host mode the unix
+         * read_events handler waits until the host display has been adopted
+         * (deferred), then dispatches our own queue -- essential so plugin
+         * modal loops (menus/dialogs), which bypass the host's event loop, keep
+         * getting wayland events.  Our reader coordinates with the host's loop
+         * via libwayland's prepare_read/read_events barrier. */
+        CloseHandle(CreateThread(NULL, 0, wayland_read_events_thread, NULL, 0, &tid));
+
+        /* Clipboard handling needs the connection up front; in host mode the
+         * host owns the clipboard, so skip our per-process clipboard window. */
+        if (!host_mode && !WAYLANDDRV_UNIX_CALL(init_clipboard, NULL))
+            CloseHandle(CreateThread(NULL, 0, clipboard_thread, NULL, 0, &tid));
+    }
 
     return TRUE;
 }

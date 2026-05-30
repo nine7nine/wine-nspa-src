@@ -409,23 +409,30 @@ BOOL wayland_process_init(void)
  */
 BOOL wayland_ensure_init(void)
 {
-    static pthread_mutex_t init_mutex = PTHREAD_MUTEX_INITIALIZER;
+    /* One-shot init guard.  Lock-free CAS, NOT a mutex: this can run on the
+     * SCHED_FIFO message thread and bind_globals below does blocking wayland
+     * roundtrips -- a raw pthread mutex is not priority-inheriting (inversion
+     * risk), and wine-nspa avoids holding plain pthread locks on RT threads.
+     * No lock is held across the init work, so there is nothing to invert. */
+    static int initializing; /* 0 = free, 1 = a thread owns the init */
     struct wl_display *host;
     BOOL ret;
 
     if (process_wayland.initialized) return TRUE;
     if (!process_wayland.host_mode) return FALSE;
 
-    pthread_mutex_lock(&init_mutex);
-    if (process_wayland.initialized)
+    if (!__sync_bool_compare_and_swap(&initializing, 0, 1))
+        return process_wayland.initialized; /* another thread owns the init */
+
+    if (process_wayland.initialized) /* a peer finished between our checks */
     {
-        pthread_mutex_unlock(&init_mutex);
+        __sync_lock_release(&initializing);
         return TRUE;
     }
 
     if (!(host = nspa_get_host_display()))
     {
-        pthread_mutex_unlock(&init_mutex);
+        __sync_lock_release(&initializing); /* retry on a later call */
         TRACE("nspa: host display not published yet; staying deferred\n");
         return FALSE;
     }
@@ -441,14 +448,15 @@ BOOL wayland_ensure_init(void)
     process_wayland.wl_display = host;
     if (!(process_wayland.wl_event_queue = wl_display_create_queue(host)))
     {
-        pthread_mutex_unlock(&init_mutex);
+        __sync_lock_release(&initializing);
         ERR("nspa: failed to create event queue on adopted display\n");
         return FALSE;
     }
     ERR("nspa: adopting host wl_display=%p (own queue + reader thread)\n",
         (void *)host);
 
-    ret = wayland_bind_globals();
-    pthread_mutex_unlock(&init_mutex);
+    ret = wayland_bind_globals(); /* sets process_wayland.initialized on success */
+    if (!ret) __sync_lock_release(&initializing); /* failed -- allow a retry */
+    /* On success leave `initializing` held: init is one-shot. */
     return ret;
 }

@@ -119,6 +119,11 @@
 #include "request.h"
 #include "user.h"
 
+#ifdef __linux__
+#include <linux/ntsync.h>
+#include "nspa/inproc_event_table.h"
+#endif
+
 #if defined(linux) && !defined(IP_UNICAST_IF)
 #define IP_UNICAST_IF 50
 #endif
@@ -300,6 +305,7 @@ struct sock
     unsigned int        exclusiveaddruse : 1; /* winsock SO_EXCLUSIVEADDRUSE option value */
 #ifdef __linux__
     volatile unsigned char *client_poll_bitmap; /* NSPA E2: per-process bitmap (from process) */
+    int                 client_event_fd; /* NSPA: ntsync fd of a client-range inproc event registered via WSAEventSelect (only when ->event == NULL); -1 otherwise.  Owned by the per-process inproc_event_table — do not close from here. */
 #endif
 };
 
@@ -1358,8 +1364,22 @@ static void post_socket_event( struct sock *sock, enum afd_poll_bit event_bit )
         sock->pending_events |= event;
         sock->reported_events |= event;
 
-        if ((sock->mask & event) && sock->event)
-            set_event( sock->event );
+        if (sock->mask & event)
+        {
+            if (sock->event)
+                set_event( sock->event );
+#ifdef __linux__
+            /* NSPA: WSAEventSelect registered a PE-side client-range inproc
+             * event (not a server event obj) — signal its ntsync fd directly,
+             * the same immediate-signal as set_event (mirrors async.c 4.6.C).
+             * PE-side waiters wake via inproc-sync. */
+            else if (sock->client_event_fd >= 0)
+            {
+                __u32 count;
+                ioctl( sock->client_event_fd, NTSYNC_IOC_EVENT_SET, &count );
+            }
+#endif
+        }
     }
 }
 
@@ -1839,6 +1859,7 @@ static struct sock *create_socket(void)
     sock->bound_addr[0] = sock->bound_addr[1] = NULL;
 #ifdef __linux__
     sock->client_poll_bitmap = NULL;
+    sock->client_event_fd = -1;
 #endif
     init_async_queue( &sock->read_q );
     init_async_queue( &sock->write_q );
@@ -2149,6 +2170,12 @@ static struct sock *accept_socket( struct sock *sock )
         acceptsock->connect_time        = current_time;
 
         if (sock->event) acceptsock->event = (struct event *)grab_object( sock->event );
+#ifdef __linux__
+        /* NSPA: mirror the event inheritance for a client-range inproc event.
+         * The fd is owned by the per-process inproc_event_table (shared, not
+         * grab_object'd) — both sockets reference it, neither closes it. */
+        else if (sock->client_event_fd >= 0) acceptsock->client_event_fd = sock->client_event_fd;
+#endif
         if (!(acceptsock->fd = create_anonymous_fd( &sock_fd_ops, acceptfd, &acceptsock->obj,
                                                     get_fd_options( sock->fd ) )))
         {
@@ -2892,6 +2919,9 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
         {
             if (sock->event) release_object( sock->event );
             sock->event = NULL;
+#ifdef __linux__
+            sock->client_event_fd = -1;
+#endif
             sock->window = 0;
             sock->mask = 0;
             sock->nonblocking = 1;
@@ -2982,12 +3012,36 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
         if ((event_handle || mask) &&
             !(event = get_event_obj( current->process, event_handle, EVENT_MODIFY_STATE )))
         {
-            set_error( STATUS_INVALID_PARAMETER );
-            return;
+            int client_event_fd = -1;
+#ifdef __linux__
+            /* NSPA: the handle isn't in the server's event table — it may be a
+             * PE-side client-range inproc event (created via /dev/ntsync, never
+             * registered with the server as an event obj).  Look up its ntsync
+             * fd so post_socket_event() can signal it directly, mirroring
+             * create_async Phase 4.6.B.  Clear the error get_event_obj set. */
+            client_event_fd = nspa_inproc_event_lookup( current->process, event_handle );
+#endif
+            if (client_event_fd < 0)
+            {
+                set_error( STATUS_INVALID_PARAMETER );
+                return;
+            }
+            clear_error();
+            if (sock->event) release_object( sock->event );
+            sock->event = NULL;
+#ifdef __linux__
+            sock->client_event_fd = client_event_fd;
+#endif
+        }
+        else
+        {
+            if (sock->event) release_object( sock->event );
+            sock->event = event;
+#ifdef __linux__
+            sock->client_event_fd = -1;
+#endif
         }
 
-        if (sock->event) release_object( sock->event );
-        sock->event = event;
         sock->mask = mask;
         sock->window = 0;
         sock->message = 0;
@@ -3012,6 +3066,15 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
                                       sock->pending_events & mask );
             set_event( event );
         }
+#ifdef __linux__
+        else if (sock->client_event_fd >= 0 && (sock->pending_events & mask))
+        {
+            __u32 count;
+            if (debug_level) fprintf( stderr, "signalling pending events %#x due to event select (inproc)\n",
+                                      sock->pending_events & mask );
+            ioctl( sock->client_event_fd, NTSYNC_IOC_EVENT_SET, &count );
+        }
+#endif
 
         return;
     }
@@ -3034,6 +3097,9 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
             sock->reported_events = 0;
         }
         sock->event = NULL;
+#ifdef __linux__
+        sock->client_event_fd = -1;
+#endif
         sock->mask = params->mask;
         sock->window = params->window;
         sock->message = params->message;
@@ -4207,6 +4273,9 @@ DECL_HANDLER(socket_get_events)
     unsigned int status[13];
     struct event *event = NULL;
     unsigned int i;
+#ifdef __linux__
+    int client_event_fd = -1;
+#endif
 
     if (get_reply_max_size() < sizeof(status))
     {
@@ -4220,8 +4289,19 @@ DECL_HANDLER(socket_get_events)
     {
         if (!(event = get_event_obj( current->process, req->event, EVENT_MODIFY_STATE )))
         {
-            release_object( sock );
-            return;
+#ifdef __linux__
+            /* NSPA: WSAEnumNetworkEvents may pass a PE-side client-range inproc
+             * event (not in the server event table) to reset.  Look up its
+             * ntsync fd and reset it below.  Clear get_event_obj's error. */
+            client_event_fd = nspa_inproc_event_lookup( current->process, req->event );
+            if (client_event_fd >= 0)
+                clear_error();
+            else
+#endif
+            {
+                release_object( sock );
+                return;
+            }
         }
     }
 
@@ -4237,6 +4317,13 @@ DECL_HANDLER(socket_get_events)
         reset_event( event );
         release_object( event );
     }
+#ifdef __linux__
+    else if (client_event_fd >= 0)
+    {
+        __u32 count;
+        ioctl( client_event_fd, NTSYNC_IOC_EVENT_RESET, &count );
+    }
+#endif
 
     set_reply_data( status, sizeof(status) );
 

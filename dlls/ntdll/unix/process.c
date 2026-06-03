@@ -379,7 +379,7 @@ done:
 /***********************************************************************
  *           set_stdio_fd
  */
-static void set_stdio_fd( int stdin_fd, int stdout_fd )
+static void set_stdio_fd( int stdin_fd, int stdout_fd, int stderr_fd )
 {
     int fd = -1;
 
@@ -392,6 +392,10 @@ static void set_stdio_fd( int stdin_fd, int stdout_fd )
 
     if (stdin_fd != 0) dup2( stdin_fd, 0 );
     if (stdout_fd != 1) dup2( stdout_fd, 1 );
+    /* NSPA: route an explicit hStdError (e.g. a service log file) to unix fd 2 so
+     * WINEDEBUG/ERR output from the child is captured.  stderr_fd == -1 (the usual
+     * case, incl. all normal apps) leaves fd 2 inherited exactly as before. */
+    if (stderr_fd != -1 && stderr_fd != 2) dup2( stderr_fd, 2 );
     if (fd != -1) close( fd );
 }
 
@@ -412,7 +416,7 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
                                int unixdir, char *winedebug, const struct pe_image_info *pe_info )
 {
     NTSTATUS status = STATUS_SUCCESS;
-    int stdin_fd = -1, stdout_fd = -1;
+    int stdin_fd = -1, stdout_fd = -1, stderr_fd = -1;
     pid_t pid;
     char **argv;
 
@@ -424,6 +428,10 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
         isatty(1) && is_unix_console_handle( params->hStdOutput ))
         stdout_fd = 1;
 
+    /* NSPA: map an explicit hStdError to the child's unix fd 2 (the wine-debug
+     * sink), so WINEDEBUG output from detached services can be captured. */
+    wine_server_handle_to_fd( params->hStdError, FILE_WRITE_DATA, &stderr_fd, NULL );
+
     if (!(pid = fork()))  /* child */
     {
         if (!(pid = fork()))  /* grandchild */
@@ -434,12 +442,13 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
                 params->ConsoleHandle == NULL)
             {
                 setsid();
-                set_stdio_fd( -1, -1 );  /* close stdin and stdout */
+                set_stdio_fd( -1, -1, stderr_fd );  /* close stdin and stdout; route stderr if set */
             }
-            else set_stdio_fd( stdin_fd, stdout_fd );
+            else set_stdio_fd( stdin_fd, stdout_fd, stderr_fd );
 
             if (stdin_fd != -1 && stdin_fd != 0) close( stdin_fd );
             if (stdout_fd != -1 && stdout_fd != 1) close( stdout_fd );
+            if (stderr_fd != -1 && stderr_fd != 2) close( stderr_fd );
 
             if (winedebug) putenv( winedebug );
             if (unixdir != -1)
@@ -605,9 +614,9 @@ static NTSTATUS fork_and_exec( OBJECT_ATTRIBUTES *attr, const char *unix_name, i
                 params->ConsoleHandle == NULL)
             {
                 setsid();
-                set_stdio_fd( -1, -1 );  /* close stdin and stdout */
+                set_stdio_fd( -1, -1, -1 );  /* close stdin and stdout */
             }
-            else set_stdio_fd( stdin_fd, stdout_fd );
+            else set_stdio_fd( stdin_fd, stdout_fd, -1 );
 
             if (stdin_fd != -1 && stdin_fd != 0) close( stdin_fd );
             if (stdout_fd != -1 && stdout_fd != 1) close( stdout_fd );

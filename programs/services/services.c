@@ -1056,7 +1056,32 @@ found:
     process->use_count++;
     service_unlock(service_entry);
 
-    r = CreateProcessW(NULL, path, NULL, NULL, FALSE, CREATE_UNICODE_ENVIRONMENT | DETACHED_PROCESS, environment, NULL, &si, &pi);
+    /* NSPA debug: when WINE_SERVICE_LOG is set, redirect the service process's
+     * stdout/stderr to that file so WINEDEBUG output from services (which is
+     * otherwise discarded by DETACHED_PROCESS) can be captured. Harmless/no-op
+     * when the env var is unset. */
+    {
+        const char *svc_log_path = getenv("WINE_SERVICE_LOG");
+        HANDLE svc_log = INVALID_HANDLE_VALUE;
+        if (svc_log_path && svc_log_path[0])
+        {
+            SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+            WCHAR pathW[MAX_PATH];
+            MultiByteToWideChar(CP_UNIXCP, 0, svc_log_path, -1, pathW, MAX_PATH);
+            svc_log = CreateFileW(pathW, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                  &sa, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (svc_log != INVALID_HANDLE_VALUE)
+            {
+                si.dwFlags |= STARTF_USESTDHANDLES;
+                si.hStdInput = INVALID_HANDLE_VALUE;
+                si.hStdOutput = svc_log;
+                si.hStdError = svc_log;
+            }
+        }
+        r = CreateProcessW(NULL, path, NULL, NULL, svc_log != INVALID_HANDLE_VALUE,
+                           CREATE_UNICODE_ENVIRONMENT | DETACHED_PROCESS, environment, NULL, &si, &pi);
+        if (svc_log != INVALID_HANDLE_VALUE) CloseHandle(svc_log);
+    }
     free(path);
     if (!r)
     {

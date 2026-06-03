@@ -190,6 +190,119 @@ static LONG call_vectored_handlers( EXCEPTION_RECORD *rec, CONTEXT *context )
 }
 
 
+/* NSPA diagnostic: decode an MSVC C++ exception (EXCEPTION_WINE_CXX_EXCEPTION)
+ * to recover the thrown type name(s) and std::exception::what() — which apps
+ * (e.g. NTKDaemon) routinely swallow into a generic error.  Gated on +seh.
+ * The ThrowInfo/CatchableType walk is pure RVA reads (safe); the what() read
+ * only runs when std::exception is in the catchable-type chain, which
+ * guarantees the {vptr; const char* _What @ +8} layout. */
+static BOOL nspa_streq( const char *a, const char *b )
+{
+    while (*a && *a == *b) { a++; b++; }
+    return *a == *b;
+}
+
+/* Interpret a 32-byte region as an MSVC std::string {union{char buf[16];char*ptr;};
+ * size_t size@16; size_t cap@24} and print its content.  SDK exceptions stash the
+ * real error detail in such a member even when what() is empty. */
+static void nspa_print_stdstr( UINT off, const unsigned char *m )
+{
+    ULONG64 size = *(const ULONG64 *)(m + 16);
+    ULONG64 cap  = *(const ULONG64 *)(m + 24);
+    const char *data;
+    char buf[256];
+    UINT j, n;
+
+    if (size > cap || cap < 7 || cap > 8192) return;   /* not a plausible std::string */
+    if (cap >= 16)
+    {
+        data = *(const char * const *)m;               /* heap buffer */
+        if ((ULONG_PTR)data < 0x10000) return;
+    }
+    else data = (const char *)m;                       /* SSO inline buffer */
+    n = (size < sizeof(buf) - 1) ? (UINT)size : (UINT)(sizeof(buf) - 1);
+    for (j = 0; j < n; j++) buf[j] = data[j];
+    buf[n] = 0;
+    ERR( "NSPA-CXX str@%u = [%s]\n", off, buf );
+}
+
+static void nspa_dump_cxx_exception( EXCEPTION_RECORD *rec, CONTEXT *context )
+{
+    const struct nspa_throw_info { UINT attributes; int destructor; int custom; int type_array; } *ti;
+    const struct nspa_type_array { UINT count; int types[1]; } *arr;
+    BOOL std_derived = FALSE;
+    char *base;
+    UINT i;
+
+    (void)context;  /* used only in the x86_64 stack-scan below */
+    if (rec->NumberParameters < 4 || rec->ExceptionInformation[0] != 0x19930520) return;
+    base = (char *)rec->ExceptionInformation[3];
+    ti   = (const void *)rec->ExceptionInformation[2];
+    if (!base || !ti) return;
+    arr = (const void *)(base + ti->type_array);
+    for (i = 0; i < arr->count && i < 12u; i++)
+    {
+        const struct nspa_catchable { UINT properties; int type_desc; } *cti =
+            (const void *)(base + arr->types[i]);
+        const char *name = base + cti->type_desc + 16;   /* TypeDescriptor.name (after vtable+spare ptrs) */
+        ERR( "NSPA-CXX type[%u] = %s\n", i, name );
+        if (nspa_streq( name, ".?AVexception@std@@" )) std_derived = TRUE;
+    }
+    if (std_derived && rec->ExceptionInformation[1])
+    {
+        const char *what = *(const char **)((char *)rec->ExceptionInformation[1] + 8);
+        ERR( "NSPA-CXX what() = %s\n", what ? what : "(null)" );
+    }
+    /* Dump the exception object: many SDK exceptions carry the real detail in a
+     * member std::string (inline/SSO shows up directly here), not in what(). */
+    if (rec->ExceptionInformation[1])
+    {
+        const unsigned char *o = (const unsigned char *)rec->ExceptionInformation[1];
+        char asc[65]; UINT k;
+        for (k = 0; k < 64; k++) asc[k] = (o[k] >= 0x20 && o[k] < 0x7f) ? o[k] : '.';
+        asc[64] = 0;
+        ERR( "NSPA-CXX obj[0..64]=|%s|\n", asc );
+        for (k = 0; k < 8; k++)
+            ERR( "NSPA-CXX obj.q[%u]=%p\n", k, (void *)(ULONG_PTR)((const ULONG64 *)o)[k] );
+        /* scan member offsets for an std::string carrying the real error detail */
+        for (k = 8; k <= 40; k += 8)
+            nspa_print_stdstr( k, o + k );
+    }
+    /* Throwing call chain: properly unwind the raising context so each frame is a
+     * real return address (the naive stack-scan caught only ctor-internal frames).
+     * Print frames inside NTKDaemon.exe (preferred base 0x140000000) so the throw
+     * site + failing operation can be located in the disassembly.  x86_64-only. */
+#ifdef __x86_64__
+    if (context)
+    {
+        CONTEXT ctx = *context;
+        UINT n;
+        for (n = 0; n < 24u; n++)
+        {
+            ULONG64 base = 0, frame = 0;
+            void *handler_data;
+            RUNTIME_FUNCTION *func;
+
+            if (ctx.Rip >= 0x140000000ull && ctx.Rip < 0x141600000ull)
+                ERR( "NSPA-CXX frame[%u] = NTKDaemon.exe + %p\n", n,
+                     (void *)(ULONG_PTR)(ctx.Rip - 0x140000000ull) );
+            func = RtlLookupFunctionEntry( ctx.Rip, &base, NULL );
+            if (func)
+                RtlVirtualUnwind( UNW_FLAG_NHANDLER, base, ctx.Rip, func, &ctx,
+                                  &handler_data, &frame, NULL );
+            else
+            {
+                if (!ctx.Rsp) break;
+                ctx.Rip = *(ULONG64 *)ctx.Rsp;   /* leaf: pop return address */
+                ctx.Rsp += 8;
+            }
+            if (!ctx.Rip) break;
+        }
+    }
+#endif
+}
+
+
 /*******************************************************************
  *		dispatch_exception
  */
@@ -242,6 +355,9 @@ NTSTATUS WINAPI dispatch_exception( EXCEPTION_RECORD *rec, CONTEXT *context )
                                   debugstr_exception_code(rec->ExceptionCode), rec->ExceptionCode );
         break;
     }
+
+    if (TRACE_ON(seh) && rec->ExceptionCode == EXCEPTION_WINE_CXX_EXCEPTION)
+        nspa_dump_cxx_exception( rec, context );
 
     TRACE( "code=%lx (%s) flags=%lx addr=%p\n",
            rec->ExceptionCode, debugstr_exception_code(rec->ExceptionCode),

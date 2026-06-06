@@ -1087,6 +1087,21 @@ static NTSTATUS cache_client_inproc_sync( HANDLE handle, int fd,
     }
 
     cache = &inproc_sync_cache[entry][idx];
+
+    /* The handle value may have just been recycled (alloc_client_handle LIFO-
+     * reuses a freed slot) while another thread is still mid-wait on the
+     * PREVIOUS object that occupied this handle: inproc_wait holds a cache ref
+     * for the whole wait, and close_client_inproc_sync() returns the handle to
+     * the pool before that ref necessarily drops to 0.  In that window the slot
+     * is still live — don't clobber it.  Bail so the caller frees this fd+handle
+     * and falls back to a server-allocated object (self-heals once the lingering
+     * waiter releases).  Mirrors the guard in cache_inproc_sync() for the
+     * server-discovered path; without it the InterlockedExchange below trips
+     * assert(!refcount) and aborts the process (or, with asserts compiled out,
+     * silently corrupts the cache by reusing a slot another thread is reading). */
+    if (InterlockedCompareExchange( &cache->refcount, 0, 0 ))
+        return STATUS_NOT_IMPLEMENTED;
+
     cache->fd = fd;
     cache->access = access;
     cache->type = type;

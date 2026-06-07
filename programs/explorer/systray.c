@@ -19,6 +19,7 @@
  */
 
 #include <assert.h>
+#include <stdlib.h>
 
 #include <windows.h>
 #include <ntuser.h>
@@ -1203,6 +1204,16 @@ void handle_parent_notify( HWND hwnd, WPARAM wp )
 void initialize_systray( BOOL arg_using_root, BOOL arg_enable_shell, BOOL arg_show_systray, BOOL arg_no_tray_items )
 {
     RECT work_rect, primary_rect, taskbar_rect;
+    const char *no_systray_env = getenv( "WINE_NO_SYSTRAY" );
+
+    /* WINE_NO_SYSTRAY=1 disables the systray entirely. Some apps (e.g. the
+     * Native Instruments / Native Access stack) misbehave when a systray host
+     * window exists; this env var lets the user opt out without a recompile. */
+    if (no_systray_env && atoi( no_systray_env ) == 1)
+    {
+        ERR( "WINE_NO_SYSTRAY=1 set; systray will not be created.\n" );
+        return;
+    }
 
     shell_traywnd_class.hIcon = LoadIconW( 0, (const WCHAR *)IDI_WINLOGO );
     shell_traywnd_class.hCursor = LoadCursorW( 0, (const WCHAR *)IDC_ARROW );

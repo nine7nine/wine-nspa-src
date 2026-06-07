@@ -20,6 +20,7 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 
 #define COBJMACROS
 #define OEMRESOURCE
@@ -32,6 +33,8 @@
 #include "exdisp.h"
 
 #include "wine/debug.h"
+#define NSPA_WAYLAND_EMBED_NO_HELPER
+#include "wine/nspa_wayland_embed.h"
 #include "explorer_private.h"
 #include "resource.h"
 
@@ -1004,7 +1007,21 @@ static void load_graphics_driver( const WCHAR *driver, GUID *guid )
     HKEY hkey;
     char error[80];
 
-    if (!driver)
+    if (getenv( NSPA_WAYLAND_HOST_ENV ))
+    {
+        /* Wine-NSPA: a winelib host (Lulada/Element) launched in wayland
+         * host-mode forces winewayland.drv for THIS desktop session,
+         * overriding both the /desktop command-line driver and the
+         * prefix's HKCU\Software\Wine\Drivers Graphics default.  This lets
+         * the prefix default stay "x11" -- so general Wine-NSPA usage
+         * (plugin installers, standalone wine apps) renders via XWayland,
+         * which they expect -- while the host + its in-process plugin
+         * surfaces render natively on wayland.  The driver is selected
+         * per desktop session, so the two never collide. */
+        lstrcpyW( buffer, L"wayland" );
+        TRACE( "WINE_NSPA_WAYLAND_HOST set -- forcing wayland graphics driver\n" );
+    }
+    else if (!driver)
     {
         lstrcpyW( buffer, default_driver );
 

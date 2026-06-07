@@ -3050,6 +3050,43 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
 
         sock_reselect( sock );
 
+#ifdef __linux__
+        /* NSPA: match Win32 WSAEventSelect re-evaluation semantics for FD_READ.
+         *
+         * Per MSDN, calling WSAEventSelect( ..., FD_READ ) re-records FD_READ
+         * whenever data is actually present in the receive buffer, independent
+         * of whether a previous FD_READ was already consumed by
+         * WSAEnumNetworkEvents().  Wine's re-fire below is gated only on
+         * pending_events, so this case is missed: once an app enumerates the
+         * event (clearing pending_events) but re-arms the select *without* a
+         * draining recv() (asio reactor batching; aria2 toggling the mask
+         * 0x99<->0<->0x99), reported_events keeps AFD_POLL_READ latched, which
+         * makes sock_get_poll_events() strip POLLIN, so buffered data is never
+         * re-detected and the FD_READ notification never fires again -> the
+         * socket wedges forever (the NA2 download stall + cloud-SDK
+         * "<general client error>" reads).
+         *
+         * Re-record FD_READ here when the underlying condition genuinely holds.
+         * Tightly gated so only the wedge precondition pays the poll(): the
+         * read latch must be set, no FD_READ already pending, a connected
+         * stream with no hangup, no overlapped read owning the data, and real
+         * buffered data.  We only set pending_events (not clear the latch):
+         * the existing signal block below then wakes the waiter, and the app's
+         * subsequent recv() clears the latch and re-arms POLLIN via
+         * recv_socket().  This fires once per select (post-fire FD_READ is
+         * pending, so the gate is false until the next enumerate), matching
+         * Windows and avoiding the epoll re-arm storm of earlier attempts. */
+        if ((mask & AFD_POLL_READ)
+            && (sock->reported_events & AFD_POLL_READ)
+            && !(sock->pending_events & AFD_POLL_READ)
+            && sock->state == SOCK_CONNECTED && !sock->hangup
+            && !async_queued( &sock->read_q )
+            && (check_fd_events( sock->fd, POLLIN ) & POLLIN))
+        {
+            sock->pending_events |= AFD_POLL_READ;
+        }
+#endif
+
         /* Explicitly wake the socket up if the mask matches pending_events.
          *
          * The logic here is a bit surprising. We always set the event if the

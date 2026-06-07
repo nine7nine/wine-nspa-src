@@ -1535,7 +1535,18 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
             open_flags = (access & unix_read) ? O_RDWR : O_WRONLY;
         else
             open_flags = O_RDONLY;
-        if (disposition == FILE_OVERWRITE) open_flags |= O_TRUNC;
+        /* All overwrite-class dispositions truncate an existing file to 0 on
+         * open (NT: FILE_OVERWRITE / FILE_OVERWRITE_IF / FILE_SUPERSEDE).  The
+         * function's own disposition comment promises this, but only
+         * FILE_OVERWRITE was honored — so CREATE_ALWAYS (FILE_OVERWRITE_IF) and
+         * FILE_SUPERSEDE rewrites of an EXISTING file kept the old tail when the
+         * new content was shorter, corrupting the file (e.g. NA2's metalink:
+         * a shorter rewrite left a stale tail → invalid XML → aria2 "Unable to
+         * read metalink file" → download fails).  O_TRUNC also feeds the
+         * FILE_MAPPING_ACCESS arbitration above, matching FILE_OVERWRITE. */
+        if (disposition == FILE_OVERWRITE || disposition == FILE_OVERWRITE_IF ||
+            disposition == FILE_SUPERSEDE)
+            open_flags |= O_TRUNC;
         if (options & FILE_OPEN_REPARSE_POINT) open_flags |= O_NOFOLLOW;
     }
 
@@ -1588,7 +1599,19 @@ NTSTATUS nspa_local_file_try_bypass( HANDLE *handle, const char *unix_name,
     }
 
     *handle = h;
-    if (io) io->Information = FILE_OPENED;
+    /* Report the correct disposition result for an EXISTING file: overwrite
+     * dispositions yield FILE_OVERWRITTEN / FILE_SUPERSEDED, not FILE_OPENED
+     * (apps branch on io->Information). */
+    if (io)
+    {
+        switch (disposition)
+        {
+        case FILE_OVERWRITE:
+        case FILE_OVERWRITE_IF: io->Information = FILE_OVERWRITTEN; break;
+        case FILE_SUPERSEDE:    io->Information = FILE_SUPERSEDED;  break;
+        default:                io->Information = FILE_OPENED;      break;
+        }
+    }
     /* Phase 1A.6 debug: log mint with path so we can correlate with
      * subsequent operations on this handle.  Filtered: only log if
      * NSPA_LF_TRACE=1 to avoid spam. */

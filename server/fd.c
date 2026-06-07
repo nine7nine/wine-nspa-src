@@ -1834,7 +1834,20 @@ void set_fd_events( struct fd *fd, int events )
     int user = fd->poll_index;
     assert( poll_users[user] == fd );
 
-    fd->poll_generation = ++poll_generation;  /* NSPA v1.5 */
+    /* NSPA v1.5 generation: bump ONLY on slot occupancy change (add_poll_user),
+     * NOT on a mere re-arm.  main_loop_epoll drops any returned event whose fd
+     * has poll_generation > the generation captured before epoll_wait, to skip
+     * stale events for a slot whose fd was removed/reused mid-cycle.  Bumping
+     * here on every reselect made that skip fire for a fd that was simply
+     * re-armed during the same dispatch cycle: a busy socket reselected 2-3x
+     * between capture and dispatch (e.g. its own select() request handled
+     * earlier in the batch) had its real EPOLLIN dropped -> the read never
+     * completed -> aria2 "Calculating" stall (observed: the download fd's
+     * EPOLLIN dropped tens of thousands of times, its poll_generation only 2-3
+     * over the captured value).  The reuse hazard the skip guards is an
+     * occupancy change, still bumped in add_poll_user(); a re-armed same-fd
+     * event is safe to dispatch (sock_poll_event re-validates), matching
+     * upstream wine which has no such skip. */
     set_fd_epoll_events( fd, user, events );
 
     if (events == -1)  /* stop waiting on this fd completely */

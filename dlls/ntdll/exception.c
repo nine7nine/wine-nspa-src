@@ -311,6 +311,27 @@ NTSTATUS WINAPI dispatch_exception( EXCEPTION_RECORD *rec, CONTEXT *context )
     NTSTATUS status;
     DWORD i;
 
+    {
+        /* NSPA: bound runaway re-entrant exception dispatch.  A fault storm that
+         * re-raises during dispatch recurses KiUserExceptionDispatcher ->
+         * dispatch_exception -> call_seh_handlers -> ... until the stack overflows
+         * and abort_thread()s -- taking down the process (and trashing the box).
+         * Real Windows bounds exception dispatch; here, once the dispatch stack is
+         * nearly exhausted, terminate ONLY this thread so the rest of the process
+         * survives.  Fires only within ~64 KB of the absolute stack floor, i.e.
+         * never on legitimate nesting.  (+seh masks the storm by serialising it;
+         * this stops the catastrophic case directly.) */
+        ULONG_PTR sp = (ULONG_PTR)__builtin_frame_address( 0 );
+        ULONG_PTR floor = (ULONG_PTR)NtCurrentTeb()->DeallocationStack;
+
+        if (floor && sp > floor && sp - floor < 0x10000)
+        {
+            ERR( "runaway exception dispatch (sp=%p floor=%p code=%08lx) -- terminating thread\n",
+                 (void *)sp, (void *)floor, rec->ExceptionCode );
+            NtTerminateThread( GetCurrentThread(), rec->ExceptionCode );
+        }
+    }
+
     switch (rec->ExceptionCode)
     {
     case EXCEPTION_WINE_STUB:

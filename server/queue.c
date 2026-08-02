@@ -1169,6 +1169,16 @@ static void nspa_free_bypass_shm( struct msg_queue *queue )
 {
     if (queue->nspa_shared && queue->nspa_bypass_size)
     {
+        /* Publish queue death to peers BEFORE unmapping.  Senders parked in
+         * nspa_try_send_ring's reply wait and the local-timer publisher
+         * hold their own mmaps of this memfd (the pages outlive our
+         * munmap), and ring->active going 0 is their only signal that this
+         * queue is gone — without it a sender whose message was claimed
+         * but never replied to would wait forever.  The flag can never go
+         * back to 1 in those mappings: a reincarnated queue (same tid
+         * reused) gets a fresh memfd. */
+        __atomic_store_n( &queue->nspa_shared->nspa_msg_ring.active, 0, __ATOMIC_RELEASE );
+        __atomic_store_n( &queue->nspa_shared->nspa_timer_ring.active, 0, __ATOMIC_RELEASE );
         munmap( (void *)queue->nspa_shared, queue->nspa_bypass_size );
         queue->nspa_shared = NULL;
     }
@@ -1511,6 +1521,24 @@ static int find_nspa_send_message( struct msg_queue *queue, user_handle_t win,
     return find_nspa_ring_message( queue, NSPA_TYPE_MASK_SEND, win, first, last, match );
 }
 
+/* Claim a matched ring slot READY -> CONSUMED.  Must be a CAS, not a plain
+ * store: since the M1-A fix the SENDER retracts a timed-out SEND slot with
+ * the same READY -> CONSUMED transition from another thread, so the server
+ * can lose the claim race (returns 0 — the message is the sender's again
+ * and must not be delivered).  The MR4 signal-failure rollback in
+ * nspa_try_post_ring races this the same way for POSTED slots. */
+static int claim_nspa_ring_message( struct nspa_posted_match *match )
+{
+    unsigned int expected = NSPA_MSG_STATE_READY;
+    return __atomic_compare_exchange_n( &match->slot->state, &expected,
+                                        NSPA_MSG_STATE_CONSUMED, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED );
+}
+
+/* Post-claim accounting: pending counts, tail advance, queue bits.  The
+ * tail walk may recycle the just-claimed slot to EMPTY (a producer can
+ * then re-reserve and overwrite it), so callers must copy any slot fields
+ * they need BEFORE calling this. */
 static void consume_nspa_ring_message( struct msg_queue *queue, struct nspa_posted_match *match )
 {
     volatile nspa_msg_ring_t *ring = &queue->nspa_shared->nspa_msg_ring;
@@ -1518,7 +1546,6 @@ static void consume_nspa_ring_message( struct msg_queue *queue, struct nspa_post
     unsigned int slot_type = match->slot->type;
     int is_send = (slot_type < 32) && (NSPA_TYPE_MASK_SEND & (1u << slot_type));
 
-    __atomic_store_n( &match->slot->state, NSPA_MSG_STATE_CONSUMED, __ATOMIC_RELEASE );
     __atomic_fetch_sub( &ring->pending_count, 1, __ATOMIC_ACQ_REL );
     if (is_send) __atomic_fetch_sub( &ring->pending_send_count, 1, __ATOMIC_ACQ_REL );
 
@@ -1549,6 +1576,20 @@ static int return_nspa_ring_message( struct msg_queue *queue, struct nspa_posted
     volatile nspa_msg_slot_t *slot = match->slot;
     unsigned int slot_type = slot->type;
     int is_send = (slot_type < 32) && (NSPA_TYPE_MASK_SEND & (1u << slot_type));
+    /* SEND-class slots are consumed regardless of PM_REMOVE, mirroring the
+     * legacy path where receive_message() unconditionally removes a sent
+     * message from msg_list[SEND_MESSAGE] (get_message ignores req->flags
+     * there).  Honouring PM_NOREMOVE here would leave the slot READY after
+     * the client dispatches the winproc — a later claim would run it a
+     * second time (M1-family duplicate delivery). */
+    int consume = is_send || (flags & PM_REMOVE);
+
+    /* Claim before reading the payload: once we own the CONSUMED state the
+     * slot contents are frozen until the tail walk in
+     * consume_nspa_ring_message (below) recycles it.  A lost claim means
+     * the sender retracted the message (timeout / MR4 rollback) — report
+     * "no message" and let the caller re-scan. */
+    if (consume && !claim_nspa_ring_message( match )) return 0;
 
     reply->total  = 0;
     reply->type   = slot->type;
@@ -1578,7 +1619,7 @@ static int return_nspa_ring_message( struct msg_queue *queue, struct nspa_posted
         reply->nspa_reply_gen  = 0;
     }
 
-    if (flags & PM_REMOVE) consume_nspa_ring_message( queue, match );
+    if (consume) consume_nspa_ring_message( queue, match );
     return 1;
 }
 
@@ -1591,8 +1632,14 @@ static int get_posted_message( struct msg_queue *queue, user_handle_t win,
     struct message *msg = find_posted_message( queue, win, first, last );
     int have_ring = find_nspa_posted_message( queue, win, first, last, &ring_match );
 
-    if (have_ring && (!msg || nspa_seq_before( ring_match.seq, msg->post_seq )))
-        return return_nspa_ring_message( queue, &ring_match, flags, reply );
+    /* Re-scan on a lost claim: the matched slot was retracted under us
+     * (MR4 signal-failure rollback), but a later READY slot may still
+     * qualify. */
+    while (have_ring && (!msg || nspa_seq_before( ring_match.seq, msg->post_seq )))
+    {
+        if (return_nspa_ring_message( queue, &ring_match, flags, reply )) return 1;
+        have_ring = find_nspa_posted_message( queue, win, first, last, &ring_match );
+    }
     if (!msg) return 0;
 
     reply->total = msg->data_size;
@@ -1639,8 +1686,11 @@ static int get_nspa_ring_send_message( struct msg_queue *queue, user_handle_t wi
 {
     struct nspa_posted_match ring_match;
 
-    if (!find_nspa_send_message( queue, win, first, last, &ring_match )) return 0;
-    return return_nspa_ring_message( queue, &ring_match, flags, reply );
+    /* Re-scan on a lost claim: the matched slot was retracted under us by
+     * the sender's M1-A timeout, but a later READY slot may still qualify. */
+    while (find_nspa_send_message( queue, win, first, last, &ring_match ))
+        if (return_nspa_ring_message( queue, &ring_match, flags, reply )) return 1;
+    return 0;
 }
 
 static int get_quit_message( struct msg_queue *queue, unsigned int flags,

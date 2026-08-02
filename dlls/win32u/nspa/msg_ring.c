@@ -78,6 +78,11 @@ struct nspa_cache_entry
     HANDLE               sync_handle;    /* event handle for queue->sync */
     nspa_queue_bypass_shm_t *mapped_ptr; /* mmap of peer's bypass memfd (or NULL for negative cache) */
     size_t               mapped_size;    /* for munmap on clear */
+    unsigned int         pin_count;      /* live send wait-loops holding pointers into mapped_ptr;
+                                          * cache is strictly per-thread so plain int suffices —
+                                          * "concurrent" users are reentrant frames of this thread
+                                          * (drain → winproc → nested send/reply) */
+    unsigned int         stale;          /* clear requested while pinned; teardown deferred to unpin */
 };
 
 /* Per-thread cache.  HOT path reads via TEB backpointer in
@@ -178,6 +183,7 @@ enum nspa_send_reason
     SEND_REJ_NO_OWN_SYNC,
     SEND_REJ_DEST_RING_FULL,
     SEND_REJ_REPLY_TIMEOUT,
+    SEND_ACCEPT_DEAD_PEER,
     SEND_REASON_NB
 };
 
@@ -217,6 +223,7 @@ static const char *const nspa_send_reason_name[SEND_REASON_NB] = {
     "rej_no_own_sync",
     "rej_dest_ring_full",
     "rej_reply_timeout",
+    "accept_dead_peer",
 };
 
 static const char *const nspa_post_reason_name[POST_REASON_NB] = {
@@ -552,9 +559,25 @@ static void nspa_clear_cache_entry( struct nspa_cache_entry *entry )
     void *mapped = (void *)entry->mapped_ptr;
     size_t mapped_size = entry->mapped_size;
 
+    /* A send wait-loop on this thread still holds ring/slot pointers into
+     * mapped_ptr (nspa_try_send_ring pins across its reply wait, and its
+     * per-tick drain can reenter here via winproc → post/send/reply signal
+     * failures).  Defer the munmap/close to the matching unpin. */
+    if (entry->pin_count)
+    {
+        entry->stale = 1;
+        return;
+    }
+
     memset( entry, 0, sizeof(*entry) );
     if (mapped && mapped_size) munmap( mapped, mapped_size );
     if (sync_handle) NtClose( sync_handle );
+}
+
+static void nspa_cache_entry_unpin( struct nspa_cache_entry *entry )
+{
+    if (entry->pin_count && --entry->pin_count == 0 && entry->stale)
+        nspa_clear_cache_entry( entry );
 }
 
 static const nspa_queue_bypass_shm_t *nspa_get_cached_bypass_shm( const struct nspa_cache_entry *entry )
@@ -837,26 +860,37 @@ BOOL nspa_try_post_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
         /* MR4 fix: both signal paths failed.  The slot is published READY
          * but no wake reached the receiver — if the receiver is idle on
          * its queue->sync, this message could be lost indefinitely.
-         * Try to roll back the slot (CAS READY -> EMPTY); if rollback
+         * Try to roll back the slot (CAS READY -> CONSUMED); if rollback
          * succeeds the receiver never saw it and the caller falls back
          * to the authoritative server post path.  If rollback fails the
          * consumer has already CAS-claimed the slot, so the message WILL
          * be delivered (consumer drives forward progress) — keep the
-         * post-acceptance shape in that case. */
+         * post-acceptance shape in that case.
+         *
+         * Rollback target is CONSUMED, not EMPTY: the consumer-side tail
+         * advance (nspa_client_advance_own_ring_tail and the server's
+         * consume walk) only steps over CONSUMED slots.  An EMPTY hole
+         * mid-ring would pin tail below it forever, and once head wraps
+         * to tail+SLOTS the ring reports permanently full. */
         unsigned int expected = NSPA_MSG_STATE_READY;
         BOOL rolled_back = __atomic_compare_exchange_n( &slot->state, &expected,
-                                                        NSPA_MSG_STATE_EMPTY, 0,
+                                                        NSPA_MSG_STATE_CONSUMED, 0,
                                                         __ATOMIC_ACQ_REL,
                                                         __ATOMIC_RELAXED );
-        nspa_clear_cache_entry( entry );
-        WARN( "failed to signal bypass queue %u (rolled_back=%d)\n", dest_tid, rolled_back );
         if (rolled_back)
         {
             /* Pair with the pending_count++ above so counters remain
              * consistent after rollback.  change_seq is left advanced —
              * a spurious advance just causes consumers to scan once and
-             * find nothing, which is benign. */
+             * find nothing, which is benign.  Must precede the cache-entry
+             * clear below: ring points into entry->mapped_ptr and the clear
+             * munmaps it. */
             __atomic_fetch_sub( &ring->pending_count, 1, __ATOMIC_ACQ_REL );
+        }
+        nspa_clear_cache_entry( entry );
+        WARN( "failed to signal bypass queue %u (rolled_back=%d)\n", dest_tid, rolled_back );
+        if (rolled_back)
+        {
             nspa_post_diag_bump( POST_REJ_RING_INACTIVE );
             return FALSE;   /* caller falls back to server post_message */
         }
@@ -1221,19 +1255,39 @@ BOOL nspa_try_pop_own_ring_post( HWND filter_hwnd, UINT first, UINT last,
     return FALSE;
 }
 
+/* Receiver-side claim marker for a reply slot mid-write.  Kept local to
+ * this file rather than in protocol.def next to its NSPA_REPLY_STATE_*
+ * siblings because only the client reply writer / sender free paths ever
+ * see it (the server never touches reply slots), and a protocol.def edit
+ * regenerates server_protocol.h → near-full unix-side rebuild.  Migrate
+ * it there on the next change that already touches the protocol. */
+#define NSPA_REPLY_STATE_WRITING  3
+
 /* Write a reply to a remote sender's reply slot and wake them.
  * Called by the receiver after its window proc returns, if the message
  * came from a ring slot (sender_tid != 0, reply_slot_idx in range).
  * Returns TRUE if the reply was delivered; FALSE means the caller
- * should fall back to the server reply_message path. */
+ * should fall back to the server reply_message path.
+ *
+ * Delivery matters more than speed here: since the M1-A fix, a sender
+ * whose ring message was claimed by this receiver waits indefinitely for
+ * this reply (server fallback would double-execute the winproc), so a
+ * dropped reply is a hung SendMessage.  If the cached peer lookup cannot
+ * resolve the sender (cache full, negative-cached after a transient
+ * failure, OOM), fall back to a one-shot uncached resolve before giving
+ * up. */
 BOOL nspa_write_ring_reply( DWORD sender_tid, UINT reply_slot_idx,
                             UINT expected_gen,
                             LRESULT result, const void *data, UINT data_size )
 {
     struct nspa_cache_entry *entry;
+    struct nspa_cache_entry local_entry = { 0 };
+    BOOL using_local = FALSE;
     const nspa_queue_bypass_shm_t *bypass;
     volatile nspa_reply_slot_t *slot;
+    HANDLE sender_sync;
     NTSTATUS status;
+    BOOL delivered = FALSE;
 
     if (!sender_tid || reply_slot_idx >= NSPA_REPLY_RING_SLOTS) return FALSE;
     if (data_size > NSPA_REPLY_INLINE_MAX)
@@ -1244,45 +1298,67 @@ BOOL nspa_write_ring_reply( DWORD sender_tid, UINT reply_slot_idx,
     }
 
     entry = nspa_lookup_peer( sender_tid );
-    if (!entry)
-    {
-        TRACE_(nspa_bypass)( "reply skip lookup-fail sender=%04x slot=%u\n",
-                             (UINT)sender_tid, reply_slot_idx );
-        return FALSE;
-    }
-    bypass = nspa_get_cached_bypass_shm( entry );
+    bypass = entry ? nspa_get_cached_bypass_shm( entry ) : NULL;
     if (!bypass)
     {
-        nspa_clear_cache_entry( entry );
-        TRACE_(nspa_bypass)( "reply skip no-bypass-shm sender=%04x slot=%u\n",
-                             (UINT)sender_tid, reply_slot_idx );
-        return FALSE;
+        if (entry) nspa_clear_cache_entry( entry );
+
+        /* One-shot uncached resolve.  Failure here means the server says
+         * the sender thread / queue is gone — nobody is waiting, dropping
+         * the reply is correct. */
+        if (!nspa_populate_cache_entry( sender_tid, &local_entry ) ||
+            !(bypass = nspa_get_cached_bypass_shm( &local_entry )))
+        {
+            nspa_clear_cache_entry( &local_entry );
+            TRACE_(nspa_bypass)( "reply skip lookup-fail sender=%04x slot=%u\n",
+                                 (UINT)sender_tid, reply_slot_idx );
+            return FALSE;
+        }
+        using_local = TRUE;
+
+        /* Un-poison a negative-cache sentinel for this sender so the next
+         * reply resolves through the cache again.  (Pinned entries are
+         * always positive, so a sentinel is safe to recycle in place.) */
+        {
+            struct nspa_cache_entry *cache = nspa_cache_get();
+            struct nspa_cache_entry *neg = cache ? nspa_cache_find( cache, sender_tid ) : NULL;
+            if (neg && neg->tid == sender_tid && !neg->mapped_ptr && !neg->pin_count)
+                memset( neg, 0, sizeof(*neg) );
+        }
     }
+    sender_sync = using_local ? local_entry.sync_handle : entry->sync_handle;
 
     slot = &((nspa_queue_bypass_shm_t *)bypass)->nspa_reply_ring.slots[reply_slot_idx];
 
-    /* MR1 ABA guard: the original sender may have timed out (PENDING -> FREE)
-     * and another sender on the same thread may have re-reserved this slot
-     * (FREE -> PENDING with generation++).  Capture the slot generation BEFORE
-     * the state check; if it doesn't match what the sender stamped at SEND
-     * time, drop the reply silently rather than misdelivering an LRESULT to
-     * the wrong sender.  expected_gen == 0 means the caller didn't track
-     * generation (legacy callers / pre-stamping path) — fall back to
-     * state-only check for compatibility. */
+    /* MR1 ABA guard + M1-B claim.  Claim the slot PENDING -> WRITING first:
+     * from here until the READY store the sender's free paths keep their
+     * hands off (they CAS from PENDING / wait out WRITING), so the payload
+     * write below cannot land in a slot the sender has recycled.  Then
+     * recheck the generation under the claim; it can only advance through a
+     * FREE -> PENDING re-reserve, which the WRITING claim excludes, so a
+     * mismatch here means we claimed a newer incarnation than the message
+     * referenced — undo and drop rather than misdeliver an LRESULT.
+     * expected_gen == 0 means the caller didn't track generation (legacy
+     * callers / pre-stamping path) — state-only check for compatibility. */
     {
-        unsigned int slot_gen = __atomic_load_n( &slot->generation, __ATOMIC_ACQUIRE );
-        unsigned int state = __atomic_load_n( &slot->state, __ATOMIC_ACQUIRE );
-        if (state != NSPA_REPLY_STATE_PENDING)
+        unsigned int expected = NSPA_REPLY_STATE_PENDING;
+        unsigned int slot_gen;
+
+        if (!__atomic_compare_exchange_n( &slot->state, &expected,
+                                          NSPA_REPLY_STATE_WRITING, 0,
+                                          __ATOMIC_ACQUIRE, __ATOMIC_RELAXED ))
         {
             TRACE_(nspa_bypass)( "reply drop stale-slot sender=%04x slot=%u state=%u\n",
-                                 (UINT)sender_tid, reply_slot_idx, state );
-            return FALSE;
+                                 (UINT)sender_tid, reply_slot_idx, expected );
+            goto done;
         }
+        slot_gen = __atomic_load_n( &slot->generation, __ATOMIC_ACQUIRE );
         if (expected_gen && slot_gen != expected_gen)
         {
+            __atomic_store_n( &slot->state, NSPA_REPLY_STATE_PENDING, __ATOMIC_RELEASE );
             TRACE_(nspa_bypass)( "reply drop ABA-gen-mismatch sender=%04x slot=%u expected=%u got=%u\n",
                                  (UINT)sender_tid, reply_slot_idx, expected_gen, slot_gen );
-            return FALSE;
+            goto done;
         }
     }
 
@@ -1292,6 +1368,7 @@ BOOL nspa_write_ring_reply( DWORD sender_tid, UINT reply_slot_idx,
     if (data_size) memcpy( (void *)slot->data, data, data_size );
 
     __atomic_store_n( &slot->state, NSPA_REPLY_STATE_READY, __ATOMIC_RELEASE );
+    delivered = TRUE;
 
     /* Wake the sender's targeted futex on slot->state.  Sender's wait loop
      * uses futex_wait directly on the reply slot value so it sees this
@@ -1306,17 +1383,19 @@ BOOL nspa_write_ring_reply( DWORD sender_tid, UINT reply_slot_idx,
     /* Also kick the queue->sync ntsync event for any waiter that came in
      * via the legacy queue-wide path (e.g. wait_message_reply on a server-
      * routed send).  Cheap; no-op if no waiter. */
-    status = wine_server_signal_internal_sync( entry->sync_handle );
-    if (status) status = NtSetEvent( entry->sync_handle, NULL );
+    status = wine_server_signal_internal_sync( sender_sync );
+    if (status) status = NtSetEvent( sender_sync, NULL );
     if (status)
     {
-        nspa_clear_cache_entry( entry );
+        if (!using_local) nspa_clear_cache_entry( entry );
         WARN( "reply: failed to signal sender %u\n", sender_tid );
     }
 
     TRACE_(nspa_bypass)( "reply written sender=%04x slot=%u result=%lx data=%u\n",
                          (UINT)sender_tid, reply_slot_idx, (unsigned long)result, data_size );
-    return TRUE;
+done:
+    if (using_local) nspa_clear_cache_entry( &local_entry );
+    return delivered;
 }
 
 /* Try the blocking send fast path.  On success, *result_out is filled and
@@ -1340,6 +1419,8 @@ BOOL nspa_try_send_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
     DWORD own_tid;
     BOOL is_notify;
     BOOL was_neg_cache = FALSE;
+    BOOL msg_claimed = FALSE;   /* M1-A: receiver won the msg-slot claim race */
+    BOOL dest_dead = FALSE;     /* dest ring->active observed clear */
     int waits = 0;
 
     TRACE_(nspa_bypass)( "PROBE try_send_ring enter dest=%04x type=%u hwnd=%p msg=%04x\n",
@@ -1487,6 +1568,13 @@ BOOL nspa_try_send_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
     __atomic_store_n( &slot->state, NSPA_MSG_STATE_READY, __ATOMIC_RELEASE );
     __atomic_add_fetch( &ring->change_seq, 1, __ATOMIC_RELEASE );
 
+    /* Pin the cache entry: from here to the last exit below, ring / slot
+     * point into entry->mapped_ptr, and both the signal-failure branch just
+     * beneath and any reentrant post/send/reply inside the wait loop's
+     * message drain can call nspa_clear_cache_entry on this entry — the
+     * pin turns that munmap into a deferred teardown at unpin. */
+    entry->pin_count++;
+
     status = wine_server_signal_internal_sync( entry->sync_handle );
     if (status) status = NtSetEvent( entry->sync_handle, NULL );
     if (status)
@@ -1500,6 +1588,7 @@ BOOL nspa_try_send_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
 
     if (is_notify)
     {
+        nspa_cache_entry_unpin( entry );
         nspa_send_diag_bump( SEND_ACCEPT_NOTIFY );
         return TRUE;
     }
@@ -1516,10 +1605,20 @@ BOOL nspa_try_send_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
      * SendMessages back to us while we are waiting, we drain incoming
      * SENDs before each futex_wait so the peer can make forward progress.
      *
-     * Total cap: 2 s (200 iterations × 10 ms futex timeout).  Lower than
-     * the legacy 5 s because the futex actually waits the full 10 ms when
-     * no real signal is pending; under genuine receiver outage the cap is
-     * the floor for falling back to the server send_message path. */
+     * M1-A: the 2 s cap (200 × 10 ms ticks) is no longer an unconditional
+     * fall-back-to-server point — that re-sent a message whose ring slot
+     * was still READY (or already claimed), so one SendMessage could run
+     * the winproc twice.  The cap (or an early receiver-death signal via
+     * ring->active) now triggers a retraction attempt on the msg slot:
+     *   - CAS READY -> CONSUMED wins  → the receiver provably never saw
+     *     the message; undo the publish accounting, release the reply
+     *     slot, fall back to the server path.  Exactly-once holds.
+     *     CONSUMED, not EMPTY, so the consumer tail walk can step over
+     *     the hole (see the MR4 rollback note in nspa_try_post_ring).
+     *   - CAS loses → the receiver owns the message.  SendMessage has no
+     *     timeout semantics, so keep waiting and never re-send; the only
+     *     remaining exits are the reply itself or receiver death
+     *     (msg_queue_destroy clears ring->active before unmapping). */
     for (;;)
     {
         unsigned int state = __atomic_load_n( &reply_slot->state, __ATOMIC_ACQUIRE );
@@ -1527,23 +1626,81 @@ BOOL nspa_try_send_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
         long ret;
 
         if (state == NSPA_REPLY_STATE_READY) break;
-        if (waits > 200)  /* 200 * 10 ms = 2 s */
+
+        if (!dest_dead && !__atomic_load_n( &ring->active, __ATOMIC_ACQUIRE ))
+            dest_dead = TRUE;
+
+        if (!msg_claimed && (dest_dead || waits > 200))  /* 200 * 10 ms = 2 s */
         {
-            TRACE_(nspa_bypass)( "send timeout dest=%04x msg=%04x slot=%u\n",
-                                 (UINT)dest_tid, msg, reply_idx );
-            __atomic_store_n( &reply_slot->state, NSPA_REPLY_STATE_FREE, __ATOMIC_RELEASE );
-            nspa_send_diag_bump( SEND_REJ_REPLY_TIMEOUT );
-            return FALSE;
+            unsigned int expected = NSPA_MSG_STATE_READY;
+            if (__atomic_compare_exchange_n( &slot->state, &expected,
+                                             NSPA_MSG_STATE_CONSUMED, 0,
+                                             __ATOMIC_ACQ_REL, __ATOMIC_RELAXED ))
+            {
+                __atomic_fetch_sub( &ring->pending_count, 1, __ATOMIC_ACQ_REL );
+                __atomic_fetch_sub( &ring->pending_send_count, 1, __ATOMIC_ACQ_REL );
+
+                /* Release the reply slot.  No receiver ever learned of it —
+                 * the only reference was in the just-retracted msg slot —
+                 * so the CAS from PENDING cannot lose; if it somehow does,
+                 * leak the slot rather than risk tearing a live writer. */
+                expected = NSPA_REPLY_STATE_PENDING;
+                if (!__atomic_compare_exchange_n( &reply_slot->state, &expected,
+                                                  NSPA_REPLY_STATE_FREE, 0,
+                                                  __ATOMIC_ACQ_REL, __ATOMIC_RELAXED ))
+                    ERR( "retracted send has reply slot %u in state %u — leaking it\n",
+                         reply_idx, expected );
+
+                TRACE_(nspa_bypass)( "send timeout-retract dest=%04x msg=%04x slot=%u dead=%d\n",
+                                     (UINT)dest_tid, msg, reply_idx, dest_dead );
+                nspa_cache_entry_unpin( entry );
+                nspa_send_diag_bump( SEND_REJ_REPLY_TIMEOUT );
+                return FALSE;   /* server path delivers exactly once */
+            }
+            msg_claimed = TRUE;
         }
+
+        if (msg_claimed && dest_dead)
+        {
+            /* The receiver claimed the message but its queue is gone; the
+             * reply can no longer arrive (reply writes only ever come from
+             * the receiver thread, which is past the point of running user
+             * code once its queue is destroyed).  Reclaim the reply slot
+             * from whatever state death left it in — PENDING, or WRITING
+             * mid-payload — and report the send the way the server reports
+             * a receiver that died holding the message (free_message:
+             * result 0, STATUS_ACCESS_DENIED).  CAS from the observed
+             * state so a reply that raced death to READY is never freed —
+             * on CAS failure loop back and take it. */
+            if (state != NSPA_REPLY_STATE_READY &&
+                __atomic_compare_exchange_n( &reply_slot->state, &state,
+                                             NSPA_REPLY_STATE_FREE, 0,
+                                             __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE ))
+            {
+                TRACE_(nspa_bypass)( "send dest-died dest=%04x msg=%04x slot=%u\n",
+                                     (UINT)dest_tid, msg, reply_idx );
+                nspa_cache_entry_unpin( entry );
+                nspa_send_diag_bump( SEND_ACCEPT_DEAD_PEER );
+                RtlSetLastWin32Error( RtlNtStatusToDosError( STATUS_ACCESS_DENIED ));
+                *result_out = 0;
+                return TRUE;    /* delivered-then-died: mirror server semantics */
+            }
+            continue;
+        }
+
         /* Drain inbound SEND messages before waiting so a peer that has
          * called back into us can make forward progress. */
         nspa_process_sent_messages();
         /* Re-check state after the drain — peer may have replied during it. */
         state = __atomic_load_n( &reply_slot->state, __ATOMIC_ACQUIRE );
         if (state == NSPA_REPLY_STATE_READY) break;
-        /* futex_wait returns immediately with EAGAIN if state has already
-         * changed from PENDING (the receiver beat us to the wait), so no
-         * lost-wake race vs. the WAKE on the receiver side.
+        /* futex_wait returns immediately with EAGAIN if the state has
+         * already moved past the value passed as the expected argument
+         * (the receiver beat us to the wait), so no lost-wake race vs. the
+         * WAKE on the receiver side.  Wait on the freshly loaded value,
+         * not a hardcoded PENDING — the M1-B WRITING claim state must also
+         * sleep here instead of EAGAIN-spinning while the receiver fills
+         * the payload.
          *
          * MR2: must NOT use FUTEX_WAIT_PRIVATE — see receiver-side note in
          * nspa_write_ring_reply.  Plain FUTEX_WAIT uses the global hash so
@@ -1552,7 +1709,7 @@ BOOL nspa_try_send_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
         rel.tv_sec  = 0;
         rel.tv_nsec = 10 * 1000 * 1000;  /* 10 ms */
         ret = syscall( SYS_futex, (void *)&reply_slot->state,
-                       FUTEX_WAIT, NSPA_REPLY_STATE_PENDING,
+                       FUTEX_WAIT, state,
                        &rel, NULL, 0 );
         (void)ret;  /* EAGAIN / ETIMEDOUT / 0 / EINTR all loop back to recheck */
         waits++;
@@ -1562,6 +1719,7 @@ BOOL nspa_try_send_ring( DWORD dest_tid, UINT type_enum, HWND hwnd,
     *result_out = reply_slot->result;
     __atomic_store_n( &reply_slot->state, NSPA_REPLY_STATE_FREE, __ATOMIC_RELEASE );
 
+    nspa_cache_entry_unpin( entry );
     TRACE_(nspa_bypass)( "send got-reply dest=%04x msg=%04x result=%lx waits=%d\n",
                          (UINT)dest_tid, msg, (unsigned long)*result_out, waits );
     nspa_send_diag_bump( SEND_ACCEPT_SYNC );

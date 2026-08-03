@@ -3397,12 +3397,11 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
          * the eventfd drain loop against the absolute deadline.  TRUE =
          * deadline reached; FALSE = everything was delivered mid-sleep —
          * fall through and finish the remainder on the normal paths.
-         * Deliberately OUTSIDE the clock_nanosleep block below: this
-         * build's config.h has no HAVE_CLOCK_NANOSLEEP, so that whole
-         * block (and anything inside it) is compiled out and finite
-         * non-alertable sleeps take the select() loop at the bottom —
-         * verified by strace on the first U3 build (pselect6 4.0s, no
-         * nanosleep). */
+         * Kept OUTSIDE the clock_nanosleep precision block below so the
+         * drain routing holds no matter which sleep primitive follows
+         * (that block was dead code until 2026-08-02 — see its comment —
+         * and the U3 stall was originally reproduced against the select()
+         * fallback at the bottom of this function). */
         if (ticks != 0 && ntdll_io_uring_has_pending())
         {
             struct timespec dts;
@@ -3426,8 +3425,15 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
         }
 #endif
 
-#if defined(HAVE_CLOCK_GETTIME) && defined(HAVE_CLOCK_NANOSLEEP)
+#ifdef HAVE_CLOCK_GETTIME
         /* NSPA: use clock_nanosleep FIRST for sub-ms precision.
+         *
+         * Formerly also gated on HAVE_CLOCK_NANOSLEEP, but no configure
+         * check ever defined it — the whole block was dead code since it
+         * landed, and finite non-alertable sleeps silently used the coarse
+         * select() fallback below (discovered 2026-08-02 via U3 strace).
+         * Wine-NSPA is Linux-only and clock_nanosleep is unconditional
+         * glibc/POSIX, so gate on clock_gettime alone.
          * Relative NT timeouts (ticks < 0) are interval intent — compute the
          * deadline on CLOCK_MONOTONIC so NTP steps cannot shift or skip the
          * wake. Absolute NT filetimes (ticks > 0) are wall-clock intent —

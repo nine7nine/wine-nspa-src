@@ -143,8 +143,9 @@ static BOOL is_pool_op( void *p )
 }
 
 /* Defined in the async-op section below; needed by the sync-poll foreign-CQE
- * routing above it. */
+ * routing and the U2 thread-exit drain above it. */
 static void complete_uring_op( struct uring_async_op *op, int result );
+static void uring_poll_route_foreign( struct io_uring_cqe *cqe );
 
 static void op_pool_init(void)
 {
@@ -274,6 +275,54 @@ void ntdll_io_uring_cleanup(void)
     if (!ring_initialized) return;
 
     ntdll_io_uring_process_completions();
+
+    /* U2: don't tear the ring down over in-flight ops.  queue_exit's
+     * kernel-side cancellation is asynchronous, which left three hazards:
+     * (a) each in-flight op's dup_fd ("we own this, always close") leaked;
+     * (b) waiters on the ops' events never saw a completion; and (c) for
+     * RECVMSG the kernel reads/writes msghdr + buffers living in this
+     * thread's __thread op_pool — glibc can hand that TLS block to a new
+     * thread while a mid-copy recvmsg still writes into it.  Windows
+     * cancels a thread's pending I/O at thread exit and completes it with
+     * STATUS_CANCELLED; do the same: cancel-all, then drain until the
+     * in-flight count (U3) reaches zero — every reaped CQE routes through
+     * complete_uring_op, so events/IOSBs error-complete and fds close.
+     * Bounded: a stuck op can only stall each wait 500ms and the loop
+     * gives up after RING_SIZE + a margin of CQEs rather than hanging
+     * thread exit forever (then we are merely no worse than before). */
+    if (ntdll_io_uring_inflight_count)
+    {
+        struct io_uring_sqe *sqe;
+        struct io_uring_cqe *cqe;
+        struct __kernel_timespec ts = { .tv_sec = 0, .tv_nsec = 500 * 1000 * 1000 };
+        unsigned int reaped = 0;
+
+        TRACE( "thread exit with %u in-flight ops — cancelling\n", ntdll_io_uring_inflight_count );
+
+        if ((sqe = io_uring_get_sqe( &thread_ring )))
+        {
+            io_uring_prep_cancel64( sqe, 0, IORING_ASYNC_CANCEL_ANY );
+            io_uring_sqe_set_data( sqe, URING_INTERNAL_TAG );
+            io_uring_submit( &thread_ring );
+        }
+
+        while (ntdll_io_uring_inflight_count && reaped < RING_SIZE + 8)
+        {
+            int ret = io_uring_wait_cqe_timeout( &thread_ring, &cqe, &ts );
+            if (ret == -EINTR) continue;
+            if (ret < 0)
+            {
+                ERR( "abandoning %u in-flight ops at thread exit (%s)\n",
+                     ntdll_io_uring_inflight_count, strerror( -ret ) );
+                break;
+            }
+            uring_poll_route_foreign( cqe );   /* op CQEs -> complete_uring_op; tags discarded */
+            io_uring_cqe_seen( &thread_ring, cqe );
+            reaped++;
+        }
+    }
+
+    ntdll_io_uring_flush_deferred();
     io_uring_queue_exit( &thread_ring );
     if (ntdll_io_uring_ring_efd >= 0) { close( ntdll_io_uring_ring_efd ); ntdll_io_uring_ring_efd = -1; }
     ring_initialized = FALSE;
@@ -570,7 +619,11 @@ static void complete_uring_op( struct uring_async_op *op, int result )
     else
     {
         information = op->already;
-        status = errno_to_status( -result );
+        /* -ECANCELED comes from the U2 thread-exit cancel-all (and any
+         * future cancel path): report it as NT does for I/O cancelled at
+         * thread exit.  errno_to_status has no ECANCELED case and would
+         * turn it into STATUS_UNSUCCESSFUL / ERROR_GEN_FAILURE. */
+        status = (result == -ECANCELED) ? STATUS_CANCELLED : errno_to_status( -result );
     }
 
     file_complete_async( op->handle, op->options, op->event, op->apc,

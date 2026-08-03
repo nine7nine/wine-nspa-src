@@ -423,6 +423,10 @@ struct nspa_local_section
     HANDLE           handle;
     HANDLE           file_handle;
     HANDLE           server_handle;   /* cached server-side mapping (Phase F promote) */
+    unsigned long long open_seq;      /* L4: unique per table-add (under sections mutex);
+                                       * lazy-promote store-back requires it unchanged so a
+                                       * close+re-mint of the same handle slot can never
+                                       * receive a server handle bound to the old object */
     int              unix_fd;
     size_t           size;
     unsigned int     sec_flags;

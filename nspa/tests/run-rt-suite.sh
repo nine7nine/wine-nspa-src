@@ -349,6 +349,7 @@ REGRESSION_TESTS=(
     "test-send-timeout-dup"     # M1-A/M1-B msg-ring SEND timeout dup delivery (wine 674358cb093)
     "test-uring-sleep-stall"    # U3 io_uring completion stall in non-alertable sleeps
     "test-uring-exit-cancel"    # U2 io_uring thread-exit cancel/complete + fd-leak sentinel
+    "test-lf-promote-close-race" # L4 local-file lazy-promote vs concurrent close (leak/wrong-file)
 )
 
 regression_setup() {

@@ -352,6 +352,11 @@ struct nspa_local_open
     struct list       entry;
     HANDLE            handle;            /* local-range handle returned to app */
     HANDLE            server_handle;     /* lazy-promoted server handle, 0 if not yet promoted (1A.4) */
+    unsigned long long open_seq;         /* L4: unique per table-add (stamped under opens mutex).
+                                          * The lazy-promote store-back requires it unchanged, so a
+                                          * concurrent close + same-slot re-mint (handle values are
+                                          * reused, see "ABA properties") can never be handed a
+                                          * server handle that was minted for the old entry's file. */
     int               unix_fd;
     unsigned long long device;
     unsigned long long inode;
@@ -386,6 +391,10 @@ static struct list      nspa_lf_opens          = LIST_INIT(nspa_lf_opens);
  * RT-promoted ones (audio threads occasionally open/close files at
  * init / library scan).  PSHARED flag NOT set — process-local. */
 static DEFINE_PI_MUTEX(nspa_lf_opens_mutex, 0);
+
+/* L4: monotone open-sequence source for struct nspa_local_open.open_seq.
+ * Incremented under nspa_lf_opens_mutex at table-add. */
+static unsigned long long nspa_lf_open_seq_counter;
 
 /* Linux-only TID-cached pid via getpid().  pid is process-wide so we
  * cache it in a static after first call. */
@@ -700,6 +709,7 @@ NTSTATUS nspa_local_file_table_add( HANDLE handle, int unix_fd,
          * NOT_SUPPORTED, caller falls back to promote + server RPC. */
     }
     pi_mutex_lock( &nspa_lf_opens_mutex );
+    o->open_seq = ++nspa_lf_open_seq_counter;
     list_add_head( &nspa_lf_opens, &o->entry );
     pi_mutex_unlock( &nspa_lf_opens_mutex );
     return STATUS_SUCCESS;
@@ -1701,7 +1711,8 @@ HANDLE nspa_local_file_get_or_promote_server_handle( HANDLE local_handle )
 {
     struct nspa_local_open *o;
     int need_promote = 0;
-    int unix_fd = -1;
+    int dup_fd = -1;
+    unsigned long long promote_seq = 0;
     unsigned int access = 0, sharing = 0, options = 0, attributes = 0;
     WCHAR *nt_name_copy = NULL;
     USHORT nt_name_len = 0;
@@ -1718,21 +1729,33 @@ HANDLE nspa_local_file_get_or_promote_server_handle( HANDLE local_handle )
             if (o->server_handle) result = o->server_handle;
             else
             {
-                need_promote = 1;
-                unix_fd    = o->unix_fd;
-                access     = o->access;
-                sharing    = o->sharing;
-                options    = o->options;
-                attributes = o->attributes;
-                /* Snapshot NT path so we can send it after dropping the
-                 * lock — wine_server_call can block. */
-                if (o->nt_name && o->nt_name_len)
+                /* L4: take our own reference to the unix fd UNDER the
+                 * table lock.  nspa_local_file_close (or the deferred
+                 * close queue) may close o->unix_fd the moment we drop
+                 * it, and a recycled fd number would send the WRONG file
+                 * to the server (registered in its sharing tables with
+                 * no closable owner).  A dead fd would also feed
+                 * wine_server_send_fd an EBADF.  dup is a non-blocking
+                 * O(1) fd-table op — safe under the PI mutex. */
+                dup_fd = fcntl( o->unix_fd, F_DUPFD_CLOEXEC, 0 );
+                if (dup_fd >= 0)
                 {
-                    nt_name_copy = malloc( o->nt_name_len );
-                    if (nt_name_copy)
+                    need_promote = 1;
+                    promote_seq = o->open_seq;
+                    access     = o->access;
+                    sharing    = o->sharing;
+                    options    = o->options;
+                    attributes = o->attributes;
+                    /* Snapshot NT path so we can send it after dropping
+                     * the lock — wine_server_call can block. */
+                    if (o->nt_name && o->nt_name_len)
                     {
-                        memcpy( nt_name_copy, o->nt_name, o->nt_name_len );
-                        nt_name_len = o->nt_name_len;
+                        nt_name_copy = malloc( o->nt_name_len );
+                        if (nt_name_copy)
+                        {
+                            memcpy( nt_name_copy, o->nt_name, o->nt_name_len );
+                            nt_name_len = o->nt_name_len;
+                        }
                     }
                 }
             }
@@ -1752,10 +1775,10 @@ HANDLE nspa_local_file_get_or_promote_server_handle( HANDLE local_handle )
     {
         HANDLE promoted = 0;
         unsigned int ret;
-        wine_server_send_fd( unix_fd );
+        wine_server_send_fd( dup_fd );
         SERVER_START_REQ( nspa_create_file_from_unix_fd )
         {
-            req->fd         = unix_fd;
+            req->fd         = dup_fd;
             req->access     = access;
             req->sharing    = sharing;
             /* Phase 1A.4 fix: pass through the actual options the file
@@ -1776,6 +1799,7 @@ HANDLE nspa_local_file_get_or_promote_server_handle( HANDLE local_handle )
             if (!ret) promoted = wine_server_ptr_handle( reply->handle );
         }
         SERVER_END_REQ;
+        close( dup_fd );
         free( nt_name_copy );
         nt_name_copy = NULL;
         if (!promoted)
@@ -1783,33 +1807,45 @@ HANDLE nspa_local_file_get_or_promote_server_handle( HANDLE local_handle )
             return 0;
         }
 
-        /* Store back, racing safely with another concurrent promotion
-         * (we keep whichever lands first; close our own if loser). */
+        /* Store back.  Install only on the SAME entry we promoted:
+         * matching handle value alone is not enough — the entry may have
+         * been closed and its handle slot re-minted for a different file
+         * while the RPC was in flight (handle values are reused, see
+         * "ABA properties"), and installing there would silently bind
+         * the new file to the old file's server handle.  open_seq is
+         * unique per table-add, so requiring it unchanged pins the
+         * store-back to our snapshot.  Two promoters of the SAME entry
+         * still race benignly: first installs, second matches the seq,
+         * sees server_handle set, and adopts it.  Every path that does
+         * not install (lost race, entry gone, slot re-minted) closes the
+         * orphaned server handle — leaving it open would leak it forever
+         * and its sharing registration would inflict phantom
+         * SHARING_VIOLATIONs on the file with no closable owner. */
         pi_mutex_lock( &nspa_lf_opens_mutex );
         LIST_FOR_EACH_ENTRY( o, &nspa_lf_opens, struct nspa_local_open, entry )
         {
-            if (o->handle == local_handle)
+            if (o->handle == local_handle && o->open_seq == promote_seq)
             {
-                if (o->server_handle)
+                if (o->server_handle) result = o->server_handle;  /* lost same-entry race */
+                else
                 {
-                    /* Lost race — keep existing, drop ours. */
-                    pi_mutex_unlock( &nspa_lf_opens_mutex );
-                    {
-                        SERVER_START_REQ( close_handle )
-                        {
-                            req->handle = wine_server_obj_handle( promoted );
-                            wine_server_call( req );
-                        }
-                        SERVER_END_REQ;
-                    }
-                    return o->server_handle;
+                    o->server_handle = promoted;
+                    result = promoted;
                 }
-                o->server_handle = promoted;
-                result = promoted;
                 break;
             }
         }
         pi_mutex_unlock( &nspa_lf_opens_mutex );
+
+        if (result != promoted)
+        {
+            SERVER_START_REQ( close_handle )
+            {
+                req->handle = wine_server_obj_handle( promoted );
+                wine_server_call( req );
+            }
+            SERVER_END_REQ;
+        }
     }
     return result;
 }
@@ -1981,6 +2017,10 @@ static struct list      nspa_ls_sections     = LIST_INIT(nspa_ls_sections);
  * nspa_local_file_aggregate_publish_mapping (Phase H). */
 static DEFINE_PI_MUTEX(nspa_ls_sections_mutex, 0);
 
+/* L4: monotone open-sequence source for struct nspa_local_section.open_seq.
+ * Incremented under nspa_ls_sections_mutex at table-add. */
+static unsigned long long nspa_ls_open_seq_counter;
+
 /* NSPA local-section bypass — DEFAULT-ON since Phase J (2026-05-03 PM),
  * env gate retired 2026-05-04.  Validated end-to-end on Ableton
  * workload: -70% nspa_create_mapping_from_unix_fd RPCs, no EBADF /
@@ -2145,6 +2185,7 @@ NTSTATUS nspa_local_section_table_add( HANDLE handle, HANDLE file_handle, int un
     list_init( &s->views );
 
     pi_mutex_lock( &nspa_ls_sections_mutex );
+    s->open_seq = ++nspa_ls_open_seq_counter;   /* L4 store-back identity */
     list_add_head( &nspa_ls_sections, &s->entry );
     pi_mutex_unlock( &nspa_ls_sections_mutex );
     return STATUS_SUCCESS;
@@ -2445,8 +2486,8 @@ HANDLE nspa_local_section_get_or_promote_server_handle( HANDLE handle )
 {
     struct nspa_local_section *s;
     HANDLE cached = 0;
-    int unix_fd = -1;
     int section_dup_fd = -1;
+    unsigned long long promote_seq = 0;
     unsigned int sec_access = 0, sec_flags = 0, sec_file_access = 0;
     size_t size = 0;
     HANDLE file_handle = 0;
@@ -2457,13 +2498,17 @@ HANDLE nspa_local_section_get_or_promote_server_handle( HANDLE handle )
 
     if (!nspa_local_section_is_local_handle( handle )) return 0;
 
-    /* Snapshot under the table lock; check cache. */
+    /* Snapshot under the table lock; check cache.  L4: the dup must also
+     * happen under the lock — the section close path closes s->unix_fd
+     * right after dropping it, and a recycled fd number would mint a
+     * server mapping over the wrong file. */
     pi_mutex_lock( &nspa_ls_sections_mutex );
     LIST_FOR_EACH_ENTRY( s, &nspa_ls_sections, struct nspa_local_section, entry )
     {
         if (s->handle != handle) continue;
         if (s->server_handle) { cached = s->server_handle; break; }
-        unix_fd         = s->unix_fd;
+        section_dup_fd  = fcntl( s->unix_fd, F_DUPFD_CLOEXEC, 0 );
+        promote_seq     = s->open_seq;
         sec_access      = s->access;
         sec_flags       = s->sec_flags;
         sec_file_access = s->file_access;
@@ -2474,13 +2519,7 @@ HANDLE nspa_local_section_get_or_promote_server_handle( HANDLE handle )
     pi_mutex_unlock( &nspa_ls_sections_mutex );
 
     if (cached) return cached;
-    if (unix_fd < 0) return 0;   /* entry not found or invalid */
-
-    /* Dup so the section's PE-side fd survives the RPC.  Server's
-     * nspa_create_mapping_from_unix_fd handler consumes the inflight
-     * fd via thread_get_inflight_fd. */
-    section_dup_fd = dup( unix_fd );
-    if (section_dup_fd < 0) return 0;
+    if (section_dup_fd < 0) return 0;   /* entry not found or fd already closed */
 
     /* Minimal objattr — local sections are always unnamed + no SD. */
     if (alloc_object_attributes( NULL, &objattr, &objattr_len ) != STATUS_SUCCESS)
@@ -2502,19 +2541,25 @@ HANDLE nspa_local_section_get_or_promote_server_handle( HANDLE handle )
         if (!rpc_status) server_handle = wine_server_ptr_handle( reply->handle );
     }
     SERVER_END_REQ;
+    /* wine_server_send_fd only sendmsg's the fd — the sender's copy stays
+     * open.  This dup previously leaked on every section promotion. */
+    close( section_dup_fd );
     free( objattr );
 
     if (!server_handle) return 0;
 
     /* Install on the entry.  Race window: another thread may have
      * concurrently promoted; whichever installs first wins and the
-     * loser closes its server handle. */
+     * loser closes its server handle.  L4: require open_seq unchanged so
+     * a close + same-slot re-mint during the RPC can never receive a
+     * mapping bound to the old section's file (see the file-side
+     * store-back comment in nspa_local_file_get_or_promote_server_handle). */
     {
         HANDLE winner = 0;
         pi_mutex_lock( &nspa_ls_sections_mutex );
         LIST_FOR_EACH_ENTRY( s, &nspa_ls_sections, struct nspa_local_section, entry )
         {
-            if (s->handle != handle) continue;
+            if (s->handle != handle || s->open_seq != promote_seq) continue;
             if (s->server_handle) winner = s->server_handle;
             else { s->server_handle = server_handle; winner = server_handle; }
             break;

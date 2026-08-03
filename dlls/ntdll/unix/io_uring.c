@@ -100,6 +100,8 @@ struct uring_async_op
     void              *apc_user;    /* APC user context / IOCP cvalue */
     IO_STATUS_BLOCK   *io;          /* IO status block */
     unsigned int       options;     /* file options for set_sync_iosb */
+    BOOL               in_flight;   /* U1: SQE submitted, CQE not yet drained — makes the
+                                     * pool scannable as the per-thread cancel registry */
     int                dup_fd;      /* dup'd fd — we own this, always close (-1 = none) */
     ULONG              already;     /* bytes transferred before io_uring */
     ULONG              count;       /* total bytes requested */
@@ -573,6 +575,7 @@ static void complete_uring_op( struct uring_async_op *op, int result )
      * instead of wrapping the counter. */
     if (ntdll_io_uring_inflight_count) ntdll_io_uring_inflight_count--;
     else ERR( "in-flight counter underflow (type=%d handle=%p)\n", op->type, op->handle );
+    op->in_flight = FALSE;   /* U1: drop out of the cancel registry */
 
     /* Socket poll completions — both sync and overlapped complete inline.
      * Overlapped uses ntdll_signal_event_direct (raw ntsync ioctl) instead
@@ -678,6 +681,7 @@ int ntdll_io_uring_submit_file_read( int unix_fd, int needs_close, void *buffer,
     io_uring_sqe_set_data( sqe, op );
     io_uring_submit( &thread_ring );
     ntdll_io_uring_inflight_count++;
+    op->in_flight = TRUE;
 
     /* the caller's fd lifecycle is unchanged — close if needed */
     if (needs_close) close( unix_fd );
@@ -729,6 +733,7 @@ int ntdll_io_uring_submit_file_write( int unix_fd, int needs_close, const void *
     io_uring_sqe_set_data( sqe, op );
     io_uring_submit( &thread_ring );
     ntdll_io_uring_inflight_count++;
+    op->in_flight = TRUE;
 
     if (needs_close) close( unix_fd );
 
@@ -829,6 +834,7 @@ int ntdll_io_uring_submit_socket_recvmsg( int unix_fd, HANDLE handle,
     io_uring_sqe_set_data( sqe, op );
     io_uring_submit( &thread_ring );
     ntdll_io_uring_inflight_count++;
+    op->in_flight = TRUE;
 
     TRACE( "submitted socket RECVMSG: handle=%p fd=%d(%d) sock_async=%p flags=%#x\n",
            handle, unix_fd, ring_fd, sock_async, unix_flags );
@@ -896,6 +902,7 @@ int ntdll_io_uring_submit_socket_sendmsg( int unix_fd, HANDLE handle,
     io_uring_sqe_set_data( sqe, op );
     io_uring_submit( &thread_ring );
     ntdll_io_uring_inflight_count++;
+    op->in_flight = TRUE;
 
     TRACE( "submitted socket SENDMSG: handle=%p fd=%d(%d) sock_async=%p flags=%#x\n",
            handle, unix_fd, ring_fd, sock_async, unix_flags );
@@ -968,6 +975,7 @@ int ntdll_io_uring_submit_socket_poll( int unix_fd, short events,
     io_uring_sqe_set_data( sqe, op );
     io_uring_submit( &thread_ring );
     ntdll_io_uring_inflight_count++;
+    op->in_flight = TRUE;
 
     TRACE( "submitted async socket poll: handle=%p fd=%d events=%#x %s\n",
            handle, unix_fd, events, is_send ? "send" : "recv" );
@@ -1028,6 +1036,100 @@ void ntdll_io_uring_process_completions(void)
 
     if (count)
         io_uring_cq_advance( &thread_ring, count );
+}
+
+
+/* -----------------------------------------------------------------------
+ * U1: NtCancelIoFile / NtCancelIoFileEx support
+ *
+ * Async ops submitted through this file's bypass paths have no
+ * server-side async registered — the server's cancel_async RPC cannot
+ * see them, so before this fix CancelIo(Ex) "succeeded" having cancelled
+ * nothing: an op whose data never arrived left the IOSB PENDING forever
+ * (CancelIoEx + GetOverlappedResult(bWait=TRUE) hung), and an app that
+ * freed its buffer after the successful-looking cancel could be
+ * scribbled on when the kernel eventually completed the read.
+ *
+ * The op_pool doubles as the registry: in_flight ops carry the NT handle
+ * and the app IOSB pointer.  Scope is the CALLING THREAD's ring, which
+ * matches NtCancelIoFile's NT contract exactly (it is defined as
+ * calling-thread-only); for NtCancelIoFileEx it covers ops issued on the
+ * calling thread.  RESIDUAL GAP: NtCancelIoFileEx of ops issued on a
+ * DIFFERENT thread cannot reach that thread's SINGLE_ISSUER ring from
+ * here — those ops complete normally instead of cancelling (strictly
+ * better than the pre-fix behavior, which cancelled nothing for anyone).
+ * ----------------------------------------------------------------------- */
+
+/* Cancel this thread's in-flight ops on @handle; @io non-NULL restricts
+ * to ops whose application IOSB matches (NtCancelIoFileEx).  Submits a
+ * targeted cancel per op and drains until every matched op has completed
+ * — the CQEs deliver STATUS_CANCELLED through the normal completion
+ * paths, so events/IOSBs fire and the kernel is done with the app's
+ * buffers before we return.  Returns the number of ops matched. */
+int ntdll_io_uring_cancel_ops( HANDLE handle, IO_STATUS_BLOCK *io )
+{
+    struct io_uring_cqe *cqe;
+    struct __kernel_timespec ts = { .tv_sec = 0, .tv_nsec = 500 * 1000 * 1000 };
+    unsigned int matched_mask = 0;
+    unsigned int i, spins = 0;
+
+    if (!ring_initialized) return 0;
+
+    for (i = 0; i < RING_SIZE; i++)
+    {
+        struct uring_async_op *op = &op_pool[i];
+        struct io_uring_sqe *sqe;
+
+        if (!op->in_flight || op->handle != handle) continue;
+        if (io && op->io != io) continue;
+
+        sqe = io_uring_get_sqe( &thread_ring );
+        if (!sqe)
+        {
+            ntdll_io_uring_process_completions();
+            if (!op->in_flight) continue;   /* completed in the drain */
+            sqe = io_uring_get_sqe( &thread_ring );
+            if (!sqe) break;   /* no room for cancels — remaining ops complete naturally */
+        }
+        io_uring_prep_cancel64( sqe, (uintptr_t)op, 0 );
+        io_uring_sqe_set_data( sqe, URING_INTERNAL_TAG );
+        matched_mask |= 1u << i;
+    }
+    if (!matched_mask) return 0;
+    io_uring_submit( &thread_ring );
+
+    /* Reap until every matched op's CQE has been delivered.  Op slots
+     * cannot recycle under us: only this thread submits to this ring and
+     * we are inside the app's cancel call.  A matched op that completed
+     * with real data just before the cancel landed reaps the same way —
+     * cancel raced completion, which is normal NT behavior. */
+    for (;;)
+    {
+        unsigned int pending = 0;
+        int ret;
+
+        for (i = 0; i < RING_SIZE; i++)
+            if ((matched_mask & (1u << i)) && op_pool[i].in_flight) pending++;
+        if (!pending) break;
+
+        ret = io_uring_wait_cqe_timeout( &thread_ring, &cqe, &ts );
+        if (ret == -EINTR) continue;
+        if (ret < 0 || ++spins > RING_SIZE * 4)
+        {
+            ERR( "abandoning cancel wait with %u ops pending (%s)\n",
+                 pending, ret < 0 ? strerror( -ret ) : "spin cap" );
+            break;
+        }
+        uring_poll_route_foreign( cqe );   /* op CQEs -> complete_uring_op; cancel tags discarded */
+        io_uring_cqe_seen( &thread_ring, cqe );
+    }
+
+    {
+        int n = 0;
+        for (i = 0; i < RING_SIZE; i++) if (matched_mask & (1u << i)) n++;
+        TRACE( "cancelled %d in-flight ops for handle %p io %p\n", n, handle, io );
+        return n;
+    }
 }
 
 
@@ -1113,6 +1215,7 @@ __thread unsigned int ntdll_io_uring_deferred_count;
 __thread unsigned int ntdll_io_uring_inflight_count;
 void ntdll_io_uring_flush_deferred_slow(void) { }
 BOOL ntdll_io_uring_sleep_drain( int clock_id, const struct timespec *deadline ) { return FALSE; }
+int  ntdll_io_uring_cancel_ops( HANDLE handle, IO_STATUS_BLOCK *io ) { return 0; }
 
 int ntdll_io_uring_submit_socket_poll( int unix_fd, short events,
                                        HANDLE handle, HANDLE wait_handle,

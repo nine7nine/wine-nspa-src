@@ -350,6 +350,7 @@ REGRESSION_TESTS=(
     "test-uring-sleep-stall"    # U3 io_uring completion stall in non-alertable sleeps
     "test-uring-exit-cancel"    # U2 io_uring thread-exit cancel/complete + fd-leak sentinel
     "test-lf-promote-close-race" # L4 local-file lazy-promote vs concurrent close (leak/wrong-file)
+    "test-uring-cancel-io"      # U1 NtCancelIoFile(Ex) reaches io_uring bypass ops
 )
 
 regression_setup() {
@@ -362,6 +363,10 @@ regression_setup() {
             rm -f /tmp/nspa-u2-1.fifo
             mkfifo /tmp/nspa-u2-1.fifo 2>/dev/null || true
             ;;
+        test-uring-cancel-io)
+            rm -f /tmp/nspa-u1-1.fifo
+            mkfifo /tmp/nspa-u1-1.fifo 2>/dev/null || true
+            ;;
     esac
 }
 
@@ -372,6 +377,9 @@ regression_teardown() {
             ;;
         test-uring-exit-cancel)
             rm -f /tmp/nspa-u2-1.fifo
+            ;;
+        test-uring-cancel-io)
+            rm -f /tmp/nspa-u1-1.fifo
             ;;
     esac
 }

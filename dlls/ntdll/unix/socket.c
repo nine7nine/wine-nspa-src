@@ -1386,7 +1386,10 @@ void ntdll_complete_socket_poll( struct uring_async_op *op, int poll_revents )
 
     if (poll_revents < 0)
     {
-        status = errno_to_status( -poll_revents );
+        /* -ECANCELED = U1 NtCancelIoFile / U2 thread-exit cancel; report
+         * as NT does (errno_to_status has no ECANCELED case). */
+        status = (poll_revents == -ECANCELED) ? STATUS_CANCELLED
+                                              : errno_to_status( -poll_revents );
         complete_socket_poll_result( op, wait_handle, status, 0 );
         if (is_send)
         {
@@ -1523,8 +1526,12 @@ void ntdll_complete_socket_recvmsg( struct uring_async_op *op, int result )
 
     /* CQE result: bytes received (>=0) or -errno (<0).  Pass to
      * try_recv_post_process the same way the sync try_recv does (saved_errno
-     * only meaningful when ret < 0). */
-    if (result < 0)
+     * only meaningful when ret < 0).  -ECANCELED (U1/U2 cancels) is
+     * reported directly as STATUS_CANCELLED — post-process would map it
+     * through errno_to_status, which has no ECANCELED case. */
+    if (result == -ECANCELED)
+        status = STATUS_CANCELLED;
+    else if (result < 0)
         status = try_recv_post_process( async, hdr, unix_addr, -1, -result, &information );
     else
         status = try_recv_post_process( async, hdr, unix_addr, result, 0, &information );
@@ -1570,7 +1577,14 @@ void ntdll_complete_socket_sendmsg( struct uring_async_op *op, int result )
     if (result == -EISCONN || result == -ECONNREFUSED || result == -EINTR)
         retry_via_sync = 1;
 
-    if (retry_via_sync)
+    if (result == -ECANCELED)
+    {
+        /* U1/U2 cancel — report as NT does; sent_len preserves any
+         * partial progress for the IOSB. */
+        status = STATUS_CANCELLED;
+        information = async->sent_len;
+    }
+    else if (retry_via_sync)
     {
         int fd, needs_close = FALSE;
 

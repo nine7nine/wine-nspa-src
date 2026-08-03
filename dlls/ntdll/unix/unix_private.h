@@ -730,6 +730,12 @@ static inline BOOL ntdll_io_uring_has_pending(void)
  * draining CQEs as they arrive.  TRUE = deadline reached; FALSE = nothing
  * left in flight (finish the remaining sleep precisely) or unavailable. */
 extern BOOL ntdll_io_uring_sleep_drain( int clock_id, const struct timespec *deadline );
+/* U1: cancel the calling thread's in-flight bypass ops on @handle (all of
+ * them when @io is NULL, else only those with a matching app IOSB) and
+ * drain until their STATUS_CANCELLED completions have been delivered.
+ * Calling-thread scope = NtCancelIoFile's NT contract; cross-thread
+ * NtCancelIoFileEx of another ring's ops is a documented residual gap. */
+extern int  ntdll_io_uring_cancel_ops( HANDLE handle, IO_STATUS_BLOCK *io );
 extern void ntdll_signal_event_direct( HANDLE event );
 extern int  ntdll_resolve_event_sync_fd( HANDLE event );
 extern int  ntdll_io_uring_submit_socket_poll( int unix_fd, short events,

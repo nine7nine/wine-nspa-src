@@ -7110,6 +7110,14 @@ static NTSTATUS cancel_io( HANDLE handle, IO_STATUS_BLOCK *io, IO_STATUS_BLOCK *
      * NtCancelIoFileEx (both call this helper). */
     srv_handle = nspa_promote_if_local( handle );
 
+    /* NSPA U1: cancel the calling thread's in-flight io_uring bypass ops
+     * on this handle first — they have no server-side async, so the
+     * cancel_async RPC below cannot see them.  Their CQEs deliver
+     * STATUS_CANCELLED through the normal completion paths before this
+     * returns.  (Cross-thread NtCancelIoFileEx of ops issued on another
+     * thread's ring is a documented residual — see io_uring.c.) */
+    ntdll_io_uring_cancel_ops( handle, io );
+
     SERVER_START_REQ( cancel_async )
     {
         req->handle      = wine_server_obj_handle( srv_handle );

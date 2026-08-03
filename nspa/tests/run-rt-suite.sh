@@ -7,9 +7,13 @@
 #     (channels, EVENT_SET_PI, raw sched attrs).
 # Layer 2: PE Wine binary nspa_rt_test.exe.
 #   - Validate full Wine -> ntsync stack via Win32 APIs.
+# Layer 3: NSPA regression exes (standalone mingw-built reproducers for
+#   fixed NSPA bugs — see REGRESSION_TESTS below).  Each must keep
+#   passing across builds/releases; exit 77 = SKIP (environment cannot
+#   exercise the path).
 #
 # Usage: ./run-rt-suite.sh [layer]
-#   layer = "native" | "wine" | "all"  (default: all)
+#   layer = "native" | "wine" | "regression" | "all"  (default: all)
 #
 # Default behavior:
 #   - runs Layer 1 native + Layer 2 PE
@@ -331,6 +335,89 @@ run_wine() {
     return $rc
 }
 
+# ---------------------------------------------------------------------------
+# Layer 3: NSPA regression exes.
+#
+# Standalone mingw-built reproducers for fixed NSPA bugs — regression gates
+# that must keep passing across builds/releases (NSPA features have no
+# upstream wine tests).  Contract: exit 0 = PASS, 77 = SKIP (environment
+# cannot exercise the path — e.g. io_uring absent), anything else = FAIL.
+# To add one: drop test-<name>.c/.exe in this directory, list it in
+# REGRESSION_TESTS, and add any per-test setup/teardown below.
+# ---------------------------------------------------------------------------
+REGRESSION_TESTS=(
+    "test-send-timeout-dup"     # M1-A/M1-B msg-ring SEND timeout dup delivery (wine 674358cb093)
+    "test-uring-sleep-stall"    # U3 io_uring completion stall in non-alertable sleeps
+)
+
+regression_setup() {
+    case "$1" in
+        test-uring-sleep-stall)
+            rm -f /tmp/nspa-u3-1.fifo /tmp/nspa-u3-2.fifo
+            mkfifo /tmp/nspa-u3-1.fifo /tmp/nspa-u3-2.fifo 2>/dev/null || true
+            ;;
+    esac
+}
+
+regression_teardown() {
+    case "$1" in
+        test-uring-sleep-stall)
+            rm -f /tmp/nspa-u3-1.fifo /tmp/nspa-u3-2.fifo
+            ;;
+    esac
+}
+
+run_regression() {
+    local wine_bin=${WINE:-/usr/bin/wine}
+    local prefix=${WINEPREFIX:-/home/ninez/Winebox/winebox-master}
+    local log_dir=${LOG_DIR:-$LOG_DIR_DEFAULT}
+    local mingw=x86_64-w64-mingw32-gcc
+    local fails=0 skips=0 passes=0
+    local t
+
+    echo
+    echo "$(bold "=== Layer 3: NSPA regression exes ===")"
+    mkdir -p "$log_dir"
+
+    for t in "${REGRESSION_TESTS[@]}"; do
+        local src="$HERE/$t.c" exe="$HERE/$t.exe" log="$log_dir/regression_$t.log"
+        local rc
+
+        # (Re)build when the source is newer than the exe.  Extra import
+        # libs are picked up from the test's "Build:" header comment.
+        if [[ -f "$src" && ( ! -f "$exe" || "$src" -nt "$exe" ) ]]; then
+            if command -v "$mingw" >/dev/null 2>&1; then
+                local libs
+                libs=$(grep -m1 -oE '(\-l[a-z0-9_]+ ?)+' "$src" | head -1)
+                "$mingw" -O2 -o "$exe" "$src" $libs >/dev/null 2>&1 || true
+            fi
+        fi
+        if [[ ! -x "$exe" ]]; then
+            printf '  %-28s %s\n' "$t" "$(yellow SKIP) (no exe / no mingw)"
+            skips=$((skips + 1)); continue
+        fi
+
+        regression_setup "$t"
+        WINEPREFIX="$prefix" timeout --kill-after=5 120 "$wine_bin" "$exe" > "$log" 2>&1
+        rc=$?
+        regression_teardown "$t"
+
+        if [[ $rc -eq 0 ]]; then
+            printf '  %-28s %s\n' "$t" "$(green PASS)"
+            passes=$((passes + 1))
+        elif [[ $rc -eq 77 ]]; then
+            printf '  %-28s %s\n' "$t" "$(yellow SKIP) (path unavailable — see $(basename "$log"))"
+            skips=$((skips + 1))
+        else
+            printf '  %-28s %s (rc=%d, see %s)\n' "$t" "$(red FAIL)" "$rc" "$log"
+            fails=$((fails + 1))
+        fi
+    done
+
+    echo "  regression: $passes pass, $skips skip, $fails fail"
+    return $fails
+}
+
 post_cleanup() {
     [[ "$CLEANUP_AFTER" == "1" ]] || return 0
     echo
@@ -541,14 +628,19 @@ case "$LAYER" in
         post_run ;;
     wine)
         run_wine
+        run_regression || true
+        post_run ;;
+    regression)
+        run_regression
         post_run ;;
     all)
         run_native || true
         cooldown   # no-op unless LAYER_COOLDOWN_SECS=N (e.g. after stress)
         run_wine
+        run_regression || true
         post_run ;;
     *)
-        echo "usage: $0 [native|wine|all]" >&2
+        echo "usage: $0 [native|wine|regression|all]" >&2
         exit 2
         ;;
 esac

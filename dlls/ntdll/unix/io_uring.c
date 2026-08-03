@@ -39,6 +39,7 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
@@ -63,6 +64,17 @@ WINE_DEFAULT_DEBUG_CHANNEL(io_uring);
 
 /* Sentinel user_data value for internal operations (cancel, etc.) */
 #define URING_INTERNAL_TAG ((void *)(uintptr_t)1)
+
+/* CQE user_data discipline.  Three tag classes share the 64-bit user_data:
+ *   - async op:   pointer into this thread's op_pool (aligned, so even)
+ *   - sync poll:  per-call odd tag minted from uring_poll_seq (see
+ *                 ntdll_io_uring_poll) — odd values can never alias a pool
+ *                 pointer, and the sequence makes every call's tag unique
+ *                 so a stale CQE from an orphaned earlier poll can never be
+ *                 misattributed to a later call
+ *   - internal:   URING_INTERNAL_TAG (cancel SQEs)
+ * Only pool pointers may ever be dereferenced; everything else is
+ * discardable on sight.  is_pool_op() is the single authority. */
 
 /* -----------------------------------------------------------------------
  * Async op types and per-thread pool (forward declarations needed by
@@ -114,6 +126,25 @@ struct uring_async_op
  * Allocated once at ring init time — zero malloc in the submit path. */
 static __thread struct uring_async_op  op_pool[RING_SIZE];
 static __thread struct uring_async_op *op_free_head;
+
+/* U3: count of async ops submitted to this thread's ring whose CQE has not
+ * yet been drained (one CQE per op, no multishot).  Together with
+ * ntdll_io_uring_deferred_count this answers "does this thread owe anyone
+ * a completion delivery?" — consulted by the non-alertable NtDelayExecution
+ * routing (a plain clock_nanosleep would sit on completions that only this
+ * thread can deliver, stalling any other thread waiting on the op's event).
+ * The sync ntdll_io_uring_poll never counts: its SQE is consumed within the
+ * call and represents no deliverable completion. */
+__thread unsigned int ntdll_io_uring_inflight_count;
+
+static BOOL is_pool_op( void *p )
+{
+    return p >= (void *)op_pool && p < (void *)(op_pool + RING_SIZE);
+}
+
+/* Defined in the async-op section below; needed by the sync-poll foreign-CQE
+ * routing above it. */
+static void complete_uring_op( struct uring_async_op *op, int result );
 
 static void op_pool_init(void)
 {
@@ -304,11 +335,73 @@ void ntdll_io_uring_flush_deferred_slow(void)
  * Returns: positive revents on success, 0 on timeout, negative on error.
  * ----------------------------------------------------------------------- */
 
+/* Per-thread sequence for sync-poll CQE tags.  Tag = ((++seq) << 1) | 1:
+ * odd, so it can never alias an op_pool pointer, and unique per call, so a
+ * CQE from an earlier orphaned poll can never be taken for the current
+ * call's result. */
+static __thread uintptr_t uring_poll_seq;
+
+/* Route one foreign CQE encountered while waiting for our own.  Async op
+ * completions are delivered properly (they used to be silently eaten here:
+ * this function took the FIRST CQE as its poll result, so an async op
+ * completing between the entry drain and the wait lost its event/IOSB
+ * delivery, leaked its op slot + dup fd, and fed its res to the caller as
+ * revents).  Anything else — stale poll tags, internal cancels — is
+ * discardable by the user_data discipline. */
+static void uring_poll_route_foreign( struct io_uring_cqe *cqe )
+{
+    void *data = io_uring_cqe_get_data( cqe );
+    if (is_pool_op( data )) complete_uring_op( data, cqe->res );
+}
+
+/* Cancel this call's still-pending poll SQE and reap CQEs until the poll's
+ * own CQE has been seen (routing foreign completions on the way).  Exits
+ * early on wait errors — any CQEs left behind are safely discarded later
+ * by the user_data discipline. */
+static void uring_poll_cancel_and_reap( void *tag )
+{
+    struct io_uring_sqe *sqe;
+    struct io_uring_cqe *cqe;
+    int spins = 0;
+
+    sqe = io_uring_get_sqe( &thread_ring );
+    if (!sqe)
+    {
+        ntdll_io_uring_process_completions();
+        sqe = io_uring_get_sqe( &thread_ring );
+        /* No room for the cancel: orphan the poll.  Its CQE carries our
+         * unique odd tag and is discarded by any later drain. */
+        if (!sqe) return;
+    }
+    io_uring_prep_cancel64( sqe, (uintptr_t)tag, 0 );
+    io_uring_sqe_set_data( sqe, URING_INTERNAL_TAG );
+    io_uring_submit( &thread_ring );
+
+    for (;;)
+    {
+        int ret = io_uring_wait_cqe( &thread_ring, &cqe );
+        if (ret == -EINTR)
+        {
+            if (++spins > 1000) return;   /* pathological signal storm — orphan */
+            continue;
+        }
+        if (ret < 0) return;
+        if (io_uring_cqe_get_data( cqe ) == tag)
+        {
+            io_uring_cqe_seen( &thread_ring, cqe );
+            return;   /* poll CQE reaped (fired or -ECANCELED) — done */
+        }
+        uring_poll_route_foreign( cqe );
+        io_uring_cqe_seen( &thread_ring, cqe );
+    }
+}
+
 int ntdll_io_uring_poll( int fd, short events, int timeout_ms )
 {
     struct io_uring_sqe *sqe;
     struct io_uring_cqe *cqe;
     struct __kernel_timespec ts;
+    void *tag;
     int ret;
 
     if (!ensure_ring()) return -ENOSYS;
@@ -319,49 +412,55 @@ int ntdll_io_uring_poll( int fd, short events, int timeout_ms )
     sqe = io_uring_get_sqe( &thread_ring );
     if (!sqe) return -ENOMEM;
 
+    tag = (void *)(uintptr_t)(((++uring_poll_seq) << 1) | 1);
     io_uring_prep_poll_add( sqe, fd, (unsigned)events );
-    io_uring_sqe_set_data( sqe, NULL );
+    io_uring_sqe_set_data( sqe, tag );
+    io_uring_submit( &thread_ring );
 
-    if (timeout_ms > 0)
+    if (timeout_ms >= 0)
     {
         ts.tv_sec  = timeout_ms / 1000;
         ts.tv_nsec = (long)(timeout_ms % 1000) * 1000000;
-        ret = io_uring_submit_and_wait_timeout( &thread_ring, &cqe, 1, &ts, NULL );
-    }
-    else if (timeout_ms == 0)
-    {
-        io_uring_submit( &thread_ring );
-        ret = io_uring_peek_cqe( &thread_ring, &cqe );
-    }
-    else
-    {
-        io_uring_submit( &thread_ring );
-        ret = io_uring_wait_cqe( &thread_ring, &cqe );
     }
 
-    if (ret == -ETIME || (ret == -EAGAIN && timeout_ms == 0))
+    for (;;)
     {
-        /* timed out — cancel the pending poll, drain all CQEs */
-        struct io_uring_sqe *cancel_sqe = io_uring_get_sqe( &thread_ring );
-        if (cancel_sqe)
+        if (timeout_ms > 0)
+            ret = io_uring_wait_cqe_timeout( &thread_ring, &cqe, &ts );
+        else if (timeout_ms == 0)
+            ret = io_uring_peek_cqe( &thread_ring, &cqe );
+        else
+            ret = io_uring_wait_cqe( &thread_ring, &cqe );
+
+        if (ret == -ETIME || (ret == -EAGAIN && timeout_ms == 0))
         {
-            io_uring_prep_cancel64( cancel_sqe, 0, 0 );
-            io_uring_sqe_set_data( cancel_sqe, URING_INTERNAL_TAG );
-            io_uring_submit( &thread_ring );
-            /* wait for the cancel completion + the cancelled poll */
-            for (int i = 0; i < 2; i++)
-            {
-                if (io_uring_wait_cqe( &thread_ring, &cqe ) == 0)
-                    io_uring_cqe_seen( &thread_ring, cqe );
-            }
+            /* timed out / not ready — retract our poll before returning so
+             * it can't linger in the ring. */
+            uring_poll_cancel_and_reap( tag );
+            return 0;  /* timeout — matches poll() returning 0 */
         }
-        return 0;  /* timeout — matches poll() returning 0 */
-    }
-    if (ret < 0) return ret;
+        if (ret < 0)
+        {
+            /* -EINTR (or wait failure): retract and surface to the caller,
+             * which handles EINTR by restarting its I/O loop. */
+            uring_poll_cancel_and_reap( tag );
+            return ret;
+        }
 
-    ret = cqe->res;
-    io_uring_cqe_seen( &thread_ring, cqe );
-    return (ret < 0) ? ret : ret;  /* revents mask or error */
+        if (io_uring_cqe_get_data( cqe ) == tag)
+        {
+            ret = cqe->res;
+            io_uring_cqe_seen( &thread_ring, cqe );
+            return ret;  /* revents mask or error */
+        }
+
+        /* Foreign CQE (async op / stale tag) — deliver or discard, then
+         * keep waiting for ours.  NOTE: the fixed timeout is re-armed per
+         * iteration; foreign completions are rare enough that the small
+         * timeout stretch is preferable to deadline bookkeeping here. */
+        uring_poll_route_foreign( cqe );
+        io_uring_cqe_seen( &thread_ring, cqe );
+    }
 }
 
 
@@ -419,6 +518,12 @@ static void complete_uring_op( struct uring_async_op *op, int result )
 {
     NTSTATUS status;
     ULONG_PTR information;
+
+    /* U3: every submitted async op funnels through here exactly once (one
+     * CQE per op).  Guarded so an accounting bug degrades Sleep routing
+     * instead of wrapping the counter. */
+    if (ntdll_io_uring_inflight_count) ntdll_io_uring_inflight_count--;
+    else ERR( "in-flight counter underflow (type=%d handle=%p)\n", op->type, op->handle );
 
     /* Socket poll completions — both sync and overlapped complete inline.
      * Overlapped uses ntdll_signal_event_direct (raw ntsync ioctl) instead
@@ -519,6 +624,7 @@ int ntdll_io_uring_submit_file_read( int unix_fd, int needs_close, void *buffer,
     io_uring_prep_read( sqe, ring_fd, (char *)buffer + already, count - already, 0 );
     io_uring_sqe_set_data( sqe, op );
     io_uring_submit( &thread_ring );
+    ntdll_io_uring_inflight_count++;
 
     /* the caller's fd lifecycle is unchanged — close if needed */
     if (needs_close) close( unix_fd );
@@ -569,6 +675,7 @@ int ntdll_io_uring_submit_file_write( int unix_fd, int needs_close, const void *
     io_uring_prep_write( sqe, ring_fd, (const char *)buffer + already, count - already, 0 );
     io_uring_sqe_set_data( sqe, op );
     io_uring_submit( &thread_ring );
+    ntdll_io_uring_inflight_count++;
 
     if (needs_close) close( unix_fd );
 
@@ -668,6 +775,7 @@ int ntdll_io_uring_submit_socket_recvmsg( int unix_fd, HANDLE handle,
     io_uring_prep_recvmsg( sqe, ring_fd, &op->sock_msghdr, unix_flags );
     io_uring_sqe_set_data( sqe, op );
     io_uring_submit( &thread_ring );
+    ntdll_io_uring_inflight_count++;
 
     TRACE( "submitted socket RECVMSG: handle=%p fd=%d(%d) sock_async=%p flags=%#x\n",
            handle, unix_fd, ring_fd, sock_async, unix_flags );
@@ -734,6 +842,7 @@ int ntdll_io_uring_submit_socket_sendmsg( int unix_fd, HANDLE handle,
     io_uring_prep_sendmsg( sqe, ring_fd, &op->sock_msghdr, unix_flags );
     io_uring_sqe_set_data( sqe, op );
     io_uring_submit( &thread_ring );
+    ntdll_io_uring_inflight_count++;
 
     TRACE( "submitted socket SENDMSG: handle=%p fd=%d(%d) sock_async=%p flags=%#x\n",
            handle, unix_fd, ring_fd, sock_async, unix_flags );
@@ -805,6 +914,7 @@ int ntdll_io_uring_submit_socket_poll( int unix_fd, short events,
     io_uring_prep_poll_add( sqe, unix_fd, (unsigned)events );
     io_uring_sqe_set_data( sqe, op );
     io_uring_submit( &thread_ring );
+    ntdll_io_uring_inflight_count++;
 
     TRACE( "submitted async socket poll: handle=%p fd=%d events=%#x %s\n",
            handle, unix_fd, events, is_send ? "send" : "recv" );
@@ -832,7 +942,11 @@ void ntdll_io_uring_process_completions(void)
     {
         struct uring_async_op *op = io_uring_cqe_get_data( cqe );
 
-        if (op && op != URING_INTERNAL_TAG)
+        /* Only op_pool pointers may be dereferenced — NULL, internal cancel
+         * tags and (unique, odd) sync-poll tags from orphaned polls are all
+         * discardable on sight.  See the user_data discipline note at the
+         * top of the file. */
+        if (is_pool_op( op ))
         {
             int result = cqe->res;
 
@@ -864,6 +978,75 @@ void ntdll_io_uring_process_completions(void)
 }
 
 
+/* -----------------------------------------------------------------------
+ * U3: drain-capable non-alertable sleep
+ *
+ * A thread that submits an async op and then blocks in a plain
+ * clock_nanosleep / select sits on completions only it can deliver (rings
+ * are SINGLE_ISSUER, per-thread): another thread waiting on the op's event
+ * stalls for the whole sleep — Sleep(INFINITE) forever.  Windows delivers
+ * I/O completions regardless of what the submitting thread is doing, so
+ * when this thread owes completions, NtDelayExecution sleeps here instead:
+ * ppoll on the ring's registered eventfd, drain + flush on every CQE
+ * arrival, re-sleep for the remainder.
+ *
+ * Draining from a non-alertable sleep is NT-correct: events / IOSBs are
+ * published (as the kernel would), and APCs are only *queued* — they still
+ * deliver at the next alertable point.
+ *
+ * @clock_id / @deadline: absolute deadline on that clock; NULL = sleep
+ * forever.  Returns TRUE when the deadline was reached (sleep satisfied),
+ * FALSE when nothing is left in flight (caller finishes the remaining
+ * sleep with the precise clock_nanosleep path) or the mechanism is
+ * unavailable.
+ * ----------------------------------------------------------------------- */
+
+BOOL ntdll_io_uring_sleep_drain( int clock_id, const struct timespec *deadline )
+{
+    struct pollfd pfd;
+
+    if (!ring_initialized || ntdll_io_uring_ring_efd < 0) return FALSE;
+
+    pfd.fd     = ntdll_io_uring_ring_efd;
+    pfd.events = POLLIN;
+
+    while (ntdll_io_uring_inflight_count || ntdll_io_uring_deferred_count)
+    {
+        struct timespec rel, *prel = NULL;
+        int ret;
+
+        if (deadline)
+        {
+            struct timespec now;
+            clock_gettime( clock_id, &now );
+            rel.tv_sec  = deadline->tv_sec - now.tv_sec;
+            rel.tv_nsec = deadline->tv_nsec - now.tv_nsec;
+            if (rel.tv_nsec < 0) { rel.tv_sec--; rel.tv_nsec += 1000000000; }
+            if (rel.tv_sec < 0) return TRUE;   /* deadline already passed */
+            prel = &rel;
+        }
+
+        pfd.revents = 0;
+        ret = ppoll( &pfd, 1, prel, NULL );
+        if (ret > 0)
+        {
+            uint64_t val;
+            if (!(pfd.revents & POLLIN)) return FALSE;   /* can't happen on an eventfd; bail to precise sleep */
+            /* Clear the (level-triggered) eventfd counter, then deliver.
+             * EAGAIN is fine — another drain path may have consumed it. */
+            if (read( ntdll_io_uring_ring_efd, &val, sizeof(val) ) < 0) { /* EAGAIN */ }
+            ntdll_io_uring_process_completions();
+            ntdll_io_uring_flush_deferred();
+        }
+        else if (ret == 0) return TRUE;   /* deadline reached */
+        /* ret < 0: EINTR — non-alertable sleep ignores signals; recompute
+         * the remainder and continue (mirrors the clock_nanosleep EINTR
+         * retry in NtDelayExecution). */
+    }
+    return FALSE;   /* nothing left in flight */
+}
+
+
 #else /* !HAVE_LIBURING_H */
 
 /* Stubs — all return -ENOSYS so callers fall back to existing paths */
@@ -874,7 +1057,9 @@ int  ntdll_io_uring_poll( int fd, short events, int timeout_ms ) { return -ENOSY
 void ntdll_io_uring_process_completions(void) { }
 __thread int ntdll_io_uring_ring_efd = -1;
 __thread unsigned int ntdll_io_uring_deferred_count;
+__thread unsigned int ntdll_io_uring_inflight_count;
 void ntdll_io_uring_flush_deferred_slow(void) { }
+BOOL ntdll_io_uring_sleep_drain( int clock_id, const struct timespec *deadline ) { return FALSE; }
 
 int ntdll_io_uring_submit_socket_poll( int unix_fd, short events,
                                        HANDLE handle, HANDLE wait_handle,

@@ -709,6 +709,23 @@ static inline void ntdll_io_uring_flush_deferred(void)
 {
     if (ntdll_io_uring_deferred_count) ntdll_io_uring_flush_deferred_slow();
 }
+/* U3: async ops submitted to this thread's ring whose CQE hasn't been
+ * drained yet.  Rings are SINGLE_ISSUER — only this thread can deliver
+ * these completions, so blocking without a drain point while this is
+ * nonzero stalls every other thread waiting on one of the ops' events.
+ * ntdll_io_uring_has_pending() is the cheap gate NtDelayExecution uses to
+ * decide between plain clock_nanosleep and the eventfd drain-sleep
+ * (ntdll_io_uring_sleep_drain).  U1/U2 (cancel support, thread-exit
+ * cleanup) reuse the same counter. */
+extern __thread unsigned int ntdll_io_uring_inflight_count;
+static inline BOOL ntdll_io_uring_has_pending(void)
+{
+    return ntdll_io_uring_inflight_count || ntdll_io_uring_deferred_count;
+}
+/* Sleep until @deadline (absolute on @clock_id; NULL = forever) while
+ * draining CQEs as they arrive.  TRUE = deadline reached; FALSE = nothing
+ * left in flight (finish the remaining sleep precisely) or unavailable. */
+extern BOOL ntdll_io_uring_sleep_drain( int clock_id, const struct timespec *deadline );
 extern void ntdll_signal_event_direct( HANDLE event );
 extern int  ntdll_resolve_event_sync_fd( HANDLE event );
 extern int  ntdll_io_uring_submit_socket_poll( int unix_fd, short events,

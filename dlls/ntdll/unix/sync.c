@@ -3375,13 +3375,56 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
 
     if (!timeout || timeout->QuadPart == TIMEOUT_INFINITE)  /* sleep forever */
     {
-        for (;;) select( 0, NULL, NULL, NULL, NULL );
+        for (;;)
+        {
+            /* NSPA U3: if this thread still owes io_uring completion
+             * deliveries (per-thread SINGLE_ISSUER ring — nobody else can
+             * drain it), sleep on the ring eventfd and deliver as CQEs
+             * arrive; a plain select would stall other threads waiting on
+             * those ops' events for the whole (here: infinite) sleep. */
+            if (!ntdll_io_uring_has_pending() || !ntdll_io_uring_sleep_drain( CLOCK_MONOTONIC, NULL ))
+                select( 0, NULL, NULL, NULL, NULL );
+        }
     }
     else
     {
         LONGLONG ticks = timeout->QuadPart;
         LARGE_INTEGER now;
         timeout_t when = ticks, diff;
+
+#ifdef HAVE_CLOCK_GETTIME
+        /* NSPA U3: with completions owed on this thread's ring, sleep via
+         * the eventfd drain loop against the absolute deadline.  TRUE =
+         * deadline reached; FALSE = everything was delivered mid-sleep —
+         * fall through and finish the remainder on the normal paths.
+         * Deliberately OUTSIDE the clock_nanosleep block below: this
+         * build's config.h has no HAVE_CLOCK_NANOSLEEP, so that whole
+         * block (and anything inside it) is compiled out and finite
+         * non-alertable sleeps take the select() loop at the bottom —
+         * verified by strace on the first U3 build (pselect6 4.0s, no
+         * nanosleep). */
+        if (ticks != 0 && ntdll_io_uring_has_pending())
+        {
+            struct timespec dts;
+            int dclock;
+
+            if (ticks < 0)
+            {
+                dclock = CLOCK_MONOTONIC;
+                clock_gettime( CLOCK_MONOTONIC, &dts );
+                dts.tv_sec += (time_t)(-ticks / TICKSPERSEC);
+                dts.tv_nsec += (long)((-ticks % TICKSPERSEC) * 100);
+                if (dts.tv_nsec >= 1000000000) { dts.tv_sec++; dts.tv_nsec -= 1000000000; }
+            }
+            else
+            {
+                dclock = CLOCK_REALTIME;
+                dts.tv_sec = (time_t)((ticks / TICKSPERSEC) - SECS_1601_TO_1970);
+                dts.tv_nsec = (long)((ticks % TICKSPERSEC) * 100);
+            }
+            if (ntdll_io_uring_sleep_drain( dclock, &dts )) return STATUS_SUCCESS;
+        }
+#endif
 
 #if defined(HAVE_CLOCK_GETTIME) && defined(HAVE_CLOCK_NANOSLEEP)
         /* NSPA: use clock_nanosleep FIRST for sub-ms precision.
